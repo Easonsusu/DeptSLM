@@ -1,0 +1,107 @@
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# macOS and editor metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Node.js / Next.js
+node_modules/
+.next/
+out/
+.nuxt/
+.turbo/
+.parcel-cache/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tsbuildinfo
+
+# Tests and generic generated output
+coverage/
+.cache/
+tmp/
+temp/
+*.tmp
+*.log
+
+# Local databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# DeptSLM runtime data. Deny these directory names recursively so an accidental
+# write below an app, service, package, or data directory cannot be staged.
+# data/sample_docs and data/eval_sets intentionally remain source-controlled for
+# small, reviewed synthetic fixtures.
+**/runtime/
+**/.runtime/
+**/uploads/
+**/extracted_text/
+**/vector_snapshots/
+**/training_datasets/
+**/adapters/
+**/model_cache/
+**/eval_results/
+**/logs/
+**/exports/
+**/service_state/
+**/qdrant_storage/
+**/postgres-data/
+/postgres/
+
+# Model weights, checkpoints, and local model caches
+*.safetensors
+*.bin
+*.gguf
+*.ggml
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.h5
+*.tflite
+**/.huggingface/
+**/.ollama/
+**/model_weights/
+**/models-cache/
+
+# Docker and local service state
+**/.docker-data/

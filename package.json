@@ -1,0 +1,22 @@
+{
+  "name": "deptslm",
+  "version": "0.0.0",
+  "private": true,
+  "description": "University departmental SLM customization platform",
+  "packageManager": "pnpm@11.7.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "apps/*",
+    "services/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build:web": "pnpm --filter @deptslm/web build",
+    "compose:config": "./scripts/compose.sh config",
+    "dev": "./scripts/compose.sh up --build",
+    "down": "./scripts/compose.sh down",
+    "typecheck:web": "pnpm --filter @deptslm/web typecheck"
+  }
+}

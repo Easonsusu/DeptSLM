@@ -1,0 +1,112 @@
+name: deptslm
+
+# Phase 0 local-development scaffold. Use scripts/compose.sh so the host path is
+# verified as absolute, existing, and outside this repository before Compose runs.
+x-deptslm-wrapper-required: "${DEPTSLM_COMPOSE_WRAPPER:?Run ./scripts/compose.sh instead of invoking docker compose directly}"
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    environment:
+      API_URL: "http://api:8000"
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+      PORT: "3000"
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_started
+
+  api:
+    build:
+      context: ./apps/api
+    environment:
+      API_PORT: "${API_PORT:-8000}"
+      DATABASE_URL: "${DATABASE_URL:-postgresql://deptslm:deptslm@postgres:5432/deptslm}"
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+      QDRANT_URL: "${QDRANT_URL:-http://qdrant:6333}"
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}"
+        target: /runtime/deptslm
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: deptslm
+      POSTGRES_PASSWORD: deptslm
+      POSTGRES_USER: deptslm
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/service_state/postgres"
+        target: /var/lib/postgresql/data
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U deptslm -d deptslm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.4
+    ports:
+      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:6334:6334"
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/service_state/qdrant"
+        target: /qdrant/storage
+        bind:
+          create_host_path: false
+
+  rag-worker:
+    build:
+      context: ./services/rag-worker
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql://deptslm:deptslm@postgres:5432/deptslm}"
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+      QDRANT_URL: "${QDRANT_URL:-http://qdrant:6333}"
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}"
+        target: /runtime/deptslm
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+
+  training-worker:
+    build:
+      context: ./services/training-worker
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql://deptslm:deptslm@postgres:5432/deptslm}"
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}"
+        target: /runtime/deptslm
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy

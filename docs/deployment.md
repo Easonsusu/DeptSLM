@@ -1,0 +1,149 @@
+# Deployment and Local Development
+
+## Phase 0 status
+
+DeptSLM is not production ready. Phase 0 uses Docker Compose to make the intended local service topology visible and to provide a foundation for later implementation. The web and API skeletons are intentionally minimal, while worker definitions and integrations may remain placeholders. RAG, model serving, database migrations, training, authentication, secrets management, backups, and production operations are not implemented in this phase.
+
+## Planned local services
+
+| Service | Role | Phase 0 expectation |
+| --- | --- | --- |
+| `web` | Next.js user interface | Basic landing page only. |
+| `api` | FastAPI control plane | `GET /health` and `GET /version` only. |
+| `postgres` | Application metadata database | Local service placeholder; business schema is deferred. |
+| `qdrant` | Vector search | Local service placeholder; no ingestion is implemented. |
+| `rag-worker` | Future ingestion and retrieval jobs | Structural placeholder; no RAG workflow is implemented. |
+| `training-worker` | Future LLaMA-Factory jobs | Structural placeholder; no fine-tuning is implemented. |
+
+Qwen3, Qwen3-Embedding, LlamaIndex, and LLaMA-Factory are target components, but Phase 0 should not download models or add heavy training/inference dependencies merely to make the skeleton appear complete.
+
+## Prerequisites
+
+- macOS for the provided Google Drive setup script
+- a mounted Google Drive desktop folder for persistent local runtime artifacts
+- Git
+- Docker Desktop with the `docker compose` command
+- enough local resources for PostgreSQL and Qdrant
+
+Running application skeletons directly outside containers requires Node.js 20 or newer and Python 3.11 or newer, as declared by the current manifests. Do not assume globally installed tool versions when a repository file provides one.
+
+## Configure external runtime storage
+
+Runtime artifacts must never be stored inside the checkout. First run:
+
+```bash
+./scripts/setup_google_drive_storage.sh
+```
+
+The script searches likely directories under:
+
+```text
+~/Library/CloudStorage/GoogleDrive-*
+```
+
+It detects the existing personal-drive folder (`My Drive` or the localized `我的雲端硬碟`), creates `DeptSLM` and the required artifact subdirectories without deleting existing files, then prints the `DEPTSLM_DATA_DIR` value. With multiple accounts it chooses the strongest unambiguous match and stops without writing if the best candidates are tied.
+
+Create a local, untracked environment file:
+
+```bash
+cp .env.example .env
+```
+
+Set these values as appropriate for the local environment:
+
+- `DEPTSLM_DATA_DIR`: the absolute path printed by the setup script
+- `DATABASE_URL`: the API's future PostgreSQL connection URL
+- `QDRANT_URL`: the future Qdrant service URL
+- `API_PORT`: API host port, normally `8000`
+- `WEB_PORT`: web host port, normally `3000`
+- `ENVIRONMENT`: local environment name, normally `development`
+
+Do not commit `.env`. Do not put production credentials in `.env.example` or Compose defaults.
+
+## Validate and start
+
+Before startup, render the resolved Compose configuration through the repository wrapper:
+
+```bash
+./scripts/compose.sh config
+```
+
+The wrapper loads `DEPTSLM_DATA_DIR` from the shell or local `.env`, resolves it, and refuses missing, relative, root, nonexistent, non-writable, source-overlapping, or incomplete paths before Docker can create a bind mount. It also supplies the guard required by `docker-compose.yml`, so invoking `docker compose` directly is rejected. Review the rendered configuration, then build and start the services:
+
+```bash
+./scripts/compose.sh up --build
+```
+
+With the default ports, basic checks are:
+
+```bash
+curl --fail http://localhost:8000/health
+curl --fail http://localhost:8000/version
+```
+
+Open `http://localhost:3000` for the landing page. These checks prove only that the Phase 0 skeletons respond; they do not prove database, vector search, storage, model, RAG, or training readiness.
+
+Inspect status and logs with:
+
+```bash
+./scripts/compose.sh ps
+./scripts/compose.sh logs api web
+```
+
+Stop local services with:
+
+```bash
+./scripts/compose.sh down
+```
+
+Do not add a volume-deletion flag unless destruction of local service state is explicitly intended and reviewed.
+
+## Runtime mounts and persistence
+
+Services that write file artifacts must receive `DEPTSLM_DATA_DIR` explicitly and use only its approved subdirectories. A missing value must fail clearly; Compose or application code must not create fallback directories in the checkout. Department-owned paths must be isolated by a validated `department_id` in future phases.
+
+PostgreSQL and live Qdrant state are bind-mounted beneath `DEPTSLM_DATA_DIR/service_state`, never inside the repository. These Phase 0 definitions are local placeholders. Before using real data, review whether a synchronized folder is safe for these databases and document migration behavior, backup and restore, retention, deletion, sync implications, and recovery testing. Portable Qdrant snapshots belong under `DEPTSLM_DATA_DIR/vector_snapshots`.
+
+Google Drive is appropriate for the requested local artifact layout, but it is not a production database or object-store design. Avoid concurrent database access through synced files and do not assume that synchronization is atomic, complete, or a substitute for backups.
+
+## Tests and CI
+
+CI must not depend on a developer's Google Drive or reuse real data. It should create a temporary directory, export that absolute path as `DEPTSLM_DATA_DIR`, run the relevant checks, and discard the directory afterward. Test inputs must be small and synthetic.
+
+At minimum, future deployment checks should cover:
+
+- Compose configuration rendering
+- web lint, type-check, test, and build commands
+- API lint, type-check, and test commands
+- API health and version smoke checks
+- clear failure when required external storage is missing
+- prevention of writes into the repository
+- department-boundary and untrusted-retrieval tests once those features exist
+
+Use the actual commands declared by each app's manifests; Phase 0 does not prescribe a monorepo task runner.
+
+## Production deployment is deferred
+
+Docker Compose is for local development, not the production architecture. A production design must be approved before real university data is used and should address at least:
+
+- TLS, ingress, domains, and network segmentation
+- SSO, role-based access, department isolation, and audit trails
+- managed secrets and credential rotation
+- durable PostgreSQL, Qdrant, object storage, and backups
+- queueing, worker scaling, retries, idempotency, and cancellation
+- model licensing, serving hardware, autoscaling, quotas, and cost controls
+- sandboxed document extraction and upload scanning
+- prompt-injection defenses and grounded-answer evaluation
+- monitoring, tracing, alerting, retention, disaster recovery, and incident response
+- safe database migrations and rollback
+- adapter approval, deployment, and rollback
+
+No Phase 0 file should be interpreted as a production security or availability guarantee.
+
+## Troubleshooting
+
+- **The storage script cannot find Google Drive:** confirm Google Drive for desktop is installed, signed in, and mounted under `~/Library/CloudStorage`. Do not create a runtime folder in the repo as a workaround.
+- **`DEPTSLM_DATA_DIR` contains spaces:** keep the full absolute value in `.env`; scripts and Compose mounts must quote it correctly.
+- **Compose rejects the storage path:** set `DEPTSLM_DATA_DIR` to the external absolute path printed by the setup script, then rerun `./scripts/compose.sh config`. Never bypass the wrapper with a repository-local path.
+- **A worker starts but does no work:** expected for a Phase 0 placeholder; RAG and training are intentionally deferred.
+- **A model is unavailable:** expected in Phase 0; do not add model weights to Git.
