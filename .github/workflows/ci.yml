@@ -145,6 +145,17 @@ jobs:
           test -x scripts/compose.sh
           test -x services/rag-worker/entrypoint.sh
           test -x services/training-worker/entrypoint.sh
+      - name: Validate Compose configuration when available
+        run: |
+          if docker compose version >/dev/null 2>&1; then
+            export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-data"
+            mkdir -p "$DEPTSLM_DATA_DIR"/{uploads,extracted_text,vector_snapshots,training_datasets,adapters,model_cache,eval_results,logs,exports}
+            mkdir -p "$DEPTSLM_DATA_DIR/service_state/postgres"
+            mkdir -p "$DEPTSLM_DATA_DIR/service_state/qdrant"
+            ./scripts/compose.sh config --quiet
+          else
+            echo "Docker Compose unavailable; skipping Compose configuration validation."
+          fi
       - name: Verify infrastructure checks leave the checkout clean
         shell: bash
         run: |
