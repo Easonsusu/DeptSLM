@@ -107,6 +107,8 @@ Stop the stack with:
 
 Contributor rules are in [AGENTS.md](AGENTS.md).
 
+Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Documentation
 
 - [Product specification](docs/product-spec.md)
@@ -114,6 +116,8 @@ Contributor rules are in [AGENTS.md](AGENTS.md).
 - [Storage policy](docs/storage-policy.md)
 - [API](docs/api.md)
 - [Deployment](docs/deployment.md)
+- [Roadmap](docs/roadmap.md)
+- [Department and authentication boundaries](docs/department-auth-boundaries.md)
 
 ## Phase 0 non-goals
 
