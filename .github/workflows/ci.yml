@@ -87,7 +87,7 @@ jobs:
           fi
 
   api:
-    name: API tests
+    name: API, worker, and storage checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -126,7 +126,7 @@ jobs:
           fi
 
   infrastructure:
-    name: Infrastructure smoke checks
+    name: Infrastructure static checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -137,13 +137,25 @@ jobs:
           bash -n scripts/compose.sh
           sh -n services/rag-worker/entrypoint.sh
           sh -n services/training-worker/entrypoint.sh
-      - name: Validate Compose with temporary storage
+      - name: Check required infrastructure files and permissions
         run: |
-          export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-data"
-          mkdir -p "$DEPTSLM_DATA_DIR"/{uploads,extracted_text,vector_snapshots,training_datasets,adapters,model_cache,eval_results,logs,exports}
-          mkdir -p "$DEPTSLM_DATA_DIR/service_state/postgres"
-          mkdir -p "$DEPTSLM_DATA_DIR/service_state/qdrant"
-          ./scripts/compose.sh config --quiet
+          test -s docker-compose.yml
+          test -x scripts/setup_google_drive_storage.sh
+          test -x scripts/validate_data_dir.sh
+          test -x scripts/compose.sh
+          test -x services/rag-worker/entrypoint.sh
+          test -x services/training-worker/entrypoint.sh
+      - name: Validate Compose configuration when available
+        run: |
+          if docker compose version >/dev/null 2>&1; then
+            export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-data"
+            mkdir -p "$DEPTSLM_DATA_DIR"/{uploads,extracted_text,vector_snapshots,training_datasets,adapters,model_cache,eval_results,logs,exports}
+            mkdir -p "$DEPTSLM_DATA_DIR/service_state/postgres"
+            mkdir -p "$DEPTSLM_DATA_DIR/service_state/qdrant"
+            ./scripts/compose.sh config --quiet
+          else
+            echo "Docker Compose unavailable; skipping Compose configuration validation."
+          fi
       - name: Verify infrastructure checks leave the checkout clean
         shell: bash
         run: |
