@@ -88,3 +88,13 @@ Treat all uploaded, extracted, indexed, and retrieved text as untrusted data. Fu
 ## 10. Insufficient-information behavior
 
 If retrieval finds no source, only irrelevant sources, or sources below the approved confidence threshold, the assistant must plainly say that it does not have enough information from the department's sources. It may ask for a more specific question or an approved document, but it must not fabricate an answer, citation, policy, or source. The same rule applies when sources conflict or cannot support the requested conclusion: describe the limitation and cite only what is actually supported.
+
+## 11. Authentication and authorization safety
+
+- Protected operations must fail closed when authentication is disabled, incomplete, malformed, or invalid.
+- Never implement custom cryptography or accept algorithms outside the verifier's explicit allowlist.
+- Development shared-secret authentication must not run in production.
+- Client-provided department or role claims are selectors and hints only; authorization requires current server-side membership resolution.
+- Missing, unknown, suspended, revoked, cross-department, and role-incompatible access must be denied without revealing resource existence.
+- `system_admin` has no implicit cross-department bypass. Any future support workflow requires narrow authorization and audit design.
+- Audit output must never include bearer tokens, JWT signatures, secrets, raw bodies, profile content, document content, or training content.

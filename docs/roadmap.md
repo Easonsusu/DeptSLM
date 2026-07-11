@@ -8,13 +8,13 @@ This roadmap separates foundational safety work from product implementation. A l
 - Keep runtime artifacts outside Git through `DEPTSLM_DATA_DIR` and Google Drive setup.
 - Define future department isolation, untrusted-document handling, and insufficient-information rules.
 
-## Phase 1 — CI and workflow foundation (current)
+## Phase 1 — CI and workflow foundation (completed)
 
 - Verify and harden automated backend, worker, storage, lint, format, frontend, and artifact-policy checks.
 - Add contribution guidance, pull request and issue templates, and the project roadmap.
 - Define department and authentication boundaries without implementing product behavior.
 
-## Phase 2 — Department and authentication boundary implementation
+## Phase 2 — Department and authentication boundary implementation (current)
 
 - Implement the reviewed authentication context and fail-closed department authorization primitives.
 - Add cross-department denial tests before exposing department-owned resources.

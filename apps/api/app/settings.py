@@ -17,6 +17,10 @@ class Settings:
 
     data_dir: Path
     environment: str
+    auth_mode: str
+    auth_issuer: str | None
+    auth_audience: str | None
+    auth_secret: str | None
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -74,10 +78,28 @@ class Settings:
                 f"received: {resolved_data_dir}"
             )
 
+        environment = os.getenv("ENVIRONMENT", "local").strip() or "local"
+        auth_mode = os.getenv("DEPTSLM_AUTH_MODE", "disabled").strip().lower()
+        if auth_mode not in {"disabled", "hs256"}:
+            raise ConfigurationError("DEPTSLM_AUTH_MODE must be 'disabled' or 'hs256'.")
+        if auth_mode == "hs256" and environment.lower() in {"production", "prod"}:
+            raise ConfigurationError(
+                "Development HS256 authentication is not allowed in production."
+            )
+
         return cls(
             data_dir=resolved_data_dir,
-            environment=os.getenv("ENVIRONMENT", "local").strip() or "local",
+            environment=environment,
+            auth_mode=auth_mode,
+            auth_issuer=_optional_environment("DEPTSLM_AUTH_ISSUER"),
+            auth_audience=_optional_environment("DEPTSLM_AUTH_AUDIENCE"),
+            auth_secret=_optional_environment("DEPTSLM_AUTH_SECRET"),
         )
+
+
+def _optional_environment(name: str) -> str | None:
+    value = os.getenv(name, "").strip()
+    return value or None
 
 
 def _find_repository_root(start: Path) -> Path | None:

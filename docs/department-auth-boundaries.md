@@ -2,7 +2,7 @@
 
 ## Status
 
-This document plans future authorization behavior. Phase 1 does not implement login, sessions, database models, department APIs, or role enforcement.
+Phase 2 implements reusable authentication and fail-closed authorization foundations. Persistent memberships, department CRUD, production identity integration, and product APIs remain deferred.
 
 ## Security objective
 
@@ -105,6 +105,10 @@ Audit events must be append-oriented, access-controlled, retained under a review
 Missing or inconsistent `department_id` enforcement can expose confidential documents, citations, conversations, student data, training examples, model behavior, logs, exports, or adapters across departments. It can also poison retrieval, train on unauthorized content, route requests to the wrong adapter, leak information through caches or errors, and make deletion or retention obligations impossible to satisfy.
 
 UI filtering, client claims, path naming, and model prompts are not security boundaries. Authorization must be enforced server-side at every storage and service boundary.
+
+## Phase 2 implementation boundary
+
+The API now validates development/test HS256 bearer tokens, exposes safe identity metadata through `GET /auth/me`, and supplies immutable department scope and authorization context types. Runtime membership resolution deliberately denies every department request until Phase 3 provides persistent server-side memberships. Focused test-only routes exercise department and role dependencies; no department product endpoint has been added.
 
 ## Acceptance criteria for Phase 2
 
