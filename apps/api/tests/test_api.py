@@ -16,6 +16,7 @@ from app.settings import ConfigurationError
 def client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     """Start the API with isolated runtime storage."""
 
+    (tmp_path / "uploads").mkdir()
     monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
     with TestClient(app) as test_client:
         yield test_client

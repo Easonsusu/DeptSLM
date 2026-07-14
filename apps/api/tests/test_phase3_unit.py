@@ -13,6 +13,7 @@ from app.settings import ConfigurationError, Settings
 
 
 def test_database_url_is_required(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / "uploads").mkdir()
     monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
     monkeypatch.delenv("DATABASE_URL")
     with pytest.raises(ConfigurationError, match="DATABASE_URL"):
@@ -20,6 +21,7 @@ def test_database_url_is_required(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
 
 
 def test_database_url_requires_psycopg(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / "uploads").mkdir()
     monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("DATABASE_URL", "sqlite:///unsafe.db")
     with pytest.raises(ConfigurationError, match="postgresql\\+psycopg"):

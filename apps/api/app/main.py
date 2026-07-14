@@ -14,6 +14,7 @@ from app.audit import LoggingAuditSink
 from app.auth import AuthenticatedPrincipal, build_token_verifier
 from app.authorization import require_authenticated_principal
 from app.database import create_database_engine, create_session_factory
+from app.document_storage import DocumentStorage
 from app.membership_resolver import SQLAlchemyMembershipResolver
 from app.routes import router as department_router
 from app.settings import Settings
@@ -52,6 +53,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     application.state.session_factory = session_factory
     application.state.membership_resolver = SQLAlchemyMembershipResolver(session_factory)
     application.state.audit_sink = LoggingAuditSink()
+    application.state.document_storage = DocumentStorage(settings.data_dir)
     try:
         yield
     finally:

@@ -66,6 +66,7 @@ The required artifact subdirectories are `uploads`, `extracted_text`, `vector_sn
 - Require review for tenant-boundary, retrieval-safety, persistence, authentication, dependency, and deployment changes.
 - Keep phase PRs focused; no RAG or fine-tuning implementation before its reviewed phase.
 - Phase 3 database changes use SQLAlchemy and Alembic. Do not call `metadata.create_all` at runtime, add unscoped department-owned repository methods, or hard-delete departments, memberships, identities, or audit events.
+- Phase 4 document uploads use raw incremental request streaming and canonical external paths. Do not introduce multipart buffering, process-temporary files, client-derived paths, hard deletion, extraction, OCR, indexing, or download behavior in this phase.
 
 ## 7. Testing expectations
 
@@ -75,6 +76,7 @@ The required artifact subdirectories are `uploads`, `extracted_text`, `vector_sn
 - Validate Compose changes with `./scripts/compose.sh config` and, when feasible, a startup smoke test. Do not bypass the wrapper's host storage-path validation for local runs.
 - Use temporary directories for all test artifacts. Tests must not require Google Drive, network access, secrets, model downloads, or pre-existing developer state unless explicitly marked as optional integration tests.
 - Future tenant-aware tests must include attempts to cross department boundaries and must prove those attempts fail.
+- Upload tests must cover streamed-size enforcement, type/signature or UTF-8 validation, authorization revalidation, quota concurrency, private permissions, and cleanup without using real Google Drive data.
 
 ## 8. Department isolation by `department_id`
 

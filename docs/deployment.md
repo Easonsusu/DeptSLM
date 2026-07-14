@@ -1,16 +1,16 @@
 # Deployment and Local Development
 
-## Phase 3 status
+## Phase 4 status
 
-DeptSLM is not production ready. Phase 3 adds Alembic-managed PostgreSQL department persistence and development/test authentication, while workers, RAG, model serving, training, production identity, secrets management, backups, and production operations remain deferred.
+DeptSLM is not production ready. Phase 4 adds document metadata and local external upload storage to the Phase 3 foundation, while extraction, malware scanning, workers, RAG, model serving, training, production identity/storage, secrets management, backups, and production operations remain deferred.
 
 ## Planned local services
 
 | Service | Role | Phase 0 expectation |
 | --- | --- | --- |
 | `web` | Next.js user interface | Basic landing page only. |
-| `api` | FastAPI control plane | `GET /health` and `GET /version` only. |
-| `postgres` | Application metadata database | Phase 3 identities, departments, memberships, and audit events. |
+| `api` | FastAPI control plane | System, auth, department, membership, and document metadata/upload APIs. |
+| `postgres` | Application metadata database | Identities, departments, memberships, documents, and audit events. |
 | `qdrant` | Vector search | Local service placeholder; no ingestion is implemented. |
 | `rag-worker` | Future ingestion and retrieval jobs | Structural placeholder; no RAG workflow is implemented. |
 | `training-worker` | Future LLaMA-Factory jobs | Structural placeholder; no fine-tuning is implemented. |
@@ -133,7 +133,7 @@ CI must not depend on a developer's Google Drive or reuse real data. It should c
 
 GitHub Actions provides PostgreSQL 16 and sets an isolated `DATABASE_TEST_URL`. Locally, run `python -m pytest -m "not postgres"` without PostgreSQL, or point `DATABASE_TEST_URL` to an isolated test database and run migrations followed by `python -m pytest`. PostgreSQL tests never fall back to SQLite and CI fails if they are skipped.
 
-CI also builds the API image and performs a non-secret inspection proving that `app.main`, `app.admin`, `alembic.ini`, and revision `0001_phase3` are present. It does not start the full stack for this check.
+CI also builds the API image and performs a non-secret inspection proving that document upload/storage modules, `alembic.ini`, and revisions `0001_phase3` and `0002_phase4_documents` are present. PostgreSQL 16 runs all migration and concurrency tests with a temporary external `uploads` directory. CI does not use Google Drive or start application services for the image check.
 
 At minimum, future deployment checks should cover:
 

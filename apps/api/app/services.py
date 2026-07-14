@@ -60,6 +60,7 @@ def authorize_transaction(
     allowed_roles: frozenset[DepartmentRole],
     *,
     lock: bool,
+    audit_action: str = "authorize_department",
 ) -> TransactionAuthorization:
     """Revalidate exact authority and emit one safe decision after it is known."""
 
@@ -67,29 +68,43 @@ def authorize_transaction(
     try:
         locked_department = lock_scoped_department(session, scope) if lock else None
         if lock and (locked_department is None or locked_department.status != "active"):
-            _authorization_audit(request_scope, principal, AuditResult.DENIED, "membership_denied")
+            _authorization_audit(
+                request_scope, principal, AuditResult.DENIED, "membership_denied", audit_action
+            )
             raise ServiceError(403, "Department access denied")
         resolved = resolve_transaction_membership(session, principal, scope, lock=lock)
     except ServiceError:
         raise
     except SQLAlchemyError as error:
         _authorization_audit(
-            request_scope, principal, AuditResult.DENIED, "membership_store_unavailable"
+            request_scope,
+            principal,
+            AuditResult.DENIED,
+            "membership_store_unavailable",
+            audit_action,
         )
         raise ServiceError(503, "Database unavailable") from error
     if resolved is None:
-        _authorization_audit(request_scope, principal, AuditResult.DENIED, "membership_denied")
+        _authorization_audit(
+            request_scope, principal, AuditResult.DENIED, "membership_denied", audit_action
+        )
         raise ServiceError(403, "Department access denied")
     department, identity, membership = resolved
     try:
         role = DepartmentRole(membership.role)
     except ValueError as error:
-        _authorization_audit(request_scope, principal, AuditResult.DENIED, "role_denied")
+        _authorization_audit(
+            request_scope, principal, AuditResult.DENIED, "role_denied", audit_action
+        )
         raise ServiceError(403, "Department access denied") from error
     if role not in allowed_roles:
-        _authorization_audit(request_scope, principal, AuditResult.DENIED, "role_denied")
+        _authorization_audit(
+            request_scope, principal, AuditResult.DENIED, "role_denied", audit_action
+        )
         raise ServiceError(403, "Department access denied")
-    _authorization_audit(request_scope, principal, AuditResult.ALLOWED, "active_membership")
+    _authorization_audit(
+        request_scope, principal, AuditResult.ALLOWED, "active_membership", audit_action
+    )
     return TransactionAuthorization(identity, membership, department)
 
 
@@ -98,13 +113,14 @@ def _authorization_audit(
     principal: AuthenticatedPrincipal,
     result: AuditResult,
     reason_code: str,
+    action: str,
 ) -> None:
     if request_scope.audit_sink is None:
         return
     request_scope.audit_sink.emit(
         AuditEvent(
             actor_subject=principal.subject,
-            action="authorize_department",
+            action=action,
             result=result,
             reason_code=reason_code,
             department_id=str(request_scope.department),
@@ -137,6 +153,33 @@ def _audit(
                 UUID(request_scope.correlation_id) if request_scope.correlation_id else None
             ),
         )
+    )
+
+
+def database_call(operation):
+    """Expose the established safe database error mapping to focused services."""
+
+    return _db_call(operation)
+
+
+def append_mutation_audit(
+    session: Session,
+    *,
+    actor: UserIdentity,
+    actor_subject: str,
+    request_scope: DepartmentRequestScope,
+    action: str,
+    resource_type: str,
+    resource_id: UUID,
+) -> None:
+    _audit(
+        session,
+        actor=actor,
+        actor_subject=actor_subject,
+        request_scope=request_scope,
+        action=action,
+        resource_type=resource_type,
+        resource_id=resource_id,
     )
 
 

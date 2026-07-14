@@ -2,7 +2,7 @@
 
 ## Status
 
-The Phase 3 API keeps public system endpoints and authenticated identity inspection, and adds persistent department and membership endpoints. See [department-membership-api.md](department-membership-api.md) for the exact contracts. Documents, RAG, training, and production identity integration remain deferred.
+The Phase 4 API keeps the Phase 3 control plane and adds department-scoped document metadata, raw source upload, and soft deletion. See [department-membership-api.md](department-membership-api.md) and [document-upload.md](document-upload.md). Extraction, download, RAG, training, and production identity integration remain deferred.
 
 For the default local configuration, the base URL is:
 
@@ -87,6 +87,15 @@ Development HS256 startup requires an explicit `ENVIRONMENT` of `local`, `develo
 
 Phase 3 implements `GET /departments`, same-department `GET/PATCH/DELETE /departments/{department_id}`, and scoped membership list/create/read/update/revoke routes. Department creation uses the local bootstrap command and is not a public endpoint. All lists are paginated and all membership-resource queries include the path department predicate.
 
+## Current document endpoints
+
+- `GET /departments/{department_id}/documents`
+- `POST /departments/{department_id}/documents`
+- `GET /departments/{department_id}/documents/{document_id}`
+- `DELETE /departments/{department_id}/documents/{document_id}`
+
+List/read accepts every active same-department role. Upload accepts same-department `system_admin`, `department_admin`, and `instructor`; soft deletion accepts same-department `system_admin` and `department_admin`. Deleted documents are hidden, source bytes are retained, and there is no global list, search, download, extraction, or indexing endpoint. Upload uses a raw request body and the strict headers, formats, limits, storage layout, and cleanup rules in [document-upload.md](document-upload.md).
+
 ## Future API conventions
 
 The following conventions should be decided before business endpoints are introduced:
@@ -125,7 +134,7 @@ Names and paths below are conceptual and may change after contract design.
 - source reprocessing, retirement, and deletion
 - department-scoped index status
 
-Uploads and extracted text will be stored under `DEPTSLM_DATA_DIR`, not in Git or arbitrary API-server paths.
+Uploaded sources are stored beneath `DEPTSLM_DATA_DIR/uploads/<department_id>/<document_id>/source`, not in Git or arbitrary API-server paths. Extracted text remains deferred.
 
 ### Chat and retrieval
 

@@ -19,13 +19,15 @@ This roadmap separates foundational safety work from product implementation. A l
 - Implement the reviewed authentication context and fail-closed department authorization primitives.
 - Add cross-department denial tests before exposing department-owned resources.
 
-## Phase 3 — Department CRUD and membership model (current)
+## Phase 3 — Department CRUD and membership model (completed)
 
 - Add PostgreSQL department lifecycle, membership management, scoped authorization, migrations, and transactional audit events.
 
-## Phase 4 — Document metadata and upload flow
+## Phase 4 — Document metadata and upload flow (current; not completed)
 
-- Add department-scoped document metadata and a validated upload workflow using external storage.
+- Add department-scoped document metadata and a validated, incrementally streamed upload workflow using external storage.
+- Require transaction-time authorization revalidation, serialized quota enforcement, safe audit evidence, and compensating cleanup.
+- Keep extraction, OCR, chunking, indexing, download, malware scanning, and production storage deferred.
 
 ## Phase 5 — Document extraction and chunking
 

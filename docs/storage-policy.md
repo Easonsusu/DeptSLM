@@ -51,7 +51,7 @@ The setup script may create missing directories, but it must never delete or ove
 
 | Artifact | External subdirectory | Notes |
 | --- | --- | --- |
-| Uploaded source files | `uploads/` | Future paths must be isolated by `department_id`. |
+| Uploaded source files | `uploads/` | Phase 4 paths are isolated by `department_id` and document UUID. |
 | Extracted or normalized text | `extracted_text/` | Treat as sensitive and untrusted. |
 | Vector database snapshots | `vector_snapshots/` | Live Qdrant persistence is a separate deployment concern; it must also remain outside the repo. |
 | Generated training datasets | `training_datasets/` | Store provenance and department ownership. |
@@ -62,7 +62,7 @@ The setup script may create missing directories, but it must never delete or ove
 | Generated reports and bundles | `exports/` | Review access and content before sharing. |
 | Local service state | `service_state/` | Compose-only PostgreSQL and Qdrant persistence; not a backup or portable snapshot. |
 
-Future path conventions should include a validated, non-user-controlled department segment, for example `<root>/uploads/<department_id>/...`. Code must use safe path joining and reject traversal outside the resolved `DEPTSLM_DATA_DIR` root.
+Phase 4 uses `<root>/uploads/<department_id>/.staging/<upload_id>.part` while streaming and `<root>/uploads/<department_id>/<document_id>/source` after finalization. Filenames are metadata only and never become path components. The `uploads` root must preexist as a real writable directory. Storage uses descriptor-relative no-follow operations, exclusive files, `0700` directories, `0600` sources, and same-filesystem atomic rename. Normal handled failures compensate, while crash-orphan discovery and physical retention remain deferred.
 
 ## Never commit
 
@@ -114,6 +114,7 @@ Tests and CI must not depend on Google Drive. Each run should create a fresh tem
 - paths cannot escape the configured root;
 - one department cannot read another department's artifacts;
 - no test writes runtime artifacts into the repository.
+- interrupted, invalid, unauthorized, over-quota, storage-failed, and database-failed uploads leave no staged source.
 
 ## Google Drive limitations
 

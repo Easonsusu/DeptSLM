@@ -52,7 +52,7 @@ Neither audit boundary can carry bearer tokens, JWT signatures, auth secrets, ra
 
 ## External storage path safety
 
-Department paths use the form `DEPTSLM_DATA_DIR/departments/<validated-uuid>/...`. The helper requires a `DepartmentScope`, rejects absolute and traversal children, resolves paths before returning them, and rejects symlink escape. Tests use temporary directories and never read or write the real Google Drive folder.
+Artifact paths use typed areas such as `DEPTSLM_DATA_DIR/uploads/<validated-department-uuid>/...`. The helper requires both `ArtifactArea` and `DepartmentScope` and rejects unsafe path segments. Phase 4 upload I/O additionally uses descriptor-relative no-follow operations so symlinks cannot redirect staging or final sources. Tests use temporary directories and never read or write the real Google Drive folder.
 
 ## Future vector scope
 
