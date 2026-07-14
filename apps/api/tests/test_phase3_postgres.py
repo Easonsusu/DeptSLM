@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
@@ -14,11 +15,12 @@ import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from alembic import command
 from app.admin import BootstrapError, bootstrap_department
+from app.audit import AuditEvent, AuditSink, LoggingAuditSink
 from app.auth import AuthenticatedPrincipal, DepartmentRole
 from app.authorization import (
     DepartmentRequestScope,
@@ -43,6 +45,18 @@ SECRET = "phase-3-test-secret-0123456789-abcdefghijklmnopqrstuvwxyz"
 ISSUER = "https://phase3.issuer.invalid"
 AUDIENCE = "phase3-tests"
 ADMIN = "opaque-admin"
+
+
+@dataclass
+class CollectingAuditSink(AuditSink):
+    events: list[AuditEvent] = field(default_factory=list)
+
+    def emit(self, event: AuditEvent) -> None:
+        self.events.append(event)
+
+
+def _authorization_events(sink: CollectingAuditSink) -> list[AuditEvent]:
+    return [event for event in sink.events if event.action == "authorize_department"]
 
 
 def _database_url() -> str:
@@ -281,6 +295,205 @@ def test_department_list_is_identity_scoped(
     assert [item["id"] for item in response.json()["items"]] == [str(own.id)]
 
 
+def test_allowed_department_read_emits_authorization_event(
+    db: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, department, _ = _seed(db)
+    sink = CollectingAuditSink()
+    with _client(monkeypatch, tmp_path) as client:
+        client.app.state.audit_sink = sink
+        response = client.get(
+            f"/departments/{department.id}",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
+    assert response.status_code == 200
+    decisions = _authorization_events(sink)
+    assert [(event.result, event.reason_code) for event in decisions] == [
+        ("allowed", "active_membership")
+    ]
+
+
+def test_allowed_mutation_emits_authorization_and_persistent_success(
+    db: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, department, _ = _seed(db)
+    sink = CollectingAuditSink()
+    with _client(monkeypatch, tmp_path) as client:
+        client.app.state.audit_sink = sink
+        response = client.patch(
+            f"/departments/{department.id}",
+            headers={"Authorization": f"Bearer {_token()}"},
+            json={"display_name": "Audited update"},
+        )
+    assert response.status_code == 200
+    decisions = _authorization_events(sink)
+    assert [(event.result, event.reason_code) for event in decisions] == [
+        ("allowed", "active_membership")
+    ]
+    db.expire_all()
+    assert db.query(PersistentAuditEvent).filter_by(action="department.update").count() == 1
+
+
+def test_role_denial_emits_authorization_without_persistent_success(
+    db: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, department, _ = _seed(db, role="viewer")
+    sink = CollectingAuditSink()
+    with _client(monkeypatch, tmp_path) as client:
+        client.app.state.audit_sink = sink
+        response = client.patch(
+            f"/departments/{department.id}",
+            headers={"Authorization": f"Bearer {_token()}"},
+            json={"display_name": "Denied update"},
+        )
+    assert response.status_code == 403
+    decisions = _authorization_events(sink)
+    assert [(event.result, event.reason_code) for event in decisions] == [("denied", "role_denied")]
+    assert db.query(PersistentAuditEvent).count() == 0
+
+
+@pytest.mark.parametrize(
+    "stale_state",
+    [
+        "identity_suspended",
+        "identity_revoked",
+        "membership_suspended",
+        "membership_revoked",
+        "membership_expired",
+        "department_archived",
+    ],
+)
+def test_stale_route_authorization_emits_denial_without_persistent_success(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stale_state: str,
+) -> None:
+    identity, department, membership = _seed(db)
+    if stale_state == "identity_suspended":
+        identity.status = "suspended"
+    elif stale_state == "identity_revoked":
+        identity.status = "revoked"
+    elif stale_state == "membership_suspended":
+        membership.status = "suspended"
+    elif stale_state == "membership_revoked":
+        membership.status = "revoked"
+    elif stale_state == "membership_expired":
+        membership.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    else:
+        department.status = "archived"
+    db.commit()
+    sink = CollectingAuditSink()
+
+    with _client(monkeypatch, tmp_path) as client:
+        client.app.state.audit_sink = sink
+        response = client.get(
+            f"/departments/{department.id}",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
+    assert response.status_code == 403
+    decisions = _authorization_events(sink)
+    assert [(event.result, event.reason_code) for event in decisions] == [
+        ("denied", "membership_denied")
+    ]
+    assert db.query(PersistentAuditEvent).count() == 0
+
+
+def test_cross_department_route_denial_emits_authorization_event(
+    db: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _seed(db)
+    _, other_department, _ = _seed(db, subject="other-admin")
+    sink = CollectingAuditSink()
+    with _client(monkeypatch, tmp_path) as client:
+        client.app.state.audit_sink = sink
+        response = client.get(
+            f"/departments/{other_department.id}",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
+    assert response.status_code == 403
+    decisions = _authorization_events(sink)
+    assert [(event.result, event.reason_code) for event in decisions] == [
+        ("denied", "membership_denied")
+    ]
+    assert db.query(PersistentAuditEvent).count() == 0
+
+
+def test_authorization_database_failure_emits_safe_unavailable_event(
+    db: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, department, _ = _seed(db)
+    sink = CollectingAuditSink()
+
+    def fail_resolution(*_args, **_kwargs):
+        raise SQLAlchemyError("SELECT secret FROM memberships AT database.internal")
+
+    monkeypatch.setattr("app.services.resolve_transaction_membership", fail_resolution)
+    with _client(monkeypatch, tmp_path) as client:
+        client.app.state.audit_sink = sink
+        response = client.get(
+            f"/departments/{department.id}",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Database unavailable"}
+    decisions = _authorization_events(sink)
+    assert [(event.result, event.reason_code) for event in decisions] == [
+        ("denied", "membership_store_unavailable")
+    ]
+    assert "SELECT secret" not in repr(sink.events)
+    assert "database.internal" not in repr(sink.events)
+    assert db.query(PersistentAuditEvent).count() == 0
+
+
+def test_production_authorization_audit_excludes_sensitive_data(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _, department, _ = _seed(db)
+    exact_token = _token()
+    raw_body = "raw request body document content source content training content"
+    sql_text = "SELECT * FROM memberships WHERE bearer_token = 'secret'"
+    database_url = _database_url()
+    sink = CollectingAuditSink()
+    with _client(monkeypatch, tmp_path) as client:
+        client.app.state.audit_sink = sink
+        response = client.patch(
+            f"/departments/{department.id}",
+            headers={"Authorization": f"Bearer {exact_token}"},
+            json={"display_name": raw_body},
+        )
+    assert response.status_code == 200
+
+    serialized_events = repr(sink.events)
+    forbidden_values = (
+        exact_token,
+        SECRET,
+        database_url,
+        sql_text,
+        "raw request body",
+        "source content",
+        "document content",
+        "training content",
+        "database.internal",
+    )
+    for forbidden in forbidden_values:
+        assert forbidden not in serialized_events
+
+    caplog.set_level("INFO", logger="deptslm.audit")
+    with _client(monkeypatch, tmp_path) as client:
+        client.app.state.audit_sink = LoggingAuditSink()
+        logged = client.get(
+            f"/departments/{department.id}",
+            headers={"Authorization": f"Bearer {exact_token}"},
+        )
+    assert logged.status_code == 200
+    for forbidden in forbidden_values:
+        assert forbidden not in caplog.text
+
+
 def test_department_update_archive_and_audit(
     db: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -369,7 +582,7 @@ def test_mutation_revalidates_stale_authorization(db: Session, engine, stale_sta
     request_scope = DepartmentRequestScope(scope)
     with Session(engine) as authorization_session:
         stale = authorize_transaction(
-            authorization_session, principal, scope, ADMIN_ROLES, lock=False
+            authorization_session, principal, request_scope, ADMIN_ROLES, lock=False
         )
         assert stale.membership.id == membership.id
 
@@ -442,7 +655,9 @@ def test_membership_noop_does_not_increment_or_audit(
     _, department, admin = _seed(db)
     original_version = admin.version
     headers = {"Authorization": f"Bearer {_token()}"}
+    sink = CollectingAuditSink()
     with _client(monkeypatch, tmp_path) as client:
+        client.app.state.audit_sink = sink
         same = client.patch(
             f"/departments/{department.id}/memberships/{admin.id}",
             headers=headers,
@@ -460,6 +675,10 @@ def test_membership_noop_does_not_increment_or_audit(
         )
     assert same.status_code == 200 and same.json()["version"] == original_version
     assert empty.status_code == 422 and ambiguous.status_code == 422
+    decisions = _authorization_events(sink)
+    assert [(event.result, event.reason_code) for event in decisions] == [
+        ("allowed", "active_membership")
+    ]
     db.expire_all()
     assert db.query(PersistentAuditEvent).count() == 0
 

@@ -22,6 +22,12 @@ Pagination defaults to 25 and accepts `limit` from 1 through 100 plus a non-nega
 
 An empty membership PATCH or a request combining `expires_at` with `clear_expiry` returns `422`. A valid PATCH that would not change stored role, status, or expiry returns the current row without incrementing its version or writing a success audit event.
 
+## Audit behavior
+
+Every production department-route authorization attempt emits one typed process-level `AuditSink` event after transaction-time membership and role evaluation. Safe outcomes include `active_membership`, `membership_denied`, `role_denied`, and `membership_store_unavailable`. These events never include credentials, request bodies, database connection details, SQL, or department content.
+
+Successful state mutations separately append one PostgreSQL `audit_events` row in the same transaction. Denied or unavailable requests and no-op mutations do not append a mutation-success row. Persistent denied-event storage and tamper-resistant production audit storage are not implemented.
+
 ## Local bootstrap
 
 Department creation is deliberately absent from the public API. After applying migrations, run from `apps/api`:

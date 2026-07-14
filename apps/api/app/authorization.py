@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated, Protocol
 from uuid import UUID
 
@@ -86,10 +86,11 @@ class DepartmentAuthorizationContext:
 
 @dataclass(frozen=True, slots=True)
 class DepartmentRequestScope:
-    """Validated path selector without authorization evidence."""
+    """Validated path selector and safe decision sink, without authorization evidence."""
 
     department: DepartmentScope
     correlation_id: str | None = None
+    audit_sink: AuditSink | None = field(default=None, repr=False, compare=False)
 
 
 def _audit(request: Request, event: AuditEvent) -> None:
@@ -275,7 +276,11 @@ def require_path_department_selector(
                 ),
             )
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Department access denied")
-    return DepartmentRequestScope(department=department, correlation_id=_correlation_id(request))
+    return DepartmentRequestScope(
+        department=department,
+        correlation_id=_correlation_id(request),
+        audit_sink=request.app.state.audit_sink,
+    )
 
 
 def _authorize_department(

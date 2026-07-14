@@ -12,7 +12,7 @@ Every department-owned operation must authenticate the caller, derive allowed de
 
 | Role | Intended authority |
 | --- | --- |
-| `system_admin` | Operate platform-wide configuration and approved support workflows. Cross-department access must be explicit, audited, and limited to a defined administrative purpose. |
+| `system_admin` | Reserved for future platform operations. Phase 3 treats it only as a same-department administrative membership and provides no cross-department bypass. |
 | `department_admin` | Manage one department's settings, memberships, approved sources, jobs, evaluations, adapters, and exports. |
 | `instructor` | Use and curate approved department knowledge, review grounded answers, and perform explicitly granted content or evaluation actions. |
 | `student` | Query approved department assistants and use resources made visible to students. No administrative, ingestion, training, or adapter-management authority. |
@@ -22,7 +22,7 @@ Roles grant permissions only within active memberships. A role name must never c
 
 ## Membership model
 
-A future membership must bind one user to one department with:
+Phase 3 persists each membership as a binding between one identity and one department with:
 
 - non-null `user_id` and `department_id`
 - one reviewed role
@@ -30,7 +30,7 @@ A future membership must bind one user to one department with:
 - creation, update, and optional expiry timestamps
 - actor and reason metadata for role or status changes
 
-The database should prevent duplicate active memberships for the same user and department. Authorization must use current server-side membership state rather than cached client claims alone. Removing or suspending membership must invalidate future access promptly.
+The database prevents duplicate identity/department memberships. Authorization uses current server-side membership state rather than cached client claims. Revoking, suspending, expiring, or demoting a membership, suspending or revoking its identity, or archiving its department invalidates subsequent access.
 
 ## Department-scoped access rules
 
@@ -98,7 +98,9 @@ Audit records should capture:
 - authorization decision and policy reason without exposing credentials or source content
 - membership, visibility, dataset, training, adapter, export, and administrative changes
 
-Audit events must be append-oriented, access-controlled, retained under a reviewed policy, and protected from cross-department discovery. `system_admin` access and denied cross-department attempts require explicit audit coverage.
+Phase 3 emits safe process-level `AuditSink` events for authentication and transaction-time authorization decisions, including denied and unavailable decisions. Successful mutations separately append PostgreSQL `audit_events` rows atomically with the state change. Denied, unavailable, and no-op operations do not create mutation-success rows. Phase 3 does not claim persistent denied-event storage or tamper-resistant production audit storage.
+
+Future production audit storage must be append-oriented, access-controlled, retained under a reviewed policy, and protected from cross-department discovery. Any future system-admin support access and denied cross-department attempts require explicit audit coverage.
 
 ## Risks when filtering is missing
 
@@ -112,7 +114,7 @@ The API validates development/test HS256 bearer tokens, exposes safe identity me
 
 ## Phase 3 persistence boundary
 
-Server-side membership resolution requires exact issuer, opaque subject, and path department matching. Resource services repeat this check in their request session, and mutations lock the department first before revalidating the actor and locking targets. Stale authorization after archival, suspension, revocation, expiry, or demotion fails without a success audit row. Effective-administrator checks join active identities and memberships and serialize changes per department. Scoped repository methods always include `department_id`; cross-department membership IDs appear not found. Department creation is restricted to a reviewed local bootstrap command, public APIs cannot grant `system_admin`, and final effective administrators cannot be removed transactionally. Production SSO, platform administration, and product data remain deferred.
+Server-side membership resolution requires exact issuer, opaque subject, and path department matching. Resource services repeat this check in their request session, and mutations lock the department first before revalidating the actor and locking targets. Each production-route authorization attempt emits one safe process decision after current membership and role state is known. Stale authorization after archival, suspension, revocation, expiry, or demotion fails without a success audit row. Effective-administrator checks join active identities and memberships and serialize changes per department. Scoped repository methods always include `department_id`; cross-department membership IDs appear not found. Department creation is restricted to a reviewed local bootstrap command, public APIs cannot grant `system_admin`, and final effective administrators cannot be removed transactionally. Production SSO, platform administration, and product data remain deferred.
 
 ## Acceptance criteria for Phase 2
 

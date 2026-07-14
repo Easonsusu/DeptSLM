@@ -2,7 +2,7 @@
 
 DeptSLM is a university departmental small language model (SLM) customization platform. It is intended to let each department build an isolated assistant from its own approved documents, retrieval index, evaluation data, and eventually its own LoRA or QLoRA adapter.
 
-> **Phase 3 status:** PostgreSQL departments, identities, memberships, scoped administration APIs, Alembic migrations, and transactional mutation audit records are under review. Production identity integration, documents, RAG, model serving, and fine-tuning remain deferred.
+> **Phase 3 status:** PostgreSQL departments, identities, memberships, scoped administration APIs, Alembic migrations, safe authentication/authorization decision logs, and transactional mutation-success audit records are under review. Production identity integration, documents, RAG, model serving, and fine-tuning remain deferred.
 
 ## Planned stack
 

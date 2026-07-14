@@ -75,6 +75,8 @@ Successful responses contain `subject` and `issuer`. Missing, malformed, disable
 
 Department-scoped dependencies return `403` for missing, malformed, unknown, inactive, expired, cross-department, or role-incompatible membership scope. Database verification failures return a generic `503`. Neither response receives a Bearer challenge or exposes database details.
 
+Authentication and transaction-time department authorization decisions emit safe process-level `AuditSink` events. Successful state mutations separately append transactional PostgreSQL `audit_events` rows. Denied, unavailable, and no-op operations do not create mutation-success rows; persistent denied-event storage is not implemented.
+
 ## Current error behavior
 
 Unknown routes use FastAPI's default JSON `404 Not Found` response. Authentication failures use `401` with a Bearer challenge; authenticated department authorization failures use `403` without that challenge. No project-wide error envelope is defined yet.

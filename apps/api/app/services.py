@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.audit import AuditEvent, AuditResult
 from app.auth import AuthenticatedPrincipal, DepartmentRole, MembershipStatus
 from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.models import Department, Membership, PersistentAuditEvent, UserIdentity
@@ -55,27 +56,61 @@ def _db_call(operation):
 def authorize_transaction(
     session: Session,
     principal: AuthenticatedPrincipal,
-    scope: DepartmentScope,
+    request_scope: DepartmentRequestScope,
     allowed_roles: frozenset[DepartmentRole],
     *,
     lock: bool,
 ) -> TransactionAuthorization:
-    """Revalidate exact authority in this transaction, locking department first."""
+    """Revalidate exact authority and emit one safe decision after it is known."""
 
-    locked_department = lock_scoped_department(session, scope) if lock else None
-    if lock and (locked_department is None or locked_department.status != "active"):
-        raise ServiceError(403, "Department access denied")
-    resolved = resolve_transaction_membership(session, principal, scope, lock=lock)
+    scope = request_scope.department
+    try:
+        locked_department = lock_scoped_department(session, scope) if lock else None
+        if lock and (locked_department is None or locked_department.status != "active"):
+            _authorization_audit(request_scope, principal, AuditResult.DENIED, "membership_denied")
+            raise ServiceError(403, "Department access denied")
+        resolved = resolve_transaction_membership(session, principal, scope, lock=lock)
+    except ServiceError:
+        raise
+    except SQLAlchemyError as error:
+        _authorization_audit(
+            request_scope, principal, AuditResult.DENIED, "membership_store_unavailable"
+        )
+        raise ServiceError(503, "Database unavailable") from error
     if resolved is None:
+        _authorization_audit(request_scope, principal, AuditResult.DENIED, "membership_denied")
         raise ServiceError(403, "Department access denied")
     department, identity, membership = resolved
     try:
         role = DepartmentRole(membership.role)
     except ValueError as error:
+        _authorization_audit(request_scope, principal, AuditResult.DENIED, "role_denied")
         raise ServiceError(403, "Department access denied") from error
     if role not in allowed_roles:
+        _authorization_audit(request_scope, principal, AuditResult.DENIED, "role_denied")
         raise ServiceError(403, "Department access denied")
+    _authorization_audit(request_scope, principal, AuditResult.ALLOWED, "active_membership")
     return TransactionAuthorization(identity, membership, department)
+
+
+def _authorization_audit(
+    request_scope: DepartmentRequestScope,
+    principal: AuthenticatedPrincipal,
+    result: AuditResult,
+    reason_code: str,
+) -> None:
+    if request_scope.audit_sink is None:
+        return
+    request_scope.audit_sink.emit(
+        AuditEvent(
+            actor_subject=principal.subject,
+            action="authorize_department",
+            result=result,
+            reason_code=reason_code,
+            department_id=str(request_scope.department),
+            correlation_id=request_scope.correlation_id,
+        )
+    )
 
 
 def _audit(
@@ -117,7 +152,7 @@ def get_department(
     return _db_call(
         lambda: (
             authorize_transaction(
-                session, principal, request_scope.department, ALL_ROLES, lock=False
+                session, principal, request_scope, ALL_ROLES, lock=False
             ).department
         )
     )
@@ -131,7 +166,7 @@ def update_department(
 ) -> Department:
     def operation() -> Department:
         authorization = authorize_transaction(
-            session, principal, request_scope.department, ADMIN_ROLES, lock=True
+            session, principal, request_scope, ADMIN_ROLES, lock=True
         )
         department = authorization.department
         if department.display_name == display_name:
@@ -161,7 +196,7 @@ def archive_department(
 ) -> Department:
     def operation() -> Department:
         authorization = authorize_transaction(
-            session, principal, request_scope.department, ADMIN_ROLES, lock=True
+            session, principal, request_scope, ADMIN_ROLES, lock=True
         )
         department = authorization.department
         if confirm_slug != department.slug:
@@ -206,7 +241,7 @@ def list_memberships(
     offset: int,
 ):
     def operation():
-        authorize_transaction(session, principal, request_scope.department, ADMIN_ROLES, lock=False)
+        authorize_transaction(session, principal, request_scope, ADMIN_ROLES, lock=False)
         return list_scoped_memberships(
             session, request_scope.department, limit=limit, offset=offset
         )
@@ -221,7 +256,7 @@ def get_membership(
     membership_id: UUID,
 ):
     def operation():
-        authorize_transaction(session, principal, request_scope.department, ADMIN_ROLES, lock=False)
+        authorize_transaction(session, principal, request_scope, ADMIN_ROLES, lock=False)
         row = get_scoped_membership(session, request_scope.department, membership_id)
         if row is None:
             raise ServiceError(404, "Membership not found")
@@ -245,7 +280,7 @@ def create_membership(
 
     def operation():
         authorization = authorize_transaction(
-            session, principal, request_scope.department, ADMIN_ROLES, lock=True
+            session, principal, request_scope, ADMIN_ROLES, lock=True
         )
         identity = session.execute(
             select(UserIdentity)
@@ -348,7 +383,7 @@ def update_membership(
 
     def operation():
         authorization = authorize_transaction(
-            session, principal, request_scope.department, ADMIN_ROLES, lock=True
+            session, principal, request_scope, ADMIN_ROLES, lock=True
         )
         row = get_scoped_membership(session, request_scope.department, membership_id, lock=True)
         if row is None:
@@ -401,7 +436,7 @@ def revoke_membership(
 ):
     def operation():
         authorization = authorize_transaction(
-            session, principal, request_scope.department, ADMIN_ROLES, lock=True
+            session, principal, request_scope, ADMIN_ROLES, lock=True
         )
         row = get_scoped_membership(session, request_scope.department, membership_id, lock=True)
         if row is None:
