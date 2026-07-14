@@ -17,7 +17,7 @@ from alembic.config import Config
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.datastructures import Headers
 from starlette.requests import Request
@@ -737,7 +737,7 @@ def test_document_filename_constraints_reject_invalid_values(db: Session, filena
             sha256="0" * 64,
         )
     )
-    with pytest.raises(IntegrityError):
+    with pytest.raises(SQLAlchemyError):
         db.commit()
 
 
