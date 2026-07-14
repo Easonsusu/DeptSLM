@@ -27,7 +27,7 @@ class UploadError(RuntimeError):
 class UploadMetadata:
     original_filename: str
     media_type: str
-    content_length: int
+    content_length: int | None
     ascii_only: bool = False
 
 
@@ -56,44 +56,54 @@ def parse_upload_metadata(headers, max_bytes: int) -> UploadMetadata:
 
     _require_single_header(headers, "content-disposition")
     _require_single_header(headers, "content-type")
-    _require_single_header(headers, "content-length")
+    length_values = headers.getlist("content-length")
+    if len(length_values) > 1:
+        raise UploadError(422, "Content-Length must not be duplicated", "invalid_headers")
     if len(headers.getlist("content-encoding")) > 1:
-        raise UploadError(400, "Content-Encoding is duplicated", "invalid_headers")
+        raise UploadError(422, "Content-Encoding is duplicated", "invalid_headers")
     content_encoding = headers.get("content-encoding")
     if content_encoding is not None and content_encoding.strip().lower() != "identity":
         raise UploadError(415, "Content encoding is not supported", "content_encoding_denied")
 
     filename = parse_content_disposition(headers["content-disposition"])
     media_type, ascii_only = _validate_media_type(filename, headers["content-type"])
-    raw_length = headers["content-length"]
-    if not raw_length or not raw_length.isascii() or not raw_length.isdecimal():
-        raise UploadError(400, "Content-Length must be a positive decimal", "invalid_length")
-    content_length = int(raw_length)
-    if content_length <= 0:
-        raise UploadError(400, "Document must not be empty", "empty_document")
-    if content_length > max_bytes:
-        raise UploadError(413, "Document exceeds the configured size limit", "size_limit")
+    content_length = None
+    if length_values:
+        raw_length = length_values[0]
+        if not raw_length or not raw_length.isascii() or not raw_length.isdecimal():
+            raise UploadError(
+                422, "Content-Length must be a positive ASCII decimal", "invalid_length"
+            )
+        significant_length = raw_length.lstrip("0")
+        if not significant_length:
+            raise UploadError(422, "Document must not be empty", "empty_document")
+        maximum = str(max_bytes)
+        if len(significant_length) > len(maximum) or (
+            len(significant_length) == len(maximum) and significant_length > maximum
+        ):
+            raise UploadError(413, "Document exceeds the configured size limit", "size_limit")
+        content_length = int(significant_length)
     return UploadMetadata(filename, media_type, content_length, ascii_only)
 
 
 def _require_single_header(headers, name: str) -> None:
     values = headers.getlist(name)
     if len(values) != 1:
-        raise UploadError(400, f"Exactly one {name.title()} header is required", "invalid_headers")
+        raise UploadError(422, f"Exactly one {name.title()} header is required", "invalid_headers")
 
 
 def parse_content_disposition(value: str) -> str:
     if any(unicodedata.category(character) == "Cc" for character in value):
         raise UploadError(
-            400, "Content-Disposition contains control characters", "invalid_filename"
+            422, "Content-Disposition contains control characters", "invalid_filename"
         )
     parts = _split_parameters(value)
     if not parts or parts[0].strip().lower() != "attachment":
-        raise UploadError(400, "Content-Disposition must be attachment", "invalid_filename")
+        raise UploadError(422, "Content-Disposition must be attachment", "invalid_filename")
     parameters: dict[str, str] = {}
     for raw_parameter in parts[1:]:
         if "=" not in raw_parameter:
-            raise UploadError(400, "Content-Disposition is malformed", "invalid_filename")
+            raise UploadError(422, "Content-Disposition is malformed", "invalid_filename")
         raw_name, raw_value = raw_parameter.split("=", 1)
         name = raw_name.strip().lower()
         if (
@@ -101,7 +111,7 @@ def parse_content_disposition(value: str) -> str:
             or name not in {"filename", "filename*"}
             or name in parameters
         ):
-            raise UploadError(400, "Content-Disposition is malformed", "invalid_filename")
+            raise UploadError(422, "Content-Disposition is malformed", "invalid_filename")
         parameters[name] = raw_value.strip()
 
     plain_filename = (
@@ -119,7 +129,7 @@ def parse_content_disposition(value: str) -> str:
     elif "filename" in parameters:
         filename = plain_filename
     else:
-        raise UploadError(400, "Content-Disposition filename is required", "invalid_filename")
+        raise UploadError(422, "Content-Disposition filename is required", "invalid_filename")
     assert filename is not None
     return filename
 
@@ -145,14 +155,14 @@ def _split_parameters(value: str) -> list[str]:
         else:
             current.append(character)
     if quoted or escaped:
-        raise UploadError(400, "Content-Disposition is malformed", "invalid_filename")
+        raise UploadError(422, "Content-Disposition is malformed", "invalid_filename")
     parts.append("".join(current))
     return parts
 
 
 def _decode_quoted_filename(value: str) -> str:
     if len(value) < 2 or value[0] != '"' or value[-1] != '"':
-        raise UploadError(400, "filename must be a quoted string", "invalid_filename")
+        raise UploadError(422, "filename must be a quoted string", "invalid_filename")
     result: list[str] = []
     index = 1
     while index < len(value) - 1:
@@ -160,7 +170,7 @@ def _decode_quoted_filename(value: str) -> str:
         if character == "\\":
             index += 1
             if index >= len(value) - 1 or value[index] not in {'"', "\\"}:
-                raise UploadError(400, "filename contains an invalid escape", "invalid_filename")
+                raise UploadError(422, "filename contains an invalid escape", "invalid_filename")
             character = value[index]
         result.append(character)
         index += 1
@@ -169,43 +179,43 @@ def _decode_quoted_filename(value: str) -> str:
 
 def _decode_extended_filename(value: str) -> str:
     if value.startswith('"'):
-        raise UploadError(400, "filename* must use RFC 5987 UTF-8 encoding", "invalid_filename")
+        raise UploadError(422, "filename* must use RFC 5987 UTF-8 encoding", "invalid_filename")
     parts = value.split("'", 2)
     if len(parts) != 3 or parts[0].lower() != "utf-8" or not _RFC5987_LANGUAGE.fullmatch(parts[1]):
-        raise UploadError(400, "filename* must use RFC 5987 UTF-8 encoding", "invalid_filename")
+        raise UploadError(422, "filename* must use RFC 5987 UTF-8 encoding", "invalid_filename")
     encoded = parts[2]
     index = 0
     while index < len(encoded):
         if encoded[index] == "%":
             if index + 2 >= len(encoded) or not _HEX_PAIR.fullmatch(encoded[index + 1 : index + 3]):
                 raise UploadError(
-                    400, "filename* has malformed percent encoding", "invalid_filename"
+                    422, "filename* has malformed percent encoding", "invalid_filename"
                 )
             index += 3
         else:
             if not _RFC5987_ATTR_CHAR.fullmatch(encoded[index]):
                 raise UploadError(
-                    400, "filename* contains an invalid character", "invalid_filename"
+                    422, "filename* contains an invalid character", "invalid_filename"
                 )
             index += 1
     try:
         return unquote_to_bytes(encoded).decode("utf-8", "strict")
     except UnicodeDecodeError as error:
-        raise UploadError(400, "filename* is not valid UTF-8", "invalid_filename") from error
+        raise UploadError(422, "filename* is not valid UTF-8", "invalid_filename") from error
 
 
 def _validate_filename(value: str) -> str:
     filename = unicodedata.normalize("NFC", value)
     if not filename or not filename.strip() or filename in {".", ".."}:
-        raise UploadError(400, "Filename is invalid", "invalid_filename")
+        raise UploadError(422, "Filename is invalid", "invalid_filename")
     if "/" in filename or "\\" in filename:
-        raise UploadError(400, "Filename must not contain path separators", "invalid_filename")
+        raise UploadError(422, "Filename must not contain path separators", "invalid_filename")
     if any(
         character == "\x00" or unicodedata.category(character) == "Cc" for character in filename
     ):
-        raise UploadError(400, "Filename contains a control character", "invalid_filename")
+        raise UploadError(422, "Filename contains a control character", "invalid_filename")
     if len(filename) > 255 or len(filename.encode("utf-8")) > 255:
-        raise UploadError(400, "Filename is too long", "invalid_filename")
+        raise UploadError(422, "Filename is too long", "invalid_filename")
     return filename
 
 
@@ -303,25 +313,53 @@ async def stream_upload(
             if not chunk:
                 continue
             byte_size += len(chunk)
-            if byte_size > max_bytes or byte_size > metadata.content_length:
+            if byte_size > max_bytes:
+                raise UploadError(413, "Document exceeds the configured size limit", "size_limit")
+            if metadata.content_length is not None and byte_size > metadata.content_length:
                 raise UploadError(
-                    413, "Document exceeds the declared or configured size", "size_limit"
+                    422, "Content-Length does not match the request body", "length_mismatch"
                 )
             validator.feed(chunk)
             digest.update(chunk)
             await asyncio.to_thread(writer.write, chunk)
         if byte_size == 0:
-            raise UploadError(400, "Document must not be empty", "empty_document")
-        if byte_size != metadata.content_length:
+            raise UploadError(422, "Document must not be empty", "empty_document")
+        if metadata.content_length is not None and byte_size != metadata.content_length:
             raise UploadError(
-                400, "Content-Length does not match the request body", "length_mismatch"
+                422, "Content-Length does not match the request body", "length_mismatch"
             )
         validator.finish()
         await asyncio.to_thread(writer.finish)
     except ClientDisconnect as error:
-        await asyncio.to_thread(writer.abort)
-        raise UploadError(400, "Upload was interrupted", "client_disconnected") from error
+        await _abort_writer(writer)
+        raise UploadError(422, "Upload was interrupted", "client_disconnected") from error
+    except asyncio.CancelledError:
+        try:
+            await _abort_writer(writer)
+        except Exception:
+            # Cleanup failure must not replace the request's cancellation signal.
+            pass
+        raise
     except BaseException:
-        await asyncio.to_thread(writer.abort)
+        await _abort_writer(writer)
         raise
     return StreamResult(byte_size=byte_size, sha256=digest.hexdigest())
+
+
+async def _abort_writer(writer: UploadWriter) -> None:
+    """Complete blocking cleanup even if the request task is cancelled again."""
+
+    cleanup = asyncio.create_task(asyncio.to_thread(writer.abort))
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+    if cancelled:
+        try:
+            cleanup.result()
+        except Exception:
+            pass
+        raise asyncio.CancelledError
+    cleanup.result()

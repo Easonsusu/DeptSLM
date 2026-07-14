@@ -108,11 +108,10 @@ class MembershipUpdate(BaseModel):
 
 
 class DocumentResponse(ORMResponse):
-    """Safe document metadata; storage paths and checksums are intentionally excluded."""
+    """Safe document metadata; internal identity and storage fields are excluded."""
 
     id: UUID
     department_id: UUID
-    uploaded_by_user_id: UUID
     original_filename: str
     media_type: str
     byte_size: int

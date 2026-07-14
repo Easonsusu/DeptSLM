@@ -118,7 +118,7 @@ def finalize_document_upload(
                         result=AuditResult.DENIED,
                         reason_code="quota_exceeded",
                     )
-                    raise ServiceError(413, "Department document quota exceeded")
+                    raise ServiceError(409, "Department document quota exceeded")
                 staged.finalize(document_id)
                 document = Document(
                     id=document_id,
@@ -138,7 +138,7 @@ def finalize_document_upload(
                     actor=authorization.identity,
                     actor_subject=principal.subject,
                     request_scope=request_scope,
-                    action="document.create",
+                    action="document.upload",
                     resource_type="document",
                     resource_id=document.id,
                 )
@@ -181,9 +181,9 @@ def finalize_document_upload(
             principal,
             action="document.upload.database",
             result=AuditResult.DENIED,
-            reason_code="resource_conflict",
+            reason_code="database_unavailable",
         )
-        raise ServiceError(409, "Resource conflict") from error
+        raise ServiceError(503, "Database unavailable") from error
     except SQLAlchemyError as error:
         _compensate_safely(staged)
         emit_document_event(

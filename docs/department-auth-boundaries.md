@@ -120,7 +120,7 @@ Server-side membership resolution requires exact issuer, opaque subject, and pat
 
 ## Phase 4 document boundary
 
-Document repositories require `DepartmentScope` and always filter `department_id`. Upload admission uses a short session; streaming holds no database transaction. Finalization starts a new transaction, locks the department first, repeats exact identity/membership/role validation, and serializes retained-byte quota decisions. Fixed-field process events distinguish admission, finalization, validation, storage, database, read, and delete decisions without recording filenames, headers, bodies, hashes, or paths. Successful create/delete mutations append a persistent audit row in the same transaction as metadata.
+Document repositories require `DepartmentScope` and always filter `department_id`. Upload admission uses a short session; streaming holds no database transaction. Finalization starts a new transaction, locks the department first, repeats exact identity/membership/role validation, and serializes retained-byte quota decisions. Fixed-field process events distinguish admission, finalization, validation, storage, database, read, and delete decisions without recording filenames, headers, bodies, hashes, or paths. Successful upload/delete mutations append `document.upload` or `document.delete` persistent audit rows in the same transaction as metadata.
 
 ## Acceptance criteria for Phase 2
 

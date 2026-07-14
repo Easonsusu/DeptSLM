@@ -96,6 +96,10 @@ Phase 3 implements `GET /departments`, same-department `GET/PATCH/DELETE /depart
 
 List/read accepts every active same-department role. Upload accepts same-department `system_admin`, `department_admin`, and `instructor`; soft deletion accepts same-department `system_admin` and `department_admin`. Deleted documents are hidden, source bytes are retained, and there is no global list, search, download, extraction, or indexing endpoint. Upload uses a raw request body and the strict headers, formats, limits, storage layout, and cleanup rules in [document-upload.md](document-upload.md).
 
+`Content-Length` is optional for upload. If supplied, it must be one nonzero ASCII-decimal header, is checked early against the per-file maximum, and must match the streamed byte count. Independent streaming limits still protect requests that omit it. Document create, list, read, and delete responses expose safe metadata only; they never expose uploader/deletion identity IDs, issuer, subject, checksum, or storage path.
+
+Document errors use `403` for authorization, `409` for department quota exhaustion, `413` for the per-file size limit, `415` for unsupported or invalid content, `422` for malformed metadata/filename, empty input, duplicate metadata headers, or length mismatch, and a generic `503` for database or storage unavailability. Successful upload finalization records transactional action `document.upload`; deletion continues to record `document.delete`.
+
 ## Future API conventions
 
 The following conventions should be decided before business endpoints are introduced:

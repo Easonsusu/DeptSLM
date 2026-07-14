@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import stat
 from pathlib import Path
+from threading import Event
 from uuid import UUID, uuid4
 
 import pytest
@@ -31,15 +33,16 @@ from app.settings import (
 def _headers(
     filename: str = "notes.txt",
     content_type: str = "text/plain; charset=utf-8",
-    length: int = 5,
+    length: int | str | None = 5,
     **extra: str,
 ) -> Headers:
     values = {
         "content-disposition": f'attachment; filename="{filename}"',
         "content-type": content_type,
-        "content-length": str(length),
         **{name.replace("_", "-"): value for name, value in extra.items()},
     }
+    if length is not None:
+        values["content-length"] = str(length)
     return Headers(values)
 
 
@@ -98,8 +101,9 @@ def test_unsupported_or_mismatched_media_is_rejected(filename: str, content_type
     ],
 )
 def test_invalid_content_disposition_is_rejected(value: str) -> None:
-    with pytest.raises(UploadError):
+    with pytest.raises(UploadError) as captured:
         parse_content_disposition(value)
+    assert captured.value.status_code == 422
 
 
 def test_rfc5987_filename_is_decoded_and_normalized() -> None:
@@ -123,6 +127,22 @@ def test_duplicate_required_header_is_rejected() -> None:
     )
     with pytest.raises(UploadError) as captured:
         parse_upload_metadata(headers, 100)
+    assert captured.value.status_code == 422
+    assert captured.value.reason_code == "invalid_headers"
+
+
+def test_duplicate_content_length_is_rejected() -> None:
+    headers = Headers(
+        raw=[
+            (b"content-disposition", b'attachment; filename="notes.txt"'),
+            (b"content-type", b"text/plain"),
+            (b"content-length", b"5"),
+            (b"content-length", b"5"),
+        ]
+    )
+    with pytest.raises(UploadError) as captured:
+        parse_upload_metadata(headers, 100)
+    assert captured.value.status_code == 422
     assert captured.value.reason_code == "invalid_headers"
 
 
@@ -132,10 +152,24 @@ def test_non_identity_content_encoding_is_rejected() -> None:
     assert captured.value.reason_code == "content_encoding_denied"
 
 
-@pytest.mark.parametrize("length", (0, 101))
-def test_declared_empty_or_oversize_upload_is_rejected(length: int) -> None:
-    with pytest.raises(UploadError):
+@pytest.mark.parametrize(
+    ("length", "expected"),
+    [(0, 422), (101, 413), ("9" * 5000, 413), ("", 422), ("+5", 422), ("²", 422)],
+)
+def test_invalid_declared_length_is_rejected(length: int | str, expected: int) -> None:
+    with pytest.raises(UploadError) as captured:
         parse_upload_metadata(_headers(length=length), 100)
+    assert captured.value.status_code == expected
+
+
+def test_content_length_is_optional_metadata() -> None:
+    metadata = parse_upload_metadata(_headers(length=None), 100)
+    assert metadata.content_length is None
+
+
+def test_content_length_accepts_leading_zeroes_without_unbounded_integer_parsing() -> None:
+    metadata = parse_upload_metadata(_headers(length=("0" * 5000) + "5"), 100)
+    assert metadata.content_length == 5
 
 
 def _request(chunks: list[bytes]) -> Request:
@@ -187,6 +221,33 @@ def test_chunked_text_stream_hashes_and_finalizes_with_private_permissions(tmp_p
     assert source == tmp_path / "uploads" / str(department) / str(document_id) / "source"
 
 
+@pytest.mark.parametrize("chunks", [[b"hello"], [b"he", b"ll", b"o"]])
+def test_stream_accepts_absent_content_length(tmp_path: Path, chunks: list[bytes]) -> None:
+    storage, department = _storage(tmp_path)
+    staged = storage.create_staging(department, uuid4())
+    metadata = parse_upload_metadata(_headers(length=None), 100)
+    result = asyncio.run(stream_upload(_request(chunks), staged, metadata, 100))
+    assert result.byte_size == 5
+    staged.abort()
+
+
+@pytest.mark.parametrize(
+    ("chunks", "maximum", "expected"),
+    [([b""], 100, 422), ([b"123", b"456"], 5, 413)],
+)
+def test_absent_content_length_still_rejects_empty_or_oversize_streams(
+    tmp_path: Path, chunks: list[bytes], maximum: int, expected: int
+) -> None:
+    storage, department = _storage(tmp_path)
+    staged = storage.create_staging(department, uuid4())
+    path = staged.staging_path
+    metadata = parse_upload_metadata(_headers(length=None), 100)
+    with pytest.raises(UploadError) as captured:
+        asyncio.run(stream_upload(_request(chunks), staged, metadata, maximum))
+    assert captured.value.status_code == expected
+    assert not path.exists()
+
+
 def test_pdf_signature_is_checked_across_chunk_boundaries(tmp_path: Path) -> None:
     storage, department = _storage(tmp_path)
     staged = storage.create_staging(department, uuid4())
@@ -220,15 +281,21 @@ def test_invalid_content_cleans_staging(tmp_path: Path, chunks: list[bytes]) -> 
     assert not staging_path.exists()
 
 
-def test_length_mismatch_and_streaming_limit_clean_staging(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("declared", "maximum", "body", "expected"),
+    [(6, 100, b"short", 422), (4, 100, b"12345", 422), (6, 5, b"123456", 413)],
+)
+def test_length_mismatch_and_streaming_limit_clean_staging(
+    tmp_path: Path, declared: int, maximum: int, body: bytes, expected: int
+) -> None:
     storage, department = _storage(tmp_path)
-    for declared, maximum, body in ((6, 100, b"short"), (6, 5, b"123456")):
-        staged = storage.create_staging(department, uuid4())
-        path = staged.staging_path
-        metadata = parse_upload_metadata(_headers(length=declared), 100)
-        with pytest.raises(UploadError):
-            asyncio.run(stream_upload(_request([body]), staged, metadata, maximum))
-        assert not path.exists()
+    staged = storage.create_staging(department, uuid4())
+    path = staged.staging_path
+    metadata = parse_upload_metadata(_headers(length=declared), 100)
+    with pytest.raises(UploadError) as captured:
+        asyncio.run(stream_upload(_request([body]), staged, metadata, maximum))
+    assert captured.value.status_code == expected
+    assert not path.exists()
 
 
 def test_client_disconnect_cleans_staging(tmp_path: Path) -> None:
@@ -240,6 +307,66 @@ def test_client_disconnect_cleans_staging(tmp_path: Path) -> None:
         asyncio.run(stream_upload(_disconnecting_request(b"hello"), staged, metadata, 100))
     assert captured.value.reason_code == "client_disconnected"
     assert not path.exists()
+
+
+def test_cancellation_after_a_written_chunk_removes_staging_and_closes_fds(
+    tmp_path: Path,
+) -> None:
+    storage, department = _storage(tmp_path)
+    staged = storage.create_staging(department, uuid4())
+    staging_path = staged.staging_path
+    descriptors = (staged.uploads_fd, staged.department_fd, staged.staging_fd, staged.file_fd)
+    chunk_written = Event()
+    abort_started = Event()
+    allow_abort = Event()
+    abort_completed = Event()
+
+    class SignalingWriter:
+        def write(self, chunk: bytes) -> None:
+            staged.write(chunk)
+            chunk_written.set()
+
+        def finish(self) -> None:
+            staged.finish()
+
+        def abort(self) -> None:
+            abort_started.set()
+            assert allow_abort.wait(2)
+            staged.abort()
+            abort_completed.set()
+
+    received_first = False
+
+    async def receive():
+        nonlocal received_first
+        if not received_first:
+            received_first = True
+            return {"type": "http.request", "body": b"hello", "more_body": True}
+        await asyncio.Future()
+
+    request = Request({"type": "http", "method": "POST", "headers": []}, receive)
+    metadata = parse_upload_metadata(_headers(length=None), 100)
+
+    async def cancel_upload() -> None:
+        task = asyncio.create_task(stream_upload(request, SignalingWriter(), metadata, 100))
+        assert await asyncio.to_thread(chunk_written.wait, 2)
+        task.cancel()
+        assert await asyncio.to_thread(abort_started.wait, 2)
+        task.cancel()
+        allow_abort.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_upload())
+    assert abort_completed.is_set()
+    assert staged.closed and staged.file_fd is None
+    assert not staging_path.exists()
+    assert not list((tmp_path / "uploads").rglob("source"))
+    for descriptor in descriptors:
+        assert descriptor is not None
+        with pytest.raises(OSError) as captured:
+            os.fstat(descriptor)
+        assert captured.value.errno == errno.EBADF
 
 
 def test_finalize_compensation_removes_only_created_document(tmp_path: Path) -> None:

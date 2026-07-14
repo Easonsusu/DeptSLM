@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -14,9 +15,12 @@ import jwt
 import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from starlette.datastructures import Headers
+from starlette.requests import Request
 
 from alembic import command
 from app.audit import AuditEvent, AuditSink
@@ -29,7 +33,12 @@ from app.document_services import (
     finalize_document_upload,
 )
 from app.document_storage import DocumentStorage
-from app.document_upload import StreamResult, UploadMetadata
+from app.document_upload import (
+    StreamResult,
+    UploadMetadata,
+    parse_upload_metadata,
+    stream_upload,
+)
 from app.main import app
 from app.models import Department, Document, Membership, PersistentAuditEvent, UserIdentity
 
@@ -142,6 +151,39 @@ def _upload(client: TestClient, department_id, body: bytes = b"hello"):
     )
 
 
+def _assert_safe_document_response(payload: dict) -> None:
+    assert {
+        "uploaded_by_user_id",
+        "deleted_by_user_id",
+        "issuer",
+        "subject",
+        "sha256",
+        "storage_path",
+        "path",
+    }.isdisjoint(payload)
+
+
+async def _async_stream_upload(application, department_id, chunks: list[bytes]):
+    async def body():
+        for chunk in chunks:
+            yield chunk
+            await asyncio.sleep(0)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://testserver"
+    ) as client:
+        response = await client.post(
+            f"/departments/{department_id}/documents",
+            headers={
+                "Authorization": f"Bearer {_token()}",
+                "Content-Disposition": 'attachment; filename="notes.txt"',
+                "Content-Type": "text/plain; charset=utf-8",
+            },
+            content=body(),
+        )
+        return response
+
+
 def test_migration_head_contains_document_schema(engine) -> None:
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
@@ -155,8 +197,22 @@ def test_migration_head_contains_document_schema(engine) -> None:
                 )
             ).scalars()
         )
+        constraint_names = set(
+            connection.execute(
+                text("SELECT conname FROM pg_constraint WHERE conrelid = 'documents'::regclass")
+            ).scalars()
+        )
     assert {"department_id", "uploaded_by_user_id", "sha256", "deleted_at"}.issubset(columns)
     assert "storage_path" not in columns and "content" not in columns
+    filename_constraints = {
+        "ck_document_filename_nonempty",
+        "ck_document_filename_char_length",
+        "ck_document_filename_byte_length",
+    }
+    assert filename_constraints.issubset(constraint_names)
+    assert filename_constraints.issubset(
+        {constraint.name for constraint in Document.__table__.constraints}
+    )
 
 
 def test_upload_list_read_and_safe_response(
@@ -177,8 +233,8 @@ def test_upload_list_read_and_safe_response(
     assert created.status_code == 201
     assert listed.status_code == 200 and len(listed.json()["items"]) == 1
     assert read.status_code == 200
-    assert created.json()["uploaded_by_user_id"] == str(identity.id)
-    assert {"sha256", "storage_path", "path", "deleted_by_user_id"}.isdisjoint(created.json())
+    for payload in (created.json(), listed.json()["items"][0], read.json()):
+        _assert_safe_document_response(payload)
     source = tmp_path / "uploads" / str(department.id) / created.json()["id"] / "source"
     assert source.read_bytes() == b"hello"
     db.expire_all()
@@ -187,7 +243,61 @@ def test_upload_list_read_and_safe_response(
         row is not None
         and row.sha256 == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
     )
-    assert db.query(PersistentAuditEvent).filter_by(action="document.create").count() == 1
+    assert row.uploaded_by_user_id == identity.id
+    assert db.query(PersistentAuditEvent).filter_by(action="document.upload").count() == 1
+
+
+def test_api_accepts_streaming_body_without_content_length(
+    db: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, department, _ = _seed(db)
+    with _client(monkeypatch, tmp_path) as client:
+        response = asyncio.run(_async_stream_upload(client.app, department.id, [b"he", b"llo"]))
+    assert response.status_code == 201
+    assert "content-length" not in response.request.headers
+    _assert_safe_document_response(response.json())
+    source = tmp_path / "uploads" / str(department.id) / response.json()["id"] / "source"
+    assert source.read_bytes() == b"hello"
+    assert db.query(Document).count() == 1
+    assert db.query(PersistentAuditEvent).filter_by(action="document.upload").count() == 1
+
+
+@pytest.mark.parametrize(
+    ("content_disposition", "content_length", "body", "expected"),
+    [
+        (None, "5", b"hello", 422),
+        ('attachment; filename="   "', "5", b"hello", 422),
+        ('attachment; filename="notes.txt"', "0", b"", 422),
+        ('attachment; filename="notes.txt"', "4", b"hello", 422),
+        ('attachment; filename="notes.txt"', "6", b"hello", 422),
+        ('attachment; filename="notes.txt"', "101", b"hello", 413),
+    ],
+)
+def test_upload_metadata_and_length_status_contract(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    content_disposition: str | None,
+    content_length: str,
+    body: bytes,
+    expected: int,
+) -> None:
+    _, department, _ = _seed(db)
+    headers = {
+        "Authorization": f"Bearer {_token()}",
+        "Content-Type": "text/plain",
+        "Content-Length": content_length,
+    }
+    if content_disposition is not None:
+        headers["Content-Disposition"] = content_disposition
+    with _client(monkeypatch, tmp_path, maximum=100) as client:
+        response = client.post(
+            f"/departments/{department.id}/documents", headers=headers, content=body
+        )
+    assert response.status_code == expected
+    assert db.query(Document).count() == 0
+    assert db.query(PersistentAuditEvent).filter_by(action="document.upload").count() == 0
+    assert not list((tmp_path / "uploads").rglob("*.part"))
 
 
 def test_upload_process_audit_excludes_sensitive_metadata_and_content(
@@ -244,6 +354,7 @@ def test_upload_role_matrix(
     if expected != 201:
         assert not list((tmp_path / "uploads").rglob("*.part"))
         assert db.query(Document).count() == 0
+        assert db.query(PersistentAuditEvent).filter_by(action="document.upload").count() == 0
 
 
 @pytest.mark.parametrize(
@@ -272,6 +383,8 @@ def test_every_same_department_role_can_list_and_read_metadata(
         read = client.get(f"/departments/{department.id}/documents/{document.id}", headers=headers)
     assert listed.status_code == 200 and len(listed.json()["items"]) == 1
     assert read.status_code == 200
+    _assert_safe_document_response(listed.json()["items"][0])
+    _assert_safe_document_response(read.json())
 
 
 def test_cross_department_and_header_mismatch_fail_closed(
@@ -349,6 +462,7 @@ def test_invalid_uploads_leave_no_metadata_or_staging(
         )
     assert response.status_code == expected
     assert db.query(Document).count() == 0
+    assert db.query(PersistentAuditEvent).filter_by(action="document.upload").count() == 0
     assert not list((tmp_path / "uploads").rglob("*.part"))
 
 
@@ -380,6 +494,51 @@ def test_final_authorization_rechecks_revoked_membership_and_cleans_staging(
     assert captured.value.status_code == 403
     assert not staged.staging_path.exists()
     assert db.query(Document).count() == 0
+    assert db.query(PersistentAuditEvent).filter_by(action="document.upload").count() == 0
+
+
+def test_cancelled_stream_creates_no_document_or_persistent_success_audit(
+    db: Session, tmp_path: Path
+) -> None:
+    _, department, _ = _seed(db)
+    storage = DocumentStorage(_prepared_root(tmp_path))
+    staged = storage.create_staging(DepartmentScope(department.id), uuid4())
+    staging_path = staged.staging_path
+    first_received = False
+
+    async def receive():
+        nonlocal first_received
+        if not first_received:
+            first_received = True
+            return {"type": "http.request", "body": b"hello", "more_body": True}
+        await asyncio.Future()
+
+    request = Request({"type": "http", "method": "POST", "headers": []}, receive)
+    metadata = parse_upload_metadata(
+        Headers(
+            {
+                "content-disposition": 'attachment; filename="notes.txt"',
+                "content-type": "text/plain",
+            }
+        ),
+        100,
+    )
+
+    async def cancel_after_write() -> None:
+        task = asyncio.create_task(stream_upload(request, staged, metadata, 100))
+        async with asyncio.timeout(2):
+            while not staging_path.exists() or staging_path.stat().st_size < 5:
+                await asyncio.sleep(0.001)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_after_write())
+    assert staged.closed and staged.file_fd is None
+    assert not staging_path.exists()
+    assert not list((tmp_path / "uploads").rglob("source"))
+    assert db.query(Document).count() == 0
+    assert db.query(PersistentAuditEvent).filter_by(action="document.upload").count() == 0
 
 
 def _prepared_root(path: Path) -> Path:
@@ -433,9 +592,10 @@ def test_quota_is_serialized_and_includes_soft_deleted_bytes(
         first = executor.submit(finalize_one, b"a")
         second = executor.submit(finalize_one, b"b")
         results = sorted((first.result(timeout=10), second.result(timeout=10)))
-    assert results == [201, 413]
+    assert results == [201, 409]
     db.expire_all()
     assert db.query(Document).count() == 2
+    assert db.query(PersistentAuditEvent).filter_by(action="document.upload").count() == 1
     assert not list((tmp_path / "uploads").rglob("*.part"))
 
 
@@ -450,7 +610,7 @@ def test_database_failure_after_move_compensates_file(
     staged.finish()
 
     def fail_audit(*_args, **_kwargs):
-        raise SQLAlchemyError("simulated")
+        raise IntegrityError("simulated", {}, RuntimeError("simulated"))
 
     monkeypatch.setattr("app.document_services.append_mutation_audit", fail_audit)
     with pytest.raises(ServiceError) as captured:
@@ -495,6 +655,7 @@ def test_delete_is_soft_scoped_admin_only_and_idempotent(
 
     assert denied.status_code == 403
     assert removed.status_code == 200 and removed.json()["status"] == "deleted"
+    _assert_safe_document_response(removed.json())
     assert repeated.status_code == 404 and hidden.status_code == 404
     assert source.read_bytes() == b"hello"
     db.expire_all()
@@ -558,3 +719,38 @@ def test_document_constraints_reject_invalid_lifecycle_and_checksum(db: Session)
     )
     with pytest.raises(IntegrityError):
         db.commit()
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["", "   ", "\t\n", "a" * 256, "界" * 86],
+)
+def test_document_filename_constraints_reject_invalid_values(db: Session, filename: str) -> None:
+    identity, department, _ = _seed(db)
+    db.add(
+        Document(
+            department_id=department.id,
+            uploaded_by_user_id=identity.id,
+            original_filename=filename,
+            media_type="text/plain",
+            byte_size=1,
+            sha256="0" * 64,
+        )
+    )
+    with pytest.raises(IntegrityError):
+        db.commit()
+
+
+def test_document_filename_constraints_accept_valid_unicode(db: Session) -> None:
+    identity, department, _ = _seed(db)
+    document = Document(
+        department_id=department.id,
+        uploaded_by_user_id=identity.id,
+        original_filename="部門文件.md",
+        media_type="text/markdown",
+        byte_size=1,
+        sha256="0" * 64,
+    )
+    db.add(document)
+    db.commit()
+    assert db.get(Document, document.id) is not None

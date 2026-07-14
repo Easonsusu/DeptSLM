@@ -126,6 +126,18 @@ class Document(Base):
     __tablename__ = "documents"
     __table_args__ = (
         CheckConstraint(
+            "original_filename ~ '[^[:space:]]'",
+            name="ck_document_filename_nonempty",
+        ),
+        CheckConstraint(
+            "char_length(original_filename) <= 255",
+            name="ck_document_filename_char_length",
+        ),
+        CheckConstraint(
+            "octet_length(original_filename) <= 255",
+            name="ck_document_filename_byte_length",
+        ),
+        CheckConstraint(
             "media_type IN ('application/pdf','text/plain','text/markdown')",
             name="ck_document_media_type",
         ),

@@ -4,6 +4,8 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 
 > **Phase 4 status:** Department-scoped document metadata, raw streaming uploads, external source storage, quota enforcement, and soft deletion are under review. Extraction, OCR, malware scanning, download, RAG, model serving, fine-tuning, and production identity/storage remain deferred.
 
+Phase 4 upload accepts a raw streamed body with an optional `Content-Length`; the configured byte limit is always enforced while streaming. Public document metadata excludes internal identity IDs and storage details. Successful uploads record `document.upload`, while handled cancellation and failure paths remove staging. Crash-time orphan reconciliation remains deferred.
+
 ## Planned stack
 
 - Next.js and TypeScript for the web application
