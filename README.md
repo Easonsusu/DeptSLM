@@ -2,7 +2,7 @@
 
 DeptSLM is a university departmental small language model (SLM) customization platform. It is intended to let each department build an isolated assistant from its own approved documents, retrieval index, evaluation data, and eventually its own LoRA or QLoRA adapter.
 
-> **Phase 0 status:** this repository is a project-initialization skeleton. It provides the monorepo layout, a basic web landing page, health/version API endpoints, local-service placeholders, storage setup, and design documentation. Retrieval-augmented generation (RAG), database workflows, authentication, model serving, and fine-tuning are not implemented yet.
+> **Phase 2 status:** the repository now includes development/test JWT verification and fail-closed department authorization foundations. Persistent memberships, department product APIs, production identity integration, RAG, model serving, and fine-tuning are not implemented yet.
 
 ## Planned stack
 
@@ -90,6 +90,8 @@ Prerequisites for the complete local stack are Git, Docker Desktop with Docker C
    curl http://localhost:8000/version
    ```
 
+   Protected identity checks additionally require the development/test authentication variables documented in [.env.example](.env.example). HS256 is allowed only with an explicit `ENVIRONMENT` of `local`, `development`, `dev`, or `test`; incomplete configuration stops startup. Generate a local secret of at least 32 bytes with `python -c 'import secrets; print(secrets.token_urlsafe(48))'` and keep it only in the untracked `.env`. The repository provides no usable default secret. Authentication defaults to disabled, and department authorization defaults to deny-all until Phase 3.
+
    The default ports are controlled by `API_PORT` and `WEB_PORT` in `.env`.
 
 Stop the stack with:
@@ -118,10 +120,11 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Deployment](docs/deployment.md)
 - [Roadmap](docs/roadmap.md)
 - [Department and authentication boundaries](docs/department-auth-boundaries.md)
+- [Authentication foundation](docs/authentication-foundation.md)
 
-## Phase 0 non-goals
+## Current non-goals
 
-This phase does not implement RAG, document processing, embeddings, vector indexing, model inference, fine-tuning, adapter management, authentication, or production deployment. The skeleton should stay small and easy to understand so those capabilities can be designed and reviewed in later phases.
+Phase 2 does not implement department CRUD, persistent users or memberships, production OAuth/OIDC/SSO, frontend login, documents, RAG, vector integration, model inference, fine-tuning, or production deployment.
 
 ## License
 
