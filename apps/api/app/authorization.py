@@ -18,6 +18,8 @@ from app.auth import (
     TokenVerifier,
 )
 
+BEARER_CHALLENGE = {"WWW-Authenticate": "Bearer"}
+
 
 @dataclass(frozen=True, slots=True)
 class DepartmentScope:
@@ -110,7 +112,11 @@ def require_authenticated_principal(
                 correlation_id=correlation_id,
             ),
         )
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required")
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "Authentication required",
+            headers=BEARER_CHALLENGE,
+        )
 
     parts = authorization.split()
     if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1]:
@@ -124,7 +130,11 @@ def require_authenticated_principal(
                 correlation_id=correlation_id,
             ),
         )
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid authentication")
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "Invalid authentication",
+            headers=BEARER_CHALLENGE,
+        )
 
     verifier: TokenVerifier = request.app.state.token_verifier
     try:
@@ -140,7 +150,11 @@ def require_authenticated_principal(
                 correlation_id=correlation_id,
             ),
         )
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid authentication") from None
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "Invalid authentication",
+            headers=BEARER_CHALLENGE,
+        ) from None
 
     _audit(
         request,

@@ -90,7 +90,7 @@ Prerequisites for the complete local stack are Git, Docker Desktop with Docker C
    curl http://localhost:8000/version
    ```
 
-   Protected identity checks additionally require the development/test authentication variables documented in [.env.example](.env.example). Authentication defaults to disabled, and department authorization defaults to deny-all until Phase 3.
+   Protected identity checks additionally require the development/test authentication variables documented in [.env.example](.env.example). HS256 is allowed only with an explicit `ENVIRONMENT` of `local`, `development`, `dev`, or `test`; incomplete configuration stops startup. Generate a local secret of at least 32 bytes with `python -c 'import secrets; print(secrets.token_urlsafe(48))'` and keep it only in the untracked `.env`. The repository provides no usable default secret. Authentication defaults to disabled, and department authorization defaults to deny-all until Phase 3.
 
    The default ports are controlled by `API_PORT` and `WEB_PORT` in `.env`.
 

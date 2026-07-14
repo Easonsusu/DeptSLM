@@ -71,13 +71,15 @@ curl --fail \
   http://localhost:8000/auth/me
 ```
 
-Successful responses contain `subject` and `issuer`. Missing, malformed, expired, incorrectly signed, or otherwise invalid tokens return `401`. The response never includes the raw token, secret, audience, membership data, roles, or authentication configuration.
+Successful responses contain `subject` and `issuer`. Missing, malformed, disabled, expired, incorrectly signed, or otherwise invalid authentication returns `401` with `WWW-Authenticate: Bearer`. The response never includes the raw token, secret, audience, membership data, roles, or authentication configuration.
 
 Department-scoped dependencies return `403` for missing, malformed, unknown, inactive, cross-department, or role-incompatible membership scope. This uniform denial avoids revealing whether another department or membership exists. There are no production department-scoped routes in Phase 2.
 
 ## Current error behavior
 
-Unknown routes use FastAPI's default JSON `404 Not Found` response. Authentication failures use `401`; authenticated department authorization failures use `403`. No project-wide error envelope is defined yet.
+Unknown routes use FastAPI's default JSON `404 Not Found` response. Authentication failures use `401` with a Bearer challenge; authenticated department authorization failures use `403` without that challenge. No project-wide error envelope is defined yet.
+
+Development HS256 startup requires an explicit `ENVIRONMENT` of `local`, `development`, `dev`, or `test`, complete issuer/audience/secret configuration, and a non-placeholder secret of at least 32 UTF-8 bytes. Unknown or missing environments and incomplete settings stop startup.
 
 ## Future API conventions
 

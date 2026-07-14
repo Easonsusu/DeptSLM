@@ -8,7 +8,7 @@ from typing import Protocol
 
 import jwt
 
-from app.settings import Settings
+from app.settings import ConfigurationError, Settings
 
 
 class AuthenticationError(Exception):
@@ -85,7 +85,7 @@ def build_token_verifier(settings: Settings) -> TokenVerifier:
     if settings.auth_mode != "hs256":
         return DenyAllTokenVerifier()
     if not settings.auth_secret or not settings.auth_issuer or not settings.auth_audience:
-        return DenyAllTokenVerifier()
+        raise ConfigurationError("HS256 authentication configuration is incomplete.")
     return HS256TokenVerifier(
         secret=settings.auth_secret,
         issuer=settings.auth_issuer,

@@ -8,7 +8,9 @@ Authentication and membership resolution are separate boundaries. A token proves
 
 ## Development and test JWT mode
 
-`DEPTSLM_AUTH_MODE=hs256` enables an established PyJWT verifier for local development and tests. It accepts only HS256 and validates signature, subject, issuer, audience, expiration, and `nbf` when present. Unsigned tokens and other algorithms are rejected.
+`DEPTSLM_AUTH_MODE=hs256` enables an established PyJWT verifier only when `ENVIRONMENT` is explicitly set to `local`, `development`, `dev`, or `test`. Missing, blank, unknown, staging, preview, QA, production, misspelled, and all other environments stop startup with a configuration error. Disabled authentication retains the normal local environment default.
+
+The verifier accepts only HS256 and validates signature, subject, issuer, audience, expiration, and `nbf` when present. Unsigned tokens and other algorithms are rejected.
 
 The required variables are:
 
@@ -16,7 +18,13 @@ The required variables are:
 - `DEPTSLM_AUTH_AUDIENCE`
 - `DEPTSLM_AUTH_SECRET`
 
-The repository contains placeholders only. Incomplete configuration fails closed. HS256 mode is rejected when `ENVIRONMENT` is `production` or `prod`; it is not a production identity design.
+Explicit HS256 selection requires every variable and stops startup if any value is missing or empty. The secret must contain at least 32 UTF-8 bytes and must not match a known placeholder. Generate a local secret without committing it:
+
+```bash
+python -c 'import secrets; print(secrets.token_urlsafe(48))'
+```
+
+The repository provides no usable default signing secret. Store the generated value only in the untracked local `.env`. HS256 is not a production identity design.
 
 ## Runtime membership behavior
 
@@ -25,7 +33,7 @@ The runtime membership resolver denies all department access. Tests use an in-me
 ## HTTP behavior
 
 - `/health` and `/version` remain public.
-- `/auth/me` requires valid authentication and returns `401` otherwise.
+- `/auth/me` requires valid authentication and returns `401` with `WWW-Authenticate: Bearer` otherwise.
 - Department dependencies require one explicit UUID scope and an active matching server-side membership.
 - Missing, malformed, unknown, suspended, revoked, cross-department, and role-incompatible scope returns `403` without confirming resource existence.
 - `system_admin` receives no global bypass.

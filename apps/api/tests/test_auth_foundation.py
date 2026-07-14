@@ -12,7 +12,7 @@ import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from app.audit import AuditEvent, AuditSink
+from app.audit import AuditEvent, AuditSink, LoggingAuditSink
 from app.auth import (
     AuthenticatedPrincipal,
     DepartmentRole,
@@ -109,6 +109,7 @@ def test_missing_or_malformed_bearer_is_rejected(
     with TestClient(app) as client:
         response = client.get("/auth/me", headers=headers)
     assert response.status_code == expected_status
+    assert response.headers["WWW-Authenticate"] == "Bearer"
 
 
 @pytest.mark.parametrize(
@@ -157,26 +158,95 @@ def test_invalid_tokens_are_rejected(
     with TestClient(app) as client:
         response = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 401
+    assert response.headers["WWW-Authenticate"] == "Bearer"
 
 
 def test_unconfigured_authentication_fails_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
     monkeypatch.setenv("DEPTSLM_AUTH_MODE", "disabled")
+    monkeypatch.delenv("DEPTSLM_AUTH_ISSUER", raising=False)
+    monkeypatch.delenv("DEPTSLM_AUTH_AUDIENCE", raising=False)
+    monkeypatch.delenv("DEPTSLM_AUTH_SECRET", raising=False)
     with TestClient(app) as client:
-        assert client.get("/auth/me", headers={"Authorization": "Bearer token"}).status_code == 401
+        response = client.get("/auth/me", headers={"Authorization": "Bearer token"})
+        assert response.status_code == 401
+        assert response.headers["WWW-Authenticate"] == "Bearer"
         assert client.get("/health").status_code == 200
         assert client.get("/version").status_code == 200
 
 
-def test_hs256_mode_is_rejected_in_production(
+@pytest.mark.parametrize("environment", ("local", "development", "dev", "test"))
+def test_hs256_mode_accepts_only_reviewed_local_environments(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, environment: str
+) -> None:
+    auth_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("ENVIRONMENT", environment)
+    settings = Settings.from_environment()
+    assert settings.environment == environment
+
+
+@pytest.mark.parametrize(
+    "environment",
+    (
+        None,
+        "",
+        "production",
+        "prod",
+        "staging",
+        "preview",
+        "qa",
+        "unknown",
+        "prodution",
+        "TEST",
+    ),
+)
+def test_hs256_mode_rejects_unreviewed_or_missing_environments(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, environment: str | None
+) -> None:
+    auth_environment(monkeypatch, tmp_path)
+    if environment is None:
+        monkeypatch.delenv("ENVIRONMENT")
+    else:
+        monkeypatch.setenv("ENVIRONMENT", environment)
+    with pytest.raises(ConfigurationError, match="ENVIRONMENT"):
+        Settings.from_environment()
+
+
+@pytest.mark.parametrize(
+    "missing_variable",
+    ("DEPTSLM_AUTH_ISSUER", "DEPTSLM_AUTH_AUDIENCE", "DEPTSLM_AUTH_SECRET"),
+)
+def test_hs256_mode_rejects_missing_configuration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, missing_variable: str
+) -> None:
+    auth_environment(monkeypatch, tmp_path)
+    monkeypatch.delenv(missing_variable)
+    with pytest.raises(ConfigurationError, match=missing_variable):
+        Settings.from_environment()
+
+
+@pytest.mark.parametrize(
+    "secret",
+    ("", "short-secret", "replace-with-a-local-development-secret"),
+)
+def test_hs256_mode_rejects_empty_short_or_placeholder_secrets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, secret: str
+) -> None:
+    auth_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("DEPTSLM_AUTH_SECRET", secret)
+    with pytest.raises(ConfigurationError, match="DEPTSLM_AUTH_SECRET"):
+        Settings.from_environment()
+
+
+def test_hs256_secret_length_is_measured_in_utf8_bytes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     auth_environment(monkeypatch, tmp_path)
-    monkeypatch.setenv("ENVIRONMENT", "production")
-    with pytest.raises(ConfigurationError, match="not allowed in production"):
-        Settings.from_environment()
+    monkeypatch.setenv("DEPTSLM_AUTH_SECRET", "密" * 11)
+    assert Settings.from_environment().auth_secret == "密" * 11
 
 
 def test_future_not_before_is_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -191,9 +261,10 @@ def make_authorization_client(
     resolver: MembershipResolver,
     *,
     roles: tuple[DepartmentRole, ...] = tuple(DepartmentRole),
-) -> tuple[TestClient, CollectingAuditSink]:
+    audit_sink: AuditSink | None = None,
+) -> tuple[TestClient, AuditSink]:
     test_app = FastAPI()
-    sink = CollectingAuditSink()
+    sink = audit_sink or CollectingAuditSink()
     test_app.state.token_verifier = HS256TokenVerifier(SECRET, ISSUER, AUDIENCE)
     test_app.state.membership_resolver = resolver
     test_app.state.audit_sink = sink
@@ -220,9 +291,11 @@ def membership(
     return MembershipResult("membership-test", SUBJECT, department, role, membership_status)
 
 
-def request_headers(department: DepartmentScope | str | None) -> dict[str, str]:
+def request_headers(
+    department: DepartmentScope | str | None, *, token: str | None = None
+) -> dict[str, str]:
     headers = {
-        "Authorization": f"Bearer {make_token()}",
+        "Authorization": f"Bearer {token or make_token()}",
         "X-Request-ID": "74d24ea0-0fd4-4802-9fc7-c4d1b2909015",
     }
     if department is not None:
@@ -277,7 +350,9 @@ def test_wrong_role_is_denied() -> None:
         FakeMembershipResolver((membership(department, role=DepartmentRole.VIEWER),)),
         roles=(DepartmentRole.DEPARTMENT_ADMIN,),
     )
-    assert client.get("/test-scope", headers=request_headers(department)).status_code == 403
+    response = client.get("/test-scope", headers=request_headers(department))
+    assert response.status_code == 403
+    assert "WWW-Authenticate" not in response.headers
 
 
 def test_cross_department_direct_object_reference_is_denied() -> None:
@@ -319,19 +394,38 @@ def test_context_and_scope_are_immutable() -> None:
         department.value = uuid4()  # type: ignore[misc]
 
 
-def test_audit_events_cover_allow_and_deny_without_sensitive_data() -> None:
+def test_audit_events_cover_allow_and_deny_without_sensitive_data(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     department = DepartmentScope(uuid4())
     client, sink = make_authorization_client(FakeMembershipResolver((membership(department),)))
-    client.get("/test-scope", headers=request_headers(department))
+    exact_token = make_token()
+    client.get("/test-scope", headers=request_headers(department, token=exact_token))
     client.get("/test-scope", headers=request_headers(DepartmentScope(uuid4())))
 
     serialized = repr(sink.events)
     assert any(event.result == "allowed" for event in sink.events)
     assert any(event.result == "denied" for event in sink.events)
     assert SECRET not in serialized
-    assert make_token() not in serialized
+    assert exact_token not in serialized
     assert "document content" not in serialized
     assert "source content" not in serialized
+    assert "raw request body" not in serialized
+    assert "training content" not in serialized
+
+    caplog.set_level("INFO", logger="deptslm.audit")
+    logging_client, _ = make_authorization_client(
+        FakeMembershipResolver((membership(department),)),
+        audit_sink=LoggingAuditSink(),
+    )
+    logging_client.get("/test-scope", headers=request_headers(department, token=exact_token))
+    log_output = caplog.text
+    assert exact_token not in log_output
+    assert SECRET not in log_output
+    assert "source content" not in log_output
+    assert "document content" not in log_output
+    assert "raw request body" not in log_output
+    assert "training content" not in log_output
 
 
 def test_department_storage_path_stays_under_external_root(tmp_path: Path) -> None:

@@ -6,6 +6,19 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+ALLOWED_HS256_ENVIRONMENTS = frozenset({"local", "development", "dev", "test"})
+DISALLOWED_AUTH_SECRET_PLACEHOLDERS = frozenset(
+    {
+        "changeme",
+        "change-me",
+        "example",
+        "replace-me",
+        "replace-with-a-local-development-secret",
+        "secret",
+        "your-secret",
+    }
+)
+
 
 class ConfigurationError(RuntimeError):
     """Raised when required runtime configuration is missing or invalid."""
@@ -78,28 +91,67 @@ class Settings:
                 f"received: {resolved_data_dir}"
             )
 
-        environment = os.getenv("ENVIRONMENT", "local").strip() or "local"
+        raw_environment = os.getenv("ENVIRONMENT")
+        environment = (raw_environment or "local").strip() or "local"
         auth_mode = os.getenv("DEPTSLM_AUTH_MODE", "disabled").strip().lower()
         if auth_mode not in {"disabled", "hs256"}:
             raise ConfigurationError("DEPTSLM_AUTH_MODE must be 'disabled' or 'hs256'.")
-        if auth_mode == "hs256" and environment.lower() in {"production", "prod"}:
-            raise ConfigurationError(
-                "Development HS256 authentication is not allowed in production."
-            )
+
+        auth_issuer = _optional_environment("DEPTSLM_AUTH_ISSUER")
+        auth_audience = _optional_environment("DEPTSLM_AUTH_AUDIENCE")
+        auth_secret = _optional_environment("DEPTSLM_AUTH_SECRET")
+        if auth_mode == "hs256":
+            environment = _validate_hs256_environment(raw_environment)
+            _validate_hs256_configuration(auth_issuer, auth_audience, auth_secret)
 
         return cls(
             data_dir=resolved_data_dir,
             environment=environment,
             auth_mode=auth_mode,
-            auth_issuer=_optional_environment("DEPTSLM_AUTH_ISSUER"),
-            auth_audience=_optional_environment("DEPTSLM_AUTH_AUDIENCE"),
-            auth_secret=_optional_environment("DEPTSLM_AUTH_SECRET"),
+            auth_issuer=auth_issuer,
+            auth_audience=auth_audience,
+            auth_secret=auth_secret,
         )
 
 
 def _optional_environment(name: str) -> str | None:
     value = os.getenv(name, "").strip()
     return value or None
+
+
+def _validate_hs256_environment(raw_environment: str | None) -> str:
+    if raw_environment is None or not raw_environment.strip():
+        raise ConfigurationError("ENVIRONMENT must be explicitly set when DEPTSLM_AUTH_MODE=hs256.")
+    environment = raw_environment.strip()
+    if environment not in ALLOWED_HS256_ENVIRONMENTS:
+        allowed = ", ".join(sorted(ALLOWED_HS256_ENVIRONMENTS))
+        raise ConfigurationError(
+            "Development HS256 authentication is allowed only when ENVIRONMENT is "
+            f"one of: {allowed}."
+        )
+    return environment
+
+
+def _validate_hs256_configuration(
+    issuer: str | None, audience: str | None, secret: str | None
+) -> None:
+    missing = [
+        name
+        for name, value in (
+            ("DEPTSLM_AUTH_ISSUER", issuer),
+            ("DEPTSLM_AUTH_AUDIENCE", audience),
+            ("DEPTSLM_AUTH_SECRET", secret),
+        )
+        if value is None
+    ]
+    if missing:
+        raise ConfigurationError("HS256 authentication requires: " + ", ".join(missing) + ".")
+    if secret is None:
+        raise ConfigurationError("HS256 authentication requires DEPTSLM_AUTH_SECRET.")
+    if len(secret.encode("utf-8")) < 32:
+        raise ConfigurationError("DEPTSLM_AUTH_SECRET must contain at least 32 UTF-8 bytes.")
+    if secret.casefold() in DISALLOWED_AUTH_SECRET_PLACEHOLDERS:
+        raise ConfigurationError("DEPTSLM_AUTH_SECRET must not use a placeholder value.")
 
 
 def _find_repository_root(start: Path) -> Path | None:
