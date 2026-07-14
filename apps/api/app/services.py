@@ -2,26 +2,29 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.auth import AuthenticatedPrincipal, DepartmentRole, MembershipStatus
-from app.authorization import DepartmentAuthorizationContext, DepartmentScope
+from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.models import Department, Membership, PersistentAuditEvent, UserIdentity
 from app.repositories import (
-    find_active_identity,
-    get_scoped_department,
     get_scoped_membership,
+    has_other_effective_administrator,
     list_principal_departments,
     list_scoped_memberships,
+    lock_scoped_department,
+    resolve_transaction_membership,
 )
 from app.schemas import MembershipResponse
 
-ADMIN_ROLES = {DepartmentRole.DEPARTMENT_ADMIN.value, DepartmentRole.SYSTEM_ADMIN.value}
+ADMIN_ROLES = frozenset((DepartmentRole.DEPARTMENT_ADMIN, DepartmentRole.SYSTEM_ADMIN))
+ALL_ROLES = frozenset(DepartmentRole)
 
 
 class ServiceError(RuntimeError):
@@ -29,6 +32,13 @@ class ServiceError(RuntimeError):
         self.status_code = status_code
         self.detail = detail
         super().__init__(detail)
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionAuthorization:
+    identity: UserIdentity
+    membership: Membership
+    department: Department
 
 
 def _db_call(operation):
@@ -42,35 +52,55 @@ def _db_call(operation):
         raise ServiceError(503, "Database unavailable") from error
 
 
-def _actor(session: Session, principal: AuthenticatedPrincipal) -> UserIdentity:
-    actor = find_active_identity(session, principal)
-    if actor is None:
+def authorize_transaction(
+    session: Session,
+    principal: AuthenticatedPrincipal,
+    scope: DepartmentScope,
+    allowed_roles: frozenset[DepartmentRole],
+    *,
+    lock: bool,
+) -> TransactionAuthorization:
+    """Revalidate exact authority in this transaction, locking department first."""
+
+    locked_department = lock_scoped_department(session, scope) if lock else None
+    if lock and (locked_department is None or locked_department.status != "active"):
         raise ServiceError(403, "Department access denied")
-    return actor
+    resolved = resolve_transaction_membership(session, principal, scope, lock=lock)
+    if resolved is None:
+        raise ServiceError(403, "Department access denied")
+    department, identity, membership = resolved
+    try:
+        role = DepartmentRole(membership.role)
+    except ValueError as error:
+        raise ServiceError(403, "Department access denied") from error
+    if role not in allowed_roles:
+        raise ServiceError(403, "Department access denied")
+    return TransactionAuthorization(identity, membership, department)
 
 
 def _audit(
     session: Session,
     *,
-    actor: UserIdentity | None,
-    actor_subject: str | None,
-    scope: DepartmentScope | None,
+    actor: UserIdentity,
+    actor_subject: str,
+    request_scope: DepartmentRequestScope,
     action: str,
     resource_type: str,
-    resource_id: UUID | None,
-    correlation_id: str | None,
+    resource_id: UUID,
 ) -> None:
     session.add(
         PersistentAuditEvent(
             actor_subject=actor_subject,
-            actor_user_id=actor.id if actor else None,
-            department_id=scope.value if scope else None,
+            actor_user_id=actor.id,
+            department_id=request_scope.department.value,
             action=action,
             resource_type=resource_type,
-            resource_id=str(resource_id) if resource_id else None,
+            resource_id=str(resource_id),
             result="allowed",
             reason_code="mutation_applied",
-            correlation_id=UUID(correlation_id) if correlation_id else None,
+            correlation_id=(
+                UUID(request_scope.correlation_id) if request_scope.correlation_id else None
+            ),
         )
     )
 
@@ -81,35 +111,41 @@ def list_departments(session: Session, principal: AuthenticatedPrincipal, limit:
     )
 
 
-def get_department(session: Session, scope: DepartmentScope) -> Department:
-    department = _db_call(lambda: get_scoped_department(session, scope))
-    if department is None:
-        raise ServiceError(404, "Department not found")
-    return department
+def get_department(
+    session: Session, principal: AuthenticatedPrincipal, request_scope: DepartmentRequestScope
+) -> Department:
+    return _db_call(
+        lambda: (
+            authorize_transaction(
+                session, principal, request_scope.department, ALL_ROLES, lock=False
+            ).department
+        )
+    )
 
 
 def update_department(
     session: Session,
     principal: AuthenticatedPrincipal,
-    context: DepartmentAuthorizationContext,
+    request_scope: DepartmentRequestScope,
     display_name: str,
 ) -> Department:
     def operation() -> Department:
-        actor = _actor(session, principal)
-        department = get_scoped_department(session, context.department)
-        if department is None or department.status != "active":
-            raise ServiceError(404, "Department not found")
+        authorization = authorize_transaction(
+            session, principal, request_scope.department, ADMIN_ROLES, lock=True
+        )
+        department = authorization.department
+        if department.display_name == display_name:
+            return department
         department.display_name = display_name
         department.version += 1
         _audit(
             session,
-            actor=actor,
+            actor=authorization.identity,
             actor_subject=principal.subject,
-            scope=context.department,
+            request_scope=request_scope,
             action="department.update",
             resource_type="department",
             resource_id=department.id,
-            correlation_id=context.correlation_id,
         )
         session.flush()
         return department
@@ -120,27 +156,26 @@ def update_department(
 def archive_department(
     session: Session,
     principal: AuthenticatedPrincipal,
-    context: DepartmentAuthorizationContext,
+    request_scope: DepartmentRequestScope,
     confirm_slug: str,
 ) -> Department:
     def operation() -> Department:
-        actor = _actor(session, principal)
-        department = get_scoped_department(session, context.department)
-        if department is None or department.status != "active":
-            raise ServiceError(404, "Department not found")
+        authorization = authorize_transaction(
+            session, principal, request_scope.department, ADMIN_ROLES, lock=True
+        )
+        department = authorization.department
         if confirm_slug != department.slug:
             raise ServiceError(409, "Archive confirmation did not match")
         department.status = "archived"
         department.version += 1
         _audit(
             session,
-            actor=actor,
+            actor=authorization.identity,
             actor_subject=principal.subject,
-            scope=context.department,
+            request_scope=request_scope,
             action="department.archive",
             resource_type="department",
             resource_id=department.id,
-            correlation_id=context.correlation_id,
         )
         session.flush()
         return department
@@ -163,21 +198,42 @@ def membership_response(row: tuple[Membership, UserIdentity]) -> MembershipRespo
     )
 
 
-def list_memberships(session: Session, scope: DepartmentScope, limit: int, offset: int):
-    return _db_call(lambda: list_scoped_memberships(session, scope, limit=limit, offset=offset))
+def list_memberships(
+    session: Session,
+    principal: AuthenticatedPrincipal,
+    request_scope: DepartmentRequestScope,
+    limit: int,
+    offset: int,
+):
+    def operation():
+        authorize_transaction(session, principal, request_scope.department, ADMIN_ROLES, lock=False)
+        return list_scoped_memberships(
+            session, request_scope.department, limit=limit, offset=offset
+        )
+
+    return _db_call(operation)
 
 
-def get_membership(session: Session, scope: DepartmentScope, membership_id: UUID):
-    row = _db_call(lambda: get_scoped_membership(session, scope, membership_id))
-    if row is None:
-        raise ServiceError(404, "Membership not found")
-    return row
+def get_membership(
+    session: Session,
+    principal: AuthenticatedPrincipal,
+    request_scope: DepartmentRequestScope,
+    membership_id: UUID,
+):
+    def operation():
+        authorize_transaction(session, principal, request_scope.department, ADMIN_ROLES, lock=False)
+        row = get_scoped_membership(session, request_scope.department, membership_id)
+        if row is None:
+            raise ServiceError(404, "Membership not found")
+        return row
+
+    return _db_call(operation)
 
 
 def create_membership(
     session: Session,
     principal: AuthenticatedPrincipal,
-    context: DepartmentAuthorizationContext,
+    request_scope: DepartmentRequestScope,
     subject: str,
     role: DepartmentRole,
     expires_at: datetime | None,
@@ -188,7 +244,9 @@ def create_membership(
         raise ServiceError(409, "Membership expiry must be in the future")
 
     def operation():
-        actor = _actor(session, principal)
+        authorization = authorize_transaction(
+            session, principal, request_scope.department, ADMIN_ROLES, lock=True
+        )
         identity = session.execute(
             select(UserIdentity)
             .where(UserIdentity.issuer == principal.issuer, UserIdentity.subject == subject)
@@ -202,23 +260,22 @@ def create_membership(
             raise ServiceError(409, "Identity is not active")
         membership = Membership(
             user_id=identity.id,
-            department_id=context.department.value,
+            department_id=request_scope.department.value,
             role=role.value,
             status="active",
             expires_at=expires_at,
-            created_by_user_id=actor.id,
+            created_by_user_id=authorization.identity.id,
         )
         session.add(membership)
         session.flush()
         _audit(
             session,
-            actor=actor,
+            actor=authorization.identity,
             actor_subject=principal.subject,
-            scope=context.department,
+            request_scope=request_scope,
             action="membership.create",
             resource_type="membership",
             resource_id=membership.id,
-            correlation_id=context.correlation_id,
         )
         session.flush()
         return membership, identity
@@ -226,50 +283,59 @@ def create_membership(
     return _db_call(operation)
 
 
+def _is_effective_administrator(
+    identity: UserIdentity,
+    membership: Membership,
+    *,
+    role: str,
+    status: str,
+    expiry: datetime | None,
+) -> bool:
+    now = datetime.now(UTC)
+    return (
+        identity.status == "active"
+        and role in {item.value for item in ADMIN_ROLES}
+        and status == "active"
+        and (expiry is None or expiry > now)
+    )
+
+
 def _protect_last_admin(
     session: Session,
     scope: DepartmentScope,
     target: Membership,
+    target_identity: UserIdentity,
     *,
     new_role: str,
     new_status: str,
     new_expiry: datetime | None,
 ) -> None:
-    now = datetime.now(UTC)
-    currently_admin = (
-        target.role in ADMIN_ROLES
-        and target.status == "active"
-        and (target.expires_at is None or target.expires_at > now)
+    currently_effective = _is_effective_administrator(
+        target_identity,
+        target,
+        role=target.role,
+        status=target.status,
+        expiry=target.expires_at,
     )
-    remains_admin = (
-        new_role in ADMIN_ROLES
-        and new_status == "active"
-        and (new_expiry is None or new_expiry > now)
+    remains_effective = _is_effective_administrator(
+        target_identity,
+        target,
+        role=new_role,
+        status=new_status,
+        expiry=new_expiry,
     )
-    if not currently_admin or remains_admin:
-        return
-    administrators = (
-        session.execute(
-            select(Membership)
-            .where(
-                Membership.department_id == scope.value,
-                Membership.role.in_(ADMIN_ROLES),
-                Membership.status == "active",
-                or_(Membership.expires_at.is_(None), Membership.expires_at > now),
-            )
-            .with_for_update()
-        )
-        .scalars()
-        .all()
-    )
-    if len(administrators) <= 1:
+    if (
+        currently_effective
+        and not remains_effective
+        and not has_other_effective_administrator(session, scope, target.id)
+    ):
         raise ServiceError(409, "Department must retain an active administrator")
 
 
 def update_membership(
     session: Session,
     principal: AuthenticatedPrincipal,
-    context: DepartmentAuthorizationContext,
+    request_scope: DepartmentRequestScope,
     membership_id: UUID,
     *,
     role: DepartmentRole | None,
@@ -281,8 +347,10 @@ def update_membership(
         raise ServiceError(403, "Role cannot be granted through this API")
 
     def operation():
-        actor = _actor(session, principal)
-        row = get_scoped_membership(session, context.department, membership_id, lock=True)
+        authorization = authorize_transaction(
+            session, principal, request_scope.department, ADMIN_ROLES, lock=True
+        )
+        row = get_scoped_membership(session, request_scope.department, membership_id, lock=True)
         if row is None:
             raise ServiceError(404, "Membership not found")
         membership, identity = row
@@ -291,25 +359,33 @@ def update_membership(
         new_expiry = expires_at if expiry_supplied else membership.expires_at
         if membership.status == "revoked" and new_status != "revoked":
             raise ServiceError(409, "Revoked memberships cannot be reactivated")
+        if (new_role, new_status, new_expiry) == (
+            membership.role,
+            membership.status,
+            membership.expires_at,
+        ):
+            return membership, identity
         _protect_last_admin(
             session,
-            context.department,
+            request_scope.department,
             membership,
+            identity,
             new_role=new_role,
             new_status=new_status,
             new_expiry=new_expiry,
         )
-        membership.role, membership.status, membership.expires_at = new_role, new_status, new_expiry
+        membership.role = new_role
+        membership.status = new_status
+        membership.expires_at = new_expiry
         membership.version += 1
         _audit(
             session,
-            actor=actor,
+            actor=authorization.identity,
             actor_subject=principal.subject,
-            scope=context.department,
+            request_scope=request_scope,
             action="membership.update",
             resource_type="membership",
             resource_id=membership.id,
-            correlation_id=context.correlation_id,
         )
         session.flush()
         return membership, identity
@@ -320,19 +396,24 @@ def update_membership(
 def revoke_membership(
     session: Session,
     principal: AuthenticatedPrincipal,
-    context: DepartmentAuthorizationContext,
+    request_scope: DepartmentRequestScope,
     membership_id: UUID,
 ):
     def operation():
-        actor = _actor(session, principal)
-        row = get_scoped_membership(session, context.department, membership_id, lock=True)
+        authorization = authorize_transaction(
+            session, principal, request_scope.department, ADMIN_ROLES, lock=True
+        )
+        row = get_scoped_membership(session, request_scope.department, membership_id, lock=True)
         if row is None:
             raise ServiceError(404, "Membership not found")
         membership, identity = row
+        if membership.status == "revoked":
+            return membership, identity
         _protect_last_admin(
             session,
-            context.department,
+            request_scope.department,
             membership,
+            identity,
             new_role=membership.role,
             new_status="revoked",
             new_expiry=membership.expires_at,
@@ -341,13 +422,12 @@ def revoke_membership(
         membership.version += 1
         _audit(
             session,
-            actor=actor,
+            actor=authorization.identity,
             actor_subject=principal.subject,
-            scope=context.department,
+            request_scope=request_scope,
             action="membership.revoke",
             resource_type="membership",
             resource_id=membership.id,
-            correlation_id=context.correlation_id,
         )
         session.flush()
         return membership, identity

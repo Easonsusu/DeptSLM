@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Barrier
 from uuid import uuid4
 
 import jwt
@@ -17,12 +19,23 @@ from sqlalchemy.orm import Session
 
 from alembic import command
 from app.admin import BootstrapError, bootstrap_department
-from app.auth import AuthenticatedPrincipal
-from app.authorization import DepartmentScope, MembershipResolutionUnavailable
+from app.auth import AuthenticatedPrincipal, DepartmentRole
+from app.authorization import (
+    DepartmentRequestScope,
+    DepartmentScope,
+    MembershipResolutionUnavailable,
+)
 from app.database import create_database_engine, create_session_factory
 from app.main import app
 from app.membership_resolver import SQLAlchemyMembershipResolver
 from app.models import Department, Membership, PersistentAuditEvent, UserIdentity
+from app.services import (
+    ADMIN_ROLES,
+    ServiceError,
+    authorize_transaction,
+    update_department,
+    update_membership,
+)
 from app.settings import Settings
 
 pytestmark = pytest.mark.postgres
@@ -137,10 +150,21 @@ def test_unique_constraints(db: Session, kind: str) -> None:
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("department_status", "invalid"), ("membership_role", "owner")],
+    [
+        ("user_status", "invalid"),
+        ("issuer", "   "),
+        ("subject", "\t"),
+        ("department_status", "invalid"),
+        ("membership_status", "invalid"),
+        ("membership_role", "owner"),
+    ],
 )
 def test_check_constraints(db: Session, field: str, value: str) -> None:
-    identity = UserIdentity(issuer=ISSUER, subject=ADMIN, status="active")
+    identity = UserIdentity(
+        issuer=value if field == "issuer" else ISSUER,
+        subject=value if field == "subject" else ADMIN,
+        status=value if field == "user_status" else "active",
+    )
     department = Department(
         slug="constraint-dept",
         display_name="Constraint",
@@ -149,13 +173,16 @@ def test_check_constraints(db: Session, field: str, value: str) -> None:
     db.add_all([identity, department])
     with pytest.raises(IntegrityError):
         db.flush()
-        if field == "membership_role":
+        if field in {"membership_role", "membership_status"}:
+            second_identity = UserIdentity(issuer=ISSUER, subject="constraint-user")
+            db.add(second_identity)
+            db.flush()
             db.add(
                 Membership(
-                    user_id=identity.id,
+                    user_id=second_identity.id,
                     department_id=department.id,
-                    role=value,
-                    status="active",
+                    role=value if field == "membership_role" else "viewer",
+                    status=value if field == "membership_status" else "active",
                 )
             )
         db.commit()
@@ -323,6 +350,211 @@ def test_membership_crud_scope_and_last_admin(
     assert hidden.status_code == 404 and forbidden.status_code == 403
     assert changed.json()["role"] == "viewer" and revoked.json()["status"] == "revoked"
     assert last_admin.status_code == 409 and cross.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "stale_state",
+    [
+        "membership_revoked",
+        "membership_demoted",
+        "membership_expired",
+        "identity_suspended",
+        "department_archived",
+    ],
+)
+def test_mutation_revalidates_stale_authorization(db: Session, engine, stale_state: str) -> None:
+    identity, department, membership = _seed(db)
+    principal = AuthenticatedPrincipal(ADMIN, ISSUER)
+    scope = DepartmentScope(department.id)
+    request_scope = DepartmentRequestScope(scope)
+    with Session(engine) as authorization_session:
+        stale = authorize_transaction(
+            authorization_session, principal, scope, ADMIN_ROLES, lock=False
+        )
+        assert stale.membership.id == membership.id
+
+    if stale_state == "membership_revoked":
+        membership.status = "revoked"
+    elif stale_state == "membership_demoted":
+        membership.role = "viewer"
+    elif stale_state == "membership_expired":
+        membership.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    elif stale_state == "identity_suspended":
+        identity.status = "suspended"
+    else:
+        department.status = "archived"
+    db.commit()
+
+    with Session(engine) as mutation_session:
+        with pytest.raises(ServiceError) as captured:
+            update_department(mutation_session, principal, request_scope, "Unauthorized change")
+        mutation_session.rollback()
+    assert captured.value.status_code == 403
+    db.expire_all()
+    assert db.query(PersistentAuditEvent).count() == 0
+
+
+@pytest.mark.parametrize(
+    ("identity_status", "membership_status", "expired"),
+    [
+        ("suspended", "active", False),
+        ("revoked", "active", False),
+        ("active", "suspended", False),
+        ("active", "revoked", False),
+        ("active", "active", True),
+    ],
+)
+def test_only_effective_administrators_count_for_last_admin(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    identity_status: str,
+    membership_status: str,
+    expired: bool,
+) -> None:
+    _, department, admin = _seed(db)
+    second_identity = UserIdentity(
+        issuer=ISSUER, subject="ineffective-admin", status=identity_status
+    )
+    db.add(second_identity)
+    db.flush()
+    db.add(
+        Membership(
+            user_id=second_identity.id,
+            department_id=department.id,
+            role="department_admin",
+            status=membership_status,
+            expires_at=(datetime.now(UTC) - timedelta(minutes=1) if expired else None),
+        )
+    )
+    db.commit()
+    with _client(monkeypatch, tmp_path) as client:
+        response = client.delete(
+            f"/departments/{department.id}/memberships/{admin.id}",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
+    assert response.status_code == 409
+
+
+def test_membership_noop_does_not_increment_or_audit(
+    db: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, department, admin = _seed(db)
+    original_version = admin.version
+    headers = {"Authorization": f"Bearer {_token()}"}
+    with _client(monkeypatch, tmp_path) as client:
+        same = client.patch(
+            f"/departments/{department.id}/memberships/{admin.id}",
+            headers=headers,
+            json={"role": "department_admin"},
+        )
+        empty = client.patch(
+            f"/departments/{department.id}/memberships/{admin.id}",
+            headers=headers,
+            json={},
+        )
+        ambiguous = client.patch(
+            f"/departments/{department.id}/memberships/{admin.id}",
+            headers=headers,
+            json={"expires_at": "2030-01-01T00:00:00Z", "clear_expiry": True},
+        )
+    assert same.status_code == 200 and same.json()["version"] == original_version
+    assert empty.status_code == 422 and ambiguous.status_code == 422
+    db.expire_all()
+    assert db.query(PersistentAuditEvent).count() == 0
+
+
+def test_same_department_system_admin_has_no_global_bypass(
+    db: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, own_department, _ = _seed(db, role="system_admin")
+    _, other_department, _ = _seed(db, subject="other-admin")
+    headers = {"Authorization": f"Bearer {_token()}"}
+    with _client(monkeypatch, tmp_path) as client:
+        own = client.get(f"/departments/{own_department.id}", headers=headers)
+        cross = client.get(f"/departments/{other_department.id}", headers=headers)
+    assert own.status_code == 200
+    assert cross.status_code == 403
+
+
+def test_transaction_authorization_database_failure_is_generic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://invalid:invalid@127.0.0.1:1/invalid")
+    monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("DEPTSLM_AUTH_MODE", "hs256")
+    monkeypatch.setenv("DEPTSLM_AUTH_ISSUER", ISSUER)
+    monkeypatch.setenv("DEPTSLM_AUTH_AUDIENCE", AUDIENCE)
+    monkeypatch.setenv("DEPTSLM_AUTH_SECRET", SECRET)
+    with TestClient(app) as client:
+        response = client.get(
+            f"/departments/{uuid4()}",
+            headers={"Authorization": f"Bearer {_token()}"},
+        )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Database unavailable"}
+    assert "invalid@" not in response.text
+
+
+def test_concurrent_admin_demotions_retain_effective_administrator(db: Session, engine) -> None:
+    first_identity, department, first_membership = _seed(db, subject="first-admin")
+    second_identity = UserIdentity(issuer=ISSUER, subject="second-admin", status="active")
+    db.add(second_identity)
+    db.flush()
+    second_membership = Membership(
+        user_id=second_identity.id,
+        department_id=department.id,
+        role="department_admin",
+        status="active",
+        created_by_user_id=first_identity.id,
+    )
+    db.add(second_membership)
+    db.commit()
+
+    barrier = Barrier(2)
+    scope = DepartmentRequestScope(DepartmentScope(department.id))
+
+    def demote(actor_subject: str, target_id) -> int:
+        with Session(engine) as session:
+            barrier.wait(timeout=5)
+            try:
+                update_membership(
+                    session,
+                    AuthenticatedPrincipal(actor_subject, ISSUER),
+                    scope,
+                    target_id,
+                    role=DepartmentRole.VIEWER,
+                    status=None,
+                    expires_at=None,
+                    expiry_supplied=False,
+                )
+                session.commit()
+                return 200
+            except ServiceError as error:
+                session.rollback()
+                return error.status_code
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(demote, "first-admin", second_membership.id)
+        second = executor.submit(demote, "second-admin", first_membership.id)
+        results = sorted((first.result(timeout=10), second.result(timeout=10)))
+
+    assert results == [200, 403]
+    db.expire_all()
+    effective = (
+        db.query(Membership)
+        .join(UserIdentity, Membership.user_id == UserIdentity.id)
+        .filter(
+            Membership.department_id == department.id,
+            Membership.role.in_(("department_admin", "system_admin")),
+            Membership.status == "active",
+            UserIdentity.status == "active",
+        )
+        .count()
+    )
+    assert effective == 1
+    assert db.query(PersistentAuditEvent).filter_by(action="membership.update").count() == 1
 
 
 def test_bootstrap_is_atomic_and_conflict_safe(

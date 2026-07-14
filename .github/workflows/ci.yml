@@ -164,6 +164,16 @@ jobs:
           test -x scripts/compose.sh
           test -x services/rag-worker/entrypoint.sh
           test -x services/training-worker/entrypoint.sh
+      - name: Build and inspect API migration image
+        run: |
+          docker build --tag deptslm-api-ci apps/api
+          docker run --rm --entrypoint python deptslm-api-ci -c '
+          import pathlib
+          import app.admin
+          import app.main
+          assert pathlib.Path("/app/alembic.ini").is_file()
+          assert pathlib.Path("/app/alembic/versions/0001_phase3_schema.py").is_file()
+          '
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then

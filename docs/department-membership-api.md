@@ -1,6 +1,6 @@
 # Department and Membership API
 
-Phase 3 exposes persistent department reads and department-scoped administration. Every resource path authorizes the exact `department_id` against the authenticated issuer and opaque subject. An optional `X-Department-ID`, when supplied, must exactly match the path. Database authorization failures return a generic `503`; inactive or cross-department access returns a non-challenging `403`.
+Phase 3 exposes persistent department reads and department-scoped administration. Every resource path authorizes the exact `department_id` against the authenticated issuer and opaque subject in the request-scoped database session. Mutations revalidate and lock current authority inside the mutation transaction; a previously valid context is not authorization evidence. An optional `X-Department-ID`, when supplied, must exactly match the path. Database authorization failures return a generic `503`; stale, inactive, or cross-department access returns a non-challenging `403`.
 
 ## Endpoints
 
@@ -16,9 +16,11 @@ Phase 3 exposes persistent department reads and department-scoped administration
 | `PATCH /departments/{department_id}/memberships/{membership_id}` | same-department admin | Change reviewed role, status, or expiry. |
 | `DELETE /departments/{department_id}/memberships/{membership_id}` | same-department admin | Soft revoke. |
 
-Administrative roles are `department_admin` and a `system_admin` membership in the same department. `system_admin` never bypasses membership lookup, and public APIs cannot grant it. The final active, non-expired administrator is protected with PostgreSQL row locking; removal, suspension, immediate expiry, or demotion returns `409`.
+Administrative roles are `department_admin` and a `system_admin` membership in the same department. `system_admin` never bypasses membership lookup, and public APIs cannot grant it. An effective administrator also requires an active identity, active department, active membership, and null or future expiry. Department-first PostgreSQL locking serializes admin creation, role/status/expiry changes, and revocation; removing the final effective administrator returns `409`.
 
 Pagination defaults to 25 and accepts `limit` from 1 through 100 plus a non-negative `offset`. Cross-department membership identifiers return `404` within an already authorized department and do not reveal ownership.
+
+An empty membership PATCH or a request combining `expires_at` with `clear_expiry` returns `422`. A valid PATCH that would not change stored role, status, or expiry returns the current row without incrementing its version or writing a success audit event.
 
 ## Local bootstrap
 
@@ -33,6 +35,14 @@ ENVIRONMENT=development python -m app.admin bootstrap-department \
 ```
 
 `DEPTSLM_DATA_DIR` and `DATABASE_URL` must also be configured. The command is allowed only in explicit `local`, `development`, `dev`, or `test` environments and atomically creates an identity, department, initial `department_admin`, and audit event. It never accepts or prints a bearer token or database URL. Production bootstrap and platform administration remain deferred.
+
+With Compose, use:
+
+```bash
+./scripts/compose.sh run --rm api python -m app.admin bootstrap-department \
+  --slug computer-science --display-name "Computer Science" \
+  --admin-issuer https://local-issuer.invalid --admin-subject opaque-admin-subject
+```
 
 ## Limitations
 

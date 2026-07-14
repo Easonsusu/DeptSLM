@@ -62,14 +62,26 @@ Do not commit `.env`. Do not put production credentials in `.env.example` or Com
 
 ## Validate and start
 
-Apply the schema before starting the API:
+Build the API image and apply the schema through Compose before startup:
 
 ```bash
-cd apps/api
-python -m alembic upgrade head
+./scripts/compose.sh build api
+./scripts/compose.sh run --rm api python -m alembic upgrade head
 ```
 
-For local department bootstrap, use the command documented in [department-membership-api.md](department-membership-api.md). It is intentionally disabled outside explicit reviewed local/test environments.
+This command uses the Compose-internal `postgres` hostname from `.env`. When running Alembic directly from the host in `apps/api`, set `DATABASE_URL` to a host-accessible URL such as `postgresql+psycopg://deptslm:deptslm@localhost:5432/deptslm`; the Compose hostname does not resolve from the host.
+
+Bootstrap the first local department through the same image:
+
+```bash
+./scripts/compose.sh run --rm api python -m app.admin bootstrap-department \
+  --slug computer-science \
+  --display-name "Computer Science" \
+  --admin-issuer https://local-issuer.invalid \
+  --admin-subject opaque-admin-subject
+```
+
+Bootstrap remains disabled outside explicit reviewed local/test environments. Compose passes `DEPTSLM_AUTH_MODE`, issuer, audience, and secret only to the API container. Keep the generated secret only in the untracked `.env`; it is not passed to web, PostgreSQL, Qdrant, or workers.
 
 Before startup, render the resolved Compose configuration through the repository wrapper:
 
@@ -120,6 +132,8 @@ Google Drive is appropriate for the requested local artifact layout, but it is n
 CI must not depend on a developer's Google Drive or reuse real data. It should create a temporary directory, export that absolute path as `DEPTSLM_DATA_DIR`, run the relevant checks, and discard the directory afterward. Test inputs must be small and synthetic.
 
 GitHub Actions provides PostgreSQL 16 and sets an isolated `DATABASE_TEST_URL`. Locally, run `python -m pytest -m "not postgres"` without PostgreSQL, or point `DATABASE_TEST_URL` to an isolated test database and run migrations followed by `python -m pytest`. PostgreSQL tests never fall back to SQLite and CI fails if they are skipped.
+
+CI also builds the API image and performs a non-secret inspection proving that `app.main`, `app.admin`, `alembic.ini`, and revision `0001_phase3` are present. It does not start the full stack for this check.
 
 At minimum, future deployment checks should cover:
 

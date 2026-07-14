@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.auth import DepartmentRole, MembershipStatus
 
@@ -89,6 +89,15 @@ class MembershipUpdate(BaseModel):
     status: MembershipStatus | None = None
     expires_at: datetime | None = None
     clear_expiry: bool = False
+
+    @model_validator(mode="after")
+    def require_unambiguous_change(self) -> MembershipUpdate:
+        supplied = self.model_fields_set
+        if "expires_at" in supplied and self.clear_expiry:
+            raise ValueError("expires_at and clear_expiry cannot be used together")
+        if not ({"role", "status", "expires_at"} & supplied) and not self.clear_expiry:
+            raise ValueError("at least one membership change is required")
+        return self
 
     @field_validator("expires_at")
     @classmethod

@@ -84,6 +84,14 @@ class DepartmentAuthorizationContext:
     correlation_id: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class DepartmentRequestScope:
+    """Validated path selector without authorization evidence."""
+
+    department: DepartmentScope
+    correlation_id: str | None = None
+
+
 def _audit(request: Request, event: AuditEvent) -> None:
     sink: AuditSink = request.app.state.audit_sink
     sink.emit(event)
@@ -238,6 +246,36 @@ def require_path_department_scope(
             )
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Department access denied")
     return _authorize_department(request, principal, department)
+
+
+def require_path_department_selector(
+    request: Request,
+    department_id: UUID,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    header_department_id: Annotated[str | None, Header(alias="X-Department-ID")] = None,
+) -> DepartmentRequestScope:
+    """Validate a path selector; services must authorize it in their database session."""
+
+    department = DepartmentScope(department_id)
+    if header_department_id is not None:
+        try:
+            header_scope = DepartmentScope.parse(header_department_id)
+        except ValueError:
+            header_scope = None
+        if header_scope != department:
+            _audit(
+                request,
+                AuditEvent(
+                    principal.subject,
+                    "authorize_department",
+                    AuditResult.DENIED,
+                    "path_header_scope_mismatch",
+                    str(department),
+                    _correlation_id(request),
+                ),
+            )
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Department access denied")
+    return DepartmentRequestScope(department=department, correlation_id=_correlation_id(request))
 
 
 def _authorize_department(

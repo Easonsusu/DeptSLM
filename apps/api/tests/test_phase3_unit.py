@@ -5,8 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from app.admin import main
+from app.schemas import MembershipUpdate
 from app.settings import ConfigurationError, Settings
 
 
@@ -50,3 +52,12 @@ def test_bootstrap_refuses_unsafe_environment(
     captured = capsys.readouterr()
     assert result == 2
     assert "DATABASE_URL" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"clear_expiry": False}, {"expires_at": "2030-01-01T00:00:00Z", "clear_expiry": True}],
+)
+def test_membership_update_rejects_empty_or_ambiguous_input(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        MembershipUpdate.model_validate(payload)

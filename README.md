@@ -78,6 +78,7 @@ Prerequisites for the complete local stack are Git, Docker Desktop with Docker C
 
    ```bash
    ./scripts/compose.sh config
+   ./scripts/compose.sh run --rm api python -m alembic upgrade head
    ./scripts/compose.sh up --build
    ```
 
@@ -90,7 +91,15 @@ Prerequisites for the complete local stack are Git, Docker Desktop with Docker C
    curl http://localhost:8000/version
    ```
 
-   Protected identity checks additionally require the development/test authentication variables documented in [.env.example](.env.example). Apply the database migration with `cd apps/api && python -m alembic upgrade head` before starting the API. HS256 is allowed only with an explicit reviewed local environment and a non-placeholder secret of at least 32 bytes. Department authorization resolves persistent server-side membership and fails closed if PostgreSQL is unavailable.
+   Protected identity checks additionally require the development/test authentication variables documented in [.env.example](.env.example). Compose passes those variables only to the API container; the generated secret remains only in the untracked `.env`. The Compose migration command uses the internal `postgres` hostname. Host-shell Alembic commands must override `DATABASE_URL` with a host-accessible `localhost` URL. HS256 is allowed only with an explicit reviewed local environment and a non-placeholder secret of at least 32 bytes.
+
+   Bootstrap the first local department only after migration:
+
+   ```bash
+   ./scripts/compose.sh run --rm api python -m app.admin bootstrap-department \
+     --slug computer-science --display-name "Computer Science" \
+     --admin-issuer https://local-issuer.invalid --admin-subject opaque-admin
+   ```
 
    The default ports are controlled by `API_PORT` and `WEB_PORT` in `.env`.
 

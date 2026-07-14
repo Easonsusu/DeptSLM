@@ -7,11 +7,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from app.auth import AuthenticatedPrincipal, DepartmentRole
+from app.auth import AuthenticatedPrincipal
 from app.authorization import (
-    DepartmentAuthorizationContext,
+    DepartmentRequestScope,
     require_authenticated_principal,
-    require_path_department_roles,
+    require_path_department_selector,
 )
 from app.database import DatabaseSession
 from app.schemas import (
@@ -39,8 +39,6 @@ from app.services import (
 )
 
 router = APIRouter()
-ALL_ROLES = tuple(DepartmentRole)
-ADMIN_ROLES = (DepartmentRole.DEPARTMENT_ADMIN, DepartmentRole.SYSTEM_ADMIN)
 
 
 def _raise(error: ServiceError) -> None:
@@ -64,12 +62,11 @@ def get_departments(
 @router.get("/departments/{department_id}", response_model=DepartmentResponse, tags=["departments"])
 def read_department(
     session: DatabaseSession,
-    context: Annotated[
-        DepartmentAuthorizationContext, Depends(require_path_department_roles(*ALL_ROLES))
-    ],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
 ) -> DepartmentResponse:
     try:
-        return DepartmentResponse.model_validate(get_department(session, context.department))
+        return DepartmentResponse.model_validate(get_department(session, principal, request_scope))
     except ServiceError as error:
         _raise(error)
 
@@ -81,12 +78,10 @@ def patch_department(
     body: DepartmentUpdate,
     session: DatabaseSession,
     principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
-    context: Annotated[
-        DepartmentAuthorizationContext, Depends(require_path_department_roles(*ADMIN_ROLES))
-    ],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
 ) -> DepartmentResponse:
     try:
-        value = update_department(session, principal, context, body.display_name)
+        value = update_department(session, principal, request_scope, body.display_name)
         return DepartmentResponse.model_validate(value)
     except ServiceError as error:
         _raise(error)
@@ -99,12 +94,10 @@ def delete_department(
     body: DepartmentArchive,
     session: DatabaseSession,
     principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
-    context: Annotated[
-        DepartmentAuthorizationContext, Depends(require_path_department_roles(*ADMIN_ROLES))
-    ],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
 ) -> DepartmentResponse:
     try:
-        value = archive_department(session, principal, context, body.confirm_slug)
+        value = archive_department(session, principal, request_scope, body.confirm_slug)
         return DepartmentResponse.model_validate(value)
     except ServiceError as error:
         _raise(error)
@@ -117,14 +110,13 @@ def delete_department(
 )
 def get_memberships(
     session: DatabaseSession,
-    context: Annotated[
-        DepartmentAuthorizationContext, Depends(require_path_department_roles(*ADMIN_ROLES))
-    ],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
     limit: Annotated[int, Query(ge=1, le=100)] = 25,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> MembershipListResponse:
     try:
-        rows = list_memberships(session, context.department, limit, offset)
+        rows = list_memberships(session, principal, request_scope, limit, offset)
         return MembershipListResponse(
             items=[membership_response(row) for row in rows], limit=limit, offset=offset
         )
@@ -142,13 +134,18 @@ def post_membership(
     body: MembershipCreate,
     session: DatabaseSession,
     principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
-    context: Annotated[
-        DepartmentAuthorizationContext, Depends(require_path_department_roles(*ADMIN_ROLES))
-    ],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
 ) -> MembershipResponse:
     try:
         return membership_response(
-            create_membership(session, principal, context, body.subject, body.role, body.expires_at)
+            create_membership(
+                session,
+                principal,
+                request_scope,
+                body.subject,
+                body.role,
+                body.expires_at,
+            )
         )
     except ServiceError as error:
         _raise(error)
@@ -162,12 +159,11 @@ def post_membership(
 def read_membership(
     membership_id: UUID,
     session: DatabaseSession,
-    context: Annotated[
-        DepartmentAuthorizationContext, Depends(require_path_department_roles(*ADMIN_ROLES))
-    ],
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
 ) -> MembershipResponse:
     try:
-        return membership_response(get_membership(session, context.department, membership_id))
+        return membership_response(get_membership(session, principal, request_scope, membership_id))
     except ServiceError as error:
         _raise(error)
 
@@ -182,9 +178,7 @@ def patch_membership(
     body: MembershipUpdate,
     session: DatabaseSession,
     principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
-    context: Annotated[
-        DepartmentAuthorizationContext, Depends(require_path_department_roles(*ADMIN_ROLES))
-    ],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
 ) -> MembershipResponse:
     try:
         expiry_supplied = "expires_at" in body.model_fields_set or body.clear_expiry
@@ -193,7 +187,7 @@ def patch_membership(
             update_membership(
                 session,
                 principal,
-                context,
+                request_scope,
                 membership_id,
                 role=body.role,
                 status=body.status,
@@ -214,11 +208,11 @@ def delete_membership(
     membership_id: UUID,
     session: DatabaseSession,
     principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
-    context: Annotated[
-        DepartmentAuthorizationContext, Depends(require_path_department_roles(*ADMIN_ROLES))
-    ],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
 ) -> MembershipResponse:
     try:
-        return membership_response(revoke_membership(session, principal, context, membership_id))
+        return membership_response(
+            revoke_membership(session, principal, request_scope, membership_id)
+        )
     except ServiceError as error:
         _raise(error)

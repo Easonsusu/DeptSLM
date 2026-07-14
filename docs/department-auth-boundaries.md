@@ -37,7 +37,7 @@ The database should prevent duplicate active memberships for the same user and d
 1. Authenticate before resolving department context.
 2. Resolve allowed departments from active membership.
 3. Validate the requested department against that set.
-4. Pass an immutable authorization context to repositories, jobs, storage helpers, and model workflows.
+4. Treat request selectors and earlier contexts as hints only; revalidate current authority in the database transaction before resource access or mutation.
 5. Require `department_id` in every department-owned query and mutation.
 6. Include department scope in constraints, indexes, vector filters, paths, job payloads, cache keys, logs, and exports.
 7. Reject cross-department joins, fallback indexes, datasets, adapters, caches, and exports.
@@ -112,7 +112,7 @@ The API validates development/test HS256 bearer tokens, exposes safe identity me
 
 ## Phase 3 persistence boundary
 
-Server-side membership resolution requires exact issuer, opaque subject, and path department matching. Scoped repository methods always include `department_id`; cross-department membership IDs appear not found. Archived departments, inactive identities or memberships, and expired memberships cannot authorize. Department creation is restricted to a reviewed local bootstrap command, public APIs cannot grant `system_admin`, and final active administrators cannot be removed transactionally. Production SSO, platform administration, and product data remain deferred.
+Server-side membership resolution requires exact issuer, opaque subject, and path department matching. Resource services repeat this check in their request session, and mutations lock the department first before revalidating the actor and locking targets. Stale authorization after archival, suspension, revocation, expiry, or demotion fails without a success audit row. Effective-administrator checks join active identities and memberships and serialize changes per department. Scoped repository methods always include `department_id`; cross-department membership IDs appear not found. Department creation is restricted to a reviewed local bootstrap command, public APIs cannot grant `system_admin`, and final effective administrators cannot be removed transactionally. Production SSO, platform administration, and product data remain deferred.
 
 ## Acceptance criteria for Phase 2
 

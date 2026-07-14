@@ -38,8 +38,8 @@ class UserIdentity(Base):
     __tablename__ = "user_identities"
     __table_args__ = (
         UniqueConstraint("issuer", "subject", name="uq_user_identity_issuer_subject"),
-        CheckConstraint("length(issuer) > 0", name="ck_user_identity_issuer_nonempty"),
-        CheckConstraint("length(subject) > 0", name="ck_user_identity_subject_nonempty"),
+        CheckConstraint("issuer ~ '[^[:space:]]'", name="ck_user_identity_issuer_nonempty"),
+        CheckConstraint("subject ~ '[^[:space:]]'", name="ck_user_identity_subject_nonempty"),
         CheckConstraint(
             "status IN ('active','suspended','revoked')",
             name="ck_user_identity_status",
