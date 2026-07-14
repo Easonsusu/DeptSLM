@@ -4,6 +4,8 @@
 
 Phase 2 adds immutable typed models for authenticated principals, UUID department scopes, department authorization contexts, five department roles, and active, suspended, or revoked membership states. `GET /auth/me` returns only the server-validated subject and issuer.
 
+Phase 3 replaces the runtime deny-all resolver with a PostgreSQL-backed resolver. It matches the exact validated issuer, opaque subject, and requested department UUID, and requires active identity, department, and membership rows plus a non-expired membership. Client role or department claims remain untrusted. A `system_admin` still requires same-department membership and has no global bypass. Database errors fail closed with a generic `503`; authentication behavior and the Bearer challenge remain unchanged.
+
 Authentication and membership resolution are separate boundaries. A token proves identity; it does not prove department access. A client-provided department identifier is only a resource selector.
 
 ## Development and test JWT mode
@@ -28,23 +30,25 @@ The repository provides no usable default signing secret. Store the generated va
 
 ## Runtime membership behavior
 
-The runtime membership resolver denies all department access. Tests use an in-memory resolver to verify authorization behavior. Phase 3 will add persistent server-side department and membership models. JWT department or role claims are not used as authorization evidence.
+Phase 3 stores identities, departments, and memberships in PostgreSQL and exposes production department and membership APIs. Each department route matches the validated token issuer and opaque subject to the path `department_id` inside the request database transaction. It requires an active identity, active department, active non-expired membership, and an allowed same-department role. JWT department or role claims are not authorization evidence.
+
+Mutations lock the department first, then revalidate and lock the actor identity and membership before locking target rows. An earlier dependency result or authorization context is not evidence for the mutation. Suspended or revoked identities, archived departments, suspended, revoked, or expired memberships, role mismatches, and cross-department selectors fail closed. Database or membership-store failures return a generic `503` without exposing connection or query details.
 
 ## HTTP behavior
 
 - `/health` and `/version` remain public.
 - `/auth/me` requires valid authentication and returns `401` with `WWW-Authenticate: Bearer` otherwise.
-- Department dependencies require one explicit UUID scope and an active matching server-side membership.
+- Production department and membership endpoints require one explicit UUID path scope and an active matching server-side membership.
 - Missing, malformed, unknown, suspended, revoked, cross-department, and role-incompatible scope returns `403` without confirming resource existence.
 - `system_admin` receives no global bypass.
 
-Department dependencies are exercised through test-only routes. No department product endpoint exists yet.
-
 ## Audit events
 
-Authentication and authorization decisions emit typed events to a safe logging sink. Events may include actor subject, action, allowed or denied result, policy reason, authorized department, and a validated UUID correlation identifier.
+Authentication and transaction-time department authorization decisions emit typed process-level events through `AuditSink`. Events may include actor subject, action, allowed or denied result, a safe reason code, selected department, and a validated UUID correlation identifier. Authorization events are emitted only after current database membership and role state produces an allowed, denied, or unavailable decision.
 
-The event schema cannot carry bearer tokens, signatures, secrets, raw request bodies, personal profiles, documents, retrieved sources, or training content. Persistent audit storage and retention policy are deferred.
+Separately, successful department and membership mutations append a PostgreSQL `audit_events` row in the same transaction as the state change. Denied requests, unavailable authorization checks, and no-op mutations do not create a mutation-success row. Process events cover those authorization outcomes without claiming persistent denied-event storage.
+
+Neither audit boundary can carry bearer tokens, JWT signatures, auth secrets, raw request bodies, database URLs, SQL statements, hostnames, personal profiles, documents, retrieved sources, or training content. The process logging sink and PostgreSQL success rows are not claimed to be tamper-resistant production audit storage; retention, access, export, and operational hardening remain deferred.
 
 ## External storage path safety
 
@@ -59,8 +63,8 @@ The pure `DepartmentVectorScope` helper always produces a mandatory `department_
 - Local HS256 secrets must be generated and stored outside Git.
 - No token revocation, key rotation, JWKS, OIDC discovery, OAuth flow, session, cookie, or frontend login exists.
 - No production identity provider is selected or integrated.
-- Memberships are not persistent and runtime department authorization intentionally denies all requests.
-- Audit events are process logs, not tamper-resistant persistent records.
+- Development/test HS256 is the only configured identity mode; production identity integration remains deferred.
+- Authorization decision events are process logs, while persistent rows cover successful state mutations only. Neither is a complete tamper-resistant production audit system.
 - Rate limiting, operational monitoring, and audited system-admin support workflows remain deferred.
 
-Production identity-provider selection must define asymmetric verification, key rotation, issuer metadata, token lifetime, revocation, account lifecycle, and deployment secret management. Persistent membership work belongs to Phase 3.
+Production identity-provider selection must define asymmetric verification, key rotation, issuer metadata, token lifetime, revocation, account lifecycle, and deployment secret management.

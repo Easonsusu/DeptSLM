@@ -1,8 +1,8 @@
 # Deployment and Local Development
 
-## Phase 0 status
+## Phase 3 status
 
-DeptSLM is not production ready. Phase 0 uses Docker Compose to make the intended local service topology visible and to provide a foundation for later implementation. The web and API skeletons are intentionally minimal, while worker definitions and integrations may remain placeholders. RAG, model serving, database migrations, training, authentication, secrets management, backups, and production operations are not implemented in this phase.
+DeptSLM is not production ready. Phase 3 adds Alembic-managed PostgreSQL department persistence and development/test authentication, while workers, RAG, model serving, training, production identity, secrets management, backups, and production operations remain deferred.
 
 ## Planned local services
 
@@ -10,7 +10,7 @@ DeptSLM is not production ready. Phase 0 uses Docker Compose to make the intende
 | --- | --- | --- |
 | `web` | Next.js user interface | Basic landing page only. |
 | `api` | FastAPI control plane | `GET /health` and `GET /version` only. |
-| `postgres` | Application metadata database | Local service placeholder; business schema is deferred. |
+| `postgres` | Application metadata database | Phase 3 identities, departments, memberships, and audit events. |
 | `qdrant` | Vector search | Local service placeholder; no ingestion is implemented. |
 | `rag-worker` | Future ingestion and retrieval jobs | Structural placeholder; no RAG workflow is implemented. |
 | `training-worker` | Future LLaMA-Factory jobs | Structural placeholder; no fine-tuning is implemented. |
@@ -52,7 +52,7 @@ cp .env.example .env
 Set these values as appropriate for the local environment:
 
 - `DEPTSLM_DATA_DIR`: the absolute path printed by the setup script
-- `DATABASE_URL`: the API's future PostgreSQL connection URL
+- `DATABASE_URL`: the API PostgreSQL connection URL using `postgresql+psycopg://`
 - `QDRANT_URL`: the future Qdrant service URL
 - `API_PORT`: API host port, normally `8000`
 - `WEB_PORT`: web host port, normally `3000`
@@ -61,6 +61,27 @@ Set these values as appropriate for the local environment:
 Do not commit `.env`. Do not put production credentials in `.env.example` or Compose defaults.
 
 ## Validate and start
+
+Build the API image and apply the schema through Compose before startup:
+
+```bash
+./scripts/compose.sh build api
+./scripts/compose.sh run --rm api python -m alembic upgrade head
+```
+
+This command uses the Compose-internal `postgres` hostname from `.env`. When running Alembic directly from the host in `apps/api`, set `DATABASE_URL` to a host-accessible URL such as `postgresql+psycopg://deptslm:deptslm@localhost:5432/deptslm`; the Compose hostname does not resolve from the host.
+
+Bootstrap the first local department through the same image:
+
+```bash
+./scripts/compose.sh run --rm api python -m app.admin bootstrap-department \
+  --slug computer-science \
+  --display-name "Computer Science" \
+  --admin-issuer https://local-issuer.invalid \
+  --admin-subject opaque-admin-subject
+```
+
+Bootstrap remains disabled outside explicit reviewed local/test environments. Compose passes `DEPTSLM_AUTH_MODE`, issuer, audience, and secret only to the API container. Keep the generated secret only in the untracked `.env`; it is not passed to web, PostgreSQL, Qdrant, or workers.
 
 Before startup, render the resolved Compose configuration through the repository wrapper:
 
@@ -109,6 +130,10 @@ Google Drive is appropriate for the requested local artifact layout, but it is n
 ## Tests and CI
 
 CI must not depend on a developer's Google Drive or reuse real data. It should create a temporary directory, export that absolute path as `DEPTSLM_DATA_DIR`, run the relevant checks, and discard the directory afterward. Test inputs must be small and synthetic.
+
+GitHub Actions provides PostgreSQL 16 and sets an isolated `DATABASE_TEST_URL`. Locally, run `python -m pytest -m "not postgres"` without PostgreSQL, or point `DATABASE_TEST_URL` to an isolated test database and run migrations followed by `python -m pytest`. PostgreSQL tests never fall back to SQLite and CI fails if they are skipped.
+
+CI also builds the API image and performs a non-secret inspection proving that `app.main`, `app.admin`, `alembic.ini`, and revision `0001_phase3` are present. It does not start the full stack for this check.
 
 At minimum, future deployment checks should cover:
 

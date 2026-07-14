@@ -12,7 +12,10 @@ from pydantic import BaseModel
 from app import __version__
 from app.audit import LoggingAuditSink
 from app.auth import AuthenticatedPrincipal, build_token_verifier
-from app.authorization import DenyAllMembershipResolver, require_authenticated_principal
+from app.authorization import require_authenticated_principal
+from app.database import create_database_engine, create_session_factory
+from app.membership_resolver import SQLAlchemyMembershipResolver
+from app.routes import router as department_router
 from app.settings import Settings
 
 
@@ -43,9 +46,16 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     settings = Settings.from_environment()
     application.state.settings = settings
     application.state.token_verifier = build_token_verifier(settings)
-    application.state.membership_resolver = DenyAllMembershipResolver()
+    engine = create_database_engine(settings.database_url)
+    session_factory = create_session_factory(engine)
+    application.state.engine = engine
+    application.state.session_factory = session_factory
+    application.state.membership_resolver = SQLAlchemyMembershipResolver(session_factory)
     application.state.audit_sink = LoggingAuditSink()
-    yield
+    try:
+        yield
+    finally:
+        engine.dispose()
 
 
 app = FastAPI(
@@ -54,6 +64,7 @@ app = FastAPI(
     version=__version__,
     lifespan=lifespan,
 )
+app.include_router(department_router)
 
 
 @app.get("/health", response_model=HealthResponse, tags=["system"])

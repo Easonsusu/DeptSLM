@@ -2,7 +2,7 @@
 
 ## Status and boundaries
 
-This is a target architecture for future phases of DeptSLM. Phase 0 provides only a Next.js landing page, a small FastAPI application, service placeholders, and local-development configuration. The ingestion, retrieval, model-serving, database, training, adapter, authentication, and authorization flows below are designs, not implemented capabilities.
+Phase 3 implements the PostgreSQL department, identity, membership, and mutation-audit control-plane foundation. The ingestion, retrieval, model-serving, training, and adapter flows below remain designs, not implemented capabilities.
 
 ## System context
 
@@ -65,11 +65,11 @@ The arrows describe intended responsibilities and do not imply that a production
 
 ### FastAPI backend
 
-`apps/api` is the planned control plane for authentication integration, department authorization, metadata APIs, job creation, and orchestration. Phase 0 exposes only `GET /health` and `GET /version`. Long-running ingestion, model, and training work should not block API request workers.
+`apps/api` is the control plane for development authentication, persistent department authorization, and department administration. It uses synchronous request-scoped SQLAlchemy sessions and Alembic migrations. Long-running ingestion, model, and training work remains deferred and must not block API request workers.
 
 ### PostgreSQL
 
-PostgreSQL is planned to store structured application state such as departments, memberships, documents, source metadata, job records, conversations, adapter registry entries, evaluation metadata, and audit events. Department-owned rows must have a non-null `department_id`, and repository/data-access methods must require an explicit department scope.
+PostgreSQL stores Phase 3 identities, departments, memberships, and safe mutation audit events. Department-owned repository methods require an explicit `DepartmentScope`; later metadata such as documents and jobs remains deferred.
 
 ### Qdrant
 

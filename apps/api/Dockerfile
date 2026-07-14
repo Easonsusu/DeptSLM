@@ -12,6 +12,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
 
 COPY --chown=deptslm:deptslm app ./app
+COPY --chown=deptslm:deptslm alembic.ini ./alembic.ini
+COPY --chown=deptslm:deptslm alembic ./alembic
 
 USER deptslm
 EXPOSE 8000

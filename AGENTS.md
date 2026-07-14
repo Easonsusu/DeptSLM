@@ -4,7 +4,7 @@ These repository-specific rules apply to Codex and every other automated or huma
 
 ## 1. Project identity
 
-DeptSLM is a university departmental SLM customization platform. Its purpose is to help departments create assistants from department-approved knowledge and, in future phases, department-specific LoRA or QLoRA adapters. Phase 0 is initialization only: preserve a small, understandable skeleton and do not present planned behavior as implemented.
+DeptSLM is a university departmental SLM customization platform. Its purpose is to help departments create assistants from department-approved knowledge and, in future phases, department-specific LoRA or QLoRA adapters. Preserve a small, understandable implementation and do not present planned behavior as implemented.
 
 ## 2. Tech stack
 
@@ -20,7 +20,7 @@ Use the planned stack consistently:
 - `services/rag-worker` and `services/training-worker` for long-running jobs
 - Docker Compose for local orchestration
 
-Do not add an overlapping framework or heavy dependency without a documented need. Do not implement RAG or fine-tuning as part of Phase 0.
+Do not add an overlapping framework or heavy dependency without a documented need. Do not implement RAG or fine-tuning before its reviewed phase.
 
 ## 3. Storage policy
 
@@ -64,7 +64,8 @@ The required artifact subdirectories are `uploads`, `extracted_text`, `vector_sn
 - Update the relevant docs when behavior or setup changes.
 - Do not claim a planned feature works until it has an implementation and a test.
 - Require review for tenant-boundary, retrieval-safety, persistence, authentication, dependency, and deployment changes.
-- Keep Phase 0 PRs limited to initialization; no RAG or fine-tuning implementation.
+- Keep phase PRs focused; no RAG or fine-tuning implementation before its reviewed phase.
+- Phase 3 database changes use SQLAlchemy and Alembic. Do not call `metadata.create_all` at runtime, add unscoped department-owned repository methods, or hard-delete departments, memberships, identities, or audit events.
 
 ## 7. Testing expectations
 
