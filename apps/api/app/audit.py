@@ -1,4 +1,4 @@
-"""Safe, non-persistent audit event foundation."""
+"""Safe authentication audit sink; Phase 3 mutation audit rows are database-backed."""
 
 from __future__ import annotations
 

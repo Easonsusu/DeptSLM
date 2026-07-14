@@ -4,6 +4,8 @@
 
 Phase 2 adds immutable typed models for authenticated principals, UUID department scopes, department authorization contexts, five department roles, and active, suspended, or revoked membership states. `GET /auth/me` returns only the server-validated subject and issuer.
 
+Phase 3 replaces the runtime deny-all resolver with a PostgreSQL-backed resolver. It matches the exact validated issuer, opaque subject, and requested department UUID, and requires active identity, department, and membership rows plus a non-expired membership. Client role or department claims remain untrusted. A `system_admin` still requires same-department membership and has no global bypass. Database errors fail closed with a generic `503`; authentication behavior and the Bearer challenge remain unchanged.
+
 Authentication and membership resolution are separate boundaries. A token proves identity; it does not prove department access. A client-provided department identifier is only a resource selector.
 
 ## Development and test JWT mode

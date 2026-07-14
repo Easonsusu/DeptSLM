@@ -24,6 +24,15 @@ Set `DEPTSLM_DATA_DIR` in the untracked `.env` file to the path printed by the s
 
 ## Required validation
 
+Database schema changes require PostgreSQL 16 and Alembic validation. From `apps/api`, set `DATABASE_TEST_URL` to an isolated `postgresql+psycopg://` database, then run:
+
+```bash
+python -m alembic upgrade head
+python -m pytest -m postgres
+```
+
+Never run migration-cycle tests against shared or production data. Non-database tests remain runnable with `python -m pytest -m "not postgres"`.
+
 Run the smallest relevant checks. The complete Phase 1 validation set is:
 
 ```bash

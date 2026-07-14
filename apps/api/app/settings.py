@@ -29,6 +29,7 @@ class Settings:
     """Validated settings loaded from the process environment."""
 
     data_dir: Path
+    database_url: str
     environment: str
     auth_mode: str
     auth_issuer: str | None
@@ -91,6 +92,12 @@ class Settings:
                 f"received: {resolved_data_dir}"
             )
 
+        database_url = os.getenv("DATABASE_URL", "").strip()
+        if not database_url:
+            raise ConfigurationError("DATABASE_URL is required.")
+        if not database_url.startswith("postgresql+psycopg://"):
+            raise ConfigurationError("DATABASE_URL must use the postgresql+psycopg driver.")
+
         raw_environment = os.getenv("ENVIRONMENT")
         environment = (raw_environment or "local").strip() or "local"
         auth_mode = os.getenv("DEPTSLM_AUTH_MODE", "disabled").strip().lower()
@@ -106,6 +113,7 @@ class Settings:
 
         return cls(
             data_dir=resolved_data_dir,
+            database_url=database_url,
             environment=environment,
             auth_mode=auth_mode,
             auth_issuer=auth_issuer,

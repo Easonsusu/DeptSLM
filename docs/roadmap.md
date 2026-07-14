@@ -14,14 +14,14 @@ This roadmap separates foundational safety work from product implementation. A l
 - Add contribution guidance, pull request and issue templates, and the project roadmap.
 - Define department and authentication boundaries without implementing product behavior.
 
-## Phase 2 — Department and authentication boundary implementation (current)
+## Phase 2 — Department and authentication boundary implementation (completed)
 
 - Implement the reviewed authentication context and fail-closed department authorization primitives.
 - Add cross-department denial tests before exposing department-owned resources.
 
-## Phase 3 — Department CRUD and membership model
+## Phase 3 — Department CRUD and membership model (current)
 
-- Add department lifecycle, membership, role assignment, constraints, and audit events.
+- Add PostgreSQL department lifecycle, membership management, scoped authorization, migrations, and transactional audit events.
 
 ## Phase 4 — Document metadata and upload flow
 

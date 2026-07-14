@@ -4,7 +4,11 @@ version = "0.1.0"
 description = "FastAPI control-plane skeleton for DeptSLM"
 requires-python = ">=3.11"
 dependencies = [
+    "alembic>=1.14.0,<2.0.0",
     "fastapi>=0.115.0,<1.0.0",
+    "psycopg[binary]>=3.2.0,<4.0.0",
+    "PyJWT>=2.10.0,<3.0.0",
+    "SQLAlchemy>=2.0.0,<3.0.0",
     "uvicorn[standard]>=0.34.0,<1.0.0",
 ]
 
@@ -19,6 +23,10 @@ test = [
 addopts = "-ra"
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "postgres: requires an isolated PostgreSQL database",
+    "unit: does not require PostgreSQL",
+]
 
 [tool.ruff]
 line-length = 100

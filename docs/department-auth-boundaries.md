@@ -2,7 +2,7 @@
 
 ## Status
 
-Phase 2 implements reusable authentication and fail-closed authorization foundations. Persistent memberships, department CRUD, production identity integration, and product APIs remain deferred.
+Phase 2 implemented reusable authentication and fail-closed authorization foundations. Phase 3 adds PostgreSQL-backed identities, departments, memberships, scoped administration APIs, and transactional mutation audit events. Production identity integration and product data APIs remain deferred.
 
 ## Security objective
 
@@ -108,7 +108,11 @@ UI filtering, client claims, path naming, and model prompts are not security bou
 
 ## Phase 2 implementation boundary
 
-The API now validates development/test HS256 bearer tokens, exposes safe identity metadata through `GET /auth/me`, and supplies immutable department scope and authorization context types. Runtime membership resolution deliberately denies every department request until Phase 3 provides persistent server-side memberships. Focused test-only routes exercise department and role dependencies; no department product endpoint has been added.
+The API validates development/test HS256 bearer tokens, exposes safe identity metadata through `GET /auth/me`, and supplies immutable department scope and authorization context types. These Phase 2 boundaries remain the base for persistent Phase 3 authorization.
+
+## Phase 3 persistence boundary
+
+Server-side membership resolution requires exact issuer, opaque subject, and path department matching. Scoped repository methods always include `department_id`; cross-department membership IDs appear not found. Archived departments, inactive identities or memberships, and expired memberships cannot authorize. Department creation is restricted to a reviewed local bootstrap command, public APIs cannot grant `system_admin`, and final active administrators cannot be removed transactionally. Production SSO, platform administration, and product data remain deferred.
 
 ## Acceptance criteria for Phase 2
 

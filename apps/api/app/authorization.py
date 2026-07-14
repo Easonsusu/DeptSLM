@@ -60,9 +60,13 @@ class MembershipResolver(Protocol):
     ) -> MembershipResult | None: ...
 
 
+class MembershipResolutionUnavailable(RuntimeError):
+    """Raised when membership state cannot be verified safely."""
+
+
 @dataclass(frozen=True, slots=True)
 class DenyAllMembershipResolver:
-    """Runtime default until persistent memberships are added in Phase 3."""
+    """Explicit fail-closed resolver for isolated tests and disabled integrations."""
 
     def resolve(
         self, principal: AuthenticatedPrincipal, department: DepartmentScope
@@ -192,8 +196,73 @@ def require_department_scope(
         )
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Department access denied") from None
 
+    return _authorize_department(request, principal, department)
+
+
+def require_path_department_scope(
+    request: Request,
+    department_id: UUID,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    header_department_id: Annotated[str | None, Header(alias="X-Department-ID")] = None,
+) -> DepartmentAuthorizationContext:
+    """Authorize a path department and reject a conflicting optional header."""
+
+    department = DepartmentScope(department_id)
+    if header_department_id is not None:
+        try:
+            header_scope = DepartmentScope.parse(header_department_id)
+        except ValueError:
+            _audit(
+                request,
+                AuditEvent(
+                    principal.subject,
+                    "authorize_department",
+                    AuditResult.DENIED,
+                    "path_header_scope_mismatch",
+                    str(department),
+                    _correlation_id(request),
+                ),
+            )
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Department access denied") from None
+        if header_scope != department:
+            _audit(
+                request,
+                AuditEvent(
+                    principal.subject,
+                    "authorize_department",
+                    AuditResult.DENIED,
+                    "path_header_scope_mismatch",
+                    str(department),
+                    _correlation_id(request),
+                ),
+            )
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Department access denied")
+    return _authorize_department(request, principal, department)
+
+
+def _authorize_department(
+    request: Request,
+    principal: AuthenticatedPrincipal,
+    department: DepartmentScope,
+) -> DepartmentAuthorizationContext:
+    correlation_id = _correlation_id(request)
     resolver: MembershipResolver = request.app.state.membership_resolver
-    membership = resolver.resolve(principal, department)
+    try:
+        membership = resolver.resolve(principal, department)
+    except MembershipResolutionUnavailable:
+        _audit(
+            request,
+            AuditEvent(
+                principal.subject,
+                "authorize_department",
+                AuditResult.DENIED,
+                "membership_store_unavailable",
+                correlation_id=correlation_id,
+            ),
+        )
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Authorization unavailable"
+        ) from None
     if (
         membership is None
         or membership.subject != principal.subject
@@ -245,6 +314,48 @@ def require_department_roles(
     def dependency(
         request: Request,
         context: DepartmentAuthorizationContext = Depends(require_department_scope),
+    ) -> DepartmentAuthorizationContext:
+        if context.role not in allowed:
+            _audit(
+                request,
+                AuditEvent(
+                    context.subject,
+                    "authorize_role",
+                    AuditResult.DENIED,
+                    "role_denied",
+                    str(context.department),
+                    context.correlation_id,
+                ),
+            )
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Department access denied")
+        _audit(
+            request,
+            AuditEvent(
+                context.subject,
+                "authorize_role",
+                AuditResult.ALLOWED,
+                "role_allowed",
+                str(context.department),
+                context.correlation_id,
+            ),
+        )
+        return context
+
+    return dependency
+
+
+def require_path_department_roles(
+    *allowed_roles: DepartmentRole,
+) -> Callable[[Request, DepartmentAuthorizationContext], DepartmentAuthorizationContext]:
+    """Require a role for a department identifier carried in the request path."""
+
+    allowed = frozenset(allowed_roles)
+    if not allowed:
+        raise ValueError("at least one department role is required")
+
+    def dependency(
+        request: Request,
+        context: DepartmentAuthorizationContext = Depends(require_path_department_scope),
     ) -> DepartmentAuthorizationContext:
         if context.role not in allowed:
             _audit(

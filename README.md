@@ -2,7 +2,7 @@
 
 DeptSLM is a university departmental small language model (SLM) customization platform. It is intended to let each department build an isolated assistant from its own approved documents, retrieval index, evaluation data, and eventually its own LoRA or QLoRA adapter.
 
-> **Phase 2 status:** the repository now includes development/test JWT verification and fail-closed department authorization foundations. Persistent memberships, department product APIs, production identity integration, RAG, model serving, and fine-tuning are not implemented yet.
+> **Phase 3 status:** PostgreSQL departments, identities, memberships, scoped administration APIs, Alembic migrations, and transactional mutation audit records are under review. Production identity integration, documents, RAG, model serving, and fine-tuning remain deferred.
 
 ## Planned stack
 
@@ -90,7 +90,7 @@ Prerequisites for the complete local stack are Git, Docker Desktop with Docker C
    curl http://localhost:8000/version
    ```
 
-   Protected identity checks additionally require the development/test authentication variables documented in [.env.example](.env.example). HS256 is allowed only with an explicit `ENVIRONMENT` of `local`, `development`, `dev`, or `test`; incomplete configuration stops startup. Generate a local secret of at least 32 bytes with `python -c 'import secrets; print(secrets.token_urlsafe(48))'` and keep it only in the untracked `.env`. The repository provides no usable default secret. Authentication defaults to disabled, and department authorization defaults to deny-all until Phase 3.
+   Protected identity checks additionally require the development/test authentication variables documented in [.env.example](.env.example). Apply the database migration with `cd apps/api && python -m alembic upgrade head` before starting the API. HS256 is allowed only with an explicit reviewed local environment and a non-placeholder secret of at least 32 bytes. Department authorization resolves persistent server-side membership and fails closed if PostgreSQL is unavailable.
 
    The default ports are controlled by `API_PORT` and `WEB_PORT` in `.env`.
 
@@ -121,10 +121,12 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Roadmap](docs/roadmap.md)
 - [Department and authentication boundaries](docs/department-auth-boundaries.md)
 - [Authentication foundation](docs/authentication-foundation.md)
+- [Database model](docs/database-model.md)
+- [Department and membership API](docs/department-membership-api.md)
 
 ## Current non-goals
 
-Phase 2 does not implement department CRUD, persistent users or memberships, production OAuth/OIDC/SSO, frontend login, documents, RAG, vector integration, model inference, fine-tuning, or production deployment.
+Phase 3 does not implement production OAuth/OIDC/SSO, platform administration, frontend login or administration, documents, RAG, vector integration, model inference, fine-tuning, or production deployment.
 
 ## License
 

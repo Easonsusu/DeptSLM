@@ -2,7 +2,7 @@
 
 ## Status
 
-The Phase 2 API provides two public system endpoints and one authenticated identity endpoint. It does not provide department CRUD, persistent memberships, documents, RAG, database, or training endpoints. Future sections remain planning placeholders.
+The Phase 3 API keeps public system endpoints and authenticated identity inspection, and adds persistent department and membership endpoints. See [department-membership-api.md](department-membership-api.md) for the exact contracts. Documents, RAG, training, and production identity integration remain deferred.
 
 For the default local configuration, the base URL is:
 
@@ -73,13 +73,17 @@ curl --fail \
 
 Successful responses contain `subject` and `issuer`. Missing, malformed, disabled, expired, incorrectly signed, or otherwise invalid authentication returns `401` with `WWW-Authenticate: Bearer`. The response never includes the raw token, secret, audience, membership data, roles, or authentication configuration.
 
-Department-scoped dependencies return `403` for missing, malformed, unknown, inactive, cross-department, or role-incompatible membership scope. This uniform denial avoids revealing whether another department or membership exists. There are no production department-scoped routes in Phase 2.
+Department-scoped dependencies return `403` for missing, malformed, unknown, inactive, expired, cross-department, or role-incompatible membership scope. Database verification failures return a generic `503`. Neither response receives a Bearer challenge or exposes database details.
 
 ## Current error behavior
 
 Unknown routes use FastAPI's default JSON `404 Not Found` response. Authentication failures use `401` with a Bearer challenge; authenticated department authorization failures use `403` without that challenge. No project-wide error envelope is defined yet.
 
 Development HS256 startup requires an explicit `ENVIRONMENT` of `local`, `development`, `dev`, or `test`, complete issuer/audience/secret configuration, and a non-placeholder secret of at least 32 UTF-8 bytes. Unknown or missing environments and incomplete settings stop startup.
+
+## Current department endpoints
+
+Phase 3 implements `GET /departments`, same-department `GET/PATCH/DELETE /departments/{department_id}`, and scoped membership list/create/read/update/revoke routes. Department creation uses the local bootstrap command and is not a public endpoint. All lists are paginated and all membership-resource queries include the path department predicate.
 
 ## Future API conventions
 
