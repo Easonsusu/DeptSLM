@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
+
+DEFAULT_DOCUMENT_MAX_BYTES = 26_214_400
+DEFAULT_DEPARTMENT_DOCUMENT_QUOTA_BYTES = 1_073_741_824
+DOCUMENT_MAX_BYTES_HARD_LIMIT = 104_857_600
 
 ALLOWED_HS256_ENVIRONMENTS = frozenset({"local", "development", "dev", "test"})
 DISALLOWED_AUTH_SECRET_PLACEHOLDERS = frozenset(
@@ -35,6 +40,8 @@ class Settings:
     auth_issuer: str | None
     auth_audience: str | None
     auth_secret: str | None
+    document_max_bytes: int
+    department_document_quota_bytes: int
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -92,6 +99,23 @@ class Settings:
                 f"received: {resolved_data_dir}"
             )
 
+        _validate_uploads_root(resolved_data_dir)
+
+        document_max_bytes = _positive_ascii_decimal(
+            "DEPTSLM_DOCUMENT_MAX_BYTES", DEFAULT_DOCUMENT_MAX_BYTES
+        )
+        if document_max_bytes > DOCUMENT_MAX_BYTES_HARD_LIMIT:
+            raise ConfigurationError("DEPTSLM_DOCUMENT_MAX_BYTES must not exceed 104857600 bytes.")
+        department_document_quota_bytes = _positive_ascii_decimal(
+            "DEPTSLM_DEPARTMENT_DOCUMENT_QUOTA_BYTES",
+            DEFAULT_DEPARTMENT_DOCUMENT_QUOTA_BYTES,
+        )
+        if department_document_quota_bytes < document_max_bytes:
+            raise ConfigurationError(
+                "DEPTSLM_DEPARTMENT_DOCUMENT_QUOTA_BYTES must be greater than or equal "
+                "to DEPTSLM_DOCUMENT_MAX_BYTES."
+            )
+
         database_url = os.getenv("DATABASE_URL", "").strip()
         if not database_url:
             raise ConfigurationError("DATABASE_URL is required.")
@@ -119,7 +143,37 @@ class Settings:
             auth_issuer=auth_issuer,
             auth_audience=auth_audience,
             auth_secret=auth_secret,
+            document_max_bytes=document_max_bytes,
+            department_document_quota_bytes=department_document_quota_bytes,
         )
+
+
+def _positive_ascii_decimal(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    if not raw or not raw.isascii() or not raw.isdecimal():
+        raise ConfigurationError(f"{name} must be a positive ASCII decimal integer.")
+    value = int(raw)
+    if value <= 0:
+        raise ConfigurationError(f"{name} must be greater than zero.")
+    return value
+
+
+def _validate_uploads_root(data_dir: Path) -> None:
+    uploads = data_dir / "uploads"
+    try:
+        metadata = uploads.lstat()
+    except FileNotFoundError as error:
+        raise ConfigurationError(
+            "DEPTSLM_DATA_DIR/uploads must already exist as a real writable directory."
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ConfigurationError(
+            "DEPTSLM_DATA_DIR/uploads must be a real directory, not a symlink."
+        )
+    if not os.access(uploads, os.W_OK | os.X_OK):
+        raise ConfigurationError("DEPTSLM_DATA_DIR/uploads must be writable and searchable.")
 
 
 def _optional_environment(name: str) -> str | None:

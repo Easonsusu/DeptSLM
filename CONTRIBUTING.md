@@ -9,7 +9,7 @@ DeptSLM is developed in small, reviewable phases. Contributors must preserve the
 3. Create a focused branch from current `main`.
 4. Keep planned capabilities separate from implemented behavior.
 
-Do not add RAG, authentication, database models, uploads, or training behavior to a planning-only phase.
+Do not add RAG, extraction, parsing, indexing, model, or training behavior to the Phase 4 upload scope.
 
 ## Development setup
 
@@ -67,6 +67,8 @@ Never commit or force-add:
 - real university, department, staff, faculty, or student data
 
 All future department-owned artifacts must use safe paths beneath `DEPTSLM_DATA_DIR` and include a validated `department_id` segment.
+
+Document upload changes must keep raw bodies incremental, avoid multipart and process-temporary storage, revalidate authorization after streaming, and test cleanup for denial, cancellation, storage, and database failures. Tests must create a fresh temporary `uploads` directory; they must never use a developer's Google Drive folder.
 
 ## Department and authentication safety
 

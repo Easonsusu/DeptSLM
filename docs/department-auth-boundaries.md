@@ -2,7 +2,7 @@
 
 ## Status
 
-Phase 2 implemented reusable authentication and fail-closed authorization foundations. Phase 3 adds PostgreSQL-backed identities, departments, memberships, scoped administration APIs, and transactional mutation audit events. Production identity integration and product data APIs remain deferred.
+Phase 2 implemented reusable authentication and fail-closed authorization foundations. Phase 3 added PostgreSQL identities, departments, memberships, scoped administration, and transactional audit events. Phase 4 applies those boundaries to document metadata and raw source upload. Production identity integration and later product data APIs remain deferred.
 
 ## Security objective
 
@@ -69,9 +69,11 @@ PostgreSQL constraints and indexes should include department ownership. Qdrant o
 
 ### Documents
 
-- A document is visible only to active members of its owning department with a role permitted by its publication state.
-- Draft, quarantined, failed, retired, or restricted documents require narrower permissions than approved sources.
-- Students and viewers may access only explicitly published material.
+- Phase 4 metadata is visible to any active role only inside its owning department. There is no document-content or download endpoint.
+- Upload requires same-department `system_admin`, `department_admin`, or `instructor`; soft deletion requires same-department `system_admin` or `department_admin`.
+- Admission is checked before streaming and current authority is checked again under a department lock before finalization.
+- Deleted metadata is hidden, retained source bytes still count against quota, and cross-department identifiers return no resource data.
+- Publication states and narrower student/viewer content visibility are deferred until content delivery exists.
 - Source metadata and citations must not reveal another department's names, paths, titles, or identifiers.
 
 ### Training datasets
@@ -115,6 +117,10 @@ The API validates development/test HS256 bearer tokens, exposes safe identity me
 ## Phase 3 persistence boundary
 
 Server-side membership resolution requires exact issuer, opaque subject, and path department matching. Resource services repeat this check in their request session, and mutations lock the department first before revalidating the actor and locking targets. Each production-route authorization attempt emits one safe process decision after current membership and role state is known. Stale authorization after archival, suspension, revocation, expiry, or demotion fails without a success audit row. Effective-administrator checks join active identities and memberships and serialize changes per department. Scoped repository methods always include `department_id`; cross-department membership IDs appear not found. Department creation is restricted to a reviewed local bootstrap command, public APIs cannot grant `system_admin`, and final effective administrators cannot be removed transactionally. Production SSO, platform administration, and product data remain deferred.
+
+## Phase 4 document boundary
+
+Document repositories require `DepartmentScope` and always filter `department_id`. Upload admission uses a short session; streaming holds no database transaction. Finalization starts a new transaction, locks the department first, repeats exact identity/membership/role validation, and serializes retained-byte quota decisions. Fixed-field process events distinguish admission, finalization, validation, storage, database, read, and delete decisions without recording filenames, headers, bodies, hashes, or paths. Successful upload/delete mutations append `document.upload` or `document.delete` persistent audit rows in the same transaction as metadata.
 
 ## Acceptance criteria for Phase 2
 

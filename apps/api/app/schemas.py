@@ -1,4 +1,4 @@
-"""Validated public schemas for departments and memberships."""
+"""Validated public schemas for departments, memberships, and documents."""
 
 from __future__ import annotations
 
@@ -105,3 +105,23 @@ class MembershipUpdate(BaseModel):
         if value is not None and value.utcoffset() is None:
             raise ValueError("expires_at must include a timezone")
         return value
+
+
+class DocumentResponse(ORMResponse):
+    """Safe document metadata; internal identity and storage fields are excluded."""
+
+    id: UUID
+    department_id: UUID
+    original_filename: str
+    media_type: str
+    byte_size: int
+    status: str
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class DocumentListResponse(BaseModel):
+    items: list[DocumentResponse]
+    limit: int
+    offset: int

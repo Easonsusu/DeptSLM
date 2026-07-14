@@ -1,4 +1,4 @@
-"""Safe process decision sink; Phase 3 mutation audit rows are database-backed."""
+"""Safe process decision sink; mutation-success audit rows are database-backed."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ class AuditEvent:
     reason_code: str
     department_id: str | None = None
     correlation_id: str | None = None
+    resource_id: str | None = None
 
 
 class AuditSink(Protocol):

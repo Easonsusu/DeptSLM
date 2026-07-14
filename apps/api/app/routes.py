@@ -1,12 +1,14 @@
-"""Department-scoped Phase 3 API routes."""
+"""Department-scoped control-plane and Phase 4 document routes."""
 
 from __future__ import annotations
 
+import asyncio
 from typing import Annotated
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from app.audit import AuditResult
 from app.auth import AuthenticatedPrincipal
 from app.authorization import (
     DepartmentRequestScope,
@@ -14,11 +16,23 @@ from app.authorization import (
     require_path_department_selector,
 )
 from app.database import DatabaseSession
+from app.document_services import (
+    admit_document_upload,
+    delete_document,
+    emit_document_event,
+    finalize_document_upload,
+    get_document,
+    list_documents,
+)
+from app.document_storage import DocumentStorageError
+from app.document_upload import UploadError, parse_upload_metadata, stream_upload
 from app.schemas import (
     DepartmentArchive,
     DepartmentListResponse,
     DepartmentResponse,
     DepartmentUpdate,
+    DocumentListResponse,
+    DocumentResponse,
     MembershipCreate,
     MembershipListResponse,
     MembershipResponse,
@@ -42,6 +56,10 @@ router = APIRouter()
 
 
 def _raise(error: ServiceError) -> None:
+    raise HTTPException(error.status_code, error.detail) from None
+
+
+def _raise_upload(error: UploadError) -> None:
     raise HTTPException(error.status_code, error.detail) from None
 
 
@@ -213,6 +231,150 @@ def delete_membership(
     try:
         return membership_response(
             revoke_membership(session, principal, request_scope, membership_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/documents",
+    response_model=DocumentListResponse,
+    tags=["documents"],
+)
+def get_documents(
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> DocumentListResponse:
+    try:
+        items = list_documents(session, principal, request_scope, limit, offset)
+        return DocumentListResponse(
+            items=[DocumentResponse.model_validate(item) for item in items],
+            limit=limit,
+            offset=offset,
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/documents/{document_id}",
+    response_model=DocumentResponse,
+    tags=["documents"],
+)
+def read_document(
+    document_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> DocumentResponse:
+    try:
+        return DocumentResponse.model_validate(
+            get_document(session, principal, request_scope, document_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/documents",
+    response_model=DocumentResponse,
+    status_code=201,
+    tags=["documents"],
+)
+async def post_document(
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> DocumentResponse:
+    settings = request.app.state.settings
+    factory = request.app.state.session_factory
+    try:
+        await asyncio.to_thread(admit_document_upload, factory, principal, request_scope)
+    except ServiceError as error:
+        _raise(error)
+
+    try:
+        metadata = parse_upload_metadata(request.headers, settings.document_max_bytes)
+    except UploadError as error:
+        emit_document_event(
+            request_scope,
+            principal,
+            action="document.upload.validation",
+            result=AuditResult.DENIED,
+            reason_code=error.reason_code,
+        )
+        _raise_upload(error)
+
+    try:
+        staged = await asyncio.to_thread(
+            request.app.state.document_storage.create_staging,
+            request_scope.department,
+            uuid4(),
+        )
+    except DocumentStorageError:
+        emit_document_event(
+            request_scope,
+            principal,
+            action="document.upload.storage",
+            result=AuditResult.DENIED,
+            reason_code="storage_unavailable",
+        )
+        raise HTTPException(503, "Document storage unavailable") from None
+
+    try:
+        streamed = await stream_upload(request, staged, metadata, settings.document_max_bytes)
+    except DocumentStorageError:
+        emit_document_event(
+            request_scope,
+            principal,
+            action="document.upload.storage",
+            result=AuditResult.DENIED,
+            reason_code="storage_unavailable",
+        )
+        raise HTTPException(503, "Document storage unavailable") from None
+    except UploadError as error:
+        emit_document_event(
+            request_scope,
+            principal,
+            action="document.upload.validation",
+            result=AuditResult.DENIED,
+            reason_code=error.reason_code,
+        )
+        _raise_upload(error)
+
+    try:
+        document = await asyncio.to_thread(
+            finalize_document_upload,
+            factory,
+            principal,
+            request_scope,
+            metadata,
+            streamed,
+            staged,
+            settings.department_document_quota_bytes,
+        )
+        return DocumentResponse.model_validate(document)
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.delete(
+    "/departments/{department_id}/documents/{document_id}",
+    response_model=DocumentResponse,
+    tags=["documents"],
+)
+def remove_document(
+    document_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> DocumentResponse:
+    try:
+        return DocumentResponse.model_validate(
+            delete_document(session, principal, request_scope, document_id)
         )
     except ServiceError as error:
         _raise(error)

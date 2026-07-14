@@ -26,9 +26,10 @@ from app.authorization import (
     MembershipResult,
     require_department_roles,
 )
+from app.document_storage import DocumentStorage, DocumentStorageError
 from app.main import app
 from app.settings import ConfigurationError, Settings
-from app.storage_paths import department_storage_path
+from app.storage_paths import ArtifactArea, department_artifact_path
 from app.vector_scope import DepartmentVectorScope
 
 SECRET = "unit-test-secret-not-for-runtime-0123456789-abcdefghijklmnopqrstuvwxyz"
@@ -76,6 +77,7 @@ def make_token(**overrides: object) -> str:
 
 
 def auth_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / "uploads").mkdir(exist_ok=True)
     monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("ENVIRONMENT", "test")
     monkeypatch.setenv("DEPTSLM_AUTH_MODE", "hs256")
@@ -164,6 +166,7 @@ def test_invalid_tokens_are_rejected(
 def test_unconfigured_authentication_fails_closed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    (tmp_path / "uploads").mkdir()
     monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
     monkeypatch.delenv("ENVIRONMENT", raising=False)
     monkeypatch.setenv("DEPTSLM_AUTH_MODE", "disabled")
@@ -429,29 +432,33 @@ def test_audit_events_cover_allow_and_deny_without_sensitive_data(
 
 
 def test_department_storage_path_stays_under_external_root(tmp_path: Path) -> None:
+    (tmp_path / "uploads").mkdir()
     department = DepartmentScope(uuid4())
-    result = department_storage_path(tmp_path, department, "uploads", "file.txt")
+    result = department_artifact_path(tmp_path, ArtifactArea.UPLOADS, department, "file.txt")
     assert result.is_relative_to(tmp_path.resolve())
     assert str(department) in result.parts
 
 
 @pytest.mark.parametrize("child", ("../escape", "/absolute", "uploads/../../escape"))
 def test_department_storage_path_rejects_unsafe_children(tmp_path: Path, child: str) -> None:
+    (tmp_path / "uploads").mkdir()
     with pytest.raises(ValueError):
-        department_storage_path(tmp_path, DepartmentScope(uuid4()), child)
+        department_artifact_path(tmp_path, ArtifactArea.UPLOADS, DepartmentScope(uuid4()), child)
 
 
 def test_department_storage_path_rejects_symlink_escape(tmp_path: Path) -> None:
+    (tmp_path / "uploads").mkdir()
     department = DepartmentScope(uuid4())
-    department_root = tmp_path / "departments" / str(department)
-    department_root.mkdir(parents=True)
     outside = tmp_path.parent / f"outside-{uuid4()}"
     outside.mkdir()
-    (department_root / "link").symlink_to(outside, target_is_directory=True)
+    (tmp_path / "uploads" / str(department)).symlink_to(outside, target_is_directory=True)
     try:
         with pytest.raises(ValueError):
-            department_storage_path(tmp_path, department, "link", "file.txt")
+            department_artifact_path(tmp_path, ArtifactArea.UPLOADS, department, "source")
+        with pytest.raises(DocumentStorageError):
+            DocumentStorage(tmp_path).create_staging(department, uuid4())
     finally:
+        (tmp_path / "uploads" / str(department)).unlink()
         outside.rmdir()
 
 

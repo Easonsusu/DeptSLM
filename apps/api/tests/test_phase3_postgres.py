@@ -30,7 +30,7 @@ from app.authorization import (
 from app.database import create_database_engine, create_session_factory
 from app.main import app
 from app.membership_resolver import SQLAlchemyMembershipResolver
-from app.models import Department, Membership, PersistentAuditEvent, UserIdentity
+from app.models import Department, Document, Membership, PersistentAuditEvent, UserIdentity
 from app.services import (
     ADMIN_ROLES,
     ServiceError,
@@ -79,6 +79,7 @@ def engine():
 def db(engine) -> Session:
     with Session(engine) as session:
         session.execute(delete(PersistentAuditEvent))
+        session.execute(delete(Document))
         session.execute(delete(Membership))
         session.execute(delete(Department))
         session.execute(delete(UserIdentity))
@@ -118,6 +119,7 @@ def _token(subject: str = ADMIN) -> str:
 
 
 def _client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
+    (tmp_path / "uploads").mkdir(exist_ok=True)
     monkeypatch.setenv("DATABASE_URL", _database_url())
     monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("ENVIRONMENT", "test")
@@ -135,7 +137,7 @@ def test_00_migration_cycle_reaches_head(engine) -> None:
     command.upgrade(config, "head")
     with engine.connect() as connection:
         current = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert current == "0001_phase3"
+        assert current == "0002_phase4_documents"
         assert {"user_identities", "departments", "memberships", "audit_events"}.issubset(
             set(
                 connection.execute(
@@ -699,6 +701,7 @@ def test_same_department_system_admin_has_no_global_bypass(
 def test_transaction_authorization_database_failure_is_generic(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    (tmp_path / "uploads").mkdir()
     monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://invalid:invalid@127.0.0.1:1/invalid")
     monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("ENVIRONMENT", "test")
@@ -779,6 +782,7 @@ def test_concurrent_admin_demotions_retain_effective_administrator(db: Session, 
 def test_bootstrap_is_atomic_and_conflict_safe(
     db: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    (tmp_path / "uploads").mkdir()
     monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("DATABASE_URL", _database_url())
     monkeypatch.setenv("ENVIRONMENT", "test")

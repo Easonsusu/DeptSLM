@@ -2,7 +2,7 @@
 
 ## Status and boundaries
 
-Phase 3 implements the PostgreSQL department, identity, membership, and mutation-audit control-plane foundation. The ingestion, retrieval, model-serving, training, and adapter flows below remain designs, not implemented capabilities.
+Phase 4 adds department-scoped document metadata and secure external source upload to the Phase 3 control plane. Extraction, ingestion jobs, retrieval, model-serving, training, and adapter flows below remain designs, not implemented capabilities.
 
 ## System context
 
@@ -69,7 +69,7 @@ The arrows describe intended responsibilities and do not imply that a production
 
 ### PostgreSQL
 
-PostgreSQL stores Phase 3 identities, departments, memberships, and safe mutation audit events. Department-owned repository methods require an explicit `DepartmentScope`; later metadata such as documents and jobs remains deferred.
+PostgreSQL stores identities, departments, memberships, documents, and safe mutation audit events. Department-owned repository methods require an explicit `DepartmentScope`; jobs remain deferred.
 
 ### Qdrant
 
@@ -97,15 +97,15 @@ The training worker is planned to launch controlled LoRA or QLoRA jobs through L
 
 ### Document ingestion
 
-1. The API authenticates the user and resolves an allowed `department_id` from membership.
-2. The upload is written beneath that department's external `uploads` path.
-3. The API records source metadata and schedules an ingestion job.
-4. The RAG worker extracts and chunks the document, preserving provenance.
+1. The API authenticates the user, performs a short admission check, and validates the raw upload headers.
+2. The upload streams to a private staging file beneath that department's external `uploads` path.
+3. A new transaction locks the department, revalidates authority, enforces quota, atomically finalizes the source, and records metadata plus audit evidence.
+4. A future RAG worker will extract and chunk the document, preserving provenance.
 5. Qwen3-Embedding creates vectors.
 6. LlamaIndex writes points to Qdrant with the required `department_id` payload.
 7. Job state and audit metadata are recorded in PostgreSQL.
 
-File validation, malware controls, supported formats, queue technology, retries, and deletion semantics remain to be designed.
+Phase 4 implements shallow PDF/UTF-8 validation and metadata-only soft deletion. Malware controls, extraction, queue technology, retries, download, physical retention, and orphan reconciliation remain deferred.
 
 ### Department-scoped question answering
 

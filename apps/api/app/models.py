@@ -1,4 +1,4 @@
-"""Phase 3 PostgreSQL persistence models."""
+"""PostgreSQL persistence models through Phase 4."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -24,6 +25,8 @@ DEPARTMENT_STATUSES = ("active", "archived")
 MEMBERSHIP_STATUSES = tuple(item.value for item in MembershipStatus)
 DEPARTMENT_ROLES = tuple(item.value for item in DepartmentRole)
 AUDIT_RESULTS = ("allowed", "denied")
+DOCUMENT_STATUSES = ("stored", "deleted")
+DOCUMENT_MEDIA_TYPES = ("application/pdf", "text/plain", "text/markdown")
 
 
 class Base(DeclarativeBase):
@@ -113,6 +116,61 @@ class Membership(Base):
         ForeignKey("user_identities.id", ondelete="RESTRICT")
     )
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class Document(Base):
+    __tablename__ = "documents"
+    __table_args__ = (
+        CheckConstraint(
+            "original_filename ~ '[^[:space:]]'",
+            name="ck_document_filename_nonempty",
+        ),
+        CheckConstraint(
+            "char_length(original_filename) <= 255",
+            name="ck_document_filename_char_length",
+        ),
+        CheckConstraint(
+            "octet_length(original_filename) <= 255",
+            name="ck_document_filename_byte_length",
+        ),
+        CheckConstraint(
+            "media_type IN ('application/pdf','text/plain','text/markdown')",
+            name="ck_document_media_type",
+        ),
+        CheckConstraint("byte_size > 0", name="ck_document_byte_size_positive"),
+        CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="ck_document_sha256"),
+        CheckConstraint("status IN ('stored','deleted')", name="ck_document_status"),
+        CheckConstraint("version > 0", name="ck_document_version_positive"),
+        CheckConstraint(
+            "(status = 'stored' AND deleted_at IS NULL AND deleted_by_user_id IS NULL) OR "
+            "(status = 'deleted' AND deleted_at IS NOT NULL AND deleted_by_user_id IS NOT NULL)",
+            name="ck_document_deletion_lifecycle",
+        ),
+        Index("ix_document_department_status_created", "department_id", "status", "created_at"),
+        Index("ix_document_department_sha256", "department_id", "sha256"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(
+        ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False
+    )
+    uploaded_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="stored")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deleted_by_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT")
+    )
     created_at: Mapped[datetime] = utc_timestamp()
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False

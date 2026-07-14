@@ -131,7 +131,7 @@ jobs:
         working-directory: apps/api
         run: |
           export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-data"
-          mkdir -p "$DEPTSLM_DATA_DIR"
+          mkdir -p "$DEPTSLM_DATA_DIR/uploads"
           python -m alembic upgrade head
           python -m pytest
       - name: Verify API checks leave the checkout clean
@@ -170,10 +170,16 @@ jobs:
           docker run --rm --entrypoint python deptslm-api-ci -c '
           import pathlib
           import app.admin
+          import app.document_storage
+          import app.document_upload
           import app.main
           assert pathlib.Path("/app/alembic.ini").is_file()
           assert pathlib.Path("/app/alembic/versions/0001_phase3_schema.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0002_phase4_documents.py").is_file()
           '
+      - name: Check raw streaming upload boundary
+        run: |
+          ! grep -R -E 'UploadFile|python-multipart|request\.body\(' apps/api/app apps/api/requirements*.txt
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then
