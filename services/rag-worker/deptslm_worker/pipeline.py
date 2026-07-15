@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import asdict
 
@@ -64,21 +65,29 @@ def process_job(
         return False
     staging = None
     try:
+        extraction_storage = ExtractionStorage(settings.data_dir)
+        department = DepartmentScope(job.department_id)
+        if job.stale_claim_token is not None:
+            _cleanup_stale_claim(
+                extraction_storage,
+                department,
+                job,
+            )
         if should_stop():
             requeue_owned(factory, job)
             return False
         media_type = _load_media_type(factory, job)
-        department = DepartmentScope(job.department_id)
-        with SourceStorage(settings.data_dir).open_verified(
+        staging = extraction_storage.create_staging(
+            department, job.document_id, job.id, job.claim_token
+        )
+        with SourceStorage(settings.data_dir).create_verified_snapshot(
             department,
             job.document_id,
             job.source_byte_size,
             job.source_sha256,
+            staging,
         ) as source:
             _event(job, "source_integrity", "allowed", "source_verified")
-            staging = ExtractionStorage(settings.data_dir).create_staging(
-                department, job.document_id, job.id, job.claim_token
-            )
             result = run_extractor(
                 source,
                 staging,
@@ -89,6 +98,7 @@ def process_job(
                 heartbeat=lambda: heartbeat(factory, job, settings.extraction_lease_seconds),
                 should_stop=should_stop,
             )
+        staging.remove_file(".source.snapshot")
         _event(job, "parser", "allowed", "parser_completed")
         _event(job, "normalization", "allowed", "normalization_completed")
         if should_stop():
@@ -129,23 +139,23 @@ def process_job(
             "manifest.json",
             (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode(),
         )
+        output_byte_size = staging.prepare_publication()
         publication = Publication(
             result.parser_name,
             result.parser_version,
             normalized_sha256,
             len(normalized_bytes),
-            staging.output_size(),
+            output_byte_size,
             tuple(chunks),
         )
         # Detect host-side mutation that occurs after the parser received its
         # read-only descriptor but before metadata and output are finalized.
-        with SourceStorage(settings.data_dir).open_verified(
+        SourceStorage(settings.data_dir).verify_canonical(
             department,
             job.document_id,
             job.source_byte_size,
             job.source_sha256,
-        ):
-            pass
+        )
         _event(job, "source_integrity", "allowed", "source_reverified")
         if not heartbeat(factory, job, settings.extraction_lease_seconds):
             raise ExtractorError("claim_lost")
@@ -227,6 +237,29 @@ def _cleanup(staging) -> None:
             staging.cleanup()
     except ExtractionStorageError:
         pass
+
+
+def _cleanup_stale_claim(
+    storage: ExtractionStorage,
+    department: DepartmentScope,
+    job: ClaimedJob,
+) -> None:
+    assert job.stale_claim_token is not None
+    last_error = None
+    for attempt in range(3):
+        try:
+            storage.cleanup_claim(
+                department,
+                job.document_id,
+                job.id,
+                job.stale_claim_token,
+            )
+            return
+        except ExtractionStorageError as error:
+            last_error = error
+            if attempt < 2:
+                time.sleep(0.05)
+    raise last_error or ExtractionStorageError()
 
 
 def _event(job: ClaimedJob, action: str, result: str, reason: str) -> None:

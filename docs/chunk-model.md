@@ -4,7 +4,7 @@
 
 `phase5-character-chunker-v1` is deterministic and uses Unicode code-point counts rather than a tokenizer. Defaults are 1,200 maximum characters and 200 overlapping characters. Overlap must be less than and no more than half the maximum.
 
-For each chunk, the algorithm prefers a paragraph boundary near the target, then newline, whitespace, and finally a hard character boundary. It avoids a boundary immediately before a Unicode combining mark where practical. Chunks are nonempty, contain non-whitespace text, never exceed the configured maximum, and use zero-based ordinals plus half-open normalized offsets `[char_start, char_end)`.
+For each chunk, the algorithm prefers a paragraph boundary near the target, then newline, whitespace, and finally a hard character boundary. It avoids a boundary immediately before a Unicode combining mark where practical. Every loop has a reviewed progress floor of the previous start plus one; combining-mark adjustment can never move behind that floor. A combining sequence longer than the overlap or boundary window therefore favors strict progress and the size limit rather than looping. Chunks are nonempty, contain non-whitespace text, never exceed the configured maximum, and use zero-based ordinals plus half-open normalized offsets `[char_start, char_end)`.
 
 Identical normalized input and settings produce identical text, offsets, byte sizes, hashes, ordering, and provenance. `DEPTSLM_MAX_CHUNKS_PER_DOCUMENT` stops pathological output without partial publication.
 

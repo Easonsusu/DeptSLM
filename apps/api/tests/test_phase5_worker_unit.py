@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import subprocess
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,11 +17,15 @@ from deptslm_worker.chunking import ChunkingError, chunk_document
 from deptslm_worker.extractor import ExtractorError, run_extractor
 from deptslm_worker.normalization import (
     NormalizationError,
+    NormalizedDocument,
+    ProvenanceSpan,
     normalize_pdf_pages,
     normalize_text_source,
 )
 from deptslm_worker.settings import WorkerConfigurationError, WorkerSettings
 from deptslm_worker.storage import (
+    FINAL_FILES,
+    SOURCE_SNAPSHOT,
     ExtractionStorage,
     ExtractionStorageError,
     SourceStorage,
@@ -154,37 +159,107 @@ def test_chunk_limit_is_fail_closed() -> None:
     assert captured.value.code == "chunk_limit_exceeded"
 
 
-def test_source_storage_verifies_exact_canonical_source(tmp_path: Path) -> None:
+@pytest.mark.parametrize("overlap", [0, 63])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\u0301" * 3_000,
+        "a" + "\u0301" * 3_000 + "z",
+        "\u0301" * 80 + " paragraph\n\n" + "b\u0301" * 200,
+        "prefix " + "\u0301" * 90 + "\nspace " + "c\u0301" * 100,
+        "tail" + "\u0301" * 3_000,
+    ],
+)
+def test_chunking_combining_marks_terminate_with_strict_progress(text: str, overlap: int) -> None:
+    document = NormalizedDocument(text, "line", (ProvenanceSpan(0, len(text), 1),))
+    started = time.monotonic()
+    first = chunk_document(document, max_chars=64, overlap_chars=overlap, max_chunks=10_000)
+    second = chunk_document(document, max_chars=64, overlap_chars=overlap, max_chunks=10_000)
+    assert time.monotonic() - started < 2
+    assert first == second
+    assert all(
+        left.char_start < right.char_start for left, right in zip(first, first[1:], strict=False)
+    )
+    assert all(
+        0 <= chunk.char_start < chunk.char_end <= len(text)
+        and chunk.char_end - chunk.char_start <= 64
+        and chunk.text == text[chunk.char_start : chunk.char_end]
+        and chunk.byte_size == len(chunk.text.encode("utf-8"))
+        and chunk.content_sha256 == hashlib.sha256(chunk.text.encode("utf-8")).hexdigest()
+        and chunk.line_start == chunk.line_end == 1
+        for chunk in first
+    )
+
+
+def _source_fixture(tmp_path: Path, payload: bytes):
     root = _root(tmp_path)
     department = DepartmentScope(uuid4())
     document_id = uuid4()
     source = root / "uploads" / str(department) / str(document_id) / "source"
     source.parent.mkdir(parents=True)
-    payload = b"private source"
     source.write_bytes(payload)
+    extraction_id, claim_token = uuid4(), uuid4()
+    staging = ExtractionStorage(root).create_staging(
+        department, document_id, extraction_id, claim_token
+    )
+    return root, department, document_id, source, staging
+
+
+def test_source_storage_snapshots_exact_canonical_bytes(tmp_path: Path) -> None:
+    payload = b"private source"
+    root, department, document_id, source, staging = _source_fixture(tmp_path, payload)
     original_mode = source.stat().st_mode
-    with SourceStorage(root).open_verified(
-        department, document_id, len(payload), hashlib.sha256(payload).hexdigest()
+    with SourceStorage(root).create_verified_snapshot(
+        department,
+        document_id,
+        len(payload),
+        hashlib.sha256(payload).hexdigest(),
+        staging,
     ) as handle:
         assert os.read(handle.descriptor, len(payload)) == payload
         with pytest.raises(OSError):
             os.write(handle.descriptor, b"mutation")
-    assert source.read_bytes() == payload and source.stat().st_mode == original_mode
+        source.write_bytes(b"changed source")
+        os.lseek(handle.descriptor, 0, os.SEEK_SET)
+        assert os.read(handle.descriptor, len(payload)) == payload
+    assert stat.S_IMODE(os.stat(SOURCE_SNAPSHOT, dir_fd=staging.claim_fd).st_mode) == 0o600
+    staging.cleanup()
+    assert source.read_bytes() == b"changed source" and source.stat().st_mode == original_mode
 
 
 @pytest.mark.parametrize("mismatch", ["size", "hash"])
 def test_source_integrity_mismatch_is_safe(tmp_path: Path, mismatch: str) -> None:
-    root = _root(tmp_path)
-    department = DepartmentScope(uuid4())
-    document_id = uuid4()
-    source = root / "uploads" / str(department) / str(document_id) / "source"
-    source.parent.mkdir(parents=True)
-    source.write_bytes(b"source")
+    root, department, document_id, _source, staging = _source_fixture(tmp_path, b"source")
     size = 7 if mismatch == "size" else 6
     digest = "0" * 64 if mismatch == "hash" else hashlib.sha256(b"source").hexdigest()
     with pytest.raises(ExtractionStorageError) as captured:
-        SourceStorage(root).open_verified(department, document_id, size, digest)
+        SourceStorage(root).create_verified_snapshot(department, document_id, size, digest, staging)
     assert captured.value.code == "source_integrity_mismatch"
+    staging.cleanup()
+
+
+def test_source_mutation_during_snapshot_copy_fails_closed(tmp_path: Path) -> None:
+    payload = b"a" * (2 * 1024 * 1024)
+    root, department, document_id, source, staging = _source_fixture(tmp_path, payload)
+    mutated = False
+
+    def mutate_after_first_block(_total: int) -> None:
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            source.write_bytes(b"b" * len(payload))
+
+    with pytest.raises(ExtractionStorageError) as captured:
+        SourceStorage(root).create_verified_snapshot(
+            department,
+            document_id,
+            len(payload),
+            hashlib.sha256(payload).hexdigest(),
+            staging,
+            _copy_observer=mutate_after_first_block,
+        )
+    assert captured.value.code == "source_integrity_mismatch"
+    staging.cleanup()
 
 
 def test_source_and_extracted_symlinks_are_rejected(tmp_path: Path) -> None:
@@ -194,7 +269,7 @@ def test_source_and_extracted_symlinks_are_rejected(tmp_path: Path) -> None:
     department = DepartmentScope(uuid4())
     (root / "uploads" / str(department)).symlink_to(real, target_is_directory=True)
     with pytest.raises(ExtractionStorageError):
-        SourceStorage(root).open_verified(department, uuid4(), 1, "0" * 64)
+        SourceStorage(root).verify_canonical(department, uuid4(), 1, "0" * 64)
     (root / "extracted_text").rmdir()
     (root / "extracted_text").symlink_to(real, target_is_directory=True)
     with pytest.raises(ExtractionStorageError):
@@ -214,6 +289,9 @@ def test_extraction_staging_is_private_exclusive_and_non_overwriting(tmp_path: P
         staging.create_file("normalized.txt")
     assert stat.S_IMODE(os.fstat(staging.claim_fd).st_mode) == 0o700
     assert stat.S_IMODE(os.stat("normalized.txt", dir_fd=staging.claim_fd).st_mode) == 0o600
+    assert staging.prepare_publication() == sum(
+        os.stat(name, dir_fd=staging.claim_fd).st_size for name in FINAL_FILES
+    )
     staging.publish()
     final = root / "extracted_text" / str(department) / str(document_id) / str(extraction_id)
     assert sorted(path.name for path in final.iterdir()) == [
@@ -225,10 +303,203 @@ def test_extraction_staging_is_private_exclusive_and_non_overwriting(tmp_path: P
     second = storage.create_staging(department, document_id, extraction_id, uuid4())
     for name in ("normalized.txt", "chunks.jsonl", "manifest.json"):
         second.write_file(name, b"x")
+    second.prepare_publication()
     with pytest.raises(ExtractionStorageError):
         second.publish()
     second.cleanup()
     assert (final / "normalized.txt").read_bytes() == b"text"
+
+
+def _ready_staging(tmp_path: Path):
+    root = _root(tmp_path)
+    department = DepartmentScope(uuid4())
+    document_id, extraction_id, claim = uuid4(), uuid4(), uuid4()
+    staging = ExtractionStorage(root).create_staging(department, document_id, extraction_id, claim)
+    staging.write_file("normalized.txt", b"normalized")
+    staging.write_file("chunks.jsonl", b'{"text":"normalized"}\n')
+    staging.write_file("manifest.json", b"{}\n")
+    return root, department, document_id, extraction_id, claim, staging
+
+
+@pytest.mark.parametrize("intrusion", ["file", "directory", "symlink"])
+def test_publication_rejects_unknown_claim_entries(tmp_path: Path, intrusion: str) -> None:
+    root, _department, _document, _extraction, _claim, staging = _ready_staging(tmp_path)
+    if intrusion == "file":
+        descriptor = os.open(
+            "unknown.tmp", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=staging.claim_fd
+        )
+        os.write(descriptor, b"x" * 10_000)
+        os.close(descriptor)
+    elif intrusion == "directory":
+        os.mkdir("unknown", 0o700, dir_fd=staging.claim_fd)
+    else:
+        target = root / "outside"
+        target.write_text("preserve")
+        os.symlink(target, "unknown-link", dir_fd=staging.claim_fd)
+    with pytest.raises(ExtractionStorageError):
+        staging.prepare_publication()
+    staging.cleanup()
+    assert not (root / "outside").exists() or (root / "outside").read_text() == "preserve"
+
+
+@pytest.mark.parametrize("replacement", ["regular", "hardlink", "directory", "symlink", "fifo"])
+def test_publication_rejects_replaced_or_unsafe_final_file(
+    tmp_path: Path, replacement: str
+) -> None:
+    _root_path, _department, _document, _extraction, _claim, staging = _ready_staging(tmp_path)
+    os.unlink("normalized.txt", dir_fd=staging.claim_fd)
+    if replacement == "regular":
+        descriptor = os.open(
+            "normalized.txt",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=staging.claim_fd,
+        )
+        os.write(descriptor, b"replacement")
+        os.close(descriptor)
+    elif replacement == "hardlink":
+        replacement_path = tmp_path / "replacement"
+        replacement_path.write_bytes(b"replacement")
+        os.link(replacement_path, "normalized.txt", dst_dir_fd=staging.claim_fd)
+    elif replacement == "directory":
+        os.mkdir("normalized.txt", 0o700, dir_fd=staging.claim_fd)
+    elif replacement == "symlink":
+        replacement_path = tmp_path / "replacement"
+        replacement_path.write_bytes(b"replacement")
+        os.symlink(replacement_path, "normalized.txt", dir_fd=staging.claim_fd)
+    else:
+        os.mkfifo("normalized.txt", 0o600, dir_fd=staging.claim_fd)
+    with pytest.raises(ExtractionStorageError):
+        staging.prepare_publication()
+    staging.cleanup()
+
+
+def test_scratch_is_recursively_cleaned_without_following_symlinks(tmp_path: Path) -> None:
+    root, department, document_id, extraction_id, _claim, staging = _ready_staging(tmp_path)
+    descriptor = os.open(
+        "parser.tmp",
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+        dir_fd=staging.scratch_fd,
+    )
+    os.write(descriptor, b"scratch bytes excluded from quota")
+    os.close(descriptor)
+    os.mkdir("nested", 0o700, dir_fd=staging.scratch_fd)
+    outside = root / "outside-scratch"
+    outside.mkdir()
+    (outside / "preserve").write_text("safe")
+    os.symlink(outside, "external-link", dir_fd=staging.scratch_fd)
+    exact_size = sum(os.stat(name, dir_fd=staging.claim_fd).st_size for name in FINAL_FILES)
+    assert staging.prepare_publication() == exact_size
+    staging.publish()
+    final = root / "extracted_text" / str(department) / str(document_id) / str(extraction_id)
+    assert sorted(path.name for path in final.iterdir()) == sorted(FINAL_FILES)
+    assert (outside / "preserve").read_text() == "safe"
+    staging.close()
+
+
+@pytest.mark.parametrize("tamper", ["unknown-file", "grow-final"])
+def test_post_review_tampering_cannot_bypass_exact_output_quota(
+    tmp_path: Path, tamper: str
+) -> None:
+    root, department, document_id, extraction_id, _claim, staging = _ready_staging(tmp_path)
+    reviewed_size = staging.prepare_publication()
+    if tamper == "unknown-file":
+        descriptor = os.open(
+            "quota-bypass.tmp",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=staging.claim_fd,
+        )
+    else:
+        descriptor = os.open("normalized.txt", os.O_WRONLY | os.O_APPEND, dir_fd=staging.claim_fd)
+    os.write(descriptor, b"x" * (reviewed_size + 1))
+    os.close(descriptor)
+    with pytest.raises(ExtractionStorageError):
+        staging.publish()
+    final = root / "extracted_text" / str(department) / str(document_id) / str(extraction_id)
+    assert not final.exists()
+    staging.cleanup()
+
+
+def test_exact_stale_claim_cleanup_is_idempotent_and_scoped(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    storage = ExtractionStorage(root)
+    department = DepartmentScope(uuid4())
+    document_id, extraction_id = uuid4(), uuid4()
+    stale_token, unrelated_token = uuid4(), uuid4()
+    stale = storage.create_staging(department, document_id, extraction_id, stale_token)
+    unrelated = storage.create_staging(department, document_id, extraction_id, unrelated_token)
+    stale.write_file(SOURCE_SNAPSHOT, b"abandoned")
+    unrelated.write_file(SOURCE_SNAPSHOT, b"unrelated")
+    base = (
+        root
+        / "extracted_text"
+        / str(department)
+        / str(document_id)
+        / ".staging"
+        / str(extraction_id)
+    )
+    storage.cleanup_claim(department, document_id, extraction_id, stale_token)
+    storage.cleanup_claim(department, document_id, extraction_id, stale_token)
+    assert not (base / str(stale_token)).exists()
+    assert (base / str(unrelated_token) / SOURCE_SNAPSHOT).read_bytes() == b"unrelated"
+    stale.close()
+    unrelated.cleanup()
+
+
+def test_stale_claim_cleanup_never_removes_existing_final_directory(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    storage = ExtractionStorage(root)
+    department = DepartmentScope(uuid4())
+    document_id, extraction_id, claim_token = uuid4(), uuid4(), uuid4()
+    final = root / "extracted_text" / str(department) / str(document_id) / str(extraction_id)
+    final.mkdir(parents=True)
+    (final / "unknown").write_text("preserve")
+    storage.cleanup_claim(department, document_id, extraction_id, claim_token)
+    assert (final / "unknown").read_text() == "preserve"
+
+
+def test_snapshot_parse_is_immutable_when_canonical_is_mutated_then_restored(
+    tmp_path: Path,
+) -> None:
+    payload = b"approved source"
+    root, department, document_id, source_path, staging = _source_fixture(tmp_path, payload)
+    source_storage = SourceStorage(root)
+    with source_storage.create_verified_snapshot(
+        department,
+        document_id,
+        len(payload),
+        hashlib.sha256(payload).hexdigest(),
+        staging,
+    ) as snapshot:
+        source_path.write_bytes(b"temporary evil")
+        result = run_extractor(
+            snapshot,
+            staging,
+            media_type="text/plain",
+            max_pages=10,
+            max_bytes=10_000,
+            timeout_seconds=10,
+            heartbeat=lambda: True,
+            should_stop=lambda: False,
+        )
+        source_path.write_bytes(payload)
+    assert result.normalized.text == payload.decode()
+    source_storage.verify_canonical(
+        department, document_id, len(payload), hashlib.sha256(payload).hexdigest()
+    )
+    staging.remove_file(SOURCE_SNAPSHOT)
+    staging.write_file("chunks.jsonl", b'{"text":"approved source"}\n')
+    staging.write_file("manifest.json", b"{}\n")
+    staging.prepare_publication()
+    staging.publish()
+    final = (
+        root / "extracted_text" / str(department) / str(document_id) / str(staging.extraction_id)
+    )
+    assert (final / "normalized.txt").read_bytes() == payload
+    assert SOURCE_SNAPSHOT not in {path.name for path in final.iterdir()}
+    staging.close()
 
 
 def _run_subprocess(
@@ -240,6 +511,7 @@ def _run_subprocess(
     max_pages: int = 10,
     timeout_seconds: int = 10,
     should_stop=lambda: False,
+    heartbeat=lambda: True,
 ):
     root = _root(tmp_path)
     department = DepartmentScope(uuid4())
@@ -247,23 +519,30 @@ def _run_subprocess(
     source_path = root / "uploads" / str(department) / str(document_id) / "source"
     source_path.parent.mkdir(parents=True)
     source_path.write_bytes(payload)
-    source = SourceStorage(root).open_verified(
-        department, document_id, len(payload), hashlib.sha256(payload).hexdigest()
-    )
     staging = ExtractionStorage(root).create_staging(department, document_id, uuid4(), uuid4())
     try:
-        return run_extractor(
-            source,
+        with SourceStorage(root).create_verified_snapshot(
+            department,
+            document_id,
+            len(payload),
+            hashlib.sha256(payload).hexdigest(),
             staging,
-            media_type=media_type,
-            max_pages=max_pages,
-            max_bytes=max_bytes,
-            timeout_seconds=timeout_seconds,
-            heartbeat=lambda: True,
-            should_stop=should_stop,
-        ), staging
-    finally:
-        source.close()
+        ) as source:
+            result = run_extractor(
+                source,
+                staging,
+                media_type=media_type,
+                max_pages=max_pages,
+                max_bytes=max_bytes,
+                timeout_seconds=timeout_seconds,
+                heartbeat=heartbeat,
+                should_stop=should_stop,
+            )
+        staging.remove_file(SOURCE_SNAPSHOT)
+        return result, staging
+    except Exception:
+        staging.cleanup()
+        raise
 
 
 @pytest.mark.parametrize("media_type", ["text/plain", "text/markdown"])
@@ -306,6 +585,9 @@ def test_subprocess_uses_fixed_isolated_process_boundary(
     assert "DEPTSLM_AUTH_SECRET" not in captured["env"]
     assert "PYTHONPATH" not in captured["env"]
     assert "notes.txt" not in captured["argv"]
+    assert staging.claim_fd not in captured["pass_fds"]
+    assert staging.scratch_fd in captured["pass_fds"]
+    assert captured["env"]["TMPDIR"] == f"/dev/fd/{staging.scratch_fd}"
     staging.cleanup()
 
 
@@ -331,6 +613,19 @@ def test_subprocess_enforces_output_limit_and_shutdown_cleanup(tmp_path: Path) -
             should_stop=lambda: True,
         )
     assert stopped.value.code == "worker_shutdown"
+    assert not list(tmp_path.rglob(SOURCE_SNAPSHOT))
+
+
+def test_subprocess_claim_loss_removes_snapshot_and_exact_staging(tmp_path: Path) -> None:
+    with pytest.raises(ExtractorError) as captured:
+        _run_subprocess(
+            tmp_path,
+            b"content",
+            "text/plain",
+            heartbeat=lambda: False,
+        )
+    assert captured.value.code == "claim_lost"
+    assert not list(tmp_path.rglob(SOURCE_SNAPSHOT))
 
 
 def test_subprocess_timeout_terminates_process_group(tmp_path: Path) -> None:
@@ -343,6 +638,7 @@ def test_subprocess_timeout_terminates_process_group(tmp_path: Path) -> None:
             timeout_seconds=0,
         )
     assert captured.value.code == "extraction_timeout"
+    assert not list(tmp_path.rglob(SOURCE_SNAPSHOT))
 
 
 def _pdf_bytes(tmp_path: Path, texts: list[str], *, encrypted: bool = False) -> bytes:

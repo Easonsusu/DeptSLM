@@ -2,9 +2,9 @@
 
 DeptSLM is a university departmental small language model (SLM) customization platform. It is intended to let each department build an isolated assistant from its own approved documents, retrieval index, evaluation data, and eventually its own LoRA or QLoRA adapter.
 
-> **Phase 5 status:** PostgreSQL-backed extraction jobs, source-integrity checks, constrained PDF/text/Markdown parsing, deterministic normalization/chunking, provenance, external output storage, and safe retries are under review. OCR, malware scanning, download, Qdrant, embeddings, RAG, model serving, fine-tuning, and production identity/storage remain deferred.
+> **Phase 5 status:** PostgreSQL-backed extraction jobs, immutable verified source snapshots, constrained PDF/text/Markdown parsing, deterministic forward-progress chunking, exact three-file publication, provenance, non-revivable leases, exact stale-claim cleanup, and safe retries are under review. OCR, malware scanning, download, Qdrant, embeddings, RAG, model serving, fine-tuning, and production identity/storage remain deferred.
 
-The API only enqueues and reads extraction metadata; parsing runs in the RAG worker. Extracted and chunk text remains external and has no API. The parser boundary is constrained but is not a kernel-enforced malware sandbox, and crash-time orphan reconciliation remains deferred.
+The API only enqueues and reads extraction metadata; parsing runs in the RAG worker from a claim-owned verified snapshot with separate scratch space. Extracted and chunk text remains external and has no API. The parser boundary is constrained but is not a kernel-enforced malware sandbox. Never-reclaimed staging and crash-time final-orphan reconciliation remain deferred.
 
 ## Planned stack
 

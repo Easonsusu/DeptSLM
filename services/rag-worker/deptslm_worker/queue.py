@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, or_, select, update
@@ -38,6 +38,7 @@ class ClaimedJob:
     claim_token: UUID
     worker_id: UUID
     pipeline_version: str
+    stale_claim_token: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +54,6 @@ class Publication:
 def claim_next(
     factory: sessionmaker[Session], worker_id: UUID, lease_seconds: int
 ) -> ClaimedJob | None:
-    now = datetime.now(UTC)
     try:
         with factory() as session, session.begin():
             row = session.execute(
@@ -63,7 +63,7 @@ def claim_next(
                         DocumentExtraction.status == "queued",
                         (
                             (DocumentExtraction.status == "running")
-                            & (DocumentExtraction.lease_expires_at < now)
+                            & (DocumentExtraction.lease_expires_at <= func.clock_timestamp())
                         ),
                     )
                 )
@@ -73,6 +73,8 @@ def claim_next(
             ).scalar_one_or_none()
             if row is None:
                 return None
+            now = session.execute(select(func.clock_timestamp())).scalar_one()
+            stale_claim_token = row.claim_token if row.status == "running" else None
             token = uuid4()
             row.status = "running"
             row.worker_id = worker_id
@@ -99,13 +101,13 @@ def claim_next(
                 token,
                 worker_id,
                 row.pipeline_version,
+                stale_claim_token,
             )
     except SQLAlchemyError as error:
         raise QueueError("database_unavailable") from error
 
 
 def heartbeat(factory: sessionmaker[Session], job: ClaimedJob, lease_seconds: int) -> bool:
-    now = datetime.now(UTC)
     try:
         with factory() as session, session.begin():
             result = session.execute(
@@ -115,10 +117,11 @@ def heartbeat(factory: sessionmaker[Session], job: ClaimedJob, lease_seconds: in
                     DocumentExtraction.status == "running",
                     DocumentExtraction.worker_id == job.worker_id,
                     DocumentExtraction.claim_token == job.claim_token,
+                    DocumentExtraction.lease_expires_at > func.clock_timestamp(),
                 )
                 .values(
-                    lease_expires_at=now + timedelta(seconds=lease_seconds),
-                    updated_at=now,
+                    lease_expires_at=func.clock_timestamp() + timedelta(seconds=lease_seconds),
+                    updated_at=func.clock_timestamp(),
                     version=DocumentExtraction.version + 1,
                 )
             )
@@ -128,7 +131,6 @@ def heartbeat(factory: sessionmaker[Session], job: ClaimedJob, lease_seconds: in
 
 
 def requeue_owned(factory: sessionmaker[Session], job: ClaimedJob) -> bool:
-    now = datetime.now(UTC)
     try:
         with factory() as session, session.begin():
             result = session.execute(
@@ -138,6 +140,7 @@ def requeue_owned(factory: sessionmaker[Session], job: ClaimedJob) -> bool:
                     DocumentExtraction.status == "running",
                     DocumentExtraction.worker_id == job.worker_id,
                     DocumentExtraction.claim_token == job.claim_token,
+                    DocumentExtraction.lease_expires_at > func.clock_timestamp(),
                 )
                 .values(
                     status="queued",
@@ -150,7 +153,7 @@ def requeue_owned(factory: sessionmaker[Session], job: ClaimedJob) -> bool:
                     parser_name=None,
                     parser_version=None,
                     error_code=None,
-                    updated_at=now,
+                    updated_at=func.clock_timestamp(),
                     version=DocumentExtraction.version + 1,
                 )
             )
@@ -162,7 +165,6 @@ def requeue_owned(factory: sessionmaker[Session], job: ClaimedJob) -> bool:
 def fail_owned(factory: sessionmaker[Session], job: ClaimedJob, code: str) -> bool:
     if code not in SAFE_EXTRACTION_ERROR_CODES:
         code = "parser_failed"
-    now = datetime.now(UTC)
     try:
         with factory() as session, session.begin():
             result = session.execute(
@@ -172,17 +174,18 @@ def fail_owned(factory: sessionmaker[Session], job: ClaimedJob, code: str) -> bo
                     DocumentExtraction.status == "running",
                     DocumentExtraction.worker_id == job.worker_id,
                     DocumentExtraction.claim_token == job.claim_token,
+                    DocumentExtraction.lease_expires_at > func.clock_timestamp(),
                 )
                 .values(
                     status="failed",
                     lease_expires_at=None,
-                    finished_at=now,
+                    finished_at=func.clock_timestamp(),
                     error_code=code,
                     normalized_sha256=None,
                     normalized_byte_size=None,
                     output_byte_size=None,
                     chunk_count=None,
-                    updated_at=now,
+                    updated_at=func.clock_timestamp(),
                     version=DocumentExtraction.version + 1,
                 )
             )
@@ -198,7 +201,6 @@ def finalize_success(
     staging: ExtractionStaging,
     quota_bytes: int,
 ) -> None:
-    now = datetime.now(UTC)
     published = False
     try:
         with factory() as session, session.begin():
@@ -224,6 +226,7 @@ def finalize_success(
                 )
                 .with_for_update()
             ).scalar_one_or_none()
+            now = session.execute(select(func.clock_timestamp())).scalar_one()
             if document is None or document.status != "stored":
                 raise QueueError("document_unavailable")
             if document.sha256 != job.source_sha256:
@@ -266,8 +269,18 @@ def finalize_success(
                     )
                 )
             session.flush()
+            if (
+                extraction.lease_expires_at
+                <= session.execute(select(func.clock_timestamp())).scalar_one()
+            ):
+                raise QueueError("claim_lost")
             staging.publish()
             published = True
+            if (
+                extraction.lease_expires_at
+                <= session.execute(select(func.clock_timestamp())).scalar_one()
+            ):
+                raise QueueError("claim_lost")
             extraction.status = "succeeded"
             extraction.parser_name = publication.parser_name
             extraction.parser_version = publication.parser_version

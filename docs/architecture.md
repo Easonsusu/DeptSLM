@@ -15,7 +15,7 @@ flowchart TB
     subgraph App["DeptSLM application"]
         Web["Next.js web app"]
         API["FastAPI API"]
-        RAG["RAG worker (planned)"]
+        RAG["RAG worker (extraction and chunking)"]
         Train["Training worker (planned)"]
     end
 
@@ -77,7 +77,7 @@ Qdrant is the planned vector store for document chunks embedded by Qwen3-Embeddi
 
 ### RAG worker and future LlamaIndex
 
-The RAG worker now verifies immutable sources and runs PDF/text/Markdown extraction in an installed constrained subprocess, then deterministically normalizes, chunks, and publishes external artifacts. It uses random worker/claim UUIDs, heartbeats, stale-claim checks, and department-serialized output quota. LlamaIndex, embedding, indexing, retrieval, and query assembly remain future work.
+The RAG worker stream-copies each canonical source into a private verified claim snapshot and gives only that read-only descriptor to the installed constrained PDF/text/Markdown parser subprocess. Parser scratch is separate from parent-created outputs. The worker deterministically normalizes and chunks with strict forward progress, then publishes exactly `normalized.txt`, `chunks.jsonl`, and `manifest.json` into a fresh final directory. It uses random worker/claim UUIDs, PostgreSQL-server-time leases that cannot be revived after expiry, exact stale-claim cleanup, and department-serialized output quota. LlamaIndex, embedding, indexing, retrieval, and query assembly remain future work.
 
 Retrieved text is untrusted content. Prompt assembly must delimit it as evidence, prevent instructions in it from overriding higher-priority policy, and include only sources from the authorized department. If retrieval does not yield usable evidence, the assistant must state that it does not have enough information rather than generate a department-specific claim.
 
@@ -100,12 +100,12 @@ The training worker is planned to launch controlled LoRA or QLoRA jobs through L
 1. The API authenticates the user, performs a short admission check, and validates the raw upload headers.
 2. The upload streams to a private staging file beneath that department's external `uploads` path.
 3. A new transaction locks the department, revalidates authority, enforces quota, atomically finalizes the source, and records metadata plus audit evidence.
-4. The Phase 5 RAG worker claims the PostgreSQL job, verifies source size/hash, extracts in a constrained subprocess, and publishes normalized/chunk artifacts with page/line/character provenance.
+4. The Phase 5 RAG worker claims the PostgreSQL job, creates and verifies an immutable source snapshot, extracts through the constrained subprocess and separate scratch space, re-verifies the canonical source, and publishes the exact normalized/chunk/manifest allowlist with page/line/character provenance.
 5. A future phase will use Qwen3-Embedding to create vectors.
 6. LlamaIndex writes points to Qdrant with the required `department_id` payload.
 7. Job state and audit metadata are recorded in PostgreSQL.
 
-Phase 5 adds explicit failed-attempt retry and cancels queued work on soft deletion. Malware controls, OCR, download, physical retention, and hard-crash orphan reconciliation remain deferred.
+Phase 5 adds explicit failed-attempt retry, exact expired-claim staging recovery, and cancellation of queued work on soft deletion. A never-reclaimed crash can retain staging, and a crash between filesystem publication and database commit can retain an unknown final orphan. Malware controls, OCR, download, physical retention, and final-orphan reconciliation remain deferred.
 
 ### Department-scoped question answering
 

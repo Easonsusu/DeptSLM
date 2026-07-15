@@ -79,7 +79,7 @@ def run_extractor(
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             close_fds=True,
-            pass_fds=(source.descriptor, output_fd, result_fd, staging.claim_fd),
+            pass_fds=(source.descriptor, output_fd, result_fd, staging.scratch_fd),
             start_new_session=True,
             env=environment,
             preexec_fn=lambda: _set_resource_limits(timeout_seconds, max_bytes),

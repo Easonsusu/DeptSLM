@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,12 +25,13 @@ from deptslm_worker.queue import (
     fail_owned,
     finalize_success,
     heartbeat,
+    requeue_owned,
 )
 from deptslm_worker.settings import WorkerSettings
-from deptslm_worker.storage import ExtractionStorage
+from deptslm_worker.storage import SOURCE_SNAPSHOT, ExtractionStorage, ExtractionStorageError
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, inspect, select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from alembic import command
@@ -558,6 +560,207 @@ def test_two_workers_claim_distinct_jobs_and_expired_lease_is_reclaimable(
     replacement = claim_next(factory, uuid4(), 300)
     assert replacement is not None and replacement.id == first.id
     assert replacement.claim_token != first.claim_token and not heartbeat(factory, first, 300)
+    assert replacement.stale_claim_token == first.claim_token
+
+
+def test_expired_owner_cannot_mutate_or_finalize_and_replacement_completes(
+    db: Session, engine, tmp_path: Path
+) -> None:
+    identity, department, _ = _seed(db)
+    document = _document(db, identity, department, b"x")
+    _queued(db, identity, department, document)
+    factory = create_session_factory(engine)
+    expired = claim_next(factory, uuid4(), 300)
+    assert expired is not None
+    with Session(engine) as session:
+        row = session.get(DocumentExtraction, expired.id)
+        row.lease_expires_at = datetime.now(UTC) - timedelta(milliseconds=1)
+        session.commit()
+    assert not heartbeat(factory, expired, 300)
+    assert not fail_owned(factory, expired, "parser_failed")
+    assert not requeue_owned(factory, expired)
+    (tmp_path / "uploads").mkdir()
+    (tmp_path / "extracted_text").mkdir()
+    storage = ExtractionStorage(tmp_path)
+    stale_staging, stale_publication = _prepared_publication(
+        storage, department, document, expired, "x"
+    )
+    with pytest.raises(QueueError) as before_reclaim:
+        finalize_success(factory, expired, stale_publication, stale_staging, 10_000)
+    assert before_reclaim.value.code == "claim_lost"
+    replacement = claim_next(factory, uuid4(), 300)
+    assert replacement is not None
+    assert replacement.claim_token != expired.claim_token
+    assert replacement.stale_claim_token == expired.claim_token
+    second_stale, second_publication = _prepared_publication(
+        storage, department, document, expired, "x"
+    )
+    with pytest.raises(QueueError) as after_reclaim:
+        finalize_success(factory, expired, second_publication, second_stale, 10_000)
+    assert after_reclaim.value.code == "claim_lost"
+    current_staging, current_publication = _prepared_publication(
+        storage, department, document, replacement, "x"
+    )
+    finalize_success(factory, replacement, current_publication, current_staging, 10_000)
+    db.expire_all()
+    assert db.get(DocumentExtraction, replacement.id).status == "succeeded"
+
+
+def test_concurrent_expired_heartbeat_and_reclaim_leave_one_owner(db: Session, engine) -> None:
+    identity, department, _ = _seed(db)
+    document = _document(db, identity, department)
+    _queued(db, identity, department, document)
+    factory = create_session_factory(engine)
+    original = claim_next(factory, uuid4(), 300)
+    assert original is not None
+    with Session(engine) as session:
+        row = session.get(DocumentExtraction, original.id)
+        row.lease_expires_at = datetime.now(UTC) + timedelta(milliseconds=50)
+        session.commit()
+    barrier = Barrier(2)
+
+    def late_heartbeat() -> bool:
+        barrier.wait(timeout=5)
+        time.sleep(0.1)
+        return heartbeat(factory, original, 300)
+
+    def reclaim():
+        barrier.wait(timeout=5)
+        time.sleep(0.1)
+        return claim_next(factory, uuid4(), 300)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        heartbeat_future = executor.submit(late_heartbeat)
+        reclaim_future = executor.submit(reclaim)
+        heartbeat_result = heartbeat_future.result(timeout=10)
+        replacement = reclaim_future.result(timeout=10)
+    assert heartbeat_result is False
+    assert replacement is not None and replacement.claim_token != original.claim_token
+    assert heartbeat(factory, replacement, 300)
+    assert not heartbeat(factory, original, 300)
+
+
+def test_database_unavailability_never_reports_lease_ownership(db: Session, engine) -> None:
+    identity, department, _ = _seed(db)
+    document = _document(db, identity, department)
+    _queued(db, identity, department, document)
+    job = claim_next(create_session_factory(engine), uuid4(), 300)
+    assert job is not None
+
+    def unavailable_factory():
+        raise SQLAlchemyError("database unavailable")
+
+    assert not heartbeat(unavailable_factory, job, 300)
+    assert not fail_owned(unavailable_factory, job, "parser_failed")
+    assert not requeue_owned(unavailable_factory, job)
+
+
+def test_reclaim_cleans_only_exact_stale_staging_before_processing(
+    db: Session,
+    engine,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    identity, department, _ = _seed(db)
+    payload = b"reclaimed source"
+    document = _document(db, identity, department, payload)
+    _queued(db, identity, department, document)
+    (tmp_path / "uploads").mkdir()
+    (tmp_path / "extracted_text").mkdir()
+    source = tmp_path / "uploads" / str(department.id) / str(document.id) / "source"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(payload)
+    monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL", _database_url())
+    factory = create_session_factory(engine)
+    expired = claim_next(factory, uuid4(), 300)
+    assert expired is not None
+    storage = ExtractionStorage(tmp_path)
+    stale = storage.create_staging(
+        DepartmentScope(department.id), document.id, expired.id, expired.claim_token
+    )
+    for name in ("normalized.txt", "chunks.jsonl", "manifest.json"):
+        stale.write_file(name, b"abandoned")
+    stale.write_file(SOURCE_SNAPSHOT, b"abandoned source")
+    unrelated_token = uuid4()
+    unrelated = storage.create_staging(
+        DepartmentScope(department.id), document.id, expired.id, unrelated_token
+    )
+    unrelated.write_file(SOURCE_SNAPSHOT, b"unrelated")
+    with Session(engine) as session:
+        row = session.get(DocumentExtraction, expired.id)
+        row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        session.commit()
+    replacement = claim_next(factory, uuid4(), 300)
+    assert replacement is not None and replacement.stale_claim_token == expired.claim_token
+    settings = WorkerSettings.from_environment()
+    assert process_job(factory, settings, replacement, lambda: False)
+    staging_root = (
+        tmp_path
+        / "extracted_text"
+        / str(department.id)
+        / str(document.id)
+        / ".staging"
+        / str(expired.id)
+    )
+    assert not (staging_root / str(expired.claim_token)).exists()
+    assert (staging_root / str(unrelated_token) / SOURCE_SNAPSHOT).read_bytes() == b"unrelated"
+    with pytest.raises(ExtractionStorageError):
+        stale.prepare_publication()
+    final = tmp_path / "extracted_text" / str(department.id) / str(document.id) / str(expired.id)
+    assert sorted(path.name for path in final.iterdir()) == [
+        "chunks.jsonl",
+        "manifest.json",
+        "normalized.txt",
+    ]
+    stale.close()
+    unrelated.cleanup()
+
+
+def test_stale_cleanup_failure_fails_new_claim_without_publication(
+    db: Session,
+    engine,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    identity, department, _ = _seed(db)
+    payload = b"cleanup failure"
+    document = _document(db, identity, department, payload)
+    _queued(db, identity, department, document)
+    (tmp_path / "uploads").mkdir()
+    (tmp_path / "extracted_text").mkdir()
+    source = tmp_path / "uploads" / str(department.id) / str(document.id) / "source"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(payload)
+    monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URL", _database_url())
+    factory = create_session_factory(engine)
+    expired = claim_next(factory, uuid4(), 300)
+    assert expired is not None
+    storage = ExtractionStorage(tmp_path)
+    stale = storage.create_staging(
+        DepartmentScope(department.id), document.id, expired.id, expired.claim_token
+    )
+    stale.write_file(SOURCE_SNAPSHOT, b"abandoned")
+    with Session(engine) as session:
+        row = session.get(DocumentExtraction, expired.id)
+        row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        session.commit()
+    replacement = claim_next(factory, uuid4(), 300)
+    assert replacement is not None
+
+    def fail_cleanup(*_args, **_kwargs):
+        raise ExtractionStorageError()
+
+    monkeypatch.setattr(ExtractionStorage, "cleanup_claim", fail_cleanup)
+    settings = WorkerSettings.from_environment()
+    assert not process_job(factory, settings, replacement, lambda: False)
+    db.expire_all()
+    row = db.get(DocumentExtraction, replacement.id)
+    assert (row.status, row.error_code) == ("failed", "storage_unavailable")
+    final = tmp_path / "extracted_text" / str(department.id) / str(document.id) / str(row.id)
+    assert not final.exists()
+    stale.cleanup()
 
 
 def test_worker_end_to_end_publishes_metadata_and_external_content(
@@ -658,12 +861,13 @@ def _prepared_publication(storage, department, document, job, marker: str):
         line_start=1,
         line_end=1,
     )
+    output_byte_size = staging.prepare_publication()
     return staging, Publication(
         "python-utf8",
         "3.12",
         hashlib.sha256(marker.encode()).hexdigest(),
         1,
-        staging.output_size(),
+        output_byte_size,
         (chunk,),
     )
 

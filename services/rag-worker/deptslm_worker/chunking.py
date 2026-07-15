@@ -54,8 +54,9 @@ def chunk_document(
                 raise ChunkingError("chunk_limit_exceeded")
         if end == len(text):
             break
-        next_start = max(start + 1, end - overlap_chars)
-        start = _avoid_combining_start(text, next_start, end)
+        progress_floor = start + 1
+        next_start = max(progress_floor, end - overlap_chars)
+        start = _avoid_combining_start(text, next_start, end, progress_floor)
     if not chunks:
         raise ChunkingError("no_extractable_text")
     return chunks
@@ -88,8 +89,8 @@ def _avoid_combining_end(text: str, end: int, hard_end: int) -> int:
     return end
 
 
-def _avoid_combining_start(text: str, start: int, ceiling: int) -> int:
-    while start > 0 and start < ceiling and unicodedata.combining(text[start]):
+def _avoid_combining_start(text: str, start: int, ceiling: int, floor: int) -> int:
+    while start > floor and start < ceiling and unicodedata.combining(text[start]):
         start -= 1
     return start
 
