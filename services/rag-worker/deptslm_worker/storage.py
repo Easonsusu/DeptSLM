@@ -197,6 +197,7 @@ class ExtractionStaging:
     claim_fd: int
     scratch_fd: int
     file_identities: dict[str, FileIdentity] = field(default_factory=dict)
+    file_guards: dict[str, int] = field(default_factory=dict)
     prepared_files: dict[str, FileReview] = field(default_factory=dict)
     prepared_output_size: int | None = None
     published: bool = False
@@ -214,16 +215,32 @@ class ExtractionStaging:
         if name not in STAGING_FILES or self.published or self.prepared_output_size is not None:
             raise ExtractionStorageError()
         descriptor = -1
+        guard_fd = -1
         try:
             descriptor = os.open(name, CREATE_FLAGS, 0o600, dir_fd=self.claim_fd)
             metadata = os.fstat(descriptor)
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                os.close(descriptor)
                 raise ExtractionStorageError()
             os.fchmod(descriptor, 0o600)
+            guard_fd = os.open(name, READ_FLAGS, dir_fd=self.claim_fd)
+            guard_metadata = os.fstat(guard_fd)
+            if (guard_metadata.st_dev, guard_metadata.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise ExtractionStorageError()
             self.file_identities[name] = FileIdentity(metadata.st_dev, metadata.st_ino)
+            self.file_guards[name] = guard_fd
             return descriptor
+        except ExtractionStorageError:
+            if guard_fd >= 0:
+                os.close(guard_fd)
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
         except OSError as error:
+            if guard_fd >= 0:
+                os.close(guard_fd)
             if descriptor >= 0:
                 os.close(descriptor)
             raise ExtractionStorageError() from error
@@ -282,8 +299,10 @@ class ExtractionStaging:
         try:
             os.unlink(name, dir_fd=self.claim_fd)
             self.file_identities.pop(name, None)
+            self._close_guard(name)
         except FileNotFoundError:
             self.file_identities.pop(name, None)
+            self._close_guard(name)
         except OSError as error:
             raise ExtractionStorageError() from error
 
@@ -411,6 +430,7 @@ class ExtractionStaging:
             return
         self.closed = True
         self._close_scratch()
+        self._close_guards()
         for descriptor in (
             self.claim_fd,
             self.extraction_staging_fd,
@@ -447,11 +467,17 @@ class ExtractionStaging:
 
     def _verify_file_metadata(self, name: str, metadata: os.stat_result) -> None:
         expected = self.file_identities.get(name)
+        guard_fd = self.file_guards.get(name)
+        guard_metadata = os.fstat(guard_fd) if guard_fd is not None else None
         if (
             expected is None
+            or guard_metadata is None
             or not stat.S_ISREG(metadata.st_mode)
+            or not stat.S_ISREG(guard_metadata.st_mode)
             or metadata.st_nlink != 1
+            or guard_metadata.st_nlink != 1
             or (metadata.st_dev, metadata.st_ino) != (expected.device, expected.inode)
+            or (guard_metadata.st_dev, guard_metadata.st_ino) != (expected.device, expected.inode)
         ):
             raise ExtractionStorageError()
 
@@ -488,6 +514,18 @@ class ExtractionStaging:
             except OSError:
                 pass
             self.scratch_fd = -1
+
+    def _close_guard(self, name: str) -> None:
+        descriptor = self.file_guards.pop(name, None)
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def _close_guards(self) -> None:
+        for name in tuple(self.file_guards):
+            self._close_guard(name)
 
     def _remove_created_final_if_exact(self, final_fd: int) -> None:
         try:
