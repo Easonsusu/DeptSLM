@@ -52,7 +52,7 @@ The setup script may create missing directories, but it must never delete or ove
 | Artifact | External subdirectory | Notes |
 | --- | --- | --- |
 | Uploaded source files | `uploads/` | Phase 4 paths are isolated by `department_id` and document UUID. |
-| Extracted or normalized text | `extracted_text/` | Treat as sensitive and untrusted. |
+| Extracted or normalized text | `extracted_text/` | Phase 5 uses department/document/extraction UUIDs; text and chunk JSONL are sensitive and untrusted. |
 | Vector database snapshots | `vector_snapshots/` | Live Qdrant persistence is a separate deployment concern; it must also remain outside the repo. |
 | Generated training datasets | `training_datasets/` | Store provenance and department ownership. |
 | LoRA and QLoRA adapters | `adapters/` | Never mix or fall back across departments. |
@@ -63,6 +63,8 @@ The setup script may create missing directories, but it must never delete or ove
 | Local service state | `service_state/` | Compose-only PostgreSQL and Qdrant persistence; not a backup or portable snapshot. |
 
 Phase 4 uses `<root>/uploads/<department_id>/.staging/<upload_id>.part` while streaming and `<root>/uploads/<department_id>/<document_id>/source` after finalization. Filenames are metadata only and never become path components. The `uploads` root must preexist as a real writable directory. Storage uses descriptor-relative no-follow operations, exclusive files, `0700` directories, `0600` sources, and same-filesystem atomic rename. Normal handled failures compensate, while crash-orphan discovery and physical retention remain deferred.
+
+Phase 5 stages beneath `<root>/extracted_text/<department_id>/<document_id>/.staging/<extraction_id>/<claim_token>/` and atomically publishes to `<root>/extracted_text/<department_id>/<document_id>/<extraction_id>/`. Each final directory contains `normalized.txt`, `chunks.jsonl`, and `manifest.json`. The root must preexist as a real writable non-symlink directory. Publication uses descriptor-relative no-follow operations, exclusive `0600` files, `0700` directories, and never overwrites a final result. The worker mounts uploads read-only and extracted text read-write.
 
 ## Never commit
 
@@ -97,6 +99,8 @@ Any future component that reads or writes artifacts must:
 6. Use least-privilege file permissions appropriate to the platform.
 7. Avoid writing source contents, secrets, or sensitive identifiers to logs.
 8. Define cleanup, retention, and deletion behavior before handling real data.
+
+The Phase 5 parser receives reviewed file descriptors and a descriptor-based temporary-directory alias, not an external host path, database/auth secret, filename, or user environment. PostgreSQL stores extraction/chunk metadata only; metadata APIs expose no content or paths.
 
 Do not hard-code a developer's absolute Google Drive path in source code, Docker files, tests, or committed environment templates. `.env.example` should contain a placeholder; each developer keeps the real value in an untracked `.env`.
 

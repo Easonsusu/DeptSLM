@@ -57,3 +57,7 @@ The external `uploads` root must already exist as a writable real directory, not
 ## Current limitations
 
 Validation is intentionally shallow: PDF validation checks only the signature, and text/Markdown validation checks encoding and NUL. Phase 4 has no malware scanner, archive/Office support, parser, content-disposition compatibility fallback, resumable upload, download endpoint, rate limit, antivirus quarantine, orphan reconciler, or production storage design. A process or host crash after rename but before database commit can leave an orphaned source; handled errors are compensated, but crash recovery remains deferred. Google Drive synchronization is a local-development convenience, not a production object-store guarantee.
+
+## Phase 5 handoff
+
+Upload remains an independent streaming boundary. It never parses or chunks the body and does not enqueue automatically. An authorized user explicitly enqueues a PostgreSQL extraction after upload; the RAG worker reopens the canonical source read-only and revalidates its exact byte size and SHA-256 before parsing. Soft deletion cancels queued extraction attempts and prevents running attempts from finalizing, while source and successful extraction files remain physically retained.

@@ -15,7 +15,7 @@ case "$DEPTSLM_DATA_DIR" in
 esac
 
 if [ ! -d "$DEPTSLM_DATA_DIR" ]; then
-  echo "rag-worker error: DEPTSLM_DATA_DIR does not exist or is not a directory: $DEPTSLM_DATA_DIR" >&2
+  echo "rag-worker error: DEPTSLM_DATA_DIR does not exist or is not a directory." >&2
   exit 1
 fi
 
@@ -60,17 +60,12 @@ case "$source_root" in
 esac
 
 if [ ! -w "$resolved_data_dir" ] || [ ! -x "$resolved_data_dir" ]; then
-  echo "rag-worker error: DEPTSLM_DATA_DIR is not writable and searchable: $resolved_data_dir" >&2
+  echo "rag-worker error: DEPTSLM_DATA_DIR is not writable and searchable." >&2
   exit 1
 fi
 
-if command -v python3 >/dev/null 2>&1; then
-  python_bin=python3
-elif command -v python >/dev/null 2>&1; then
-  python_bin=python
-else
-  echo "rag-worker error: Python is required to start the worker placeholder." >&2
-  exit 1
+if [ "$#" -eq 0 ]; then
+  set -- python -m deptslm_worker --poll
 fi
 
-exec "$python_bin" "$script_dir/worker.py"
+exec "$@"

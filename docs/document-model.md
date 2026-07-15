@@ -1,4 +1,4 @@
-# Phase 4 Document Model
+# Document Model Through Phase 5
 
 Phase 4 adds PostgreSQL document metadata through Alembic revision `0002_phase4_documents`. Source bytes remain external and are never stored in PostgreSQL or Git.
 
@@ -22,4 +22,6 @@ PostgreSQL and the filesystem cannot share an atomic transaction. Normal handled
 
 ## Deferred behavior
 
-Phase 4 does not parse, render, scan, extract, OCR, chunk, embed, index, download, preview, publish, or restore documents. It does not implement ingestion jobs, Qdrant, RAG, citations, malware scanning, rate limiting, or production object storage.
+Phase 5 adds extraction attempt and chunk metadata without changing document source ownership or exposing content. Stored documents may enqueue extraction; soft deletion cancels queued attempts, blocks running-worker finalization, hides extraction/chunk APIs, and retains successful output for quota and future retention review.
+
+Phase 5 extracts, normalizes, and chunks through the worker but does not render, scan, OCR, embed, index, download, preview, restore, or physically purge documents. See [document-extraction.md](document-extraction.md) and [chunk-model.md](chunk-model.md).

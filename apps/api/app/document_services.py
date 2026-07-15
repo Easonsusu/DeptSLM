@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -18,7 +19,7 @@ from app.document_repositories import (
 )
 from app.document_storage import DocumentStorageError, StagedDocument
 from app.document_upload import StreamResult, UploadMetadata
-from app.models import Document
+from app.models import Document, DocumentExtraction
 from app.services import (
     ALL_ROLES,
     ServiceError,
@@ -273,6 +274,22 @@ def delete_document(
         document.deleted_at = datetime.now(UTC)
         document.deleted_by_user_id = authorization.identity.id
         document.version += 1
+        now = datetime.now(UTC)
+        session.execute(
+            update(DocumentExtraction)
+            .where(
+                DocumentExtraction.department_id == request_scope.department.value,
+                DocumentExtraction.document_id == document_id,
+                DocumentExtraction.status == "queued",
+            )
+            .values(
+                status="cancelled",
+                finished_at=now,
+                error_code="document_unavailable",
+                version=DocumentExtraction.version + 1,
+                updated_at=now,
+            )
+        )
         append_mutation_audit(
             session,
             actor=authorization.identity,

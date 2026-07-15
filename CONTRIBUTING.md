@@ -9,7 +9,7 @@ DeptSLM is developed in small, reviewable phases. Contributors must preserve the
 3. Create a focused branch from current `main`.
 4. Keep planned capabilities separate from implemented behavior.
 
-Do not add RAG, extraction, parsing, indexing, model, or training behavior to the Phase 4 upload scope.
+Phase 5 extraction changes must remain in the PostgreSQL queue and RAG-worker boundary. Do not add Qdrant, embeddings, LlamaIndex, model, OCR, malware-scanning, download, frontend, or training behavior.
 
 ## Development setup
 
@@ -41,11 +41,12 @@ For the Compose-managed database, use the image-contained migration path:
 
 The `postgres` hostname works inside Compose only. Host-shell migration tests require a `DATABASE_URL` using `localhost`. Security-sensitive mutation tests must prove transaction-time authorization, effective-administrator protection, and concurrent admin changes against PostgreSQL 16.
 
-Run the smallest relevant checks. The complete Phase 1 validation set is:
+Run the smallest relevant checks. The current complete validation set is:
 
 ```bash
 python -m ruff check apps/api/app apps/api/tests
-python -m ruff format --check apps/api/app apps/api/tests
+python -m ruff check services/rag-worker/deptslm_worker
+python -m ruff format --check apps/api/app apps/api/tests services/rag-worker/deptslm_worker
 python -m pytest apps/api
 pnpm --filter @deptslm/web typecheck
 pnpm --filter @deptslm/web build
@@ -69,6 +70,8 @@ Never commit or force-add:
 All future department-owned artifacts must use safe paths beneath `DEPTSLM_DATA_DIR` and include a validated `department_id` segment.
 
 Document upload changes must keep raw bodies incremental, avoid multipart and process-temporary storage, revalidate authorization after streaming, and test cleanup for denial, cancellation, storage, and database failures. Tests must create a fresh temporary `uploads` directory; they must never use a developer's Google Drive folder.
+
+Extraction changes must keep parsing out of API handlers, use the installed secret-free parser subprocess, reverify source bytes, preserve claim/lease ownership, and publish only beneath a fresh temporary `extracted_text` root in tests. Metadata APIs must never expose extracted or chunk text, hashes, paths, claim tokens, or worker identity.
 
 ## Department and authentication safety
 

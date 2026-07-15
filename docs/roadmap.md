@@ -23,15 +23,16 @@ This roadmap separates foundational safety work from product implementation. A l
 
 - Add PostgreSQL department lifecycle, membership management, scoped authorization, migrations, and transactional audit events.
 
-## Phase 4 — Document metadata and upload flow (current; not completed)
+## Phase 4 — Document metadata and upload flow (completed)
 
 - Add department-scoped document metadata and a validated, incrementally streamed upload workflow using external storage.
 - Require transaction-time authorization revalidation, serialized quota enforcement, safe audit evidence, and compensating cleanup.
 - Keep extraction, OCR, chunking, indexing, download, malware scanning, and production storage deferred.
 
-## Phase 5 — Document extraction and chunking
+## Phase 5 — Document extraction and chunking (current; not completed)
 
-- Add sandboxed extraction, normalization, chunking, provenance, and failure handling.
+- Add a PostgreSQL queue, constrained parser subprocess, source verification, deterministic normalization/chunking, provenance, leases, quota enforcement, and safe failure handling.
+- Phase 5 remains current until this pull request is reviewed and merged.
 
 ## Phase 6 — Qdrant indexing and retrieval
 

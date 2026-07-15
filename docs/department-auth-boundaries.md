@@ -2,7 +2,7 @@
 
 ## Status
 
-Phase 2 implemented reusable authentication and fail-closed authorization foundations. Phase 3 added PostgreSQL identities, departments, memberships, scoped administration, and transactional audit events. Phase 4 applies those boundaries to document metadata and raw source upload. Production identity integration and later product data APIs remain deferred.
+Phase 2 implemented reusable authentication and fail-closed authorization foundations. Phase 3 added PostgreSQL identities, departments, memberships, scoped administration, and transactional audit events. Phase 4 applies those boundaries to document upload, and Phase 5 applies them to extraction jobs and chunk metadata. Production identity integration and later product data APIs remain deferred.
 
 ## Security objective
 
@@ -75,6 +75,8 @@ PostgreSQL constraints and indexes should include department ownership. Qdrant o
 - Deleted metadata is hidden, retained source bytes still count against quota, and cross-department identifiers return no resource data.
 - Publication states and narrower student/viewer content visibility are deferred until content delivery exists.
 - Source metadata and citations must not reveal another department's names, paths, titles, or identifiers.
+- Phase 5 extraction enqueue/retry requires same-department `system_admin`, `department_admin`, or `instructor`; all five roles may read safe status/provenance metadata. Every query uses department, document, and extraction scope; APIs expose no extracted/chunk text, internal hashes, paths, claims, or worker identity.
+- Workers carry explicit department/document IDs, revalidate active document ownership at finalization, and cannot publish after lease/claim loss. Composite database constraints prevent cross-department extraction or chunk assignment.
 
 ### Training datasets
 
@@ -121,6 +123,10 @@ Server-side membership resolution requires exact issuer, opaque subject, and pat
 ## Phase 4 document boundary
 
 Document repositories require `DepartmentScope` and always filter `department_id`. Upload admission uses a short session; streaming holds no database transaction. Finalization starts a new transaction, locks the department first, repeats exact identity/membership/role validation, and serializes retained-byte quota decisions. Fixed-field process events distinguish admission, finalization, validation, storage, database, read, and delete decisions without recording filenames, headers, bodies, hashes, or paths. Successful upload/delete mutations append `document.upload` or `document.delete` persistent audit rows in the same transaction as metadata.
+
+## Phase 5 extraction boundary
+
+Extraction and chunk repositories require `DepartmentScope` plus document/extraction selectors. Enqueue/retry repeats transaction-time membership checks and appends success audit rows with the queued attempt. Workers use database-owned department/document IDs, verify source integrity, and finalization locks department, document, then extraction before checking document state, source identity, pipeline, lease, and claim. Composite foreign keys reject cross-department metadata even if application filtering fails. Public schemas exclude content, paths, hashes, requestor/worker identity, and claims.
 
 ## Acceptance criteria for Phase 2
 
