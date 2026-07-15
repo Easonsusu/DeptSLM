@@ -24,9 +24,7 @@ from deptslm_worker.storage import ExtractionStaging, ExtractionStorageError
 
 class QueueError(RuntimeError):
     def __init__(self, code: str) -> None:
-        self.code = (
-            code if code in SAFE_EXTRACTION_ERROR_CODES else "database_unavailable"
-        )
+        self.code = code if code in SAFE_EXTRACTION_ERROR_CODES else "database_unavailable"
         super().__init__(self.code)
 
 
@@ -106,9 +104,7 @@ def claim_next(
         raise QueueError("database_unavailable") from error
 
 
-def heartbeat(
-    factory: sessionmaker[Session], job: ClaimedJob, lease_seconds: int
-) -> bool:
+def heartbeat(factory: sessionmaker[Session], job: ClaimedJob, lease_seconds: int) -> bool:
     now = datetime.now(UTC)
     try:
         with factory() as session, session.begin():
@@ -207,9 +203,7 @@ def finalize_success(
     try:
         with factory() as session, session.begin():
             department = session.execute(
-                select(Department)
-                .where(Department.id == job.department_id)
-                .with_for_update()
+                select(Department).where(Department.id == job.department_id).with_for_update()
             ).scalar_one_or_none()
             if department is None or department.status != "active":
                 raise QueueError("document_unavailable")
@@ -246,9 +240,7 @@ def finalize_success(
             ):
                 raise QueueError("claim_lost")
             retained = session.execute(
-                select(
-                    func.coalesce(func.sum(DocumentExtraction.output_byte_size), 0)
-                ).where(
+                select(func.coalesce(func.sum(DocumentExtraction.output_byte_size), 0)).where(
                     DocumentExtraction.department_id == job.department_id,
                     DocumentExtraction.status == "succeeded",
                 )

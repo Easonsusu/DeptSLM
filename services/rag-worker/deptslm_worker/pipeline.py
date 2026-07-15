@@ -86,9 +86,7 @@ def process_job(
                 max_pages=settings.max_pdf_pages,
                 max_bytes=settings.max_extracted_bytes,
                 timeout_seconds=settings.extraction_timeout_seconds,
-                heartbeat=lambda: heartbeat(
-                    factory, job, settings.extraction_lease_seconds
-                ),
+                heartbeat=lambda: heartbeat(factory, job, settings.extraction_lease_seconds),
                 should_stop=should_stop,
             )
         _event(job, "parser", "allowed", "parser_completed")
@@ -129,9 +127,7 @@ def process_job(
         }
         staging.write_file(
             "manifest.json",
-            (
-                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
-            ).encode(),
+            (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode(),
         )
         publication = Publication(
             result.parser_name,
@@ -200,10 +196,7 @@ def _load_media_type(factory: sessionmaker[Session], job: ClaimedJob) -> str:
             ).scalar_one_or_none()
             if document is None:
                 raise QueueError("document_unavailable")
-            if (
-                document.sha256 != job.source_sha256
-                or document.byte_size != job.source_byte_size
-            ):
+            if document.sha256 != job.source_sha256 or document.byte_size != job.source_byte_size:
                 raise QueueError("source_integrity_mismatch")
             if document.media_type not in {
                 "application/pdf",

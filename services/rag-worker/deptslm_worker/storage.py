@@ -12,9 +12,7 @@ from uuid import UUID
 
 from app.authorization import DepartmentScope
 
-DIRECTORY_FLAGS = (
-    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-)
+DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 CREATE_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
 FINAL_FILES = ("normalized.txt", "chunks.jsonl", "manifest.json")
@@ -130,9 +128,7 @@ class ExtractionStaging:
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                 raise ExtractionStorageError()
             data = bytearray()
-            while chunk := os.read(
-                descriptor, min(1024 * 1024, maximum + 1 - len(data))
-            ):
+            while chunk := os.read(descriptor, min(1024 * 1024, maximum + 1 - len(data))):
                 data.extend(chunk)
                 if len(data) > maximum:
                     raise ExtractionStorageError("extraction_output_limit")
@@ -296,9 +292,7 @@ class ExtractionStorage:
             descriptors.append(_open_or_create_child(descriptors[-1], str(department)))
             descriptors.append(_open_or_create_child(descriptors[-1], str(document_id)))
             descriptors.append(_open_or_create_child(descriptors[-1], ".staging"))
-            descriptors.append(
-                _open_or_create_child(descriptors[-1], str(extraction_id))
-            )
+            descriptors.append(_open_or_create_child(descriptors[-1], str(extraction_id)))
             os.mkdir(str(claim_token), 0o700, dir_fd=descriptors[-1])
             claim_fd = _open_child_directory(descriptors[-1], str(claim_token))
             os.fchmod(claim_fd, 0o700)

@@ -120,12 +120,8 @@ def _build_chunk(
     return Chunk(**common, line_start=first, line_end=last)
 
 
-def _provenance_numbers(
-    spans: tuple[ProvenanceSpan, ...], start: int, end: int
-) -> list[int]:
-    return [
-        span.number for span in spans if span.char_start < end and span.char_end > start
-    ]
+def _provenance_numbers(spans: tuple[ProvenanceSpan, ...], start: int, end: int) -> list[int]:
+    return [span.number for span in spans if span.char_start < end and span.char_end > start]
 
 
 def _nearest_provenance(spans: tuple[ProvenanceSpan, ...], offset: int) -> list[int]:

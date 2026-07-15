@@ -77,9 +77,7 @@ def _extract(args: argparse.Namespace) -> dict:
     if not encoded or len(encoded) > args.max_bytes:
         return {
             "ok": False,
-            "error_code": "extraction_output_limit"
-            if encoded
-            else "no_extractable_text",
+            "error_code": "extraction_output_limit" if encoded else "no_extractable_text",
         }
     _write_all(args.output_fd, encoded)
     os.fsync(args.output_fd)
@@ -88,9 +86,7 @@ def _extract(args: argparse.Namespace) -> dict:
         "parser_name": parser_name,
         "parser_version": parser_version,
         "provenance_kind": normalized.provenance_kind,
-        "spans": [
-            [span.char_start, span.char_end, span.number] for span in normalized.spans
-        ],
+        "spans": [[span.char_start, span.char_end, span.number] for span in normalized.spans],
     }
 
 
