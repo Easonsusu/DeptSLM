@@ -1,21 +1,21 @@
 # Deployment and Local Development
 
-## Phase 4 status
+## Phase 5 status
 
-DeptSLM is not production ready. Phase 4 adds document metadata and local external upload storage to the Phase 3 foundation, while extraction, malware scanning, workers, RAG, model serving, training, production identity/storage, secrets management, backups, and production operations remain deferred.
+DeptSLM is not production ready. Phase 5 adds a PostgreSQL extraction queue and constrained PDF/text/Markdown RAG worker to the Phase 4 upload foundation. Malware scanning, OCR, Qdrant, embeddings, RAG, model serving, training, production identity/storage, secrets management, backups, and production operations remain deferred.
 
 ## Planned local services
 
-| Service | Role | Phase 0 expectation |
+| Service | Role | Current expectation |
 | --- | --- | --- |
 | `web` | Next.js user interface | Basic landing page only. |
-| `api` | FastAPI control plane | System, auth, department, membership, and document metadata/upload APIs. |
-| `postgres` | Application metadata database | Identities, departments, memberships, documents, and audit events. |
+| `api` | FastAPI control plane | System, auth, department, membership, upload, and extraction-metadata APIs. |
+| `postgres` | Application metadata database and Phase 5 queue | Identities, departments, memberships, documents, extraction/chunk metadata, leases, and audit events. |
 | `qdrant` | Vector search | Local service placeholder; no ingestion is implemented. |
-| `rag-worker` | Future ingestion and retrieval jobs | Structural placeholder; no RAG workflow is implemented. |
+| `rag-worker` | Extraction and future retrieval jobs | Phase 5 PostgreSQL queue, source verification, constrained parsing, normalization, and chunking; no retrieval. |
 | `training-worker` | Future LLaMA-Factory jobs | Structural placeholder; no fine-tuning is implemented. |
 
-Qwen3, Qwen3-Embedding, LlamaIndex, and LLaMA-Factory are target components, but Phase 0 should not download models or add heavy training/inference dependencies merely to make the skeleton appear complete.
+Qwen3, Qwen3-Embedding, LlamaIndex, and LLaMA-Factory are target components, but Phase 5 does not download models or add heavy training/inference dependencies. pypdf is isolated to worker/test dependencies.
 
 ## Prerequisites
 
@@ -111,6 +111,15 @@ Inspect status and logs with:
 ./scripts/compose.sh logs api web
 ```
 
+Run one extraction attempt or the long-lived poller with:
+
+```bash
+./scripts/compose.sh run --rm rag-worker python -m deptslm_worker --once
+./scripts/compose.sh run --rm rag-worker python -m deptslm_worker --poll
+```
+
+The worker depends only on PostgreSQL health, publishes no port, receives no auth secret, mounts uploads read-only and extracted text read-write, and runs no migrations. See [rag-worker.md](rag-worker.md) for settings, leases, and sandbox limitations.
+
 Stop local services with:
 
 ```bash
@@ -133,7 +142,7 @@ CI must not depend on a developer's Google Drive or reuse real data. It should c
 
 GitHub Actions provides PostgreSQL 16 and sets an isolated `DATABASE_TEST_URL`. Locally, run `python -m pytest -m "not postgres"` without PostgreSQL, or point `DATABASE_TEST_URL` to an isolated test database and run migrations followed by `python -m pytest`. PostgreSQL tests never fall back to SQLite and CI fails if they are skipped.
 
-CI also builds the API image and performs a non-secret inspection proving that document upload/storage modules, `alembic.ini`, and revisions `0001_phase3` and `0002_phase4_documents` are present. PostgreSQL 16 runs all migration and concurrency tests with a temporary external `uploads` directory. CI does not use Google Drive or start application services for the image check.
+CI builds both API and worker images. It verifies migration `0003_phase5_extraction`, confirms pypdf is present only in worker/test dependencies, imports the installed runner, and runs a one-shot empty-queue smoke test. PostgreSQL 16 runs migration, API, lease, worker, and concurrency tests with temporary `uploads` and `extracted_text` directories. CI never uses Google Drive.
 
 At minimum, future deployment checks should cover:
 
@@ -170,5 +179,5 @@ No Phase 0 file should be interpreted as a production security or availability g
 - **The storage script cannot find Google Drive:** confirm Google Drive for desktop is installed, signed in, and mounted under `~/Library/CloudStorage`. Do not create a runtime folder in the repo as a workaround.
 - **`DEPTSLM_DATA_DIR` contains spaces:** keep the full absolute value in `.env`; scripts and Compose mounts must quote it correctly.
 - **Compose rejects the storage path:** set `DEPTSLM_DATA_DIR` to the external absolute path printed by the setup script, then rerun `./scripts/compose.sh config`. Never bypass the wrapper with a repository-local path.
-- **A worker starts but does no work:** expected for a Phase 0 placeholder; RAG and training are intentionally deferred.
+- **The RAG worker exits without work:** `--once` intentionally succeeds on an empty queue. Use `--poll` for continuous extraction. Qdrant/retrieval remains deferred.
 - **A model is unavailable:** expected in Phase 0; do not add model weights to Git.

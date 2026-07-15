@@ -1,4 +1,4 @@
-"""Department-scoped control-plane and Phase 4 document routes."""
+"""Department-scoped control-plane routes through Phase 5."""
 
 from __future__ import annotations
 
@@ -26,13 +26,24 @@ from app.document_services import (
 )
 from app.document_storage import DocumentStorageError
 from app.document_upload import UploadError, parse_upload_metadata, stream_upload
+from app.extraction_services import (
+    enqueue_extraction,
+    list_chunks,
+    list_extractions,
+    read_extraction,
+    retry_extraction,
+)
 from app.schemas import (
+    ChunkListResponse,
+    ChunkResponse,
     DepartmentArchive,
     DepartmentListResponse,
     DepartmentResponse,
     DepartmentUpdate,
     DocumentListResponse,
     DocumentResponse,
+    ExtractionListResponse,
+    ExtractionResponse,
     MembershipCreate,
     MembershipListResponse,
     MembershipResponse,
@@ -375,6 +386,124 @@ def remove_document(
     try:
         return DocumentResponse.model_validate(
             delete_document(session, principal, request_scope, document_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/documents/{document_id}/extractions",
+    response_model=ExtractionResponse,
+    status_code=202,
+    tags=["document-extractions"],
+)
+def post_extraction(
+    document_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> ExtractionResponse:
+    try:
+        return ExtractionResponse.model_validate(
+            enqueue_extraction(session, principal, request_scope, document_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/documents/{document_id}/extractions",
+    response_model=ExtractionListResponse,
+    tags=["document-extractions"],
+)
+def get_extractions(
+    document_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> ExtractionListResponse:
+    try:
+        rows = list_extractions(session, principal, request_scope, document_id, limit, offset)
+        return ExtractionListResponse(
+            items=[ExtractionResponse.model_validate(row) for row in rows],
+            limit=limit,
+            offset=offset,
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/documents/{document_id}/extractions/{extraction_id}",
+    response_model=ExtractionResponse,
+    tags=["document-extractions"],
+)
+def get_extraction(
+    document_id: UUID,
+    extraction_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> ExtractionResponse:
+    try:
+        return ExtractionResponse.model_validate(
+            read_extraction(session, principal, request_scope, document_id, extraction_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/documents/{document_id}/extractions/{extraction_id}/chunks",
+    response_model=ChunkListResponse,
+    tags=["document-extractions"],
+)
+def get_extraction_chunks(
+    document_id: UUID,
+    extraction_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> ChunkListResponse:
+    try:
+        rows = list_chunks(
+            session,
+            principal,
+            request_scope,
+            document_id,
+            extraction_id,
+            limit,
+            offset,
+        )
+        return ChunkListResponse(
+            items=[ChunkResponse.model_validate(row) for row in rows],
+            limit=limit,
+            offset=offset,
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/documents/{document_id}/extractions/{extraction_id}/retry",
+    response_model=ExtractionResponse,
+    status_code=202,
+    tags=["document-extractions"],
+)
+def post_extraction_retry(
+    document_id: UUID,
+    extraction_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> ExtractionResponse:
+    try:
+        return ExtractionResponse.model_validate(
+            retry_extraction(session, principal, request_scope, document_id, extraction_id)
         )
     except ServiceError as error:
         _raise(error)

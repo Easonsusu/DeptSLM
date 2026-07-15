@@ -2,7 +2,7 @@
 
 ## Status and boundaries
 
-Phase 4 adds department-scoped document metadata and secure external source upload to the Phase 3 control plane. Extraction, ingestion jobs, retrieval, model-serving, training, and adapter flows below remain designs, not implemented capabilities.
+Phase 5 adds department-scoped PostgreSQL extraction jobs and a constrained RAG-worker extraction/chunking pipeline to the Phase 4 source-upload boundary. Retrieval, Qdrant, embeddings, model serving, training, and adapter flows remain designs, not implemented capabilities.
 
 ## System context
 
@@ -15,7 +15,7 @@ flowchart TB
     subgraph App["DeptSLM application"]
         Web["Next.js web app"]
         API["FastAPI API"]
-        RAG["RAG worker (planned)"]
+        RAG["RAG worker (extraction and chunking)"]
         Train["Training worker (planned)"]
     end
 
@@ -65,19 +65,19 @@ The arrows describe intended responsibilities and do not imply that a production
 
 ### FastAPI backend
 
-`apps/api` is the control plane for development authentication, persistent department authorization, and department administration. It uses synchronous request-scoped SQLAlchemy sessions and Alembic migrations. Long-running ingestion, model, and training work remains deferred and must not block API request workers.
+`apps/api` is the control plane for development authentication, persistent department authorization, department administration, uploads, and extraction metadata. It enqueues PostgreSQL jobs but never opens sources for extraction, invokes parsers, normalizes, chunks, or waits for workers.
 
 ### PostgreSQL
 
-PostgreSQL stores identities, departments, memberships, documents, and safe mutation audit events. Department-owned repository methods require an explicit `DepartmentScope`; jobs remain deferred.
+PostgreSQL stores identities, departments, memberships, documents, extraction attempt/chunk metadata, and safe mutation audit events. It is the reviewed Phase 5 queue: workers claim with `SKIP LOCKED` and finite leases. Text and filesystem paths never enter PostgreSQL.
 
 ### Qdrant
 
 Qdrant is the planned vector store for document chunks embedded by Qwen3-Embedding. Every department-owned point must include `department_id` in its payload. Every search, update, and delete must apply an authorized `department_id` filter; a missing filter is an error, never a global search fallback.
 
-### LlamaIndex and the RAG worker
+### RAG worker and future LlamaIndex
 
-LlamaIndex is planned to coordinate parsing outputs, chunking, embedding, indexing, retrieval, and query assembly. The RAG worker will handle asynchronous ingestion and re-indexing work. Retrieved passages must retain document, chunk, and department provenance.
+The RAG worker stream-copies each canonical source into a private verified claim snapshot and gives only that read-only descriptor to the installed constrained PDF/text/Markdown parser subprocess. Parser scratch is separate from parent-created outputs. The worker deterministically normalizes and chunks with strict forward progress, then publishes exactly `normalized.txt`, `chunks.jsonl`, and `manifest.json` into a fresh final directory. It uses random worker/claim UUIDs, PostgreSQL-server-time leases that cannot be revived after expiry, exact stale-claim cleanup, and department-serialized output quota. LlamaIndex, embedding, indexing, retrieval, and query assembly remain future work.
 
 Retrieved text is untrusted content. Prompt assembly must delimit it as evidence, prevent instructions in it from overriding higher-priority policy, and include only sources from the authorized department. If retrieval does not yield usable evidence, the assistant must state that it does not have enough information rather than generate a department-specific claim.
 
@@ -100,12 +100,12 @@ The training worker is planned to launch controlled LoRA or QLoRA jobs through L
 1. The API authenticates the user, performs a short admission check, and validates the raw upload headers.
 2. The upload streams to a private staging file beneath that department's external `uploads` path.
 3. A new transaction locks the department, revalidates authority, enforces quota, atomically finalizes the source, and records metadata plus audit evidence.
-4. A future RAG worker will extract and chunk the document, preserving provenance.
-5. Qwen3-Embedding creates vectors.
+4. The Phase 5 RAG worker claims the PostgreSQL job, creates and verifies an immutable source snapshot, extracts through the constrained subprocess and separate scratch space, re-verifies the canonical source, and publishes the exact normalized/chunk/manifest allowlist with page/line/character provenance.
+5. A future phase will use Qwen3-Embedding to create vectors.
 6. LlamaIndex writes points to Qdrant with the required `department_id` payload.
 7. Job state and audit metadata are recorded in PostgreSQL.
 
-Phase 4 implements shallow PDF/UTF-8 validation and metadata-only soft deletion. Malware controls, extraction, queue technology, retries, download, physical retention, and orphan reconciliation remain deferred.
+Phase 5 adds explicit failed-attempt retry, exact expired-claim staging recovery, and cancellation of queued work on soft deletion. A never-reclaimed crash can retain staging, and a crash between filesystem publication and database commit can retain an unknown final orphan. Malware controls, OCR, download, physical retention, and final-orphan reconciliation remain deferred.
 
 ### Department-scoped question answering
 
@@ -141,10 +141,10 @@ PostgreSQL and Qdrant are service state. The Phase 0 Compose file is only a loca
 ## Deferred decisions
 
 - Authentication provider, SSO integration, and role model
-- Queue and worker execution technology
+- Production queue/worker scaling beyond the Phase 5 PostgreSQL lease queue
 - Exact Qwen3 variants, serving runtime, and hardware profiles
-- Supported document formats and extraction sandbox
-- Chunking, hybrid retrieval, reranking, and relevance thresholds
-- Schema, migrations, retention, deletion, and audit requirements
+- Production extraction sandbox, malware controls, and additional reviewed formats
+- Hybrid retrieval, reranking, and relevance thresholds beyond the Phase 5 character chunker
+- Production retention, physical purge, reconciliation, and tamper-resistant audit requirements
 - Adapter evaluation gates and promotion workflow
 - Production topology, secrets, observability, backup, and disaster recovery

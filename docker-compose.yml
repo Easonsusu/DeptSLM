@@ -82,23 +82,41 @@ services:
 
   rag-worker:
     build:
-      context: ./services/rag-worker
+      context: .
+      dockerfile: services/rag-worker/Dockerfile
     environment:
       DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
       DEPTSLM_DATA_DIR: /runtime/deptslm
+      DEPTSLM_EXTRACTION_TIMEOUT_SECONDS: "${DEPTSLM_EXTRACTION_TIMEOUT_SECONDS:-120}"
+      DEPTSLM_MAX_EXTRACTED_BYTES: "${DEPTSLM_MAX_EXTRACTED_BYTES:-104857600}"
+      DEPTSLM_MAX_PDF_PAGES: "${DEPTSLM_MAX_PDF_PAGES:-1000}"
+      DEPTSLM_CHUNK_MAX_CHARS: "${DEPTSLM_CHUNK_MAX_CHARS:-1200}"
+      DEPTSLM_CHUNK_OVERLAP_CHARS: "${DEPTSLM_CHUNK_OVERLAP_CHARS:-200}"
+      DEPTSLM_MAX_CHUNKS_PER_DOCUMENT: "${DEPTSLM_MAX_CHUNKS_PER_DOCUMENT:-100000}"
+      DEPTSLM_EXTRACTION_LEASE_SECONDS: "${DEPTSLM_EXTRACTION_LEASE_SECONDS:-300}"
+      DEPTSLM_WORKER_POLL_SECONDS: "${DEPTSLM_WORKER_POLL_SECONDS:-5}"
+      DEPTSLM_DEPARTMENT_EXTRACTED_QUOTA_BYTES: "${DEPTSLM_DEPARTMENT_EXTRACTED_QUOTA_BYTES:-4294967296}"
       ENVIRONMENT: "${ENVIRONMENT:-development}"
-      QDRANT_URL: "${QDRANT_URL:-http://qdrant:6333}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - type: bind
-        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}"
-        target: /runtime/deptslm
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/uploads"
+        target: /runtime/deptslm/uploads
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/extracted_text"
+        target: /runtime/deptslm/extracted_text
         bind:
           create_host_path: false
     depends_on:
       postgres:
         condition: service_healthy
-      qdrant:
-        condition: service_started
 
   training-worker:
     build:

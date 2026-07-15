@@ -67,6 +67,11 @@ The required artifact subdirectories are `uploads`, `extracted_text`, `vector_sn
 - Keep phase PRs focused; no RAG or fine-tuning implementation before its reviewed phase.
 - Phase 3 database changes use SQLAlchemy and Alembic. Do not call `metadata.create_all` at runtime, add unscoped department-owned repository methods, or hard-delete departments, memberships, identities, or audit events.
 - Phase 4 document uploads use raw incremental request streaming and canonical external paths. Do not introduce multipart buffering, process-temporary files, client-derived paths, hard deletion, extraction, OCR, indexing, or download behavior in this phase.
+- Phase 5 extraction runs only in the RAG worker through the installed constrained parser subprocess. Never parse untrusted documents in API request handlers, use original filenames as paths, or expose extracted/chunk text through metadata APIs.
+- Every extraction and chunk query requires `DepartmentScope`; every worker job carries non-null `department_id` and `document_id`. Parser subprocesses receive no secrets, database credentials, client paths, or user environment.
+- Extracted files and chunk content stay beneath `DEPTSLM_DATA_DIR/extracted_text` and never enter Git. Qdrant, embeddings, LlamaIndex, models, OCR, and malware-scanning work do not belong in Phase 5.
+- Phase 5 parsers receive only a read-only verified claim-scoped source snapshot, fixed output/result descriptors, and separate scratch. Never pass the live canonical source or a publishable directory descriptor. Final output is exactly `normalized.txt`, `chunks.jsonl`, and `manifest.json` moved into a fresh directory.
+- Expired extraction leases are non-revivable. Claim-owned mutations require PostgreSQL-server-time proof that the matching worker/token lease is strictly in the future. Reclaim cleanup may remove only the exact previous claim-token scope and must never remove unknown final directories.
 
 ## 7. Testing expectations
 
@@ -77,6 +82,7 @@ The required artifact subdirectories are `uploads`, `extracted_text`, `vector_sn
 - Use temporary directories for all test artifacts. Tests must not require Google Drive, network access, secrets, model downloads, or pre-existing developer state unless explicitly marked as optional integration tests.
 - Future tenant-aware tests must include attempts to cross department boundaries and must prove those attempts fail.
 - Upload tests must cover streamed-size enforcement, type/signature or UTF-8 validation, authorization revalidation, quota concurrency, private permissions, and cleanup without using real Google Drive data.
+- Extraction tests must cover immutable snapshot integrity and cleanup, symlink resistance, exact artifact publication, constrained subprocess failures, deterministic monotonic chunking, claim expiry/reclaim races, exact stale-claim cleanup, stale-worker denial, output quota concurrency, private external artifacts, and content-free APIs.
 
 ## 8. Department isolation by `department_id`
 

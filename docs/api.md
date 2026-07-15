@@ -2,7 +2,7 @@
 
 ## Status
 
-The Phase 4 API keeps the Phase 3 control plane and adds department-scoped document metadata, raw source upload, and soft deletion. See [department-membership-api.md](department-membership-api.md) and [document-upload.md](document-upload.md). Extraction, download, RAG, training, and production identity integration remain deferred.
+The Phase 5 API keeps the Phase 4 upload boundary and adds department-scoped extraction enqueue/retry and safe status/provenance metadata. Long-running work is PostgreSQL-backed and runs only in the RAG worker. Extracted text, chunk content, download, Qdrant, RAG, training, and production identity integration remain unavailable.
 
 For the default local configuration, the base URL is:
 
@@ -99,6 +99,18 @@ List/read accepts every active same-department role. Upload accepts same-departm
 `Content-Length` is optional for upload. If supplied, it must be one nonzero ASCII-decimal header, is checked early against the per-file maximum, and must match the streamed byte count. Independent streaming limits still protect requests that omit it. Document create, list, read, and delete responses expose safe metadata only; they never expose uploader/deletion identity IDs, issuer, subject, checksum, or storage path.
 
 Document errors use `403` for authorization, `409` for department quota exhaustion, `413` for the per-file size limit, `415` for unsupported or invalid content, `422` for malformed metadata/filename, empty input, duplicate metadata headers, or length mismatch, and a generic `503` for database or storage unavailability. Successful upload finalization records transactional action `document.upload`; deletion continues to record `document.delete`.
+
+## Current extraction endpoints
+
+- `POST /departments/{department_id}/documents/{document_id}/extractions` (`202`)
+- `GET /departments/{department_id}/documents/{document_id}/extractions`
+- `GET /departments/{department_id}/documents/{document_id}/extractions/{extraction_id}`
+- `GET /departments/{department_id}/documents/{document_id}/extractions/{extraction_id}/chunks`
+- `POST /departments/{department_id}/documents/{document_id}/extractions/{extraction_id}/retry` (`202`)
+
+Enqueue and retry require same-department `system_admin`, `department_admin`, or `instructor`; all five active roles may read metadata. Retry is explicit and allowed only for a failed attempt. Stored documents only are visible, every query includes department/document/extraction scope, and foreign identifiers disclose no resource.
+
+Responses omit requestor/worker identity, claim token, lease, source/normalized/chunk hashes, filename, path, parser stderr, exception text, and all source/normalized/chunk content. Chunk lists require a succeeded extraction and return ordinal, normalized character offsets, UTF-8 byte size, and one page or line range. Successful enqueue/retry record `document.extraction.enqueue` or `document.extraction.retry`; worker publication records `document.extraction.complete`.
 
 ## Future API conventions
 

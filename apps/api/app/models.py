@@ -1,4 +1,4 @@
-"""PostgreSQL persistence models through Phase 4."""
+"""PostgreSQL persistence models through Phase 5."""
 
 from __future__ import annotations
 
@@ -10,11 +10,13 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -27,6 +29,27 @@ DEPARTMENT_ROLES = tuple(item.value for item in DepartmentRole)
 AUDIT_RESULTS = ("allowed", "denied")
 DOCUMENT_STATUSES = ("stored", "deleted")
 DOCUMENT_MEDIA_TYPES = ("application/pdf", "text/plain", "text/markdown")
+EXTRACTION_STATUSES = ("queued", "running", "succeeded", "failed", "cancelled")
+EXTRACTION_ERROR_CODES = (
+    "source_missing",
+    "source_integrity_mismatch",
+    "unsupported_media_type",
+    "invalid_utf8",
+    "invalid_pdf",
+    "encrypted_pdf",
+    "page_limit_exceeded",
+    "extraction_timeout",
+    "extraction_output_limit",
+    "no_extractable_text",
+    "chunk_limit_exceeded",
+    "extraction_quota_exceeded",
+    "parser_failed",
+    "storage_unavailable",
+    "database_unavailable",
+    "document_unavailable",
+    "claim_lost",
+    "worker_shutdown",
+)
 
 
 class Base(DeclarativeBase):
@@ -125,6 +148,7 @@ class Membership(Base):
 class Document(Base):
     __tablename__ = "documents"
     __table_args__ = (
+        UniqueConstraint("id", "department_id", name="uq_document_id_department"),
         CheckConstraint(
             "original_filename ~ '[^[:space:]]'",
             name="ck_document_filename_nonempty",
@@ -175,6 +199,226 @@ class Document(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class DocumentExtraction(Base):
+    __tablename__ = "document_extractions"
+    __table_args__ = (
+        UniqueConstraint(
+            "id", "department_id", "document_id", name="uq_extraction_id_department_document"
+        ),
+        ForeignKeyConstraint(
+            ["document_id", "department_id"],
+            ["documents.id", "documents.department_id"],
+            name="fk_extraction_document_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["retry_of_id", "department_id", "document_id"],
+            [
+                "document_extractions.id",
+                "document_extractions.department_id",
+                "document_extractions.document_id",
+            ],
+            name="fk_extraction_retry_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "status IN ('queued','running','succeeded','failed','cancelled')",
+            name="ck_extraction_status",
+        ),
+        CheckConstraint(
+            "pipeline_version ~ '^[a-z0-9][a-z0-9._-]{0,99}$'",
+            name="ck_extraction_pipeline_version",
+        ),
+        CheckConstraint(
+            "normalization_version ~ '^[a-z0-9][a-z0-9._-]{0,99}$'",
+            name="ck_extraction_normalization_version",
+        ),
+        CheckConstraint(
+            "chunking_version ~ '^[a-z0-9][a-z0-9._-]{0,99}$'",
+            name="ck_extraction_chunking_version",
+        ),
+        CheckConstraint(
+            "parser_name IS NULL OR parser_name ~ '^[a-z0-9][a-z0-9._-]{0,99}$'",
+            name="ck_extraction_parser_name",
+        ),
+        CheckConstraint(
+            "parser_version IS NULL OR parser_version ~ '^[a-zA-Z0-9][a-zA-Z0-9._+-]{0,99}$'",
+            name="ck_extraction_parser_version",
+        ),
+        CheckConstraint("source_sha256 ~ '^[0-9a-f]{64}$'", name="ck_extraction_source_sha256"),
+        CheckConstraint("source_byte_size > 0", name="ck_extraction_source_size"),
+        CheckConstraint(
+            "normalized_sha256 IS NULL OR normalized_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_extraction_normalized_sha256",
+        ),
+        CheckConstraint(
+            "normalized_byte_size IS NULL OR normalized_byte_size > 0",
+            name="ck_extraction_normalized_size",
+        ),
+        CheckConstraint(
+            "output_byte_size IS NULL OR output_byte_size > 0", name="ck_extraction_output_size"
+        ),
+        CheckConstraint(
+            "chunk_count IS NULL OR chunk_count >= 0", name="ck_extraction_chunk_count"
+        ),
+        CheckConstraint("attempt_number > 0", name="ck_extraction_attempt"),
+        CheckConstraint("version > 0", name="ck_extraction_version"),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            "'source_missing','source_integrity_mismatch','unsupported_media_type','invalid_utf8',"
+            "'invalid_pdf','encrypted_pdf','page_limit_exceeded','extraction_timeout',"
+            "'extraction_output_limit','no_extractable_text','chunk_limit_exceeded',"
+            "'extraction_quota_exceeded','parser_failed','storage_unavailable',"
+            "'database_unavailable','document_unavailable','claim_lost','worker_shutdown')",
+            name="ck_extraction_error_code",
+        ),
+        CheckConstraint(
+            "(status = 'queued' AND worker_id IS NULL AND claim_token IS NULL "
+            "AND claimed_at IS NULL "
+            "AND lease_expires_at IS NULL AND started_at IS NULL AND finished_at IS NULL "
+            "AND parser_name IS NULL AND parser_version IS NULL AND normalized_sha256 IS NULL "
+            "AND normalized_byte_size IS NULL AND output_byte_size IS NULL AND chunk_count IS NULL "
+            "AND error_code IS NULL) OR status <> 'queued'",
+            name="ck_extraction_queued_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'running' AND worker_id IS NOT NULL AND claim_token IS NOT NULL "
+            "AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL "
+            "AND started_at IS NOT NULL AND finished_at IS NULL "
+            "AND normalized_sha256 IS NULL AND normalized_byte_size IS NULL "
+            "AND output_byte_size IS NULL AND chunk_count IS NULL AND error_code IS NULL) "
+            "OR status <> 'running'",
+            name="ck_extraction_running_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'succeeded' AND worker_id IS NOT NULL AND claim_token IS NOT NULL "
+            "AND claimed_at IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NOT NULL "
+            "AND parser_name IS NOT NULL AND parser_version IS NOT NULL "
+            "AND normalized_sha256 IS NOT NULL AND normalized_byte_size IS NOT NULL "
+            "AND output_byte_size IS NOT NULL AND chunk_count IS NOT NULL AND error_code IS NULL) "
+            "OR status <> 'succeeded'",
+            name="ck_extraction_succeeded_lifecycle",
+        ),
+        CheckConstraint(
+            "(status IN ('failed','cancelled') AND finished_at IS NOT NULL "
+            "AND error_code IS NOT NULL "
+            "AND normalized_sha256 IS NULL AND normalized_byte_size IS NULL "
+            "AND output_byte_size IS NULL AND chunk_count IS NULL) "
+            "OR status NOT IN ('failed','cancelled')",
+            name="ck_extraction_failure_lifecycle",
+        ),
+        Index("ix_extraction_department_status_created", "department_id", "status", "created_at"),
+        Index("ix_extraction_document_status_created", "document_id", "status", "created_at"),
+        Index("ix_extraction_claim", "status", "lease_expires_at", "created_at"),
+        Index(
+            "ix_extraction_lease",
+            "lease_expires_at",
+            postgresql_where=text("status = 'running'"),
+        ),
+        Index(
+            "uq_extraction_active_document",
+            "document_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued','running')"),
+        ),
+        Index(
+            "uq_extraction_succeeded_pipeline",
+            "document_id",
+            "source_sha256",
+            "pipeline_version",
+            unique=True,
+            postgresql_where=text("status = 'succeeded'"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    document_id: Mapped[UUID] = mapped_column(nullable=False)
+    requested_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    retry_of_id: Mapped[UUID | None] = mapped_column()
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    pipeline_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    parser_name: Mapped[str | None] = mapped_column(String(100))
+    parser_version: Mapped[str | None] = mapped_column(String(100))
+    normalization_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    chunking_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    normalized_sha256: Mapped[str | None] = mapped_column(String(64))
+    normalized_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    output_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    chunk_count: Mapped[int | None] = mapped_column(Integer)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    worker_id: Mapped[UUID | None] = mapped_column()
+    claim_token: Mapped[UUID | None] = mapped_column()
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class DocumentChunk(Base):
+    __tablename__ = "document_chunks"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["extraction_id", "department_id", "document_id"],
+            [
+                "document_extractions.id",
+                "document_extractions.department_id",
+                "document_extractions.document_id",
+            ],
+            name="fk_chunk_extraction_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["document_id", "department_id"],
+            ["documents.id", "documents.department_id"],
+            name="fk_chunk_document_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("ordinal >= 0", name="ck_chunk_ordinal"),
+        CheckConstraint("char_start >= 0 AND char_end > char_start", name="ck_chunk_char_range"),
+        CheckConstraint("byte_size > 0", name="ck_chunk_byte_size"),
+        CheckConstraint("content_sha256 ~ '^[0-9a-f]{64}$'", name="ck_chunk_content_sha256"),
+        CheckConstraint("provenance_kind IN ('page','line')", name="ck_chunk_provenance_kind"),
+        CheckConstraint(
+            "(provenance_kind = 'page' AND page_start IS NOT NULL AND page_end IS NOT NULL "
+            "AND page_start > 0 AND page_end >= page_start "
+            "AND line_start IS NULL AND line_end IS NULL) "
+            "OR (provenance_kind = 'line' AND line_start IS NOT NULL AND line_end IS NOT NULL "
+            "AND line_start > 0 AND line_end >= line_start "
+            "AND page_start IS NULL AND page_end IS NULL)",
+            name="ck_chunk_provenance_range",
+        ),
+        UniqueConstraint("extraction_id", "ordinal", name="uq_chunk_extraction_ordinal"),
+        Index("ix_chunk_department_document", "department_id", "document_id", "ordinal"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    document_id: Mapped[UUID] = mapped_column(nullable=False)
+    extraction_id: Mapped[UUID] = mapped_column(nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    char_start: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    char_end: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    provenance_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    page_start: Mapped[int | None] = mapped_column(Integer)
+    page_end: Mapped[int | None] = mapped_column(Integer)
+    line_start: Mapped[int | None] = mapped_column(Integer)
+    line_end: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = utc_timestamp()
 
 
 class PersistentAuditEvent(Base):

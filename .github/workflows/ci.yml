@@ -116,6 +116,7 @@ jobs:
           cache-dependency-path: |
             apps/api/requirements.txt
             apps/api/requirements-dev.txt
+            services/rag-worker/pyproject.toml
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
         working-directory: apps/api
@@ -125,15 +126,21 @@ jobs:
       - name: Lint API
         working-directory: apps/api
         run: |
-          python -m ruff check app tests
-          python -m ruff format --check app tests
+          python -m ruff check app tests ../../services/rag-worker/deptslm_worker
+          python -m ruff format --check app tests ../../services/rag-worker/deptslm_worker
       - name: Run API tests with temporary storage
         working-directory: apps/api
         run: |
           export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-data"
-          mkdir -p "$DEPTSLM_DATA_DIR/uploads"
+          mkdir -p "$DEPTSLM_DATA_DIR/uploads" "$DEPTSLM_DATA_DIR/extracted_text"
           python -m alembic upgrade head
           python -m pytest
+      - name: Run one-shot worker smoke test
+        working-directory: apps/api
+        run: |
+          export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-worker-smoke"
+          mkdir -p "$DEPTSLM_DATA_DIR/uploads" "$DEPTSLM_DATA_DIR/extracted_text"
+          python -m deptslm_worker --once
       - name: Verify API checks leave the checkout clean
         shell: bash
         run: |
@@ -176,10 +183,27 @@ jobs:
           assert pathlib.Path("/app/alembic.ini").is_file()
           assert pathlib.Path("/app/alembic/versions/0001_phase3_schema.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0002_phase4_documents.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0003_phase5_extraction.py").is_file()
+          import importlib.util
+          assert importlib.util.find_spec("pypdf") is None
+          '
+      - name: Build and inspect extraction worker image
+        run: |
+          docker build --tag deptslm-rag-worker-ci --file services/rag-worker/Dockerfile .
+          docker run --rm --entrypoint python deptslm-rag-worker-ci -I -c '
+          import pypdf
+          import deptslm_worker
+          import deptslm_worker.extraction_runner
+          import deptslm_worker.queue
+          assert tuple(int(part) for part in pypdf.__version__.split(".")[:2]) >= (6, 14)
           '
       - name: Check raw streaming upload boundary
         run: |
           ! grep -R -E 'UploadFile|python-multipart|request\.body\(' apps/api/app apps/api/requirements*.txt
+      - name: Check Phase 5 extraction non-goals
+        run: |
+          ! grep -R -E -i 'qdrant|llamaindex|llama_index|pytesseract|easyocr|transformers|sentence_transformers|huggingface_hub' services/rag-worker/deptslm_worker services/rag-worker/pyproject.toml
+          ! git ls-files | grep -E '(^|/)(normalized\.txt|chunks\.jsonl|manifest\.json)$'
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then

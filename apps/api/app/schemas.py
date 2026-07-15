@@ -1,4 +1,4 @@
-"""Validated public schemas for departments, memberships, and documents."""
+"""Validated public schemas through Phase 5."""
 
 from __future__ import annotations
 
@@ -123,5 +123,55 @@ class DocumentResponse(ORMResponse):
 
 class DocumentListResponse(BaseModel):
     items: list[DocumentResponse]
+    limit: int
+    offset: int
+
+
+class ExtractionResponse(ORMResponse):
+    """Safe job metadata without claims, identities, hashes, paths, or content."""
+
+    id: UUID
+    department_id: UUID
+    document_id: UUID
+    status: str
+    pipeline_version: str
+    parser_name: str | None
+    parser_version: str | None
+    normalization_version: str
+    chunking_version: str
+    normalized_byte_size: int | None
+    chunk_count: int | None
+    error_code: str | None
+    attempt_number: int
+    started_at: datetime | None
+    finished_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ExtractionListResponse(BaseModel):
+    items: list[ExtractionResponse]
+    limit: int
+    offset: int
+
+
+class ChunkResponse(ORMResponse):
+    """Safe provenance metadata; chunk text and its digest remain external."""
+
+    id: UUID
+    extraction_id: UUID
+    ordinal: int
+    char_start: int
+    char_end: int
+    byte_size: int
+    provenance_kind: str
+    page_start: int | None
+    page_end: int | None
+    line_start: int | None
+    line_end: int | None
+
+
+class ChunkListResponse(BaseModel):
+    items: list[ChunkResponse]
     limit: int
     offset: int

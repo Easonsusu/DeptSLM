@@ -2,9 +2,9 @@
 
 DeptSLM is a university departmental small language model (SLM) customization platform. It is intended to let each department build an isolated assistant from its own approved documents, retrieval index, evaluation data, and eventually its own LoRA or QLoRA adapter.
 
-> **Phase 4 status:** Department-scoped document metadata, raw streaming uploads, external source storage, quota enforcement, and soft deletion are under review. Extraction, OCR, malware scanning, download, RAG, model serving, fine-tuning, and production identity/storage remain deferred.
+> **Phase 5 status:** PostgreSQL-backed extraction jobs, immutable verified source snapshots, constrained PDF/text/Markdown parsing, deterministic forward-progress chunking, exact three-file publication, provenance, non-revivable leases, exact stale-claim cleanup, and safe retries are under review. OCR, malware scanning, download, Qdrant, embeddings, RAG, model serving, fine-tuning, and production identity/storage remain deferred.
 
-Phase 4 upload accepts a raw streamed body with an optional `Content-Length`; the configured byte limit is always enforced while streaming. Public document metadata excludes internal identity IDs and storage details. Successful uploads record `document.upload`, while handled cancellation and failure paths remove staging. Crash-time orphan reconciliation remains deferred.
+The API only enqueues and reads extraction metadata; parsing runs in the RAG worker from a claim-owned verified snapshot with separate scratch space. Extracted and chunk text remains external and has no API. The parser boundary is constrained but is not a kernel-enforced malware sandbox. Never-reclaimed staging and crash-time final-orphan reconciliation remain deferred.
 
 ## Planned stack
 
@@ -26,7 +26,7 @@ DeptSLM/
 │   ├── api/                  # FastAPI application
 │   └── web/                  # Next.js application
 ├── services/
-│   ├── rag-worker/           # Future ingestion and retrieval jobs
+│   ├── rag-worker/           # Phase 5 extraction and chunking jobs
 │   └── training-worker/      # Future fine-tuning jobs
 ├── packages/
 │   └── shared/               # Future shared contracts and utilities
@@ -76,7 +76,7 @@ Prerequisites for the complete local stack are Git, Docker Desktop with Docker C
 
    Never commit `.env`.
 
-4. Validate and start the Phase 0 Compose project:
+4. Validate and start the local Compose project:
 
    ```bash
    ./scripts/compose.sh config
@@ -111,6 +111,13 @@ Stop the stack with:
 ./scripts/compose.sh down
 ```
 
+Run at most one extraction job or poll continuously with:
+
+```bash
+./scripts/compose.sh run --rm rag-worker python -m deptslm_worker --once
+./scripts/compose.sh run --rm rag-worker python -m deptslm_worker --poll
+```
+
 ## Safety and data isolation
 
 - Future department-owned records, documents, indexes, jobs, adapters, and conversations must be scoped and authorized by `department_id` at every storage and service boundary.
@@ -136,10 +143,13 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Department and membership API](docs/department-membership-api.md)
 - [Document model](docs/document-model.md)
 - [Document upload](docs/document-upload.md)
+- [Document extraction](docs/document-extraction.md)
+- [Chunk model](docs/chunk-model.md)
+- [RAG worker](docs/rag-worker.md)
 
 ## Current non-goals
 
-Phase 4 does not implement production OAuth/OIDC/SSO, platform administration, frontend document UI, extraction, OCR, malware scanning, download, RAG, vector integration, model inference, fine-tuning, or production deployment.
+Phase 5 does not implement production OAuth/OIDC/SSO, platform administration, frontend ingestion UI, OCR, malware scanning, download/preview, Qdrant, embeddings, LlamaIndex, RAG, model inference, fine-tuning, or production deployment.
 
 ## License
 

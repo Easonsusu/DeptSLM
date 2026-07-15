@@ -1,10 +1,11 @@
-"""Behavioral smoke tests for the Phase 0 worker entrypoints."""
+"""Behavioral storage and argument-forwarding tests for worker entrypoints."""
 
 from __future__ import annotations
 
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -23,8 +24,11 @@ def run_entrypoint(entrypoint: Path, data_dir: str | None) -> subprocess.Complet
     else:
         environment["DEPTSLM_DATA_DIR"] = data_dir
 
+    arguments = [str(entrypoint)]
+    if entrypoint.parent.name == "rag-worker" or not entrypoint.with_name("worker.py").exists():
+        arguments.extend([sys.executable, "-c", "print('worker-forwarded')"])
     return subprocess.run(
-        [str(entrypoint)],
+        arguments,
         check=False,
         capture_output=True,
         env=environment,
@@ -38,7 +42,9 @@ def copy_worker_source(entrypoint: Path, destination: Path) -> Path:
     destination.mkdir()
     copied_entrypoint = destination / "entrypoint.sh"
     shutil.copy2(entrypoint, copied_entrypoint)
-    shutil.copy2(entrypoint.with_name("worker.py"), destination / "worker.py")
+    worker_file = entrypoint.with_name("worker.py")
+    if worker_file.exists():
+        shutil.copy2(worker_file, destination / "worker.py")
     return copied_entrypoint
 
 
@@ -47,7 +53,8 @@ def test_worker_accepts_temporary_storage(entrypoint: Path, tmp_path: Path) -> N
     result = run_entrypoint(entrypoint, str(tmp_path))
 
     assert result.returncode == 0
-    assert "placeholder" in result.stdout
+    expected = "worker-forwarded" if entrypoint.parent.name == "rag-worker" else "placeholder"
+    assert expected in result.stdout
 
 
 @pytest.mark.parametrize("entrypoint", WORKER_ENTRYPOINTS)
@@ -126,7 +133,12 @@ def test_copied_worker_accepts_external_sibling_storage(entrypoint: Path, tmp_pa
     result = run_entrypoint(copied_entrypoint, str(data_dir))
 
     assert result.returncode == 0
-    assert "placeholder" in result.stdout
+    expected = (
+        "worker-forwarded"
+        if not copied_entrypoint.with_name("worker.py").exists()
+        else "placeholder"
+    )
+    assert expected in result.stdout
 
 
 @pytest.mark.parametrize("entrypoint", WORKER_ENTRYPOINTS)

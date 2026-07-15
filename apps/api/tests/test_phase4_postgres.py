@@ -187,7 +187,7 @@ async def _async_stream_upload(application, department_id, chunks: list[bytes]):
 def test_migration_head_contains_document_schema(engine) -> None:
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "0002_phase4_documents"
+            "0003_phase5_extraction"
         )
         columns = set(
             connection.execute(
