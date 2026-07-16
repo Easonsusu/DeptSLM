@@ -1,6 +1,6 @@
-# Phase 5 Database Model
+# Phase 6 Database Model
 
-DeptSLM uses PostgreSQL 16, SQLAlchemy 2, psycopg 3, and Alembic. Revision `0003_phase5_extraction` follows the Phase 3 identity/department and Phase 4 document revisions. Alembic is the only schema-creation mechanism; runtime never calls `metadata.create_all`.
+DeptSLM uses PostgreSQL 16, SQLAlchemy 2, psycopg 3, and Alembic. Revision `0004_phase6_vector_indexing` follows `0003_phase5_extraction`. Alembic is the only schema-creation mechanism; runtime never calls `metadata.create_all`.
 
 ## Entities
 
@@ -14,6 +14,7 @@ erDiagram
     USER_IDENTITIES ||--o{ DOCUMENTS : uploads
     DOCUMENTS ||--o{ DOCUMENT_EXTRACTIONS : processes
     DOCUMENT_EXTRACTIONS ||--o{ DOCUMENT_CHUNKS : produces
+    DOCUMENT_EXTRACTIONS ||--o{ DOCUMENT_VECTOR_INDEXINGS : indexes
 ```
 
 - `user_identities`: UUID identity keyed uniquely by the exact opaque `(issuer, subject)`. Subjects are not lowercased or interpreted as email addresses. Status is `active`, `suspended`, or `revoked`.
@@ -23,6 +24,7 @@ erDiagram
 - `documents`: department-owned source metadata with an internal uploader relation, normalized filename, canonical media type, positive size, SHA-256 digest, lifecycle state, version, and timestamps. It stores no body or path, and public document schemas do not expose internal identity IDs; see [document-model.md](document-model.md).
 - `document_extractions`: immutable attempt history and PostgreSQL queue state, including source/pipeline identity, claim lease, safe result metadata, and an allowlisted error code. It stores no content, path, filename, stderr, or exception.
 - `document_chunks`: department/document/extraction-scoped offsets, byte size, internal digest, and mutually exclusive page/line provenance. Chunk text remains external.
+- `document_vector_indexings`: department/document/extraction-scoped queue/history with the fixed model/vector contract, safe counts/errors, retry relation, claim/lease authority, and no text, vectors, paths, URLs, keys, or raw Qdrant data.
 
 Composite unique and `RESTRICT` foreign-key constraints bind documents, extractions, retries, and chunks to the same department/document. Partial unique indexes allow one active attempt per document and one successful result per source checksum/pipeline. Lifecycle checks make queued, running, succeeded, failed, and cancelled metadata internally consistent.
 
@@ -48,6 +50,8 @@ python -m alembic current
 python -m alembic downgrade base  # isolated development/test database only
 ```
 
-Production migration execution, backup, recovery, and rollback procedures remain deferred. Never point destructive migration tests at a shared or production database. Phase 5 migration tests require PostgreSQL 16 and exercise `0002` to `0003`, empty-to-head, downgrade/upgrade, and repeated-head behavior.
+Production migration execution, backup, recovery, and rollback procedures remain deferred. Never point destructive migration tests at a shared or production database. Phase 6 tests require PostgreSQL 16 and exercise `0003` to `0004`, empty-to-head, downgrade/upgrade, repeated-head behavior, fixed-contract checks, lifecycle checks, composite scope, retry integrity, and partial uniqueness.
+
+`document_vector_indexings` permits at most one queued/running job per extraction and embedding pipeline and one succeeded job per extraction/current model revision/dimension/vector schema. Failed attempts do not block explicit retry. Workers use PostgreSQL server time and `SKIP LOCKED`; an expired claim cannot heartbeat, fail, requeue, activate, or finalize.
 
 For Compose, use `./scripts/compose.sh run --rm api python -m alembic upgrade head`. Its `DATABASE_URL` uses the internal `postgres` hostname; host-shell commands must use `localhost` or another host-accessible address.

@@ -4,7 +4,7 @@
 
 Phase 5 processes stored Phase 4 PDF, UTF-8 text, and Markdown sources outside API request handlers. The API only authorizes enqueue/retry requests and returns safe metadata. PostgreSQL is the queue and history store; the RAG worker verifies, extracts, normalizes, chunks, and publishes external artifacts.
 
-OCR, malware scanning, rendering, embedded-file handling, downloads, Qdrant, embeddings, LlamaIndex, model inference, RAG, and production storage are not implemented.
+OCR, malware scanning, rendering, embedded-file handling, downloads, LlamaIndex, RAG, and production storage are not implemented. Phase 6 consumes only succeeded output through a separate indexing worker; extraction handlers and parser subprocesses remain free of Qdrant/model settings and dependencies.
 
 ## Queue and states
 
@@ -78,3 +78,7 @@ PostgreSQL and the filesystem cannot commit atomically. Handled post-publication
 Public status may expose only: `source_missing`, `source_integrity_mismatch`, `unsupported_media_type`, `invalid_utf8`, `invalid_pdf`, `encrypted_pdf`, `page_limit_exceeded`, `extraction_timeout`, `extraction_output_limit`, `no_extractable_text`, `chunk_limit_exceeded`, `extraction_quota_exceeded`, `parser_failed`, `storage_unavailable`, `database_unavailable`, `document_unavailable`, `claim_lost`, and `worker_shutdown`.
 
 Exception text, parser stderr, SQL, OS errors, paths, filenames, hashes, and content are never API or audit fields.
+
+## Phase 6 handoff
+
+The Phase 6 indexer reopens only the exact final three-file allowlist through a separate descriptor-relative no-follow reader. It revalidates manifest scope/versions, sizes, hashes, incremental chunk order, and exact PostgreSQL `DocumentChunk` metadata before embedding. It never modifies Phase 5 output, invokes extraction from an API handler, passes Qdrant/model credentials to the parser, or exposes chunk text. See [vector-indexing.md](vector-indexing.md).

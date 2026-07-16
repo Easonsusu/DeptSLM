@@ -1,4 +1,4 @@
-# Document Model Through Phase 5
+# Document Model Through Phase 6
 
 Phase 4 adds PostgreSQL document metadata through Alembic revision `0002_phase4_documents`. Source bytes remain external and are never stored in PostgreSQL or Git.
 
@@ -20,8 +20,10 @@ Upload finalization locks the department first, revalidates the exact issuer, su
 
 PostgreSQL and the filesystem cannot share an atomic transaction. Normal handled failures after a move compensate by removing only the newly created destination. A process or host crash can still leave an orphaned source between the atomic rename and database commit; automatic orphan discovery or deletion is intentionally not implemented in Phase 4.
 
-## Deferred behavior
+## Extraction and indexing behavior
 
 Phase 5 adds extraction attempt and chunk metadata without changing document source ownership or exposing content. Stored documents may enqueue extraction; soft deletion cancels queued attempts, blocks running-worker finalization, hides extraction/chunk APIs, and retains successful output for quota and future retention review.
 
-Phase 5 extracts, normalizes, and chunks through the worker but does not render, scan, OCR, embed, index, download, preview, restore, or physically purge documents. See [document-extraction.md](document-extraction.md) and [chunk-model.md](chunk-model.md).
+Phase 6 adds vector-indexing history without exposing content. Soft deletion also cancels queued indexing attempts in the same PostgreSQL transaction and blocks running indexing finalization; it makes no synchronous Qdrant call. Previously succeeded points may remain physically retained, but the internal retrieval authority check rejects deleted documents. Automatic vector/source/extraction purge remains deferred.
+
+The system still does not render, scan, OCR, download, preview, restore, publicly search, run RAG, or physically purge documents. See [document-extraction.md](document-extraction.md), [chunk-model.md](chunk-model.md), and [vector-indexing.md](vector-indexing.md).

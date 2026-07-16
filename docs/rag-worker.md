@@ -1,4 +1,4 @@
-# Phase 5 RAG Worker
+# Extraction and Indexing Workers Through Phase 6
 
 ## Commands
 
@@ -43,4 +43,17 @@ Explicit values are ASCII decimals and invalid configuration stops startup. Work
 
 ## Limitations
 
-There is no network listener, production broker, automatic retry loop, cancellation API, OCR, malware scanner, Qdrant, embedding, model, or RAG behavior. Constrained Python subprocesses are not a kernel malware sandbox and arbitrary parser-code execution is not considered safely contained. Seccomp, microVMs, antivirus, CDR, and a dedicated parser service remain deferred. Hard-crash final-output orphan reconciliation and production storage are also deferred.
+The extraction path has no Qdrant/model dependency or setting. There is no network listener, production broker, automatic retry loop, cancellation API, OCR, malware scanner, public retrieval, or RAG behavior. Constrained Python subprocesses are not a kernel malware sandbox and arbitrary parser/model-code execution is not considered safely contained. Seccomp, microVMs, antivirus, CDR, reconciliation, and production storage remain deferred.
+
+## Phase 6 indexing path
+
+The separate `indexing-worker` image/Compose service runs:
+
+```bash
+./scripts/compose.sh run --rm indexing-worker python -m deptslm_worker.indexer --once
+./scripts/compose.sh run --rm indexing-worker python -m deptslm_worker.indexer --poll
+```
+
+It receives PostgreSQL and validated Qdrant settings but no API authentication secret or bearer token. It mounts only `extracted_text` and `model_cache` read-only, runs non-root with a read-only root filesystem, drops all capabilities, publishes no ports, and performs no migration, model download, or collection creation. The extraction service still mounts uploads read-only and extracted output read-write and does not install Qdrant/model dependencies.
+
+Index claims use the same PostgreSQL-server-time, `SKIP LOCKED`, non-revivable lease pattern, adding a fresh `vector_attempt_id`. Expired reclaim removes only the exact old department/indexing/attempt Qdrant points before work. The persistent embedding child receives only bounded text batches/sequence IDs and offline model access. Exact staging, activation, PostgreSQL/Qdrant consistency, and settings are documented in [vector-indexing.md](vector-indexing.md), [embedding-model.md](embedding-model.md), and [qdrant-boundary.md](qdrant-boundary.md).

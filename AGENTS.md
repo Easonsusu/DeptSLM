@@ -72,6 +72,9 @@ The required artifact subdirectories are `uploads`, `extracted_text`, `vector_sn
 - Extracted files and chunk content stay beneath `DEPTSLM_DATA_DIR/extracted_text` and never enter Git. Qdrant, embeddings, LlamaIndex, models, OCR, and malware-scanning work do not belong in Phase 5.
 - Phase 5 parsers receive only a read-only verified claim-scoped source snapshot, fixed output/result descriptors, and separate scratch. Never pass the live canonical source or a publishable directory descriptor. Final output is exactly `normalized.txt`, `chunks.jsonl`, and `manifest.json` moved into a fresh directory.
 - Expired extraction leases are non-revivable. Claim-owned mutations require PostgreSQL-server-time proof that the matching worker/token lease is strictly in the future. Reclaim cleanup may remove only the exact previous claim-token scope and must never remove unknown final directories.
+- Phase 6 Qdrant operations require a typed `DepartmentScope`; collection names and filters are fixed internally and never client-controlled. Direct Qdrant client calls outside `deptslm_worker.qdrant_adapter` are forbidden.
+- Chunk text and vectors never enter PostgreSQL, and chunk text never enters Qdrant payload. Normal workers never download models; model IDs and immutable revisions must be explicitly reviewed and validated from external `model_cache` storage.
+- Unpublished points and indexing attempts without succeeded PostgreSQL authority are never trusted. Exact-attempt cleanup must include department, indexing, and vector-attempt filters. Phase 6 exposes no public search, chunk-text, or RAG behavior.
 
 ## 7. Testing expectations
 

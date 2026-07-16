@@ -2,7 +2,7 @@
 
 ## Status and boundaries
 
-Phase 5 adds department-scoped PostgreSQL extraction jobs and a constrained RAG-worker extraction/chunking pipeline to the Phase 4 source-upload boundary. Retrieval, Qdrant, embeddings, model serving, training, and adapter flows remain designs, not implemented capabilities.
+Phase 6 adds department-scoped PostgreSQL indexing jobs, pinned offline Qwen3 chunk embeddings, and a mandatory-filter Qdrant adapter to the Phase 5 extraction boundary. Public retrieval, RAG, generation, reranking, model serving, training, and adapter flows remain designs, not implemented capabilities.
 
 ## System context
 
@@ -15,7 +15,8 @@ flowchart TB
     subgraph App["DeptSLM application"]
         Web["Next.js web app"]
         API["FastAPI API"]
-        RAG["RAG worker (extraction and chunking)"]
+        RAG["RAG worker (extraction)"]
+        Index["Indexing worker (embedding and Qdrant)"]
         Train["Training worker (planned)"]
     end
 
@@ -41,16 +42,17 @@ flowchart TB
     Web -->|"JSON API"| API
     API -->|"authorized metadata queries"| PG
     API -->|"enqueue and inspect jobs"| RAG
+    API -->|"enqueue and inspect metadata"| Index
     API -->|"enqueue and inspect jobs"| Train
     API -->|"department-scoped query"| LI
-    RAG --> LI
-    LI -->|"create embeddings"| Embed
-    LI -->|"upsert / retrieve with department_id filter"| QD
+    Index -->|"offline document embeddings"| Embed
+    Index -->|"scoped staged upserts"| QD
     LI -->|"grounded prompt"| Runtime
     Train --> Factory
     Factory -->|"produces"| Adapter
     Adapter -.->|"approved adapter only"| Runtime
     RAG -->|"documents, extracted text, snapshots"| Drive
+    Index -->|"read-only chunks and model cache"| Drive
     Train -->|"datasets, adapters, evaluations, logs"| Drive
     Runtime -->|"model cache"| Drive
 ```
@@ -69,21 +71,21 @@ The arrows describe intended responsibilities and do not imply that a production
 
 ### PostgreSQL
 
-PostgreSQL stores identities, departments, memberships, documents, extraction attempt/chunk metadata, and safe mutation audit events. It is the reviewed Phase 5 queue: workers claim with `SKIP LOCKED` and finite leases. Text and filesystem paths never enter PostgreSQL.
+PostgreSQL stores identities, departments, memberships, documents, extraction/chunk metadata, vector-indexing job metadata, and safe mutation audit events. It is the reviewed extraction/indexing queue: workers claim with `SKIP LOCKED` and finite non-revivable leases. Text, vectors, credentials, and filesystem paths never enter PostgreSQL.
 
 ### Qdrant
 
-Qdrant is the planned vector store for document chunks embedded by Qwen3-Embedding. Every department-owned point must include `department_id` in its payload. Every search, update, and delete must apply an authorized `department_id` filter; a missing filter is an error, never a global search fallback.
+Qdrant 1.13.4 is the Phase 6 vector store for chunks embedded with the pinned Qwen3 contract. Every operation requires typed `DepartmentScope`; fixed internal filters always include exact `department_id`, and searchable operations also require current pipeline plus `published=true`. Payload contains IDs/provenance only, never text or hashes. Direct client calls outside the reviewed adapter are forbidden. Public search remains deferred.
 
 ### RAG worker and future LlamaIndex
 
-The RAG worker stream-copies each canonical source into a private verified claim snapshot and gives only that read-only descriptor to the installed constrained PDF/text/Markdown parser subprocess. Parser scratch is separate from parent-created outputs. The worker deterministically normalizes and chunks with strict forward progress, then publishes exactly `normalized.txt`, `chunks.jsonl`, and `manifest.json` into a fresh final directory. It uses random worker/claim UUIDs, PostgreSQL-server-time leases that cannot be revived after expiry, exact stale-claim cleanup, and department-serialized output quota. LlamaIndex, embedding, indexing, retrieval, and query assembly remain future work.
+The extraction path stream-copies each canonical source into a private verified claim snapshot and gives only that read-only descriptor to the installed constrained parser. It publishes exactly `normalized.txt`, `chunks.jsonl`, and `manifest.json`. The separate indexing path revalidates those artifacts incrementally, invokes a secret-free offline embedding subprocess, and stages content-free Qdrant points before exact-attempt activation. Both use PostgreSQL server-time leases and exact stale cleanup. LlamaIndex, public retrieval, and query assembly remain future work.
 
 Retrieved text is untrusted content. Prompt assembly must delimit it as evidence, prevent instructions in it from overriding higher-priority policy, and include only sources from the authorized department. If retrieval does not yield usable evidence, the assistant must state that it does not have enough information rather than generate a department-specific claim.
 
 ### Qwen3 and Qwen3-Embedding
 
-Qwen3 is the target base SLM for answer generation, and Qwen3-Embedding is the target embedding model. Exact model sizes, revisions, quantization, serving runtime, hardware requirements, context limits, and licensing checks will be selected and documented in a later phase. Model weights and caches must never enter Git history.
+Qwen3 remains the future base SLM. Phase 6 fixes `Qwen/Qwen3-Embedding-0.6B` revision `d23109d65ca9fdf61eef614209744716f337f50f`, normalized 1024-dimensional output, and cosine distance. Normal workers load only verified external safetensors offline with remote code disabled. Hardware/bitwise reproducibility, production serving, and final licensing review remain operational limitations; weights and caches never enter Git.
 
 ### LLaMA-Factory and the training worker
 
@@ -101,9 +103,9 @@ The training worker is planned to launch controlled LoRA or QLoRA jobs through L
 2. The upload streams to a private staging file beneath that department's external `uploads` path.
 3. A new transaction locks the department, revalidates authority, enforces quota, atomically finalizes the source, and records metadata plus audit evidence.
 4. The Phase 5 RAG worker claims the PostgreSQL job, creates and verifies an immutable source snapshot, extracts through the constrained subprocess and separate scratch space, re-verifies the canonical source, and publishes the exact normalized/chunk/manifest allowlist with page/line/character provenance.
-5. A future phase will use Qwen3-Embedding to create vectors.
-6. LlamaIndex writes points to Qdrant with the required `department_id` payload.
-7. Job state and audit metadata are recorded in PostgreSQL.
+5. The Phase 6 indexing worker validates the exact artifacts and PostgreSQL chunk rows, creates bounded offline embeddings, and stages content-free points with exact department/job/attempt scope.
+6. It verifies count, revalidates PostgreSQL authority, activates only that attempt, and then records job success plus audit metadata.
+7. Future retrieval must filter by department/current publication and cross-check every result against succeeded PostgreSQL authority.
 
 Phase 5 adds explicit failed-attempt retry, exact expired-claim staging recovery, and cancellation of queued work on soft deletion. A never-reclaimed crash can retain staging, and a crash between filesystem publication and database commit can retain an unknown final orphan. Malware controls, OCR, download, physical retention, and final-orphan reconciliation remain deferred.
 
@@ -136,7 +138,7 @@ The browser, uploaded files, extracted text, document metadata, retrieved passag
 
 The repository is for source code only. All file-based runtime artifacts derive from the required `DEPTSLM_DATA_DIR`; in the user's local environment it points to Google Drive. No component may silently create runtime directories inside the checkout. Tests and CI substitute isolated temporary directories. See [storage-policy.md](storage-policy.md).
 
-PostgreSQL and Qdrant are service state. The Phase 0 Compose file is only a local placeholder; before either stores real data, its persistence, backup, and recovery design must be reviewed to ensure no runtime files are written into the repository and that department deletion and retention requirements can be met.
+PostgreSQL and Qdrant are service state. The Compose stack is for local development only; before either stores real data, its persistence, backup, and recovery design must be reviewed to ensure no runtime files are written into the repository and that department deletion and retention requirements can be met.
 
 ## Deferred decisions
 

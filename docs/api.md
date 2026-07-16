@@ -2,7 +2,7 @@
 
 ## Status
 
-The Phase 5 API keeps the Phase 4 upload boundary and adds department-scoped extraction enqueue/retry and safe status/provenance metadata. Long-running work is PostgreSQL-backed and runs only in the RAG worker. Extracted text, chunk content, download, Qdrant, RAG, training, and production identity integration remain unavailable.
+The Phase 6 API keeps upload/extraction boundaries and adds department-scoped vector-indexing enqueue/retry plus safe status metadata. Long-running embedding and Qdrant work occurs only in the indexing worker. Extracted/chunk text, vectors, model paths, public search, RAG, training, and production identity integration remain unavailable.
 
 For the default local configuration, the base URL is:
 
@@ -111,6 +111,17 @@ Document errors use `403` for authorization, `409` for department quota exhausti
 Enqueue and retry require same-department `system_admin`, `department_admin`, or `instructor`; all five active roles may read metadata. Retry is explicit and allowed only for a failed attempt. Stored documents only are visible, every query includes department/document/extraction scope, and foreign identifiers disclose no resource.
 
 Responses omit requestor/worker identity, claim token, lease, source/normalized/chunk hashes, filename, path, parser stderr, exception text, and all source/normalized/chunk content. Chunk lists require a succeeded extraction and return ordinal, normalized character offsets, UTF-8 byte size, and one page or line range. Successful enqueue/retry record `document.extraction.enqueue` or `document.extraction.retry`; worker publication records `document.extraction.complete`.
+
+## Current vector-indexing endpoints
+
+- `POST /departments/{department_id}/documents/{document_id}/extractions/{extraction_id}/indexings` (`202`)
+- `GET /departments/{department_id}/documents/{document_id}/extractions/{extraction_id}/indexings`
+- `GET /departments/{department_id}/documents/{document_id}/extractions/{extraction_id}/indexings/{indexing_id}`
+- `POST /departments/{department_id}/documents/{document_id}/extractions/{extraction_id}/indexings/{indexing_id}/retry` (`202`)
+
+Enqueue/retry accept same-department `system_admin`, `department_admin`, and `instructor`; all five active roles may read safe metadata. A stored document and succeeded extraction are required, duplicate active/current-success jobs return `409`, and retry accepts only failed history. All selectors are matched exactly and foreign IDs do not enumerate resources.
+
+Responses expose the fixed pipeline/model display ID/dimension/distance/schema, counts, state, safe error, attempt number, and public timestamps. They omit requestor/worker IDs, claim/vector-attempt IDs, lease, model revision/path, collection management, Qdrant URL/key, hashes, content, and vectors. API handlers never read artifacts, load models, or call Qdrant. There is no public search or query-vector route. See [vector-indexing.md](vector-indexing.md).
 
 ## Future API conventions
 

@@ -66,6 +66,8 @@ Phase 4 uses `<root>/uploads/<department_id>/.staging/<upload_id>.part` while st
 
 Phase 5 stages beneath `<root>/extracted_text/<department_id>/<document_id>/.staging/<extraction_id>/<claim_token>/` and publishes to a fresh exclusive `<root>/extracted_text/<department_id>/<document_id>/<extraction_id>/`. The claim contains a private verified source snapshot, parent-created outputs, and a separate scratch directory during processing. Before publication, the snapshot and scratch are removed, unexpected entries are rejected, and quota is computed from the exact reviewed final allowlist: `normalized.txt`, `chunks.jsonl`, and `manifest.json`. Only those three files move into the final directory; the claim directory is never renamed as the result. The root must preexist as a real writable non-symlink directory. Publication uses descriptor-relative no-follow operations, exclusive `0600` files, `0700` directories, identity/link checks, and never overwrites a final result. Expired-job recovery removes only the exact prior claim token's staging. The worker mounts uploads read-only and extracted text read-write.
 
+Phase 6 model preparation stages and caches only beneath `model_cache`, then publishes one real-file directory named for the immutable reviewed revision with a complete integrity manifest. Ordinary indexing mounts `model_cache` and `extracted_text` read-only, operates offline, and writes vectors only to Qdrant service state. Qdrant payload is content-free; live state remains beneath external `service_state/qdrant` and portable snapshots beneath `vector_snapshots`. No model, vector, chunk artifact, Hugging Face cache, or Qdrant data may enter the checkout or process temporary storage.
+
 ## Never commit
 
 The following must never be committed, even to a private branch:
@@ -102,13 +104,15 @@ Any future component that reads or writes artifacts must:
 
 The Phase 5 parser receives the read-only immutable source-snapshot descriptor, fixed output/result descriptors, and a descriptor-based scratch alias, not the live source, a publishable directory descriptor, external host path, database/auth secret, filename, or user environment. PostgreSQL stores extraction/chunk metadata only; metadata APIs expose no content or paths.
 
+The Phase 6 embedding child receives only a reviewed model directory argument plus bounded sequence/text requests. It receives no database, Qdrant, authentication, department, document, extraction, user, or filename values. PostgreSQL stores indexing metadata but no text/vectors; Qdrant stores vectors with a content-free payload.
+
 Do not hard-code a developer's absolute Google Drive path in source code, Docker files, tests, or committed environment templates. `.env.example` should contain a placeholder; each developer keeps the real value in an untracked `.env`.
 
 ## Docker Compose
 
 Local Compose configuration passes `DEPTSLM_DATA_DIR` explicitly to services that need it and binds only approved external subpaths. Use `scripts/compose.sh` for local Compose commands: it rejects missing, relative, root, nonexistent, non-writable, source-overlapping, and incomplete host paths before Docker runs. The wrapper also sets a required Compose guard, so a direct `docker compose` invocation fails instead of bypassing validation. Bind mounts disable automatic host-path creation.
 
-PostgreSQL and live Qdrant state use `service_state/` bind mounts in the Phase 0 placeholder. Before real data is used, review whether synchronized Google Drive storage is suitable, ensure volumes cannot resolve inside the checkout, and document backup, synchronization, corruption, retention, and recovery behavior. Portable Qdrant snapshots intended for retention belong in `vector_snapshots/`.
+PostgreSQL and live Qdrant state use `service_state/` bind mounts in the local Compose stack. Before real data is used, review whether synchronized Google Drive storage is suitable, ensure volumes cannot resolve inside the checkout, and document backup, synchronization, corruption, retention, and recovery behavior. Portable Qdrant snapshots intended for retention belong in `vector_snapshots/`.
 
 ## Tests and CI
 
@@ -122,6 +126,9 @@ Tests and CI must not depend on Google Drive. Each run should create a fresh tem
 - extraction failures, timeouts, claim loss, and shutdown remove the exact source snapshot and scratch staging;
 - final extraction directories contain only the three reviewed artifacts, and extra staging bytes cannot evade quota accounting;
 - expired claims cannot regain ownership and reclaim cleanup cannot cross claim-token scope.
+- model preparation and normal indexing never write model or vector artifacts into the checkout or home cache;
+- Qdrant tests use the pinned isolated service and exact department/attempt filters;
+- failed, stale, shutdown, and reclaimed indexing attempts clean only their exact vector attempt and never become trusted.
 
 ## Google Drive limitations
 

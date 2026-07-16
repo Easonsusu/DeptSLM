@@ -59,10 +59,24 @@ case "$source_root" in
     ;;
 esac
 
-if [ ! -w "$resolved_data_dir" ] || [ ! -x "$resolved_data_dir" ]; then
-  echo "rag-worker error: DEPTSLM_DATA_DIR is not writable and searchable." >&2
-  exit 1
-fi
+case "${DEPTSLM_STORAGE_READ_ONLY:-0}" in
+  0)
+    if [ ! -w "$resolved_data_dir" ] || [ ! -x "$resolved_data_dir" ]; then
+      echo "rag-worker error: DEPTSLM_DATA_DIR is not writable and searchable." >&2
+      exit 1
+    fi
+    ;;
+  1)
+    if [ ! -x "$resolved_data_dir" ]; then
+      echo "rag-worker error: DEPTSLM_DATA_DIR is not searchable." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "rag-worker error: DEPTSLM_STORAGE_READ_ONLY must be 0 or 1." >&2
+    exit 1
+    ;;
+esac
 
 if [ "$#" -eq 0 ]; then
   set -- python -m deptslm_worker --poll

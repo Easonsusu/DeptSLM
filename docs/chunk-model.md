@@ -1,4 +1,4 @@
-# Phase 5 Chunk Model
+# Chunk Model Through Phase 6
 
 ## Version and algorithm
 
@@ -17,3 +17,5 @@ PDF chunks have one-based `page_start`/`page_end` and no line range. Text and Ma
 PostgreSQL `document_chunks` rows contain department, document, extraction, ordinal, character range, UTF-8 byte size, internal SHA-256, provenance kind/range, and creation time. Composite foreign keys prevent cross-department/document assignment. The database contains no chunk text, normalized text, filename, or filesystem path.
 
 External `chunks.jsonl` is the content-bearing artifact. Each line includes chunk text and the corresponding metadata. Metadata APIs omit text, content hashes, paths, source hashes, and internal claim fields. Phase 5 has no chunk-content endpoint.
+
+Phase 6 keeps `DocumentChunk.id` as the server-owned Qdrant point UUID. The indexing worker incrementally compares each external line with the exact department/document/extraction/ordinal row before embedding. Qdrant payload retains only IDs, ordinal, page/line provenance, pipeline version, attempt identity, and publication state; chunk text, its digest, normalized text, filename, and paths remain absent. There is still no chunk-content or public search endpoint.

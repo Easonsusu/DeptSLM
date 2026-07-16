@@ -9,7 +9,7 @@ DeptSLM is developed in small, reviewable phases. Contributors must preserve the
 3. Create a focused branch from current `main`.
 4. Keep planned capabilities separate from implemented behavior.
 
-Phase 5 extraction changes must remain in the PostgreSQL queue and RAG-worker boundary. Do not add Qdrant, embeddings, LlamaIndex, model, OCR, malware-scanning, download, frontend, or training behavior.
+Phase 5 extraction behavior remains in its PostgreSQL queue and constrained parser boundary. Phase 6 Qdrant work must use only the reviewed adapter, fixed collection/model contracts, typed `DepartmentScope`, exact-attempt cleanup, and offline external model cache. Do not add public search, RAG, reranking, generation, LlamaIndex, OCR, download, frontend, or training behavior.
 
 ## Development setup
 
@@ -31,7 +31,7 @@ python -m alembic upgrade head
 python -m pytest -m postgres
 ```
 
-Never run migration-cycle tests against shared or production data. Non-database tests remain runnable with `python -m pytest -m "not postgres"`.
+Never run migration-cycle tests against shared or production data. Non-database tests remain runnable with `python -m pytest -m "not postgres and not qdrant"`. Qdrant integration tests require a disposable Qdrant 1.13.4 service plus `DEPTSLM_TEST_QDRANT_URL`, `DEPTSLM_TEST_QDRANT_API_KEY`, `DEPTSLM_TEST_QDRANT_ISOLATED=1`, and `DEPTSLM_REQUIRE_QDRANT_TESTS=1`; CI must not silently skip either PostgreSQL or Qdrant tests.
 
 For the Compose-managed database, use the image-contained migration path:
 
@@ -72,6 +72,8 @@ All future department-owned artifacts must use safe paths beneath `DEPTSLM_DATA_
 Document upload changes must keep raw bodies incremental, avoid multipart and process-temporary storage, revalidate authorization after streaming, and test cleanup for denial, cancellation, storage, and database failures. Tests must create a fresh temporary `uploads` directory; they must never use a developer's Google Drive folder.
 
 Extraction changes must keep parsing out of API handlers, use the installed secret-free parser subprocess, reverify source bytes, preserve claim/lease ownership, and publish only beneath a fresh temporary `extracted_text` root in tests. Metadata APIs must never expose extracted or chunk text, hashes, paths, claim tokens, or worker identity.
+
+Indexing changes must revalidate the exact final Phase 5 allowlist incrementally, keep embedding/model dependencies out of the API and extraction image, use deterministic fake embeddings only in exact test environments, and keep all Qdrant calls department-filtered. Tests use temporary `extracted_text` and `model_cache` directories and an isolated collection; never download the real model in CI.
 
 ## Department and authentication safety
 

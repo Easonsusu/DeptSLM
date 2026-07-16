@@ -2,7 +2,7 @@
 
 ## Status
 
-Phase 2 implemented reusable authentication and fail-closed authorization foundations. Phase 3 added PostgreSQL identities, departments, memberships, scoped administration, and transactional audit events. Phase 4 applies those boundaries to document upload, and Phase 5 applies them to extraction jobs and chunk metadata. Production identity integration and later product data APIs remain deferred.
+Phase 2 implemented reusable authentication and fail-closed authorization foundations. Phases 3–5 added persistent departments, documents, extraction jobs, and chunks. Phase 6 applies the same boundary to vector-indexing jobs and all Qdrant operations. Production identity integration and later product data APIs remain deferred.
 
 ## Security objective
 
@@ -77,6 +77,7 @@ PostgreSQL constraints and indexes should include department ownership. Qdrant o
 - Source metadata and citations must not reveal another department's names, paths, titles, or identifiers.
 - Phase 5 extraction enqueue/retry requires same-department `system_admin`, `department_admin`, or `instructor`; all five roles may read safe status/provenance metadata. Every query uses department, document, and extraction scope; APIs expose no extracted/chunk text, internal hashes, paths, claims, or worker identity.
 - Workers carry explicit department/document IDs, revalidate active document ownership at finalization, and cannot publish after lease/claim loss. Composite database constraints prevent cross-department extraction or chunk assignment.
+- Phase 6 indexing enqueue/retry uses the same curator roles; all five active roles may read content-free status. Every PostgreSQL query uses exact department/document/extraction/indexing scope, and every Qdrant operation requires typed `DepartmentScope` plus an internally constructed exact department filter.
 
 ### Training datasets
 
@@ -127,6 +128,12 @@ Document repositories require `DepartmentScope` and always filter `department_id
 ## Phase 5 extraction boundary
 
 Extraction and chunk repositories require `DepartmentScope` plus document/extraction selectors. Enqueue/retry repeats transaction-time membership checks and appends success audit rows with the queued attempt. Workers use database-owned department/document IDs, verify source integrity, and finalization locks department, document, then extraction before checking document state, source identity, pipeline, lease, and claim. Composite foreign keys reject cross-department metadata even if application filtering fails. Public schemas exclude content, paths, hashes, requestor/worker identity, and claims.
+
+## Phase 6 vector boundary
+
+Indexing repositories require `DepartmentScope` plus exact document/extraction/indexing selectors. Composite `RESTRICT` keys prevent cross-department jobs. The Qdrant adapter accepts no raw scope string, optional scope, client filter, or collection; attempt operations add exact indexing/vector-attempt filters and search adds current pipeline plus publication. Returned IDs/payload are validated and future retrieval cross-checks succeeded indexing, stored document, succeeded extraction, and exact chunk ownership in PostgreSQL. No system-admin cross-department bypass or public search exists.
+
+Process logs contain fixed action/result/reason plus department/job IDs only. Transactional success rows are `document.vector_index.enqueue`, `document.vector_index.retry`, and `document.vector_index.complete`; model, artifact, Qdrant, claim, cleanup, and database failures never receive completion-success rows. Chunk text, vectors, hashes, filenames, paths, URLs, keys, SQL, and authentication values are excluded.
 
 ## Acceptance criteria for Phase 2
 
