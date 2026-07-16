@@ -249,7 +249,8 @@ jobs:
           import sentence_transformers
           assert importlib.util.find_spec("llama_index") is None
           '
-          weight_matches="$(docker run --rm --entrypoint sh deptslm-indexing-worker-ci -c 'find / -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) -print 2>/dev/null || true')"
+          # setuptools installs this Python import-path configuration file; it is not a model artifact.
+          weight_matches="$(docker run --rm --entrypoint sh deptslm-indexing-worker-ci -c 'find / -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) ! -path "/usr/local/lib/python3.12/site-packages/distutils-precedence.pth" -print 2>/dev/null || true')"
           if [[ -n "$weight_matches" ]]; then
             printf 'Forbidden model-weight-like files in indexing image:\n%s\n' "$weight_matches" >&2
             exit 1
