@@ -33,6 +33,7 @@ pythonpath = ["."]
 testpaths = ["tests"]
 markers = [
     "postgres: requires an isolated PostgreSQL database",
+    "qdrant: requires an isolated Qdrant service",
     "unit: does not require PostgreSQL",
 ]
 

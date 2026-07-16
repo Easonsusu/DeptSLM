@@ -103,10 +103,20 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      qdrant:
+        image: qdrant/qdrant:v1.13.4
+        env:
+          QDRANT__SERVICE__API_KEY: phase6-ci-qdrant-key-0123456789
+        ports:
+          - 6333:6333
     env:
       DATABASE_URL: postgresql+psycopg://deptslm:deptslm@localhost:5432/deptslm_test
       DATABASE_TEST_URL: postgresql+psycopg://deptslm:deptslm@localhost:5432/deptslm_test
       DEPTSLM_REQUIRE_POSTGRES_TESTS: "1"
+      DEPTSLM_REQUIRE_QDRANT_TESTS: "1"
+      DEPTSLM_TEST_QDRANT_URL: http://localhost:6333
+      DEPTSLM_TEST_QDRANT_API_KEY: phase6-ci-qdrant-key-0123456789
+      DEPTSLM_TEST_QDRANT_ISOLATED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -132,8 +142,19 @@ jobs:
         working-directory: apps/api
         run: |
           export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-data"
-          mkdir -p "$DEPTSLM_DATA_DIR/uploads" "$DEPTSLM_DATA_DIR/extracted_text"
+          mkdir -p "$DEPTSLM_DATA_DIR/uploads" "$DEPTSLM_DATA_DIR/extracted_text" "$DEPTSLM_DATA_DIR/model_cache"
+          for attempt in {1..30}; do
+            if curl --fail --silent --header "api-key: $DEPTSLM_TEST_QDRANT_API_KEY" "$DEPTSLM_TEST_QDRANT_URL/healthz" >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" -eq 30 ]]; then
+              echo "Qdrant did not become healthy." >&2
+              exit 1
+            fi
+            sleep 1
+          done
           python -m alembic upgrade head
+          test "$(python -m alembic current | awk '{print $1}')" = "0004_phase6_vector_indexing"
           python -m pytest
       - name: Run one-shot worker smoke test
         working-directory: apps/api
@@ -141,6 +162,20 @@ jobs:
           export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-worker-smoke"
           mkdir -p "$DEPTSLM_DATA_DIR/uploads" "$DEPTSLM_DATA_DIR/extracted_text"
           python -m deptslm_worker --once
+      - name: Run one-shot indexing worker smoke test with fake embeddings
+        working-directory: apps/api
+        env:
+          ENVIRONMENT: test
+          DEPTSLM_QDRANT_URL: http://localhost:6333
+          DEPTSLM_QDRANT_API_KEY: phase6-ci-qdrant-key-0123456789
+          DEPTSLM_QDRANT_COLLECTION: deptslm_chunks_qwen3_0_6b_1024_v1
+          DEPTSLM_EMBEDDING_MODEL_REVISION: d23109d65ca9fdf61eef614209744716f337f50f
+          DEPTSLM_EMBEDDING_PROVIDER: fake
+        run: |
+          export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-indexer-smoke"
+          mkdir -p "$DEPTSLM_DATA_DIR/extracted_text" "$DEPTSLM_DATA_DIR/model_cache"
+          python -m deptslm_worker.vector_admin bootstrap
+          python -m deptslm_worker.indexer --once
       - name: Verify API checks leave the checkout clean
         shell: bash
         run: |
@@ -184,30 +219,62 @@ jobs:
           assert pathlib.Path("/app/alembic/versions/0001_phase3_schema.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0002_phase4_documents.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0003_phase5_extraction.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0004_phase6_vector_indexing.py").is_file()
           import importlib.util
           assert importlib.util.find_spec("pypdf") is None
+          assert importlib.util.find_spec("qdrant_client") is None
+          assert importlib.util.find_spec("sentence_transformers") is None
           '
       - name: Build and inspect extraction worker image
         run: |
-          docker build --tag deptslm-rag-worker-ci --file services/rag-worker/Dockerfile .
+          docker build --target extraction --tag deptslm-rag-worker-ci --file services/rag-worker/Dockerfile .
           docker run --rm --entrypoint python deptslm-rag-worker-ci -I -c '
+          import importlib.util
           import pypdf
           import deptslm_worker
           import deptslm_worker.extraction_runner
           import deptslm_worker.queue
           assert tuple(int(part) for part in pypdf.__version__.split(".")[:2]) >= (6, 14)
+          assert importlib.util.find_spec("qdrant_client") is None
+          assert importlib.util.find_spec("sentence_transformers") is None
           '
+      - name: Build and inspect indexing worker image
+        run: |
+          docker build --target indexing --tag deptslm-indexing-worker-ci --file services/rag-worker/Dockerfile .
+          docker run --rm --entrypoint python deptslm-indexing-worker-ci -I -c '
+          import importlib.util
+          import deptslm_worker.indexer
+          import deptslm_worker.qdrant_adapter
+          import qdrant_client
+          import sentence_transformers
+          assert importlib.util.find_spec("llama_index") is None
+          '
+          # setuptools installs this Python import-path configuration file; it is not a model artifact.
+          weight_matches="$(docker run --rm --entrypoint sh deptslm-indexing-worker-ci -c 'find / -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) ! -path "/usr/local/lib/python3.12/site-packages/distutils-precedence.pth" -print 2>/dev/null || true')"
+          if [[ -n "$weight_matches" ]]; then
+            printf 'Forbidden model-weight-like files in indexing image:\n%s\n' "$weight_matches" >&2
+            exit 1
+          fi
       - name: Check raw streaming upload boundary
         run: |
           ! grep -R -E 'UploadFile|python-multipart|request\.body\(' apps/api/app apps/api/requirements*.txt
-      - name: Check Phase 5 extraction non-goals
+      - name: Check Phase 5 extraction isolation
         run: |
-          ! grep -R -E -i 'qdrant|llamaindex|llama_index|pytesseract|easyocr|transformers|sentence_transformers|huggingface_hub' services/rag-worker/deptslm_worker services/rag-worker/pyproject.toml
+          ! grep -E -i 'qdrant|transformers|sentence_transformers|huggingface_hub' services/rag-worker/deptslm_worker/{__main__,pipeline,queue,extractor,extraction_runner}.py
+          ! grep -R -E -i 'llamaindex|llama_index|pytesseract|easyocr' services/rag-worker/deptslm_worker services/rag-worker/pyproject.toml
           ! git ls-files | grep -E '(^|/)(normalized\.txt|chunks\.jsonl|manifest\.json)$'
+      - name: Check Phase 6 architecture boundaries
+        run: |
+          ! grep -E 'QdrantClient|qdrant_client' apps/api/app/routes.py
+          test "$(grep -R -l 'QdrantClient' services/rag-worker/deptslm_worker --include='*.py' | sort)" = "services/rag-worker/deptslm_worker/qdrant_adapter.py"
+          ! grep -E '@router\.(get|post).*search|/search|query_vector' apps/api/app/routes.py
+          ! grep -E 'qdrant/qdrant:(latest|main)' docker-compose.yml .github/workflows/ci.yml
+          grep -R -F 'd23109d65ca9fdf61eef614209744716f337f50f' apps/api/app services/rag-worker/deptslm_worker >/dev/null
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then
             export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-data"
+            export DEPTSLM_QDRANT_API_KEY="phase6-ci-compose-key-0123456789"
             mkdir -p "$DEPTSLM_DATA_DIR"/{uploads,extracted_text,vector_snapshots,training_datasets,adapters,model_cache,eval_results,logs,exports}
             mkdir -p "$DEPTSLM_DATA_DIR/service_state/postgres"
             mkdir -p "$DEPTSLM_DATA_DIR/service_state/qdrant"

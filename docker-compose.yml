@@ -1,7 +1,7 @@
 name: deptslm
 
-# Phase 0 local-development scaffold. Use scripts/compose.sh so the host path is
-# verified as absolute, existing, and outside this repository before Compose runs.
+# Local-development stack. Use scripts/compose.sh so the host path is verified
+# as absolute, existing, and outside this repository before Compose runs.
 x-deptslm-wrapper-required: "${DEPTSLM_COMPOSE_WRAPPER:?Run ./scripts/compose.sh instead of invoking docker compose directly}"
 
 services:
@@ -33,7 +33,6 @@ services:
       DEPTSLM_DOCUMENT_MAX_BYTES: "${DEPTSLM_DOCUMENT_MAX_BYTES:-26214400}"
       DEPTSLM_DEPARTMENT_DOCUMENT_QUOTA_BYTES: "${DEPTSLM_DEPARTMENT_DOCUMENT_QUOTA_BYTES:-1073741824}"
       ENVIRONMENT: "${ENVIRONMENT:-development}"
-      QDRANT_URL: "${QDRANT_URL:-http://qdrant:6333}"
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     volumes:
@@ -45,8 +44,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      qdrant:
-        condition: service_started
 
   postgres:
     image: postgres:16-alpine
@@ -70,6 +67,8 @@ services:
 
   qdrant:
     image: qdrant/qdrant:v1.13.4
+    environment:
+      QDRANT__SERVICE__API_KEY: "${DEPTSLM_QDRANT_API_KEY:?Set a non-placeholder Qdrant API key in the untracked .env file}"
     ports:
       - "127.0.0.1:6333:6333"
       - "127.0.0.1:6334:6334"
@@ -84,6 +83,7 @@ services:
     build:
       context: .
       dockerfile: services/rag-worker/Dockerfile
+      target: extraction
     environment:
       DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
       DEPTSLM_DATA_DIR: /runtime/deptslm
@@ -117,6 +117,95 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  indexing-worker:
+    build:
+      context: .
+      dockerfile: services/rag-worker/Dockerfile
+      target: indexing
+    command: ["python", "-m", "deptslm_worker.indexer", "--poll"]
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      DEPTSLM_QDRANT_URL: "${DEPTSLM_QDRANT_URL:-http://qdrant:6333}"
+      DEPTSLM_QDRANT_API_KEY: "${DEPTSLM_QDRANT_API_KEY:?Set a non-placeholder Qdrant API key in the untracked .env file}"
+      DEPTSLM_QDRANT_COLLECTION: "${DEPTSLM_QDRANT_COLLECTION:-deptslm_chunks_qwen3_0_6b_1024_v1}"
+      DEPTSLM_QDRANT_TIMEOUT_SECONDS: "${DEPTSLM_QDRANT_TIMEOUT_SECONDS:-30}"
+      DEPTSLM_VECTOR_INDEX_LEASE_SECONDS: "${DEPTSLM_VECTOR_INDEX_LEASE_SECONDS:-300}"
+      DEPTSLM_VECTOR_INDEX_POLL_SECONDS: "${DEPTSLM_VECTOR_INDEX_POLL_SECONDS:-5}"
+      DEPTSLM_EMBEDDING_BATCH_SIZE: "${DEPTSLM_EMBEDDING_BATCH_SIZE:-8}"
+      DEPTSLM_EMBEDDING_MAX_BATCH_CHARS: "${DEPTSLM_EMBEDDING_MAX_BATCH_CHARS:-8192}"
+      DEPTSLM_EMBEDDING_TIMEOUT_SECONDS: "${DEPTSLM_EMBEDDING_TIMEOUT_SECONDS:-120}"
+      DEPTSLM_EMBEDDING_MODEL_REVISION: "${DEPTSLM_EMBEDDING_MODEL_REVISION:-d23109d65ca9fdf61eef614209744716f337f50f}"
+      DEPTSLM_EMBEDDING_PROVIDER: "${DEPTSLM_EMBEDDING_PROVIDER:-real}"
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/extracted_text"
+        target: /runtime/deptslm/extracted_text
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/model_cache"
+        target: /runtime/deptslm/model_cache
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+
+  model-admin:
+    profiles: ["admin"]
+    build:
+      context: .
+      dockerfile: services/rag-worker/Dockerfile
+      target: indexing
+    command: ["python", "-c", "print('Invoke the explicit model administration command.')"]
+    environment:
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      DEPTSLM_STORAGE_READ_ONLY: "0"
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/model_cache"
+        target: /runtime/deptslm/model_cache
+        bind:
+          create_host_path: false
+
+  vector-admin:
+    profiles: ["admin"]
+    build:
+      context: .
+      dockerfile: services/rag-worker/Dockerfile
+      target: indexing
+    entrypoint: ["python", "-m", "deptslm_worker.vector_admin"]
+    command: ["bootstrap"]
+    environment:
+      DEPTSLM_QDRANT_URL: "${DEPTSLM_QDRANT_URL:-http://qdrant:6333}"
+      DEPTSLM_QDRANT_API_KEY: "${DEPTSLM_QDRANT_API_KEY:?Set a non-placeholder Qdrant API key in the untracked .env file}"
+      DEPTSLM_QDRANT_COLLECTION: "${DEPTSLM_QDRANT_COLLECTION:-deptslm_chunks_qwen3_0_6b_1024_v1}"
+      DEPTSLM_QDRANT_TIMEOUT_SECONDS: "${DEPTSLM_QDRANT_TIMEOUT_SECONDS:-30}"
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      qdrant:
+        condition: service_started
 
   training-worker:
     build:

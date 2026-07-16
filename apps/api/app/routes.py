@@ -1,4 +1,4 @@
-"""Department-scoped control-plane routes through Phase 5."""
+"""Department-scoped control-plane routes through Phase 6."""
 
 from __future__ import annotations
 
@@ -48,6 +48,8 @@ from app.schemas import (
     MembershipListResponse,
     MembershipResponse,
     MembershipUpdate,
+    VectorIndexingListResponse,
+    VectorIndexingResponse,
 )
 from app.services import (
     ServiceError,
@@ -61,6 +63,12 @@ from app.services import (
     revoke_membership,
     update_department,
     update_membership,
+)
+from app.vector_index_services import (
+    enqueue_indexing,
+    list_indexings,
+    read_indexing,
+    retry_indexing,
 )
 
 router = APIRouter()
@@ -504,6 +512,111 @@ def post_extraction_retry(
     try:
         return ExtractionResponse.model_validate(
             retry_extraction(session, principal, request_scope, document_id, extraction_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/documents/{document_id}/extractions/{extraction_id}/indexings",
+    response_model=VectorIndexingResponse,
+    status_code=202,
+    tags=["document-vector-indexings"],
+)
+def post_vector_indexing(
+    document_id: UUID,
+    extraction_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> VectorIndexingResponse:
+    try:
+        return VectorIndexingResponse.model_validate(
+            enqueue_indexing(session, principal, request_scope, document_id, extraction_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/documents/{document_id}/extractions/{extraction_id}/indexings",
+    response_model=VectorIndexingListResponse,
+    tags=["document-vector-indexings"],
+)
+def get_vector_indexings(
+    document_id: UUID,
+    extraction_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> VectorIndexingListResponse:
+    try:
+        rows = list_indexings(
+            session, principal, request_scope, document_id, extraction_id, limit, offset
+        )
+        return VectorIndexingListResponse(
+            items=[VectorIndexingResponse.model_validate(row) for row in rows],
+            limit=limit,
+            offset=offset,
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/documents/{document_id}/extractions/{extraction_id}/indexings/{indexing_id}",
+    response_model=VectorIndexingResponse,
+    tags=["document-vector-indexings"],
+)
+def get_vector_indexing(
+    document_id: UUID,
+    extraction_id: UUID,
+    indexing_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> VectorIndexingResponse:
+    try:
+        return VectorIndexingResponse.model_validate(
+            read_indexing(
+                session,
+                principal,
+                request_scope,
+                document_id,
+                extraction_id,
+                indexing_id,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/documents/{document_id}/extractions/{extraction_id}/indexings/{indexing_id}/retry",
+    response_model=VectorIndexingResponse,
+    status_code=202,
+    tags=["document-vector-indexings"],
+)
+def post_vector_indexing_retry(
+    document_id: UUID,
+    extraction_id: UUID,
+    indexing_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> VectorIndexingResponse:
+    try:
+        return VectorIndexingResponse.model_validate(
+            retry_indexing(
+                session,
+                principal,
+                request_scope,
+                document_id,
+                extraction_id,
+                indexing_id,
+            )
         )
     except ServiceError as error:
         _raise(error)

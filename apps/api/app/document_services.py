@@ -19,7 +19,7 @@ from app.document_repositories import (
 )
 from app.document_storage import DocumentStorageError, StagedDocument
 from app.document_upload import StreamResult, UploadMetadata
-from app.models import Document, DocumentExtraction
+from app.models import Document, DocumentExtraction, DocumentVectorIndexing
 from app.services import (
     ALL_ROLES,
     ServiceError,
@@ -287,6 +287,21 @@ def delete_document(
                 finished_at=now,
                 error_code="document_unavailable",
                 version=DocumentExtraction.version + 1,
+                updated_at=now,
+            )
+        )
+        session.execute(
+            update(DocumentVectorIndexing)
+            .where(
+                DocumentVectorIndexing.department_id == request_scope.department.value,
+                DocumentVectorIndexing.document_id == document_id,
+                DocumentVectorIndexing.status == "queued",
+            )
+            .values(
+                status="cancelled",
+                finished_at=now,
+                error_code="document_unavailable",
+                version=DocumentVectorIndexing.version + 1,
                 updated_at=now,
             )
         )

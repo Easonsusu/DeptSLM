@@ -29,14 +29,15 @@ This roadmap separates foundational safety work from product implementation. A l
 - Require transaction-time authorization revalidation, serialized quota enforcement, safe audit evidence, and compensating cleanup.
 - Keep extraction, OCR, chunking, indexing, download, malware scanning, and production storage deferred.
 
-## Phase 5 — Document extraction and chunking (current; not completed)
+## Phase 5 — Document extraction and chunking (completed)
 
 - Add a PostgreSQL queue, constrained parser subprocess, source verification, deterministic normalization/chunking, provenance, leases, quota enforcement, and safe failure handling.
-- Phase 5 remains current until this pull request is reviewed and merged.
+- Phase 5 merged its reviewed extraction, chunking, provenance, and lease boundary.
 
-## Phase 6 — Qdrant indexing and retrieval
+## Phase 6 — Qdrant indexing and retrieval (current; not completed)
 
-- Add Qwen3-Embedding integration and mandatory `department_id` payload filters for all vector operations.
+- Add pinned offline Qwen3-Embedding integration, PostgreSQL indexing jobs, staged Qdrant publication, exact-attempt cleanup, and mandatory typed `department_id` payload filters.
+- Phase 6 remains current until this pull request is reviewed and merged; public semantic search and RAG remain deferred.
 
 ## Phase 7 — RAG chat with citations
 

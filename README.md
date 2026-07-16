@@ -2,9 +2,9 @@
 
 DeptSLM is a university departmental small language model (SLM) customization platform. It is intended to let each department build an isolated assistant from its own approved documents, retrieval index, evaluation data, and eventually its own LoRA or QLoRA adapter.
 
-> **Phase 5 status:** PostgreSQL-backed extraction jobs, immutable verified source snapshots, constrained PDF/text/Markdown parsing, deterministic forward-progress chunking, exact three-file publication, provenance, non-revivable leases, exact stale-claim cleanup, and safe retries are under review. OCR, malware scanning, download, Qdrant, embeddings, RAG, model serving, fine-tuning, and production identity/storage remain deferred.
+> **Phase 6 status:** Department-scoped PostgreSQL indexing jobs, pinned offline Qwen3 chunk embeddings, verified dense-only Qdrant schema, live-claim mutation gates, verified exact-attempt cleanup, and mandatory typed department filters are under review. No public search, RAG, reranking, generation, frontend indexing UI, fine-tuning, or production deployment is implemented.
 
-The API only enqueues and reads extraction metadata; parsing runs in the RAG worker from a claim-owned verified snapshot with separate scratch space. Extracted and chunk text remains external and has no API. The parser boundary is constrained but is not a kernel-enforced malware sandbox. Never-reclaimed staging and crash-time final-orphan reconciliation remain deferred.
+The API manages content-free upload, extraction, and indexing metadata. Parsing and embedding run in separate worker paths; extracted and chunk text remains external and has no API. Embedding IPC is byte-bounded, nonblocking, and interruptible. PostgreSQL succeeded state remains retrieval authority because PostgreSQL cannot transactionally fence an already in-flight Qdrant request. The subprocess boundaries are constrained but are not kernel-enforced malware sandboxes, and crash-time orphan reconciliation remains deferred.
 
 ## Planned stack
 
@@ -26,7 +26,7 @@ DeptSLM/
 │   ├── api/                  # FastAPI application
 │   └── web/                  # Next.js application
 ├── services/
-│   ├── rag-worker/           # Phase 5 extraction and chunking jobs
+│   ├── rag-worker/           # Extraction plus isolated Phase 6 indexing paths
 │   └── training-worker/      # Future fine-tuning jobs
 ├── packages/
 │   └── shared/               # Future shared contracts and utilities
@@ -118,6 +118,18 @@ Run at most one extraction job or poll continuously with:
 ./scripts/compose.sh run --rm rag-worker python -m deptslm_worker --poll
 ```
 
+Phase 6 requires a long untracked `DEPTSLM_QDRANT_API_KEY`. Prepare the exact pinned model and fixed collection explicitly; normal workers do neither:
+
+```bash
+./scripts/compose.sh run --rm model-admin \
+  python -m deptslm_worker.model_admin prepare-embedding
+./scripts/compose.sh run --rm vector-admin bootstrap
+./scripts/compose.sh run --rm indexing-worker \
+  python -m deptslm_worker.indexer --once
+```
+
+Model assets remain under `DEPTSLM_DATA_DIR/model_cache`. The indexing worker mounts only `extracted_text` and `model_cache` read-only and receives no API authentication secret. See [Vector indexing](docs/vector-indexing.md), [Qdrant boundary](docs/qdrant-boundary.md), and [Embedding model](docs/embedding-model.md).
+
 ## Safety and data isolation
 
 - Future department-owned records, documents, indexes, jobs, adapters, and conversations must be scoped and authorized by `department_id` at every storage and service boundary.
@@ -146,10 +158,13 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Document extraction](docs/document-extraction.md)
 - [Chunk model](docs/chunk-model.md)
 - [RAG worker](docs/rag-worker.md)
+- [Vector indexing](docs/vector-indexing.md)
+- [Qdrant boundary](docs/qdrant-boundary.md)
+- [Embedding model](docs/embedding-model.md)
 
 ## Current non-goals
 
-Phase 5 does not implement production OAuth/OIDC/SSO, platform administration, frontend ingestion UI, OCR, malware scanning, download/preview, Qdrant, embeddings, LlamaIndex, RAG, model inference, fine-tuning, or production deployment.
+Phase 6 does not implement production OAuth/OIDC/SSO, platform administration, frontend ingestion/indexing UI, OCR, malware scanning, download/preview, public semantic search, RAG, reranking, generation, LlamaIndex, fine-tuning, or production deployment.
 
 ## License
 

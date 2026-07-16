@@ -1,4 +1,4 @@
-"""Validated public schemas through Phase 5."""
+"""Validated public schemas through Phase 6."""
 
 from __future__ import annotations
 
@@ -173,5 +173,34 @@ class ChunkResponse(ORMResponse):
 
 class ChunkListResponse(BaseModel):
     items: list[ChunkResponse]
+    limit: int
+    offset: int
+
+
+class VectorIndexingResponse(ORMResponse):
+    """Safe indexing metadata without claims, paths, credentials, hashes, or vectors."""
+
+    id: UUID
+    department_id: UUID
+    document_id: UUID
+    extraction_id: UUID
+    status: str
+    embedding_pipeline_version: str
+    embedding_model_id: str
+    embedding_dimension: int
+    distance: str
+    vector_schema_version: str
+    expected_chunk_count: int
+    point_count: int | None
+    error_code: str | None
+    attempt_number: int
+    started_at: datetime | None
+    finished_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class VectorIndexingListResponse(BaseModel):
+    items: list[VectorIndexingResponse]
     limit: int
     offset: int
