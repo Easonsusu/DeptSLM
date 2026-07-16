@@ -57,6 +57,7 @@ class DepartmentQdrant:
     """Construct all filters internally from a mandatory typed department scope."""
 
     def __init__(self, url: str, api_key: str, timeout_seconds: int) -> None:
+        self._verified = False
         try:
             from qdrant_client import QdrantClient
 
@@ -73,20 +74,11 @@ class DepartmentQdrant:
         self._client.close()
 
     def verify_collection(self) -> None:
+        self._verified = False
         try:
-            if not self._client.collection_exists(QDRANT_COLLECTION):
-                raise QdrantBoundaryError("qdrant_schema_mismatch")
-            information = self._client.get_collection(QDRANT_COLLECTION)
-            vectors = information.config.params.vectors
-            parameters = vectors.get(QDRANT_VECTOR_NAME) if isinstance(vectors, dict) else None
-            distance = getattr(getattr(parameters, "distance", None), "value", None)
-            if (
-                parameters is None
-                or parameters.size != EMBEDDING_DIMENSION
-                or str(distance).lower() != EMBEDDING_DISTANCE
-            ):
-                raise QdrantBoundaryError("qdrant_schema_mismatch")
+            self._verify_vector_contract()
             self._verify_payload_indexes()
+            self._verified = True
         except QdrantBoundaryError:
             raise
         except Exception as error:
@@ -94,6 +86,7 @@ class DepartmentQdrant:
 
     def bootstrap_collection(self) -> None:
         """Create the fixed schema only when absent; never recreate existing data."""
+        self._verified = False
         try:
             from qdrant_client.http import models
 
@@ -127,7 +120,7 @@ class DepartmentQdrant:
                     field_schema=schema,
                     wait=True,
                 )
-            self._verify_payload_indexes()
+            self.verify_collection()
         except QdrantBoundaryError:
             raise
         except Exception as error:
@@ -138,7 +131,9 @@ class DepartmentQdrant:
             raise QdrantBoundaryError("qdrant_schema_mismatch")
         information = self._client.get_collection(QDRANT_COLLECTION)
         vectors = information.config.params.vectors
-        parameters = vectors.get(QDRANT_VECTOR_NAME) if isinstance(vectors, dict) else None
+        if not isinstance(vectors, dict) or set(vectors) != {QDRANT_VECTOR_NAME}:
+            raise QdrantBoundaryError("qdrant_schema_mismatch")
+        parameters = vectors[QDRANT_VECTOR_NAME]
         distance = getattr(getattr(parameters, "distance", None), "value", None)
         if (
             parameters is None
@@ -170,6 +165,7 @@ class DepartmentQdrant:
 
     def upsert_staging(self, scope: DepartmentScope, points: Sequence[VectorPoint]) -> None:
         _require_scope(scope)
+        self._require_verified()
         if not points:
             return
         if len(points) > MAX_UPSERT_POINTS:
@@ -216,6 +212,7 @@ class DepartmentQdrant:
         published: bool,
     ) -> int:
         _require_scope(scope)
+        self._require_verified()
         try:
             result = self._client.count(
                 QDRANT_COLLECTION,
@@ -232,6 +229,7 @@ class DepartmentQdrant:
         self, scope: DepartmentScope, indexing_id: UUID, vector_attempt_id: UUID
     ) -> None:
         _require_scope(scope)
+        self._require_verified()
         try:
             self._client.set_payload(
                 QDRANT_COLLECTION,
@@ -254,6 +252,7 @@ class DepartmentQdrant:
         maximum: int,
     ) -> tuple[UUID, ...]:
         _require_scope(scope)
+        self._require_verified()
         if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
             raise QdrantBoundaryError("qdrant_verification_failed")
         try:
@@ -296,6 +295,7 @@ class DepartmentQdrant:
         self, scope: DepartmentScope, indexing_id: UUID, vector_attempt_id: UUID
     ) -> None:
         _require_scope(scope)
+        self._require_verified()
         try:
             self._client.delete(
                 QDRANT_COLLECTION,
@@ -304,6 +304,12 @@ class DepartmentQdrant:
                 ),
                 wait=True,
             )
+            unpublished = self.count_attempt(scope, indexing_id, vector_attempt_id, published=False)
+            published = self.count_attempt(scope, indexing_id, vector_attempt_id, published=True)
+            if unpublished != 0 or published != 0:
+                raise QdrantBoundaryError("qdrant_cleanup_failed")
+        except QdrantBoundaryError as error:
+            raise QdrantBoundaryError("qdrant_cleanup_failed") from error
         except Exception as error:
             raise QdrantBoundaryError("qdrant_cleanup_failed") from error
 
@@ -317,6 +323,7 @@ class DepartmentQdrant:
     ) -> tuple[VectorHit, ...]:
         """Internal-only primitive. Callers must cross-check PostgreSQL authority."""
         _require_scope(scope)
+        self._require_verified()
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise QdrantBoundaryError("qdrant_verification_failed")
         if document_id is not None and not isinstance(document_id, UUID):
@@ -357,6 +364,10 @@ class DepartmentQdrant:
             raise
         except Exception as error:
             raise QdrantBoundaryError("qdrant_verification_failed") from error
+
+    def _require_verified(self) -> None:
+        if self._verified is not True:
+            raise QdrantBoundaryError("qdrant_schema_mismatch")
 
     @staticmethod
     def _payload(

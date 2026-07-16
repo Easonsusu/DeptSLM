@@ -122,6 +122,44 @@ def heartbeat(factory: sessionmaker[Session], job: ClaimedIndexJob, lease_second
         return False
 
 
+def renew_lease(factory: sessionmaker[Session], job: ClaimedIndexJob, lease_seconds: int) -> None:
+    """Renew an exact live claim while preserving database errors as database errors."""
+    try:
+        with factory() as session, session.begin():
+            result = session.execute(
+                update(DocumentVectorIndexing)
+                .where(*_owned_claim(job), _live_lease(), *_fixed_contract(job))
+                .values(
+                    lease_expires_at=func.clock_timestamp() + timedelta(seconds=lease_seconds),
+                    updated_at=func.clock_timestamp(),
+                    version=DocumentVectorIndexing.version + 1,
+                )
+            )
+            if result.rowcount != 1:
+                raise IndexQueueError("claim_lost")
+    except IndexQueueError:
+        raise
+    except SQLAlchemyError as error:
+        raise IndexQueueError("database_unavailable") from error
+
+
+def require_live_claim(factory: sessionmaker[Session], job: ClaimedIndexJob) -> None:
+    """Require exact PostgreSQL-server-time ownership before a Qdrant mutation."""
+    try:
+        with factory() as session:
+            owned = session.execute(
+                select(DocumentVectorIndexing.id).where(
+                    *_owned_claim(job), _live_lease(), *_fixed_contract(job)
+                )
+            ).scalar_one_or_none()
+            if owned is None:
+                raise IndexQueueError("claim_lost")
+    except IndexQueueError:
+        raise
+    except SQLAlchemyError as error:
+        raise IndexQueueError("database_unavailable") from error
+
+
 def requeue_owned(factory: sessionmaker[Session], job: ClaimedIndexJob) -> bool:
     try:
         with factory() as session, session.begin():
@@ -324,6 +362,9 @@ def finalize_success(
                 staged_ids
             ):
                 raise IndexQueueError("qdrant_verification_failed")
+            now = session.execute(select(func.clock_timestamp())).scalar_one()
+            if not _valid_contract(indexing, job, now):
+                raise IndexQueueError("claim_lost")
             qdrant.activate_attempt(scope, job.id, job.vector_attempt_id)
             if (
                 qdrant.count_attempt(scope, job.id, job.vector_attempt_id, published=True)
@@ -386,9 +427,26 @@ def _live_lease():
     return DocumentVectorIndexing.lease_expires_at > func.clock_timestamp()
 
 
+def _fixed_contract(job: ClaimedIndexJob):
+    return (
+        DocumentVectorIndexing.expected_chunk_count == job.expected_chunk_count,
+        DocumentVectorIndexing.embedding_pipeline_version == EMBEDDING_PIPELINE_VERSION,
+        DocumentVectorIndexing.embedding_model_id == EMBEDDING_MODEL_ID,
+        DocumentVectorIndexing.embedding_model_revision == EMBEDDING_MODEL_REVISION,
+        DocumentVectorIndexing.embedding_dimension == EMBEDDING_DIMENSION,
+        DocumentVectorIndexing.distance == EMBEDDING_DISTANCE,
+        DocumentVectorIndexing.vector_schema_version == VECTOR_SCHEMA_VERSION,
+        DocumentVectorIndexing.qdrant_collection == QDRANT_COLLECTION,
+    )
+
+
 def _valid_contract(indexing, job: ClaimedIndexJob, now) -> bool:
     return bool(
         indexing is not None
+        and indexing.id == job.id
+        and indexing.department_id == job.department_id
+        and indexing.document_id == job.document_id
+        and indexing.extraction_id == job.extraction_id
         and indexing.status == "running"
         and indexing.worker_id == job.worker_id
         and indexing.claim_token == job.claim_token

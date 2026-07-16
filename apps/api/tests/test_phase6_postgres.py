@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import jwt
 import pytest
 from alembic.config import Config
+from deptslm_worker.index_pipeline import (
+    _cleanup_stale_attempt,
+    _delete_owned_attempt,
+    _run_owned_qdrant_mutation,
+    process_index_job,
+)
 from deptslm_worker.index_queue import (
     IndexQueueError,
     claim_next,
@@ -19,11 +27,11 @@ from deptslm_worker.index_queue import (
     heartbeat,
     requeue_owned,
 )
-from deptslm_worker.qdrant_adapter import QdrantBoundaryError, VectorHit
+from deptslm_worker.qdrant_adapter import QdrantBoundaryError, VectorHit, VectorPoint
 from deptslm_worker.vector_retrieval import RetrievalBoundaryError, search_authorized
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, inspect, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from alembic import command
@@ -551,6 +559,306 @@ def test_two_workers_claim_distinct_jobs(db: Session, engine) -> None:
     assert first.id != second.id
 
 
+class _MutationSpy:
+    def __init__(self) -> None:
+        self.deleted = []
+        self.upserts = 0
+        self.activations = 0
+
+    def delete_attempt(self, scope, indexing_id, vector_attempt_id) -> None:
+        self.deleted.append((scope.value, indexing_id, vector_attempt_id))
+
+    def upsert_staging(self, _scope, _points) -> None:
+        self.upserts += 1
+
+    def activate_attempt(self, _scope, _indexing_id, _vector_attempt_id) -> None:
+        self.activations += 1
+
+
+@pytest.mark.parametrize("mutation", ["delete", "upsert", "activate"])
+def test_expired_worker_cannot_mutate_qdrant(db: Session, engine, mutation: str) -> None:
+    identity, department, document, extraction, _chunk = _seed(db)
+    db.add(_indexing(identity, department, document, extraction))
+    db.commit()
+    factory = create_session_factory(engine)
+    job = claim_next(factory, uuid4(), 60)
+    assert job is not None
+    db.execute(
+        text(
+            "UPDATE document_vector_indexings SET lease_expires_at = clock_timestamp() "
+            "- interval '1 second' WHERE id = :id"
+        ),
+        {"id": job.id},
+    )
+    db.commit()
+    settings = SimpleNamespace(lease_seconds=60)
+    qdrant = _MutationSpy()
+    with pytest.raises(IndexQueueError, match="claim_lost"):
+        if mutation == "delete":
+            _delete_owned_attempt(
+                factory,
+                settings,
+                qdrant,
+                DepartmentScope(job.department_id),
+                job,
+                job.vector_attempt_id,
+            )
+        elif mutation == "upsert":
+            _run_owned_qdrant_mutation(
+                factory,
+                settings,
+                job,
+                lambda: qdrant.upsert_staging(DepartmentScope(job.department_id), (object(),)),
+            )
+        else:
+            _run_owned_qdrant_mutation(
+                factory,
+                settings,
+                job,
+                lambda: qdrant.activate_attempt(
+                    DepartmentScope(job.department_id), job.id, job.vector_attempt_id
+                ),
+            )
+    assert qdrant.deleted == [] and qdrant.upserts == 0 and qdrant.activations == 0
+
+
+def test_reclaimed_worker_cannot_delete_after_token_replacement(db: Session, engine) -> None:
+    identity, department, document, extraction, _chunk = _seed(db)
+    db.add(_indexing(identity, department, document, extraction))
+    db.commit()
+    factory = create_session_factory(engine)
+    stale = claim_next(factory, uuid4(), 60)
+    assert stale is not None
+    db.execute(
+        text(
+            "UPDATE document_vector_indexings SET lease_expires_at = clock_timestamp() "
+            "- interval '1 second' WHERE id = :id"
+        ),
+        {"id": stale.id},
+    )
+    db.commit()
+    replacement = claim_next(factory, uuid4(), 60)
+    assert replacement is not None
+    qdrant = _MutationSpy()
+    with pytest.raises(IndexQueueError, match="claim_lost"):
+        _delete_owned_attempt(
+            factory,
+            SimpleNamespace(lease_seconds=60),
+            qdrant,
+            DepartmentScope(stale.department_id),
+            stale,
+            stale.vector_attempt_id,
+        )
+    assert qdrant.deleted == []
+
+
+class _UnavailableFactory:
+    def __call__(self):
+        raise SQLAlchemyError("database unavailable")
+
+
+def test_database_failure_prevents_qdrant_mutation() -> None:
+    job = SimpleNamespace()
+    qdrant = _MutationSpy()
+    with pytest.raises(IndexQueueError, match="database_unavailable"):
+        _run_owned_qdrant_mutation(
+            _UnavailableFactory(),
+            SimpleNamespace(lease_seconds=60),
+            job,
+            lambda: qdrant.upsert_staging(DepartmentScope(uuid4()), (object(),)),
+        )
+    assert qdrant.upserts == 0
+
+
+class _SchemaMismatchQdrant(_MutationSpy):
+    def verify_collection(self) -> None:
+        raise QdrantBoundaryError("qdrant_schema_mismatch")
+
+
+def test_collection_mismatch_fails_job_without_any_qdrant_mutation(db: Session, engine) -> None:
+    identity, department, document, extraction, _chunk = _seed(db)
+    db.add(_indexing(identity, department, document, extraction))
+    db.commit()
+    factory = create_session_factory(engine)
+    job = claim_next(factory, uuid4(), 60)
+    assert job is not None
+    qdrant = _SchemaMismatchQdrant()
+    assert (
+        process_index_job(
+            factory,
+            SimpleNamespace(lease_seconds=60),
+            qdrant,
+            job,
+            lambda: False,
+        )
+        is False
+    )
+    row = db.get(DocumentVectorIndexing, job.id)
+    db.refresh(row)
+    assert (row.status, row.error_code) == ("failed", "qdrant_schema_mismatch")
+    assert qdrant.deleted == [] and qdrant.upserts == 0 and qdrant.activations == 0
+    assert (
+        db.query(PersistentAuditEvent).filter_by(action="document.vector_index.complete").count()
+        == 0
+    )
+
+
+class _DelayedAttemptQdrant:
+    def __init__(self, stale_attempt_id) -> None:
+        self.stale_attempt_id = stale_attempt_id
+        self.stale_upsert_started = threading.Event()
+        self.release_stale_upsert = threading.Event()
+        self.lock = threading.Lock()
+        self.points: dict[tuple[object, object, object], dict[object, bool]] = {}
+        self.cleanup_attempts = []
+
+    @staticmethod
+    def _key(scope, indexing_id, vector_attempt_id):
+        return scope.value, indexing_id, vector_attempt_id
+
+    def seed(self, scope, indexing_id, vector_attempt_id, point_id, *, published=False) -> None:
+        with self.lock:
+            self.points.setdefault(self._key(scope, indexing_id, vector_attempt_id), {})[
+                point_id
+            ] = published
+
+    def upsert_staging(self, scope, points) -> None:
+        points = tuple(points)
+        if points[0].vector_attempt_id == self.stale_attempt_id:
+            self.stale_upsert_started.set()
+            assert self.release_stale_upsert.wait(timeout=5)
+        with self.lock:
+            for point in points:
+                self.points.setdefault(
+                    self._key(scope, point.indexing_id, point.vector_attempt_id), {}
+                )[point.chunk_id] = False
+
+    def delete_attempt(self, scope, indexing_id, vector_attempt_id) -> None:
+        key = self._key(scope, indexing_id, vector_attempt_id)
+        with self.lock:
+            self.cleanup_attempts.append(key)
+            self.points.pop(key, None)
+
+    def count_attempt(self, scope, indexing_id, vector_attempt_id, *, published):
+        with self.lock:
+            return sum(
+                value is published
+                for value in self.points.get(
+                    self._key(scope, indexing_id, vector_attempt_id), {}
+                ).values()
+            )
+
+    def inspect_attempt(self, scope, indexing_id, vector_attempt_id, *, published, maximum):
+        with self.lock:
+            values = tuple(
+                point_id
+                for point_id, value in self.points.get(
+                    self._key(scope, indexing_id, vector_attempt_id), {}
+                ).items()
+                if value is published
+            )
+        return values[: maximum + 1]
+
+    def activate_attempt(self, scope, indexing_id, vector_attempt_id) -> None:
+        key = self._key(scope, indexing_id, vector_attempt_id)
+        with self.lock:
+            self.points[key] = {point_id: True for point_id in self.points.get(key, {})}
+
+
+def _vector_point(job, chunk_id) -> VectorPoint:
+    return VectorPoint(
+        chunk_id=chunk_id,
+        document_id=job.document_id,
+        extraction_id=job.extraction_id,
+        indexing_id=job.id,
+        vector_attempt_id=job.vector_attempt_id,
+        chunk_ordinal=0,
+        provenance_kind="line",
+        page_start=None,
+        page_end=None,
+        line_start=1,
+        line_end=1,
+        vector=tuple([1.0] + [0.0] * (EMBEDDING_DIMENSION - 1)),
+    )
+
+
+def test_reclaim_second_cleanup_removes_late_stale_upsert_before_activation(
+    db: Session, engine
+) -> None:
+    identity, department, document, extraction, chunk = _seed(db)
+    db.add(_indexing(identity, department, document, extraction))
+    db.commit()
+    factory = create_session_factory(engine)
+    settings = SimpleNamespace(lease_seconds=60)
+    stale = claim_next(factory, uuid4(), 60)
+    assert stale is not None
+    scope = DepartmentScope(stale.department_id)
+    qdrant = _DelayedAttemptQdrant(stale.vector_attempt_id)
+    stale_errors = []
+
+    def delayed_stale_write() -> None:
+        try:
+            _run_owned_qdrant_mutation(
+                factory,
+                settings,
+                stale,
+                lambda: qdrant.upsert_staging(scope, (_vector_point(stale, uuid4()),)),
+            )
+        except IndexQueueError as error:
+            stale_errors.append(error.code)
+
+    thread = threading.Thread(target=delayed_stale_write)
+    thread.start()
+    assert qdrant.stale_upsert_started.wait(timeout=5)
+    db.execute(
+        text(
+            "UPDATE document_vector_indexings SET lease_expires_at = clock_timestamp() "
+            "- interval '1 second' WHERE id = :id"
+        ),
+        {"id": stale.id},
+    )
+    db.commit()
+    replacement = claim_next(factory, uuid4(), 60)
+    assert replacement is not None
+    assert replacement.stale_vector_attempt_id == stale.vector_attempt_id
+    replacement_scope = DepartmentScope(replacement.department_id)
+    unrelated_scope = DepartmentScope(uuid4())
+    unrelated_key = (unrelated_scope.value, uuid4(), uuid4())
+    qdrant.seed(
+        unrelated_scope,
+        unrelated_key[1],
+        unrelated_key[2],
+        uuid4(),
+    )
+    _cleanup_stale_attempt(factory, settings, qdrant, replacement_scope, replacement)
+    qdrant.release_stale_upsert.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert stale_errors == ["claim_lost"]
+    current_point = _vector_point(replacement, chunk.id)
+    _run_owned_qdrant_mutation(
+        factory,
+        settings,
+        replacement,
+        lambda: qdrant.upsert_staging(replacement_scope, (current_point,)),
+    )
+    _cleanup_stale_attempt(factory, settings, qdrant, replacement_scope, replacement)
+    finalize_success(factory, replacement, qdrant)
+    stale_key = (replacement.department_id, replacement.id, stale.vector_attempt_id)
+    current_key = (
+        replacement.department_id,
+        replacement.id,
+        replacement.vector_attempt_id,
+    )
+    assert qdrant.points.get(stale_key) is None
+    assert qdrant.points[current_key] == {chunk.id: True}
+    assert unrelated_key in qdrant.points
+    assert qdrant.cleanup_attempts.count(stale_key) == 2
+    row = db.get(DocumentVectorIndexing, replacement.id)
+    db.refresh(row)
+    assert row.status == "succeeded"
+
+
 class _SuccessfulQdrant:
     def __init__(self) -> None:
         self.activated = False
@@ -691,6 +999,36 @@ def test_internal_retrieval_rejects_non_succeeded_indexing(
         search_authorized(
             factory,
             _RetrievalQdrant(hit),
+            DepartmentScope(department.id),
+            query,
+            limit=5,
+        )
+
+
+def test_cleanup_failure_published_point_is_rejected_without_postgres_success(
+    db: Session, engine
+) -> None:
+    identity, department, document, extraction, chunk = _seed(db)
+    db.add(_indexing(identity, department, document, extraction))
+    db.commit()
+    factory = create_session_factory(engine)
+    job = claim_next(factory, uuid4(), 60)
+    assert job is not None
+    assert fail_owned(factory, job, "qdrant_cleanup_failed") is True
+    published_hit = VectorHit(
+        point_id=chunk.id,
+        document_id=document.id,
+        extraction_id=extraction.id,
+        indexing_id=job.id,
+        vector_attempt_id=job.vector_attempt_id,
+        chunk_ordinal=chunk.ordinal,
+        score=0.75,
+    )
+    query = tuple([1.0] + [0.0] * (EMBEDDING_DIMENSION - 1))
+    with pytest.raises(RetrievalBoundaryError):
+        search_authorized(
+            factory,
+            _RetrievalQdrant(published_hit),
             DepartmentScope(department.id),
             query,
             limit=5,

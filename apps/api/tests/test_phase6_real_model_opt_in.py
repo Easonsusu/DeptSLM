@@ -27,6 +27,8 @@ def test_pinned_real_embedding_model_offline_smoke() -> None:
         provider="real",
         environment="test",
         timeout_seconds=300,
+        max_batch_size=8,
+        max_batch_characters=8192,
         heartbeat=lambda: True,
         should_stop=lambda: False,
     ) as process:

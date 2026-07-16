@@ -23,7 +23,9 @@ Preparation writes `deptslm-model-manifest.json` with the model ID, immutable re
 
 ## Process and test boundary
 
-The indexing parent launches one persistent isolated subprocess per job with a fixed executable and runner path, `shell=False`, a new process session, closed unrelated descriptors, a minimal environment, and offline flags. Only a sequence number, bounded chunk-text batch, and bounded vector response cross the pipe. Database URLs, Qdrant settings, authentication configuration, bearer tokens, department/document/user identities, filenames, and host paths are absent. Timeout, shutdown, claim loss, malformed output, or child exit terminates the process group.
+The indexing parent launches one persistent isolated subprocess per job with a fixed executable and runner path, `shell=False`, a new process session, closed unrelated descriptors, a minimal environment, and offline flags. Only a sequence number, bounded chunk-text batch, and bounded vector response cross the pipe. The parent calculates the maximum encoded JSON request from the reviewed batch-count and character bounds using worst-case JSON escaping. Stdin is nonblocking and selector-driven; one operation deadline covers request transmission and response receipt, while heartbeat, shutdown, claim-loss, and child-exit checks remain active. Timeout or interruption terminates and reaps the process group. Text and vectors are never spooled to temporary or persistent files.
+
+Database URLs, Qdrant settings, authentication configuration, bearer tokens, department/document/user identities, filenames, and host paths are absent. Response bytes, ordering, sequence, one-vector-per-input, vector dimension, finiteness, and normalization remain bounded and validated.
 
 The deterministic fake provider is permitted only when `ENVIRONMENT=test` is exact. It is never the default and startup rejects it in local development, preview, staging, production, unknown, missing, or misspelled environments. CI does not download the real model. A real-model smoke test is opt-in and must use an already prepared exact cache with networking disabled.
 

@@ -18,6 +18,8 @@ from app.vector_index_domain import EMBEDDING_DIMENSION
 NORMALIZED_TOLERANCE = 1e-3
 MAX_ABSOLUTE_VALUE = 10.0
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_SEQUENCE = (1 << 63) - 1
+MAX_JSON_BYTES_PER_CHARACTER = 6
 
 
 class EmbeddingError(RuntimeError):
@@ -53,11 +55,14 @@ class EmbeddingProcess:
         provider: str,
         environment: str,
         timeout_seconds: int,
+        max_batch_size: int,
+        max_batch_characters: int,
         heartbeat: Callable[[], bool],
         should_stop: Callable[[], bool],
     ) -> None:
         if provider == "fake" and environment != "test":
             raise EmbeddingError("embedding_model_unavailable")
+        request_limit = maximum_request_bytes(max_batch_size, max_batch_characters)
         child_environment = {
             "PATH": os.defpath,
             "PYTHONIOENCODING": "utf-8",
@@ -87,13 +92,27 @@ class EmbeddingProcess:
             env=child_environment,
         )
         self.timeout_seconds = timeout_seconds
+        self.max_batch_size = max_batch_size
+        self.max_batch_characters = max_batch_characters
+        self.max_request_bytes = request_limit
         self.heartbeat = heartbeat
         self.should_stop = should_stop
         self.sequence = 0
         self.buffer = bytearray()
+        if self.process.stdin is None:
+            self.close()
+            raise EmbeddingError()
+        os.set_blocking(self.process.stdin.fileno(), False)
 
     def embed(self, texts: Sequence[str]) -> list[tuple[float, ...]]:
         if not texts or self.process.stdin is None or self.process.stdout is None:
+            raise EmbeddingError()
+        if (
+            len(texts) > self.max_batch_size
+            or any(not isinstance(text, str) or not text for text in texts)
+            or sum(len(text) for text in texts) > self.max_batch_characters
+            or self.sequence > MAX_SEQUENCE
+        ):
             raise EmbeddingError()
         sequence = self.sequence
         self.sequence += 1
@@ -106,12 +125,12 @@ class EmbeddingProcess:
             + b"\n"
         )
         try:
-            self.process.stdin.write(payload)
-            self.process.stdin.flush()
-        except (BrokenPipeError, OSError) as error:
-            raise EmbeddingError() from error
-        response = self._read_response()
-        try:
+            if len(payload) > self.max_request_bytes:
+                raise EmbeddingError()
+            deadline = time.monotonic() + self.timeout_seconds
+            next_heartbeat = time.monotonic()
+            next_heartbeat = self._write_request(payload, deadline, next_heartbeat)
+            response = self._read_response(deadline, next_heartbeat)
             value = json.loads(response)
             if value.get("sequence") != sequence or set(value) != {
                 "sequence",
@@ -123,12 +142,34 @@ class EmbeddingProcess:
                 raise ValueError
             return [validate_vector(vector) for vector in vectors]
         except (TypeError, ValueError, json.JSONDecodeError) as error:
+            self.close()
             raise EmbeddingError("invalid_embedding") from error
+        except BaseException:
+            self.close()
+            raise
 
-    def _read_response(self) -> bytes:
+    def _write_request(self, payload: bytes, deadline: float, next_heartbeat: float) -> float:
+        assert self.process.stdin is not None
+        remaining = memoryview(payload)
+        descriptor = self.process.stdin.fileno()
+        while remaining:
+            next_heartbeat = self._checkpoint(deadline, next_heartbeat)
+            _, writable, _ = select.select([], [descriptor], [], 0.1)
+            if not writable:
+                continue
+            try:
+                written = os.write(descriptor, remaining)
+            except BlockingIOError:
+                continue
+            except (BrokenPipeError, OSError) as error:
+                raise EmbeddingError() from error
+            if written <= 0:
+                raise EmbeddingError()
+            remaining = remaining[written:]
+        return next_heartbeat
+
+    def _read_response(self, deadline: float, next_heartbeat: float) -> bytes:
         assert self.process.stdout is not None
-        deadline = time.monotonic() + self.timeout_seconds
-        next_heartbeat = time.monotonic()
         while True:
             newline = self.buffer.find(b"\n")
             if newline >= 0:
@@ -137,15 +178,7 @@ class EmbeddingProcess:
                 return response
             if len(self.buffer) > MAX_RESPONSE_BYTES:
                 raise EmbeddingError("invalid_embedding")
-            if self.should_stop():
-                raise EmbeddingError("worker_shutdown")
-            now = time.monotonic()
-            if now >= deadline:
-                raise EmbeddingError("embedding_timeout")
-            if now >= next_heartbeat:
-                if not self.heartbeat():
-                    raise EmbeddingError("claim_lost")
-                next_heartbeat = now + min(10, max(1, self.timeout_seconds // 4))
+            next_heartbeat = self._checkpoint(deadline, next_heartbeat)
             readable, _, _ = select.select([self.process.stdout], [], [], 0.1)
             if not readable:
                 if self.process.poll() is not None:
@@ -155,6 +188,20 @@ class EmbeddingProcess:
             if not chunk:
                 raise EmbeddingError()
             self.buffer.extend(chunk)
+
+    def _checkpoint(self, deadline: float, next_heartbeat: float) -> float:
+        if self.should_stop():
+            raise EmbeddingError("worker_shutdown")
+        now = time.monotonic()
+        if now >= deadline:
+            raise EmbeddingError("embedding_timeout")
+        if self.process.poll() is not None:
+            raise EmbeddingError()
+        if now >= next_heartbeat:
+            if not self.heartbeat():
+                raise EmbeddingError("claim_lost")
+            return now + min(10, max(1, self.timeout_seconds // 4))
+        return next_heartbeat
 
     def close(self) -> None:
         if self.process.poll() is not None:
@@ -177,3 +224,25 @@ class EmbeddingProcess:
 
     def __exit__(self, *_args) -> None:
         self.close()
+
+
+def maximum_request_bytes(max_batch_size: int, max_batch_characters: int) -> int:
+    """Worst-case UTF-8 JSON line size for the reviewed batch constraints."""
+    if (
+        isinstance(max_batch_size, bool)
+        or not isinstance(max_batch_size, int)
+        or max_batch_size < 1
+        or isinstance(max_batch_characters, bool)
+        or not isinstance(max_batch_characters, int)
+        or max_batch_characters < 1
+    ):
+        raise EmbeddingError()
+    empty_request = (
+        json.dumps(
+            {"sequence": MAX_SEQUENCE, "texts": [""] * max_batch_size},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    return len(empty_request) + max_batch_characters * MAX_JSON_BYTES_PER_CHARACTER

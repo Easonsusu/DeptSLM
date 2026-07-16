@@ -5,17 +5,24 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import threading
 from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
+import deptslm_worker.embedding as embedding_module
 import pytest
 from deptslm_worker.artifact_reader import (
     ArtifactError,
     ArtifactExpectation,
     Phase5ArtifactReader,
 )
-from deptslm_worker.embedding import EmbeddingError, EmbeddingProcess, validate_vector
+from deptslm_worker.embedding import (
+    EmbeddingError,
+    EmbeddingProcess,
+    maximum_request_bytes,
+    validate_vector,
+)
 from deptslm_worker.index_settings import IndexConfigurationError, IndexSettings
 from deptslm_worker.model_store import (
     MANIFEST_NAME,
@@ -135,6 +142,8 @@ def test_fake_embedding_subprocess_preserves_order_and_has_no_secret_environment
         provider="fake",
         environment="test",
         timeout_seconds=5,
+        max_batch_size=8,
+        max_batch_characters=8192,
         heartbeat=lambda: True,
         should_stop=lambda: False,
     ) as process:
@@ -143,6 +152,126 @@ def test_fake_embedding_subprocess_preserves_order_and_has_no_secret_environment
     assert vectors[0] == vectors[2]
     assert vectors[0] != vectors[1]
     assert all(len(vector) == EMBEDDING_DIMENSION for vector in vectors)
+
+
+def _controlled_embedding_process(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source: str,
+    *,
+    timeout_seconds: int = 1,
+    heartbeat=lambda: True,
+    should_stop=lambda: False,
+) -> EmbeddingProcess:
+    runner = tmp_path / "embedding_runner.py"
+    runner.write_text(source)
+    monkeypatch.setattr(embedding_module, "__file__", str(tmp_path / "embedding.py"))
+    return EmbeddingProcess(
+        tmp_path,
+        provider="fake",
+        environment="test",
+        timeout_seconds=timeout_seconds,
+        max_batch_size=1,
+        max_batch_characters=131072,
+        heartbeat=heartbeat,
+        should_stop=should_stop,
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import time\ntime.sleep(60)\n",
+        "import os, time\nos.read(0, 1024)\ntime.sleep(60)\n",
+    ],
+)
+def test_embedding_blocked_or_partial_request_write_times_out_and_reaps_child(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str
+) -> None:
+    process = _controlled_embedding_process(monkeypatch, tmp_path, source)
+    with pytest.raises(EmbeddingError, match="embedding_timeout"):
+        process.embed(["x" * 131072])
+    assert process.process.poll() is not None
+    assert {path.name for path in tmp_path.iterdir()} == {"embedding_runner.py"}
+
+
+def test_embedding_child_exit_during_request_write_is_detected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    process = _controlled_embedding_process(
+        monkeypatch, tmp_path, "raise SystemExit(0)\n", timeout_seconds=5
+    )
+    with pytest.raises(EmbeddingError, match="embedding_failed"):
+        process.embed(["x" * 131072])
+    assert process.process.poll() is not None
+
+
+def test_embedding_response_stall_uses_same_operation_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    process = _controlled_embedding_process(
+        monkeypatch,
+        tmp_path,
+        "import sys, time\nsys.stdin.buffer.readline()\ntime.sleep(60)\n",
+    )
+    with pytest.raises(EmbeddingError, match="embedding_timeout"):
+        process.embed(["small request"])
+    assert process.process.poll() is not None
+
+
+def test_embedding_claim_loss_during_blocked_write_heartbeats_and_reaps_child(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    heartbeats = 0
+
+    def heartbeat() -> bool:
+        nonlocal heartbeats
+        heartbeats += 1
+        return heartbeats < 2
+
+    process = _controlled_embedding_process(
+        monkeypatch,
+        tmp_path,
+        "import time\ntime.sleep(60)\n",
+        timeout_seconds=5,
+        heartbeat=heartbeat,
+    )
+    with pytest.raises(EmbeddingError, match="claim_lost"):
+        process.embed(["x" * 131072])
+    assert heartbeats >= 2
+    assert process.process.poll() is not None
+
+
+def test_embedding_shutdown_during_blocked_write_reaps_child(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    stopped = threading.Event()
+    timer = threading.Timer(0.2, stopped.set)
+    process = _controlled_embedding_process(
+        monkeypatch,
+        tmp_path,
+        "import time\ntime.sleep(60)\n",
+        timeout_seconds=5,
+        should_stop=stopped.is_set,
+    )
+    timer.start()
+    try:
+        with pytest.raises(EmbeddingError, match="worker_shutdown"):
+            process.embed(["x" * 131072])
+    finally:
+        timer.cancel()
+    assert process.process.poll() is not None
+
+
+def test_embedding_request_limit_covers_worst_case_json_encoding() -> None:
+    assert maximum_request_bytes(1, 1) >= len(
+        json.dumps(
+            {"sequence": 0, "texts": ["\x00"]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
 
 
 def _artifact(root: Path):
@@ -316,6 +445,7 @@ def test_qdrant_payload_contains_only_reviewed_content_free_metadata() -> None:
 
 def test_qdrant_boundary_rejects_raw_scope_and_oversized_upsert() -> None:
     adapter = object.__new__(DepartmentQdrant)
+    adapter._verified = True
     with pytest.raises(QdrantBoundaryError, match="qdrant_verification_failed"):
         adapter._base_filter(str(uuid4()), published=True)
     scope = DepartmentScope(uuid4())
@@ -335,6 +465,56 @@ def test_qdrant_boundary_rejects_raw_scope_and_oversized_upsert() -> None:
     )
     with pytest.raises(QdrantBoundaryError, match="qdrant_write_failed"):
         adapter.upsert_staging(scope, (point,) * 65)
+
+
+class _DeleteClient:
+    def __init__(self) -> None:
+        self.delete_calls = 0
+
+    def delete(self, *_args, **_kwargs) -> None:
+        self.delete_calls += 1
+
+
+@pytest.mark.parametrize("counts", [(1, 0), (0, 1), (1, 1)])
+def test_exact_cleanup_rejects_unpublished_published_or_partial_residue(
+    monkeypatch: pytest.MonkeyPatch, counts: tuple[int, int]
+) -> None:
+    adapter = object.__new__(DepartmentQdrant)
+    adapter._verified = True
+    adapter._client = _DeleteClient()
+    values = iter(counts)
+    monkeypatch.setattr(adapter, "count_attempt", lambda *_args, **_kwargs: next(values))
+    with pytest.raises(QdrantBoundaryError, match="qdrant_cleanup_failed"):
+        adapter.delete_attempt(DepartmentScope(uuid4()), uuid4(), uuid4())
+    assert adapter._client.delete_calls == 1
+
+
+def test_exact_cleanup_rejects_count_failure_after_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = object.__new__(DepartmentQdrant)
+    adapter._verified = True
+    adapter._client = _DeleteClient()
+
+    def fail_count(*_args, **_kwargs):
+        raise QdrantBoundaryError("qdrant_unavailable")
+
+    monkeypatch.setattr(adapter, "count_attempt", fail_count)
+    with pytest.raises(QdrantBoundaryError, match="qdrant_cleanup_failed"):
+        adapter.delete_attempt(DepartmentScope(uuid4()), uuid4(), uuid4())
+
+
+def test_exact_cleanup_accepts_verified_zero_and_is_repeatable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = object.__new__(DepartmentQdrant)
+    adapter._verified = True
+    adapter._client = _DeleteClient()
+    monkeypatch.setattr(adapter, "count_attempt", lambda *_args, **_kwargs: 0)
+    scope, indexing_id, attempt_id = DepartmentScope(uuid4()), uuid4(), uuid4()
+    adapter.delete_attempt(scope, indexing_id, attempt_id)
+    adapter.delete_attempt(scope, indexing_id, attempt_id)
+    assert adapter._client.delete_calls == 2
 
 
 def test_qdrant_payload_validation_rejects_missing_or_foreign_scope() -> None:

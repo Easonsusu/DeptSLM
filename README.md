@@ -2,9 +2,9 @@
 
 DeptSLM is a university departmental small language model (SLM) customization platform. It is intended to let each department build an isolated assistant from its own approved documents, retrieval index, evaluation data, and eventually its own LoRA or QLoRA adapter.
 
-> **Phase 6 status:** Department-scoped PostgreSQL indexing jobs, pinned offline Qwen3 chunk embeddings, staged Qdrant writes, exact-attempt cleanup, and mandatory typed department filters are under review. No public search, RAG, reranking, generation, frontend indexing UI, fine-tuning, or production deployment is implemented.
+> **Phase 6 status:** Department-scoped PostgreSQL indexing jobs, pinned offline Qwen3 chunk embeddings, verified dense-only Qdrant schema, live-claim mutation gates, verified exact-attempt cleanup, and mandatory typed department filters are under review. No public search, RAG, reranking, generation, frontend indexing UI, fine-tuning, or production deployment is implemented.
 
-The API manages content-free upload, extraction, and indexing metadata. Parsing and embedding run in separate worker paths; extracted and chunk text remains external and has no API. The subprocess boundaries are constrained but are not kernel-enforced malware sandboxes. Crash-time orphan reconciliation remains deferred.
+The API manages content-free upload, extraction, and indexing metadata. Parsing and embedding run in separate worker paths; extracted and chunk text remains external and has no API. Embedding IPC is byte-bounded, nonblocking, and interruptible. PostgreSQL succeeded state remains retrieval authority because PostgreSQL cannot transactionally fence an already in-flight Qdrant request. The subprocess boundaries are constrained but are not kernel-enforced malware sandboxes, and crash-time orphan reconciliation remains deferred.
 
 ## Planned stack
 
