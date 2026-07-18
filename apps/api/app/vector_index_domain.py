@@ -10,6 +10,14 @@ QDRANT_COLLECTION = "deptslm_chunks_qwen3_0_6b_1024_v1"
 QDRANT_VECTOR_NAME = "dense"
 QDRANT_VERSION = "1.13.4"
 
+# Retrieval uses the exact indexed document-vector contract. Query embeddings add
+# a reviewed instruction without changing the stored document-vector pipeline.
+QUERY_EMBEDDING_PIPELINE_VERSION = "phase7-qwen3-query-embedding-v1"
+QUERY_EMBEDDING_INSTRUCTION = (
+    "Given a user question, retrieve passages from the authorized department "
+    "documents that directly support an answer."
+)
+
 SAFE_VECTOR_INDEX_ERROR_CODES = frozenset(
     {
         "document_unavailable",

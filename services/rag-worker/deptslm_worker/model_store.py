@@ -1,4 +1,4 @@
-"""Validated offline model-cache boundary for the pinned embedding model."""
+"""Validated offline model-cache boundaries for reviewed embedding and generation models."""
 
 from __future__ import annotations
 
@@ -14,9 +14,11 @@ from app.vector_index_domain import (
     EMBEDDING_MODEL_ID,
     EMBEDDING_MODEL_REVISION,
 )
+from app.rag_domain import GENERATION_MODEL_ID, GENERATION_MODEL_REVISION
 
 MANIFEST_NAME = "deptslm-model-manifest.json"
 MODEL_DIRECTORY = f"qwen3-embedding-0.6b-{EMBEDDING_MODEL_REVISION}"
+GENERATION_MODEL_DIRECTORY = f"qwen3-0.6b-{GENERATION_MODEL_REVISION}"
 FORBIDDEN_SUFFIXES = {
     ".py",
     ".pyc",
@@ -48,19 +50,11 @@ def model_directory(data_dir: Path) -> Path:
     return data_dir / "model_cache" / MODEL_DIRECTORY
 
 
+def generation_model_directory(data_dir: Path) -> Path:
+    return data_dir / "model_cache" / GENERATION_MODEL_DIRECTORY
+
+
 def validate_model_store(data_dir: Path) -> ModelLocation:
-    root = data_dir / "model_cache"
-    location = model_directory(data_dir)
-    _real_directory(root)
-    _real_directory(location)
-    manifest_path = location / MANIFEST_NAME
-    try:
-        manifest_metadata = manifest_path.lstat()
-        if stat.S_ISLNK(manifest_metadata.st_mode) or not stat.S_ISREG(manifest_metadata.st_mode):
-            raise ModelStoreError("embedding_model_unavailable")
-        manifest = json.loads(_read_file(manifest_path, manifest_metadata).decode("utf-8"))
-    except (OSError, ValueError, TypeError) as error:
-        raise ModelStoreError("embedding_model_unavailable") from error
     expected = {
         "model_id": EMBEDDING_MODEL_ID,
         "revision": EMBEDDING_MODEL_REVISION,
@@ -70,6 +64,46 @@ def validate_model_store(data_dir: Path) -> ModelLocation:
         "normalized": True,
         "trust_remote_code": False,
     }
+    return _validate_store(
+        data_dir, model_directory(data_dir), expected, EMBEDDING_MODEL_REVISION
+    )
+
+
+def validate_generation_model_store(data_dir: Path) -> ModelLocation:
+    expected = {
+        "model_id": GENERATION_MODEL_ID,
+        "revision": GENERATION_MODEL_REVISION,
+        "library": "transformers",
+        "safetensors_only": True,
+        "trust_remote_code": False,
+        "enable_thinking": False,
+    }
+    return _validate_store(
+        data_dir,
+        generation_model_directory(data_dir),
+        expected,
+        GENERATION_MODEL_REVISION,
+    )
+
+
+def _validate_store(
+    data_dir: Path, location: Path, expected: dict[str, object], revision: str
+) -> ModelLocation:
+    root = data_dir / "model_cache"
+    _real_directory(root)
+    _real_directory(location)
+    manifest_path = location / MANIFEST_NAME
+    try:
+        manifest_metadata = manifest_path.lstat()
+        if stat.S_ISLNK(manifest_metadata.st_mode) or not stat.S_ISREG(
+            manifest_metadata.st_mode
+        ):
+            raise ModelStoreError("embedding_model_unavailable")
+        manifest = json.loads(
+            _read_file(manifest_path, manifest_metadata).decode("utf-8")
+        )
+    except (OSError, ValueError, TypeError) as error:
+        raise ModelStoreError("embedding_model_unavailable") from error
     for key, value in expected.items():
         if manifest.get(key) != value:
             raise ModelStoreError("embedding_model_unavailable")
@@ -84,7 +118,10 @@ def validate_model_store(data_dir: Path) -> ModelLocation:
             raise ModelStoreError("embedding_model_unavailable")
         if stat.S_ISDIR(metadata.st_mode):
             continue
-        if not stat.S_ISREG(metadata.st_mode) or path.suffix.lower() in FORBIDDEN_SUFFIXES:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or path.suffix.lower() in FORBIDDEN_SUFFIXES
+        ):
             raise ModelStoreError("embedding_model_unavailable")
         if relative == MANIFEST_NAME:
             continue
@@ -98,10 +135,39 @@ def validate_model_store(data_dir: Path) -> ModelLocation:
             raise ModelStoreError("embedding_model_unavailable")
     if actual_names != set(files):
         raise ModelStoreError("embedding_model_unavailable")
-    return ModelLocation(location, EMBEDDING_MODEL_REVISION)
+    return ModelLocation(location, revision)
 
 
 def build_manifest(location: Path) -> dict:
+    return _build_manifest(
+        location,
+        {
+            "model_id": EMBEDDING_MODEL_ID,
+            "revision": EMBEDDING_MODEL_REVISION,
+            "dimension": EMBEDDING_DIMENSION,
+            "library": "sentence-transformers",
+            "pooling": "model-provided last-token pooling",
+            "normalized": True,
+            "trust_remote_code": False,
+        },
+    )
+
+
+def build_generation_manifest(location: Path) -> dict:
+    return _build_manifest(
+        location,
+        {
+            "model_id": GENERATION_MODEL_ID,
+            "revision": GENERATION_MODEL_REVISION,
+            "library": "transformers",
+            "safetensors_only": True,
+            "trust_remote_code": False,
+            "enable_thinking": False,
+        },
+    )
+
+
+def _build_manifest(location: Path, contract: dict[str, object]) -> dict:
     files: dict[str, dict[str, int | str]] = {}
     for path in location.rglob("*"):
         relative = path.relative_to(location).as_posix()
@@ -120,16 +186,7 @@ def build_manifest(location: Path) -> dict:
         }
     if "model.safetensors" not in files:
         raise ModelStoreError("embedding_model_unavailable")
-    return {
-        "model_id": EMBEDDING_MODEL_ID,
-        "revision": EMBEDDING_MODEL_REVISION,
-        "dimension": EMBEDDING_DIMENSION,
-        "library": "sentence-transformers",
-        "pooling": "model-provided last-token pooling",
-        "normalized": True,
-        "trust_remote_code": False,
-        "files": files,
-    }
+    return {**contract, "files": files}
 
 
 def _real_directory(path: Path) -> None:

@@ -2,7 +2,7 @@
 
 ## Scope
 
-Phase 6 adds department-scoped PostgreSQL indexing jobs and an indexing-worker path for succeeded Phase 5 chunks. API handlers enqueue or read content-free metadata only. They never read chunk text, load a model, or contact Qdrant. No public semantic search, query embedding, RAG, reranking, answer generation, citation, frontend indexing UI, or training behavior is implemented.
+Phase 6 adds department-scoped PostgreSQL indexing jobs and an indexing-worker path for succeeded Phase 5 chunks. Indexing API handlers enqueue or read content-free metadata only; they never read chunk text, load a model, or contact Qdrant. Phase 7 reuses the reviewed internal Qdrant adapter and PostgreSQL authority method for one grounded-answer endpoint, but still exposes no public semantic-search or raw retrieval API. Reranking, frontend indexing controls, and training remain unimplemented.
 
 ## Database and API
 
@@ -39,3 +39,7 @@ Cleanup is permitted only after the fixed collection schema was accepted and onl
 Document soft deletion cancels queued indexing attempts with `document_unavailable` in the same PostgreSQL transaction. Running workers fail finalization after document revalidation. No Qdrant call occurs in deletion. Succeeded vectors may remain physically retained, but the internal retrieval cross-check rejects deleted documents; automatic physical purge is deferred.
 
 Google Drive remains a local-development convenience for `DEPTSLM_DATA_DIR`, not reviewed production database, object, model, or vector storage. PostgreSQL cannot transactionally fence a Qdrant request already in flight. Exact pre-activation stale cleanup removes a late completed stale write observed before activation, while `published=true` plus committed PostgreSQL `succeeded` authority keeps later or activated orphans untrusted. PostgreSQL/Qdrant commits are not atomic, local Qdrant is not a production deployment, the constrained embedding subprocess is not a kernel sandbox, and operational reconciliation, backups, TLS, clustering, and production secrets remain deferred.
+
+## Phase 7 retrieval use
+
+Phase 7 reuses the fixed adapter and `search_authorized` PostgreSQL authority boundary; it does not change indexing or expose vector search. Query search requires typed `DepartmentScope`, exact `department_id`, `published=true`, the current embedding pipeline, a validated normalized vector, and a bounded limit. Every candidate must still match a committed succeeded indexing row, stored document, succeeded extraction, exact current vector attempt, and exact chunk ownership before the API may read selected evidence. Activated-but-uncommitted, stale, deleted, malformed, or foreign points remain physically possible but are not trusted.

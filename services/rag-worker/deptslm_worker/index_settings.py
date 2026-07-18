@@ -15,9 +15,13 @@ from app.vector_index_domain import (
 )
 
 LOCAL_ENVIRONMENTS = frozenset({"local", "development", "dev", "test"})
-KNOWN_ENVIRONMENTS = LOCAL_ENVIRONMENTS | frozenset({"preview", "staging", "production"})
+KNOWN_ENVIRONMENTS = LOCAL_ENVIRONMENTS | frozenset(
+    {"preview", "staging", "production"}
+)
 COLLECTION_PATTERN = re.compile(r"^[a-z][a-z0-9_]{2,127}$")
-PLACEHOLDERS = frozenset({"changeme", "change-me", "placeholder", "secret", "qdrant-key"})
+PLACEHOLDERS = frozenset(
+    {"changeme", "change-me", "placeholder", "secret", "qdrant-key"}
+)
 
 
 class IndexConfigurationError(RuntimeError):
@@ -36,7 +40,9 @@ class QdrantSettings:
     def from_environment(cls) -> QdrantSettings:
         environment = os.getenv("ENVIRONMENT", "").strip().lower()
         if environment not in KNOWN_ENVIRONMENTS:
-            raise IndexConfigurationError("ENVIRONMENT must be an explicit reviewed value.")
+            raise IndexConfigurationError(
+                "ENVIRONMENT must be an explicit reviewed value."
+            )
         qdrant_url = _qdrant_url(os.getenv("DEPTSLM_QDRANT_URL", ""), environment)
         qdrant_api_key = os.getenv("DEPTSLM_QDRANT_API_KEY", "").strip()
         if (
@@ -44,15 +50,23 @@ class QdrantSettings:
             or qdrant_api_key.lower() in PLACEHOLDERS
             or any(character.isspace() for character in qdrant_api_key)
         ):
-            raise IndexConfigurationError("DEPTSLM_QDRANT_API_KEY is missing or unsafe.")
+            raise IndexConfigurationError(
+                "DEPTSLM_QDRANT_API_KEY is missing or unsafe."
+            )
         collection = os.getenv("DEPTSLM_QDRANT_COLLECTION", "").strip()
-        if collection != QDRANT_COLLECTION or not COLLECTION_PATTERN.fullmatch(collection):
-            raise IndexConfigurationError("DEPTSLM_QDRANT_COLLECTION does not match the contract.")
+        if collection != QDRANT_COLLECTION or not COLLECTION_PATTERN.fullmatch(
+            collection
+        ):
+            raise IndexConfigurationError(
+                "DEPTSLM_QDRANT_COLLECTION does not match the contract."
+            )
         return cls(
             qdrant_url=qdrant_url,
             qdrant_api_key=qdrant_api_key,
             qdrant_collection=collection,
-            qdrant_timeout_seconds=_bounded("DEPTSLM_QDRANT_TIMEOUT_SECONDS", 30, 1, 300),
+            qdrant_timeout_seconds=_bounded(
+                "DEPTSLM_QDRANT_TIMEOUT_SECONDS", 30, 1, 300
+            ),
             environment=environment,
         )
 
@@ -105,7 +119,9 @@ class IndexSettings(QdrantSettings):
             lease_seconds=lease,
             poll_seconds=_bounded("DEPTSLM_VECTOR_INDEX_POLL_SECONDS", 5, 1, 60),
             batch_size=_bounded("DEPTSLM_EMBEDDING_BATCH_SIZE", 8, 1, 64),
-            max_batch_chars=_bounded("DEPTSLM_EMBEDDING_MAX_BATCH_CHARS", 8192, 256, 131072),
+            max_batch_chars=_bounded(
+                "DEPTSLM_EMBEDDING_MAX_BATCH_CHARS", 8192, 256, 131072
+            ),
             embedding_timeout_seconds=timeout,
             embedding_model_revision=revision,
             embedding_provider=provider,
@@ -113,7 +129,9 @@ class IndexSettings(QdrantSettings):
 
 
 def _data_root(
-    raw: str, *, required_directories: tuple[str, ...] = ("extracted_text", "model_cache")
+    raw: str,
+    *,
+    required_directories: tuple[str, ...] = ("extracted_text", "model_cache"),
 ) -> Path:
     value = raw.strip()
     if not value:
@@ -129,12 +147,18 @@ def _data_root(
         raise IndexConfigurationError("DEPTSLM_DATA_DIR must be a real directory.")
     resolved = root.resolve(strict=True)
     if resolved == Path(resolved.anchor):
-        raise IndexConfigurationError("DEPTSLM_DATA_DIR must not be the filesystem root.")
+        raise IndexConfigurationError(
+            "DEPTSLM_DATA_DIR must not be the filesystem root."
+        )
     repository = _find_repository_root(Path(__file__).resolve())
     if repository is not None and (
-        resolved == repository or repository in resolved.parents or resolved in repository.parents
+        resolved == repository
+        or repository in resolved.parents
+        or resolved in repository.parents
     ):
-        raise IndexConfigurationError("DEPTSLM_DATA_DIR must be external to the repository.")
+        raise IndexConfigurationError(
+            "DEPTSLM_DATA_DIR must be external to the repository."
+        )
     for name in required_directories:
         child = resolved / name
         try:
@@ -143,8 +167,12 @@ def _data_root(
             raise IndexConfigurationError(
                 f"Required runtime directory is missing: {name}"
             ) from error
-        if stat.S_ISLNK(child_metadata.st_mode) or not stat.S_ISDIR(child_metadata.st_mode):
-            raise IndexConfigurationError(f"Required runtime directory is unsafe: {name}")
+        if stat.S_ISLNK(child_metadata.st_mode) or not stat.S_ISDIR(
+            child_metadata.st_mode
+        ):
+            raise IndexConfigurationError(
+                f"Required runtime directory is unsafe: {name}"
+            )
     return resolved
 
 

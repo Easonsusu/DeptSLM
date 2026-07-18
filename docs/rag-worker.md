@@ -1,4 +1,4 @@
-# Extraction and Indexing Workers Through Phase 6
+# Extraction, Indexing, and Runtime Boundaries Through Phase 7
 
 ## Commands
 
@@ -59,3 +59,9 @@ It receives PostgreSQL and validated Qdrant settings but no API authentication s
 Index claims use the same PostgreSQL-server-time, `SKIP LOCKED`, non-revivable lease pattern, adding a fresh `vector_attempt_id`. Every claim-owned Qdrant mutation requires a fresh exact PostgreSQL ownership check; expired, replaced, or database-unavailable workers perform no further mutation. Cleanup requires a verified dense-only collection and proves exact published and unpublished zero counts. Expired reclaim cleans only the prior department/indexing/attempt before work and repeats that prior-attempt cleanup before replacement activation.
 
 The persistent embedding child receives only bounded text batches/sequence IDs and offline model access. Its nonblocking request write and response read share a deadline and retain heartbeat, shutdown, claim-loss, and child-exit handling throughout. Exact staging, activation, PostgreSQL/Qdrant consistency, and settings are documented in [vector-indexing.md](vector-indexing.md), [embedding-model.md](embedding-model.md), and [qdrant-boundary.md](qdrant-boundary.md).
+
+## Phase 7 runtime boundary
+
+Grounded answering is not added to either queue worker. The API owns authentication, retrieval authority, exact selected-artifact reads, citation validation, and final revalidation. `services/rag-runtime` owns only offline question embedding and generation behind token-authenticated internal endpoints. It has no database/Qdrant/API-auth credentials, host port, tools, or writable model cache.
+
+The runtime uses `Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca` in non-thinking mode and the Phase 6 embedding model for query vectors. Questions and selected evidence are bounded, handled in memory, and never persisted. This synchronous local boundary is not a production inference scheduler.

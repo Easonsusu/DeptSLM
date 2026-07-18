@@ -82,3 +82,7 @@ Exception text, parser stderr, SQL, OS errors, paths, filenames, hashes, and con
 ## Phase 6 handoff
 
 The Phase 6 indexer reopens only the exact final three-file allowlist through a separate descriptor-relative no-follow reader. It revalidates manifest scope/versions, sizes, hashes, incremental chunk order, and exact PostgreSQL `DocumentChunk` metadata before embedding. It never modifies Phase 5 output, invokes extraction from an API handler, passes Qdrant/model credentials to the parser, or exposes chunk text. See [vector-indexing.md](vector-indexing.md).
+
+## Phase 7 selected-evidence handoff
+
+After department-filtered retrieval and PostgreSQL authority validation, the API may read only selected chunks. It verifies the exact Phase 5 directory, manifest, file identities, hashes, sizes, JSONL order, chunk UUID/ordinal/offset/provenance metadata, and unchanged state before and after the scan. It neither buffers the complete artifact nor writes selected text to disk. A missing, changed, symlinked, malformed, or mismatched artifact fails the answer safely.

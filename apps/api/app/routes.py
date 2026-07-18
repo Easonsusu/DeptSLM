@@ -33,6 +33,10 @@ from app.extraction_services import (
     read_extraction,
     retry_extraction,
 )
+from app.rag_answer_services import (
+    RagAnswerServiceError,
+    answer_question,
+)
 from app.schemas import (
     ChunkListResponse,
     ChunkResponse,
@@ -48,6 +52,8 @@ from app.schemas import (
     MembershipListResponse,
     MembershipResponse,
     MembershipUpdate,
+    RagAnswerRequest,
+    RagAnswerResponse,
     VectorIndexingListResponse,
     VectorIndexingResponse,
 )
@@ -620,3 +626,37 @@ def post_vector_indexing_retry(
         )
     except ServiceError as error:
         _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/rag/answers",
+    response_model=RagAnswerResponse,
+    tags=["grounded-answers"],
+)
+async def post_rag_answer(
+    body: RagAnswerRequest,
+    request: Request,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> RagAnswerResponse:
+    """Return one non-streaming answer grounded in current authorized sources."""
+
+    settings = request.app.state.settings
+    if settings.rag is None:
+        raise HTTPException(503, "Grounded answer unavailable")
+    try:
+        return await asyncio.to_thread(
+            answer_question,
+            request.app.state.session_factory,
+            settings.rag,
+            settings.data_dir,
+            principal,
+            request_scope,
+            body.question,
+            runtime=getattr(request.app.state, "rag_runtime_client", None),
+            qdrant=getattr(request.app.state, "rag_qdrant", None),
+        )
+    except ServiceError as error:
+        _raise(error)
+    except RagAnswerServiceError:
+        raise HTTPException(503, "Grounded answer unavailable") from None

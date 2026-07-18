@@ -1,4 +1,4 @@
-# Chunk Model Through Phase 6
+# Chunk Model Through Phase 7
 
 ## Version and algorithm
 
@@ -19,3 +19,5 @@ PostgreSQL `document_chunks` rows contain department, document, extraction, ordi
 External `chunks.jsonl` is the content-bearing artifact. Each line includes chunk text and the corresponding metadata. Metadata APIs omit text, content hashes, paths, source hashes, and internal claim fields. Phase 5 has no chunk-content endpoint.
 
 Phase 6 keeps `DocumentChunk.id` as the server-owned Qdrant point UUID. The indexing worker incrementally compares each external line with the exact department/document/extraction/ordinal row before embedding. Qdrant payload retains only IDs, ordinal, page/line provenance, pipeline version, attempt identity, and publication state; chunk text, its digest, normalized text, filename, and paths remain absent. There is still no chunk-content or public search endpoint.
+
+Phase 7 treats the UUID as a lookup key, never as authorization. Each retrieved point must pass PostgreSQL authority before the API incrementally locates the exact selected record. The server assigns transient source labels only after selection. Public citations may expose chunk UUID, ordinal, and page/line provenance, but never chunk text, hashes, extraction/indexing IDs, paths, or scores.

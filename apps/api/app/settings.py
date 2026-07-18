@@ -7,6 +7,8 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.rag_settings import RagConfigurationError, RagSettings
+
 DEFAULT_DOCUMENT_MAX_BYTES = 26_214_400
 DEFAULT_DEPARTMENT_DOCUMENT_QUOTA_BYTES = 1_073_741_824
 DOCUMENT_MAX_BYTES_HARD_LIMIT = 104_857_600
@@ -42,6 +44,7 @@ class Settings:
     auth_secret: str | None
     document_max_bytes: int
     department_document_quota_bytes: int
+    rag: RagSettings | None
 
     @classmethod
     def from_environment(cls) -> Settings:
@@ -135,6 +138,13 @@ class Settings:
             environment = _validate_hs256_environment(raw_environment)
             _validate_hs256_configuration(auth_issuer, auth_audience, auth_secret)
 
+        try:
+            rag = RagSettings.optional_from_environment(environment)
+        except RagConfigurationError as error:
+            raise ConfigurationError(str(error)) from error
+        if rag is not None:
+            _validate_extracted_root(resolved_data_dir)
+
         return cls(
             data_dir=resolved_data_dir,
             database_url=database_url,
@@ -145,6 +155,7 @@ class Settings:
             auth_secret=auth_secret,
             document_max_bytes=document_max_bytes,
             department_document_quota_bytes=department_document_quota_bytes,
+            rag=rag,
         )
 
 
@@ -174,6 +185,22 @@ def _validate_uploads_root(data_dir: Path) -> None:
         )
     if not os.access(uploads, os.W_OK | os.X_OK):
         raise ConfigurationError("DEPTSLM_DATA_DIR/uploads must be writable and searchable.")
+
+
+def _validate_extracted_root(data_dir: Path) -> None:
+    extracted = data_dir / "extracted_text"
+    try:
+        metadata = extracted.lstat()
+    except FileNotFoundError as error:
+        raise ConfigurationError(
+            "DEPTSLM_DATA_DIR/extracted_text must already exist as a real directory."
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise ConfigurationError(
+            "DEPTSLM_DATA_DIR/extracted_text must be a real directory, not a symlink."
+        )
+    if not os.access(extracted, os.R_OK | os.X_OK):
+        raise ConfigurationError("DEPTSLM_DATA_DIR/extracted_text must be readable and searchable.")
 
 
 def _optional_environment(name: str) -> str | None:

@@ -78,6 +78,10 @@ The required artifact subdirectories are `uploads`, `extracted_text`, `vector_sn
 - A Qdrant collection must pass the exact dense-only vector and payload-index contract before any point operation. Never clean, repair, delete, or recreate a mismatched or unknown collection.
 - Every claim-owned Qdrant mutation requires current PostgreSQL-server-time ownership of the exact scope, worker, claim token, vector attempt, lease, and fixed contract. Exact deletion must verify both published and unpublished zero counts; reclaim repeats prior-attempt cleanup before activation.
 - Embedding request writes must be bounded, nonblocking, deadline-controlled, heartbeat-aware, and interruptible by shutdown or claim loss. Never spool request text or vectors to disk.
+- Phase 7 exposes only a one-turn department-scoped grounded-answer endpoint, never a public vector-search or query-vector endpoint. All five active same-department roles may answer; `system_admin` has no cross-department bypass.
+- Query retrieval must use the fixed instruction and embedding contract, typed `DepartmentScope`, `published=true`, the current pipeline, bounded candidates, and the existing PostgreSQL authority cross-check. Only selected chunks may be read, and final authorization plus source state must be revalidated before success.
+- Retrieved text is untrusted evidence, not instructions. The model runtime receives bounded questions and server-labeled evidence only, returns strict non-thinking JSON, and has no PostgreSQL, Qdrant, API-auth, or internet authority. Never persist or log questions, answers, prompts, evidence text, vectors, hashes, paths, tokens, or raw model output.
+- Citations must refer only to server-issued labels and exact authorized department/document/extraction/indexing/chunk records. Unsupported, unknown, malformed, duplicate, or missing citations fail closed. With inadequate evidence, return the exact insufficient-information response without generation when possible.
 
 ## 7. Testing expectations
 

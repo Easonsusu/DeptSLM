@@ -35,7 +35,9 @@ from deptslm_worker.qdrant_adapter import DepartmentQdrant, QdrantBoundaryError
 
 class IndexQueueError(RuntimeError):
     def __init__(self, code: str = "database_unavailable") -> None:
-        self.code = code if code in SAFE_VECTOR_INDEX_ERROR_CODES else "database_unavailable"
+        self.code = (
+            code if code in SAFE_VECTOR_INDEX_ERROR_CODES else "database_unavailable"
+        )
         super().__init__(self.code)
 
 
@@ -64,7 +66,10 @@ def claim_next(
                         DocumentVectorIndexing.status == "queued",
                         (
                             (DocumentVectorIndexing.status == "running")
-                            & (DocumentVectorIndexing.lease_expires_at <= func.clock_timestamp())
+                            & (
+                                DocumentVectorIndexing.lease_expires_at
+                                <= func.clock_timestamp()
+                            )
                         ),
                     )
                 )
@@ -105,14 +110,17 @@ def claim_next(
         raise IndexQueueError() from error
 
 
-def heartbeat(factory: sessionmaker[Session], job: ClaimedIndexJob, lease_seconds: int) -> bool:
+def heartbeat(
+    factory: sessionmaker[Session], job: ClaimedIndexJob, lease_seconds: int
+) -> bool:
     try:
         with factory() as session, session.begin():
             result = session.execute(
                 update(DocumentVectorIndexing)
                 .where(*_owned_claim(job), _live_lease())
                 .values(
-                    lease_expires_at=func.clock_timestamp() + timedelta(seconds=lease_seconds),
+                    lease_expires_at=func.clock_timestamp()
+                    + timedelta(seconds=lease_seconds),
                     updated_at=func.clock_timestamp(),
                     version=DocumentVectorIndexing.version + 1,
                 )
@@ -122,7 +130,9 @@ def heartbeat(factory: sessionmaker[Session], job: ClaimedIndexJob, lease_second
         return False
 
 
-def renew_lease(factory: sessionmaker[Session], job: ClaimedIndexJob, lease_seconds: int) -> None:
+def renew_lease(
+    factory: sessionmaker[Session], job: ClaimedIndexJob, lease_seconds: int
+) -> None:
     """Renew an exact live claim while preserving database errors as database errors."""
     try:
         with factory() as session, session.begin():
@@ -130,7 +140,8 @@ def renew_lease(factory: sessionmaker[Session], job: ClaimedIndexJob, lease_seco
                 update(DocumentVectorIndexing)
                 .where(*_owned_claim(job), _live_lease(), *_fixed_contract(job))
                 .values(
-                    lease_expires_at=func.clock_timestamp() + timedelta(seconds=lease_seconds),
+                    lease_expires_at=func.clock_timestamp()
+                    + timedelta(seconds=lease_seconds),
                     updated_at=func.clock_timestamp(),
                     version=DocumentVectorIndexing.version + 1,
                 )
@@ -306,7 +317,9 @@ def finalize_success(
     try:
         with factory() as session, session.begin():
             department = session.execute(
-                select(Department).where(Department.id == job.department_id).with_for_update()
+                select(Department)
+                .where(Department.id == job.department_id)
+                .with_for_update()
             ).scalar_one_or_none()
             document = session.execute(
                 select(Document)
@@ -347,7 +360,9 @@ def finalize_success(
             if extraction.chunk_count != job.expected_chunk_count:
                 raise IndexQueueError("chunk_artifact_mismatch")
             if (
-                qdrant.count_attempt(scope, job.id, job.vector_attempt_id, published=False)
+                qdrant.count_attempt(
+                    scope, job.id, job.vector_attempt_id, published=False
+                )
                 != job.expected_chunk_count
             ):
                 raise IndexQueueError("qdrant_verification_failed")
@@ -358,16 +373,18 @@ def finalize_success(
                 published=False,
                 maximum=job.expected_chunk_count,
             )
-            if len(staged_ids) != job.expected_chunk_count or len(set(staged_ids)) != len(
-                staged_ids
-            ):
+            if len(staged_ids) != job.expected_chunk_count or len(
+                set(staged_ids)
+            ) != len(staged_ids):
                 raise IndexQueueError("qdrant_verification_failed")
             now = session.execute(select(func.clock_timestamp())).scalar_one()
             if not _valid_contract(indexing, job, now):
                 raise IndexQueueError("claim_lost")
             qdrant.activate_attempt(scope, job.id, job.vector_attempt_id)
             if (
-                qdrant.count_attempt(scope, job.id, job.vector_attempt_id, published=True)
+                qdrant.count_attempt(
+                    scope, job.id, job.vector_attempt_id, published=True
+                )
                 != job.expected_chunk_count
             ):
                 raise IndexQueueError("qdrant_verification_failed")

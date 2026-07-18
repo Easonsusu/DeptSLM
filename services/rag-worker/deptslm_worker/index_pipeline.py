@@ -119,7 +119,9 @@ def process_index_job(
             raise IndexQueueError("worker_shutdown")
         if job.stale_vector_attempt_id is not None:
             _cleanup_stale_attempt(factory, settings, qdrant, scope, job)
-            _event(job, "stale_attempt_cleanup", "allowed", "pre_activation_zero_verified")
+            _event(
+                job, "stale_attempt_cleanup", "allowed", "pre_activation_zero_verified"
+            )
         renew_lease(factory, job, settings.lease_seconds)
         require_live_claim(factory, job)
         _event(job, "activation", "allowed", "activation_requested")
@@ -138,7 +140,9 @@ def process_index_job(
         code = "embedding_model_unavailable"
     except Exception:
         code = "embedding_failed"
-    cleanup_code = _cleanup_current(factory, settings, qdrant, scope, job, mutation_state)
+    cleanup_code = _cleanup_current(
+        factory, settings, qdrant, scope, job, mutation_state
+    )
     if cleanup_code is not None:
         code = cleanup_code
     if code == "worker_shutdown" and cleanup_code is None:
@@ -202,10 +206,15 @@ def _cleanup_current(
     job: ClaimedIndexJob,
     mutation_state: _MutationState,
 ) -> str | None:
-    if not mutation_state.collection_verified or not mutation_state.current_attempt_may_have_points:
+    if (
+        not mutation_state.collection_verified
+        or not mutation_state.current_attempt_may_have_points
+    ):
         return None
     try:
-        _delete_owned_attempt(factory, settings, qdrant, scope, job, job.vector_attempt_id)
+        _delete_owned_attempt(
+            factory, settings, qdrant, scope, job, job.vector_attempt_id
+        )
         return None
     except IndexQueueError as error:
         return error.code
@@ -222,7 +231,9 @@ def _cleanup_stale_attempt(
 ) -> None:
     if job.stale_vector_attempt_id is None:
         return
-    _delete_owned_attempt(factory, settings, qdrant, scope, job, job.stale_vector_attempt_id)
+    _delete_owned_attempt(
+        factory, settings, qdrant, scope, job, job.stale_vector_attempt_id
+    )
 
 
 def _delete_owned_attempt(

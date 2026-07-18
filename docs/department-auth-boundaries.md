@@ -135,6 +135,12 @@ Indexing repositories require `DepartmentScope` plus exact document/extraction/i
 
 Process logs contain fixed action/result/reason plus department/job IDs only. Transactional success rows are `document.vector_index.enqueue`, `document.vector_index.retry`, and `document.vector_index.complete`; model, artifact, Qdrant, claim, cleanup, and database failures never receive completion-success rows. Chunk text, vectors, hashes, filenames, paths, URLs, keys, SQL, and authentication values are excluded.
 
+## Phase 7 grounded-answer boundary
+
+All five active same-department roles may request one grounded answer. The URL department is a selector only: admission uses current exact-issuer membership, and completion reauthorizes in a new transaction before success. Qdrant search always uses typed scope plus exact `department_id`, current pipeline, and `published=true`; each candidate is cross-checked in PostgreSQL. Final citations must still belong to stored documents, succeeded extractions, current succeeded indexings, and exact chunks in that department. Cross-department, deleted, stale, malformed, or revoked state fails closed without resource enumeration. `system_admin` has no bypass.
+
+Transactional `rag.answer.start` records only content-free admitted-run metadata. `rag.answer.complete` is written only with an applied answered or insufficient result. Questions, answers, prompts, evidence, vectors, hashes, paths, raw model output, tokens, and dependency details are excluded from PostgreSQL, audit, and logs.
+
 ## Acceptance criteria for Phase 2
 
 - Authentication produces a server-validated user identity.

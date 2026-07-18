@@ -1,8 +1,9 @@
-"""PostgreSQL persistence models through Phase 6."""
+"""PostgreSQL persistence models through Phase 7."""
 
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
@@ -13,6 +14,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Index,
     Integer,
+    Numeric,
     String,
     UniqueConstraint,
     func,
@@ -67,6 +69,24 @@ VECTOR_INDEXING_ERROR_CODES = (
     "qdrant_cleanup_failed",
     "claim_lost",
     "worker_shutdown",
+    "database_unavailable",
+)
+RAG_ANSWER_STATUSES = ("running", "answered", "insufficient_information", "failed")
+RAG_ANSWER_ERROR_CODES = (
+    "runtime_unavailable",
+    "runtime_timeout",
+    "query_embedding_failed",
+    "invalid_query_embedding",
+    "qdrant_unavailable",
+    "retrieval_authority_failed",
+    "source_artifact_missing",
+    "source_artifact_mismatch",
+    "source_changed",
+    "generation_failed",
+    "generation_timeout",
+    "invalid_generation_response",
+    "invalid_citation",
+    "department_unavailable",
     "database_unavailable",
 )
 
@@ -420,6 +440,13 @@ class DocumentChunk(Base):
             name="ck_chunk_provenance_range",
         ),
         UniqueConstraint("extraction_id", "ordinal", name="uq_chunk_extraction_ordinal"),
+        UniqueConstraint(
+            "id",
+            "department_id",
+            "document_id",
+            "extraction_id",
+            name="uq_chunk_scope",
+        ),
         Index("ix_chunk_department_document", "department_id", "document_id", "ordinal"),
     )
 
@@ -615,6 +642,234 @@ class DocumentVectorIndexing(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class RagAnswerRun(Base):
+    """Content-free metadata for one non-streaming grounded-answer attempt."""
+
+    __tablename__ = "rag_answer_runs"
+    __table_args__ = (
+        UniqueConstraint("id", "department_id", name="uq_rag_run_department"),
+        CheckConstraint(
+            "status IN ('running','answered','insufficient_information','failed')",
+            name="ck_rag_run_status",
+        ),
+        CheckConstraint(
+            "question_char_count BETWEEN 1 AND 2000",
+            name="ck_rag_run_question_chars",
+        ),
+        CheckConstraint(
+            "retrieval_candidate_count IS NULL OR retrieval_candidate_count >= 0",
+            name="ck_rag_run_candidate_count",
+        ),
+        CheckConstraint(
+            "retrieval_authorized_count IS NULL OR retrieval_authorized_count >= 0",
+            name="ck_rag_run_authorized_count",
+        ),
+        CheckConstraint(
+            "selected_source_count IS NULL OR selected_source_count BETWEEN 0 AND 8",
+            name="ck_rag_run_selected_count",
+        ),
+        CheckConstraint(
+            "query_embedding_pipeline_version = 'phase7-qwen3-query-embedding-v1'",
+            name="ck_rag_run_query_pipeline",
+        ),
+        CheckConstraint(
+            "query_embedding_model_id = 'Qwen/Qwen3-Embedding-0.6B'",
+            name="ck_rag_run_embedding_model",
+        ),
+        CheckConstraint(
+            "query_embedding_model_revision = 'd23109d65ca9fdf61eef614209744716f337f50f'",
+            name="ck_rag_run_embedding_revision",
+        ),
+        CheckConstraint(
+            "generation_model_id = 'Qwen/Qwen3-0.6B'",
+            name="ck_rag_run_generation_model",
+        ),
+        CheckConstraint(
+            "generation_model_revision = 'c1899de289a04d12100db370d81485cdf75e47ca'",
+            name="ck_rag_run_generation_revision",
+        ),
+        CheckConstraint(
+            "prompt_version = 'phase7-grounded-answer-prompt-v1'",
+            name="ck_rag_run_prompt_version",
+        ),
+        CheckConstraint(
+            "answer_contract_version = 'phase7-grounded-answer-v1'",
+            name="ck_rag_run_answer_contract",
+        ),
+        CheckConstraint(
+            "minimum_score BETWEEN -1.0 AND 1.0",
+            name="ck_rag_run_minimum_score",
+        ),
+        CheckConstraint("version > 0", name="ck_rag_run_version"),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            "'runtime_unavailable','runtime_timeout','query_embedding_failed',"
+            "'invalid_query_embedding','qdrant_unavailable','retrieval_authority_failed',"
+            "'source_artifact_missing','source_artifact_mismatch','source_changed',"
+            "'generation_failed','generation_timeout','invalid_generation_response',"
+            "'invalid_citation','department_unavailable','database_unavailable')",
+            name="ck_rag_run_error_code",
+        ),
+        CheckConstraint(
+            "(status = 'running' AND finished_at IS NULL "
+            "AND retrieval_candidate_count IS NULL "
+            "AND retrieval_authorized_count IS NULL "
+            "AND selected_source_count IS NULL AND error_code IS NULL) "
+            "OR status <> 'running'",
+            name="ck_rag_run_running_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'answered' AND finished_at IS NOT NULL "
+            "AND retrieval_candidate_count IS NOT NULL "
+            "AND retrieval_authorized_count IS NOT NULL "
+            "AND selected_source_count BETWEEN 1 AND 8 "
+            "AND retrieval_candidate_count >= retrieval_authorized_count "
+            "AND retrieval_authorized_count >= selected_source_count "
+            "AND error_code IS NULL) OR status <> 'answered'",
+            name="ck_rag_run_answered_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'insufficient_information' AND finished_at IS NOT NULL "
+            "AND retrieval_candidate_count IS NOT NULL "
+            "AND retrieval_authorized_count IS NOT NULL "
+            "AND selected_source_count = 0 "
+            "AND retrieval_candidate_count >= retrieval_authorized_count "
+            "AND error_code IS NULL) OR status <> 'insufficient_information'",
+            name="ck_rag_run_insufficient_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'failed' AND finished_at IS NOT NULL "
+            "AND selected_source_count IS NULL AND error_code IS NOT NULL) "
+            "OR status <> 'failed'",
+            name="ck_rag_run_failed_lifecycle",
+        ),
+        Index("ix_rag_run_department_created", "department_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(
+        ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False
+    )
+    requested_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="running")
+    question_char_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    retrieval_candidate_count: Mapped[int | None] = mapped_column(Integer)
+    retrieval_authorized_count: Mapped[int | None] = mapped_column(Integer)
+    selected_source_count: Mapped[int | None] = mapped_column(Integer)
+    query_embedding_pipeline_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    query_embedding_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    query_embedding_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    generation_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    generation_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    answer_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    minimum_score: Mapped[Decimal] = mapped_column(Numeric(4, 3), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    started_at: Mapped[datetime] = utc_timestamp()
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class RagAnswerCitation(Base):
+    """Department-scoped provenance metadata for an actually referenced source."""
+
+    __tablename__ = "rag_answer_citations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "department_id"],
+            ["rag_answer_runs.id", "rag_answer_runs.department_id"],
+            name="fk_rag_citation_run_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["document_id", "department_id"],
+            ["documents.id", "documents.department_id"],
+            name="fk_rag_citation_document_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["extraction_id", "department_id", "document_id"],
+            [
+                "document_extractions.id",
+                "document_extractions.department_id",
+                "document_extractions.document_id",
+            ],
+            name="fk_rag_citation_extraction_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["indexing_id", "department_id", "document_id", "extraction_id"],
+            [
+                "document_vector_indexings.id",
+                "document_vector_indexings.department_id",
+                "document_vector_indexings.document_id",
+                "document_vector_indexings.extraction_id",
+            ],
+            name="fk_rag_citation_indexing_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["chunk_id", "department_id", "document_id", "extraction_id"],
+            [
+                "document_chunks.id",
+                "document_chunks.department_id",
+                "document_chunks.document_id",
+                "document_chunks.extraction_id",
+            ],
+            name="fk_rag_citation_chunk_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("source_label ~ '^S[1-8]$'", name="ck_rag_citation_source_label"),
+        CheckConstraint("rank BETWEEN 1 AND 8", name="ck_rag_citation_rank"),
+        CheckConstraint("ordinal >= 0", name="ck_rag_citation_ordinal"),
+        CheckConstraint(
+            "retrieval_score BETWEEN -1.0 AND 1.0",
+            name="ck_rag_citation_score",
+        ),
+        CheckConstraint(
+            "provenance_kind IN ('page','line')",
+            name="ck_rag_citation_provenance_kind",
+        ),
+        CheckConstraint(
+            "(provenance_kind = 'page' AND page_start IS NOT NULL AND page_end IS NOT NULL "
+            "AND page_start > 0 AND page_end >= page_start "
+            "AND line_start IS NULL AND line_end IS NULL) OR "
+            "(provenance_kind = 'line' AND line_start IS NOT NULL AND line_end IS NOT NULL "
+            "AND line_start > 0 AND line_end >= line_start "
+            "AND page_start IS NULL AND page_end IS NULL)",
+            name="ck_rag_citation_provenance_range",
+        ),
+        UniqueConstraint("run_id", "source_label", name="uq_rag_citation_run_label"),
+        UniqueConstraint("run_id", "rank", name="uq_rag_citation_run_rank"),
+        UniqueConstraint("run_id", "chunk_id", name="uq_rag_citation_run_chunk"),
+        Index("ix_rag_citation_department_run", "department_id", "run_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    run_id: Mapped[UUID] = mapped_column(nullable=False)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    document_id: Mapped[UUID] = mapped_column(nullable=False)
+    extraction_id: Mapped[UUID] = mapped_column(nullable=False)
+    indexing_id: Mapped[UUID] = mapped_column(nullable=False)
+    chunk_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_label: Mapped[str] = mapped_column(String(3), nullable=False)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    retrieval_score: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    provenance_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    page_start: Mapped[int | None] = mapped_column(Integer)
+    page_end: Mapped[int | None] = mapped_column(Integer)
+    line_start: Mapped[int | None] = mapped_column(Integer)
+    line_end: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = utc_timestamp()
 
 
 class PersistentAuditEvent(Base):

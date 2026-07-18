@@ -148,7 +148,9 @@ class EmbeddingProcess:
             self.close()
             raise
 
-    def _write_request(self, payload: bytes, deadline: float, next_heartbeat: float) -> float:
+    def _write_request(
+        self, payload: bytes, deadline: float, next_heartbeat: float
+    ) -> float:
         assert self.process.stdin is not None
         remaining = memoryview(payload)
         descriptor = self.process.stdin.fileno()
