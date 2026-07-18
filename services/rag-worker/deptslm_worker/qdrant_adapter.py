@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-import math
 from typing import Any
 from uuid import UUID
 
@@ -164,9 +164,7 @@ class DepartmentQdrant:
         if getattr(tenant, "is_tenant", None) is not True:
             raise QdrantBoundaryError("qdrant_schema_mismatch")
 
-    def upsert_staging(
-        self, scope: DepartmentScope, points: Sequence[VectorPoint]
-    ) -> None:
+    def upsert_staging(self, scope: DepartmentScope, points: Sequence[VectorPoint]) -> None:
         _require_scope(scope)
         self._require_verified()
         if not points:
@@ -238,9 +236,7 @@ class DepartmentQdrant:
                 QDRANT_COLLECTION,
                 payload={"published": True},
                 points=self._selector(
-                    self._attempt_filter(
-                        scope, indexing_id, vector_attempt_id, published=False
-                    )
+                    self._attempt_filter(scope, indexing_id, vector_attempt_id, published=False)
                 ),
                 wait=True,
             )
@@ -309,12 +305,8 @@ class DepartmentQdrant:
                 ),
                 wait=True,
             )
-            unpublished = self.count_attempt(
-                scope, indexing_id, vector_attempt_id, published=False
-            )
-            published = self.count_attempt(
-                scope, indexing_id, vector_attempt_id, published=True
-            )
+            unpublished = self.count_attempt(scope, indexing_id, vector_attempt_id, published=False)
+            published = self.count_attempt(scope, indexing_id, vector_attempt_id, published=True)
             if unpublished != 0 or published != 0:
                 raise QdrantBoundaryError("qdrant_cleanup_failed")
         except QdrantBoundaryError as error:
@@ -333,11 +325,7 @@ class DepartmentQdrant:
         """Internal-only primitive. Callers must cross-check PostgreSQL authority."""
         _require_scope(scope)
         self._require_verified()
-        if (
-            isinstance(limit, bool)
-            or not isinstance(limit, int)
-            or not 1 <= limit <= 100
-        ):
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise QdrantBoundaryError("qdrant_verification_failed")
         if document_id is not None and not isinstance(document_id, UUID):
             raise QdrantBoundaryError("qdrant_verification_failed")
@@ -422,14 +410,10 @@ class DepartmentQdrant:
         must = [cls._condition("department_id", scope.value)]
         if published is not None:
             must.append(
-                models.FieldCondition(
-                    key="published", match=models.MatchValue(value=published)
-                )
+                models.FieldCondition(key="published", match=models.MatchValue(value=published))
             )
         if published is True:
-            must.append(
-                cls._condition("embedding_pipeline_version", EMBEDDING_PIPELINE_VERSION)
-            )
+            must.append(cls._condition("embedding_pipeline_version", EMBEDDING_PIPELINE_VERSION))
         return models.Filter(must=must)
 
     @classmethod
@@ -464,9 +448,7 @@ class DepartmentQdrant:
         return models.FilterSelector(filter=query_filter)
 
     @staticmethod
-    def _validate_scope_payload(
-        scope: DepartmentScope, payload: dict[str, Any]
-    ) -> None:
+    def _validate_scope_payload(scope: DepartmentScope, payload: dict[str, Any]) -> None:
         DepartmentQdrant._validate_common_payload(scope, payload, published=True)
 
     @classmethod

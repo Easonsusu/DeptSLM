@@ -113,9 +113,7 @@ def _authorize(request: Request) -> None:
     raw = request.headers.get("authorization", "")
     expected = f"Bearer {request.app.state.settings.token}"
     if not hmac.compare_digest(raw.encode(), expected.encode()):
-        raise HTTPException(
-            401, "Authentication required", headers={"WWW-Authenticate": "Bearer"}
-        )
+        raise HTTPException(401, "Authentication required", headers={"WWW-Authenticate": "Bearer"})
 
 
 async def _json_body(request: Request):

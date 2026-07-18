@@ -84,12 +84,7 @@ def search_authorized_result(
     """Search the fixed Qdrant boundary and cross-check every hit in PostgreSQL."""
     if not isinstance(scope, DepartmentScope):
         raise RetrievalBoundaryError("invalid department scope")
-    if (
-        isinstance(limit, bool)
-        or not isinstance(limit, int)
-        or limit < 1
-        or limit > 100
-    ):
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1 or limit > 100:
         raise RetrievalBoundaryError("invalid retrieval limit")
     vector = validate_vector(query)
     try:
@@ -126,10 +121,8 @@ def _authorize_hit(session, scope, hit) -> AuthorizedVectorHit:
             DocumentVectorIndexing.id == hit.indexing_id,
             DocumentVectorIndexing.status == "succeeded",
             DocumentVectorIndexing.vector_attempt_id == hit.vector_attempt_id,
-            DocumentVectorIndexing.point_count
-            == DocumentVectorIndexing.expected_chunk_count,
-            DocumentVectorIndexing.embedding_pipeline_version
-            == EMBEDDING_PIPELINE_VERSION,
+            DocumentVectorIndexing.point_count == DocumentVectorIndexing.expected_chunk_count,
+            DocumentVectorIndexing.embedding_pipeline_version == EMBEDDING_PIPELINE_VERSION,
             DocumentVectorIndexing.embedding_model_revision == EMBEDDING_MODEL_REVISION,
             DocumentVectorIndexing.embedding_dimension == EMBEDDING_DIMENSION,
             DocumentVectorIndexing.vector_schema_version == VECTOR_SCHEMA_VERSION,

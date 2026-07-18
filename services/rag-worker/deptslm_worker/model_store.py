@@ -9,12 +9,12 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.rag_domain import GENERATION_MODEL_ID, GENERATION_MODEL_REVISION
 from app.vector_index_domain import (
     EMBEDDING_DIMENSION,
     EMBEDDING_MODEL_ID,
     EMBEDDING_MODEL_REVISION,
 )
-from app.rag_domain import GENERATION_MODEL_ID, GENERATION_MODEL_REVISION
 
 MANIFEST_NAME = "deptslm-model-manifest.json"
 MODEL_DIRECTORY = f"qwen3-embedding-0.6b-{EMBEDDING_MODEL_REVISION}"
@@ -64,9 +64,7 @@ def validate_model_store(data_dir: Path) -> ModelLocation:
         "normalized": True,
         "trust_remote_code": False,
     }
-    return _validate_store(
-        data_dir, model_directory(data_dir), expected, EMBEDDING_MODEL_REVISION
-    )
+    return _validate_store(data_dir, model_directory(data_dir), expected, EMBEDDING_MODEL_REVISION)
 
 
 def validate_generation_model_store(data_dir: Path) -> ModelLocation:
@@ -95,13 +93,9 @@ def _validate_store(
     manifest_path = location / MANIFEST_NAME
     try:
         manifest_metadata = manifest_path.lstat()
-        if stat.S_ISLNK(manifest_metadata.st_mode) or not stat.S_ISREG(
-            manifest_metadata.st_mode
-        ):
+        if stat.S_ISLNK(manifest_metadata.st_mode) or not stat.S_ISREG(manifest_metadata.st_mode):
             raise ModelStoreError("embedding_model_unavailable")
-        manifest = json.loads(
-            _read_file(manifest_path, manifest_metadata).decode("utf-8")
-        )
+        manifest = json.loads(_read_file(manifest_path, manifest_metadata).decode("utf-8"))
     except (OSError, ValueError, TypeError) as error:
         raise ModelStoreError("embedding_model_unavailable") from error
     for key, value in expected.items():
@@ -118,10 +112,7 @@ def _validate_store(
             raise ModelStoreError("embedding_model_unavailable")
         if stat.S_ISDIR(metadata.st_mode):
             continue
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or path.suffix.lower() in FORBIDDEN_SUFFIXES
-        ):
+        if not stat.S_ISREG(metadata.st_mode) or path.suffix.lower() in FORBIDDEN_SUFFIXES:
             raise ModelStoreError("embedding_model_unavailable")
         if relative == MANIFEST_NAME:
             continue

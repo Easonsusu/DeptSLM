@@ -13,9 +13,7 @@ from uuid import UUID
 
 from app.authorization import DepartmentScope
 
-DIRECTORY_FLAGS = (
-    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-)
+DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
 CREATE_FLAGS = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
 FINAL_FILES = ("normalized.txt", "chunks.jsonl", "manifest.json")
@@ -111,9 +109,7 @@ class SourceStorage:
                 raise ExtractionStorageError("source_integrity_mismatch")
             os.close(snapshot_fd)
             snapshot_fd = -1
-            return staging.open_readonly(
-                SOURCE_SNAPSHOT, expected_size, expected_sha256
-            )
+            return staging.open_readonly(SOURCE_SNAPSHOT, expected_size, expected_sha256)
         except FileNotFoundError as error:
             raise ExtractionStorageError("source_missing") from error
         except ExtractionStorageError:
@@ -216,11 +212,7 @@ class ExtractionStaging:
         return f"/dev/fd/{self.scratch_fd}"
 
     def create_file(self, name: str) -> int:
-        if (
-            name not in STAGING_FILES
-            or self.published
-            or self.prepared_output_size is not None
-        ):
+        if name not in STAGING_FILES or self.published or self.prepared_output_size is not None:
             raise ExtractionStorageError()
         descriptor = -1
         guard_fd = -1
@@ -253,9 +245,7 @@ class ExtractionStaging:
                 os.close(descriptor)
             raise ExtractionStorageError() from error
 
-    def open_readonly(
-        self, name: str, expected_size: int, expected_sha256: str
-    ) -> SourceHandle:
+    def open_readonly(self, name: str, expected_size: int, expected_sha256: str) -> SourceHandle:
         descriptor = -1
         try:
             descriptor, metadata = self._open_verified_file(name)
@@ -280,9 +270,7 @@ class ExtractionStaging:
         try:
             descriptor, _metadata = self._open_verified_file(name)
             data = bytearray()
-            while chunk := os.read(
-                descriptor, min(COPY_BLOCK_SIZE, maximum + 1 - len(data))
-            ):
+            while chunk := os.read(descriptor, min(COPY_BLOCK_SIZE, maximum + 1 - len(data))):
                 data.extend(chunk)
                 if len(data) > maximum:
                     raise ExtractionStorageError("extraction_output_limit")
@@ -489,8 +477,7 @@ class ExtractionStaging:
             or metadata.st_nlink != 1
             or guard_metadata.st_nlink != 1
             or (metadata.st_dev, metadata.st_ino) != (expected.device, expected.inode)
-            or (guard_metadata.st_dev, guard_metadata.st_ino)
-            != (expected.device, expected.inode)
+            or (guard_metadata.st_dev, guard_metadata.st_ino) != (expected.device, expected.inode)
         ):
             raise ExtractionStorageError()
 
@@ -575,9 +562,7 @@ class ExtractionStorage:
             descriptors.append(_open_or_create_child(descriptors[-1], str(department)))
             descriptors.append(_open_or_create_child(descriptors[-1], str(document_id)))
             descriptors.append(_open_or_create_child(descriptors[-1], ".staging"))
-            descriptors.append(
-                _open_or_create_child(descriptors[-1], str(extraction_id))
-            )
+            descriptors.append(_open_or_create_child(descriptors[-1], str(extraction_id)))
             os.mkdir(str(claim_token), 0o700, dir_fd=descriptors[-1])
             claim_created = True
             claim_fd = _open_child_directory(descriptors[-1], str(claim_token))
@@ -779,9 +764,7 @@ def _review_file(descriptor: int, metadata: os.stat_result) -> FileReview:
         total += len(chunk)
         digest.update(chunk)
     after = os.fstat(descriptor)
-    if total != metadata.st_size or _mutation_identity(metadata) != _mutation_identity(
-        after
-    ):
+    if total != metadata.st_size or _mutation_identity(metadata) != _mutation_identity(after):
         raise ExtractionStorageError()
     return FileReview(total, digest.hexdigest())
 

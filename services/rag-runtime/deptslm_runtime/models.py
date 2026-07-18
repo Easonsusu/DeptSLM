@@ -6,12 +6,13 @@ import hashlib
 import json
 from pathlib import Path
 
-from app.rag_domain import validate_generation_response
-from app.vector_index_domain import EMBEDDING_DIMENSION, QUERY_EMBEDDING_INSTRUCTION
 from deptslm_worker.model_store import (
     validate_generation_model_store,
     validate_model_store,
 )
+
+from app.rag_domain import validate_generation_response
+from app.vector_index_domain import EMBEDDING_DIMENSION, QUERY_EMBEDDING_INSTRUCTION
 
 
 class RuntimeModelError(RuntimeError):

@@ -8,25 +8,23 @@ import os
 import shutil
 from uuid import uuid4
 
-from app.vector_index_domain import EMBEDDING_MODEL_ID, EMBEDDING_MODEL_REVISION
 from app.rag_domain import GENERATION_MODEL_ID, GENERATION_MODEL_REVISION
+from app.vector_index_domain import EMBEDDING_MODEL_ID, EMBEDDING_MODEL_REVISION
 from deptslm_worker.index_settings import _data_root
 from deptslm_worker.model_store import (
     MANIFEST_NAME,
     ModelStoreError,
-    build_manifest,
     build_generation_manifest,
+    build_manifest,
     generation_model_directory,
     model_directory,
-    validate_model_store,
     validate_generation_model_store,
+    validate_model_store,
 )
 
 
 def prepare_embedding() -> None:
-    data_dir = _data_root(
-        os.getenv("DEPTSLM_DATA_DIR", ""), required_directories=("model_cache",)
-    )
+    data_dir = _data_root(os.getenv("DEPTSLM_DATA_DIR", ""), required_directories=("model_cache",))
     _prepare_model(
         data_dir,
         model_id=EMBEDDING_MODEL_ID,
@@ -38,9 +36,7 @@ def prepare_embedding() -> None:
 
 
 def prepare_generation() -> None:
-    data_dir = _data_root(
-        os.getenv("DEPTSLM_DATA_DIR", ""), required_directories=("model_cache",)
-    )
+    data_dir = _data_root(os.getenv("DEPTSLM_DATA_DIR", ""), required_directories=("model_cache",))
     _prepare_model(
         data_dir,
         model_id=GENERATION_MODEL_ID,
@@ -104,9 +100,7 @@ def _prepare_model(
             0o600,
         )
         try:
-            payload = (
-                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
-            ).encode()
+            payload = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
             written = 0
             while written < len(payload):
                 count = os.write(descriptor, payload[written:])
