@@ -19,8 +19,8 @@ COPY apps/api/pyproject.toml /build/api/pyproject.toml
 COPY apps/api/app /build/api/app
 COPY services/rag-runtime/pyproject.toml /build/runtime/pyproject.toml
 COPY services/rag-runtime/deptslm_runtime /build/runtime/deptslm_runtime
-COPY services/rag-worker/deptslm_worker/__init__.py /app/deptslm_worker/__init__.py
-COPY services/rag-worker/deptslm_worker/model_store.py /app/deptslm_worker/model_store.py
+COPY services/rag-runtime/deptslm_worker /build/runtime/deptslm_worker
+COPY services/rag-worker/deptslm_worker/model_store.py /build/runtime/deptslm_worker/model_store.py
 
 RUN pip install --no-cache-dir --disable-pip-version-check --no-deps /build/api \
     && pip install --no-cache-dir --disable-pip-version-check /build/runtime \

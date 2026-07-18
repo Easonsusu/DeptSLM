@@ -15,4 +15,4 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["deptslm_runtime*"]
+include = ["deptslm_runtime*", "deptslm_worker*"]
