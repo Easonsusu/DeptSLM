@@ -28,12 +28,21 @@ def _write(value) -> None:
 
 def main() -> int:
     mode = sys.argv[1]
+    if mode == "startup_exit":
+        return 3
+    if mode == "startup_hang":
+        time.sleep(float(sys.argv[2]))
+    if mode == "startup_context_mismatch":
+        _write({"ready": False, "code": "model_context_mismatch"})
+        return 3
     _write({"ready": True})
+    operation_count = 0
     while True:
         request = _read()
         if request is None:
             return 0
         operation = request.get("operation")
+        operation_count += 1
         if mode == "exit":
             return 3
         if mode == "malformed":
@@ -47,6 +56,12 @@ def main() -> int:
         if mode == "hang" or mode == f"hang_{operation}":
             while True:
                 time.sleep(1)
+        if mode == "recoverable_once" and operation_count == 1:
+            _write({"ok": False, "code": "model_input_too_large"})
+            continue
+        if mode == "fatal_once" and operation_count == 1:
+            _write({"ok": False, "code": "model_operation_failed"})
+            continue
         if mode == "environment":
             result = {"names": sorted(os.environ), "values": dict(os.environ)}
         elif operation == "query_embedding":

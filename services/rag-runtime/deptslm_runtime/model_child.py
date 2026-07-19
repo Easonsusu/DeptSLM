@@ -9,7 +9,11 @@ import sys
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from app.rag_domain import GENERATION_MODEL_REVISION, MAX_CHILD_FRAME_BYTES, normalize_question
+from app.rag_domain import (
+    GENERATION_MODEL_REVISION,
+    MAX_CHILD_FRAME_BYTES,
+    normalize_question,
+)
 from app.vector_index_domain import EMBEDDING_MODEL_REVISION
 from deptslm_runtime.models import RuntimeModelError, RuntimeModels
 from deptslm_runtime.settings import CHILD_ENVIRONMENT_NAMES
@@ -41,6 +45,8 @@ def main() -> int:
                 result = _execute(models, request)
                 response = {"ok": True, "result": result}
             except RuntimeModelError as error:
+                if error.code == "model_context_mismatch":
+                    return 2
                 response = {"ok": False, "code": error.code}
             except Exception:
                 response = {"ok": False, "code": "model_operation_failed"}

@@ -21,6 +21,7 @@ from app.rag_domain import (
 from deptslm_runtime.settings import RuntimeSettings
 from deptslm_runtime.supervisor import (
     ModelSupervisor,
+    RecoverableModelRequestError,
     RuntimeBusyError,
     RuntimeSupervisorError,
     run_until_disconnect,
@@ -148,5 +149,7 @@ async def _run_model(request: Request, operation: str, payload: dict):
         )
     except RuntimeBusyError:
         raise HTTPException(503, "Runtime busy") from None
+    except RecoverableModelRequestError:
+        raise HTTPException(422, "Model input exceeds the reviewed token budget") from None
     except RuntimeSupervisorError:
         raise HTTPException(503, "Runtime operation failed") from None

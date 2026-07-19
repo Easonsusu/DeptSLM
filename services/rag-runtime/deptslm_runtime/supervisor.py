@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -31,8 +32,12 @@ class RuntimeBusyError(RuntimeSupervisorError):
         super().__init__("runtime_busy")
 
 
+class RecoverableModelRequestError(RuntimeSupervisorError):
+    """A validated request-specific child error that leaves the child reusable."""
+
+
 class ModelSupervisor:
-    """Own one process group and replace it after every interrupted operation."""
+    """Own one process group and replace it once after a fatal operation."""
 
     def __init__(
         self,
@@ -47,7 +52,10 @@ class ModelSupervisor:
         self._operation_timeout = operation_timeout_seconds
         self._startup_timeout = startup_timeout_seconds
         self._capacity = asyncio.Lock()
+        self._lifecycle = asyncio.Lock()
         self._process: asyncio.subprocess.Process | None = None
+        self._restart_task: asyncio.Task[None] | None = None
+        self._restart_failed = False
         self._closed = False
 
     @property
@@ -55,16 +63,32 @@ class ModelSupervisor:
         return None if self._process is None else self._process.pid
 
     @property
+    def restarting(self) -> bool:
+        restart = self._restart_task
+        return restart is not None and not restart.done()
+
+    @property
     def ready(self) -> bool:
-        return not self._closed and self._process is not None and self._process.returncode is None
+        restart = self._restart_task
+        return (
+            not self._closed
+            and (restart is None or restart.done())
+            and self._process is not None
+            and self._process.returncode is None
+        )
 
     async def start(self) -> None:
         if self._closed:
             raise RuntimeSupervisorError("runtime_shutdown")
-        await self._ensure_child()
+        await self._start_child()
 
     async def close(self) -> None:
         self._closed = True
+        restart, self._restart_task = self._restart_task, None
+        if restart is not None and not restart.done():
+            restart.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await restart
         await self._terminate_child()
 
     async def request(self, operation: str, payload: dict[str, Any]) -> Any:
@@ -77,70 +101,132 @@ class ModelSupervisor:
         await self._capacity.acquire()
         try:
             frame = _encode_frame({"operation": operation, "payload": payload})
+            process = self._ready_process()
+            if process is None:
+                if self.restarting:
+                    raise RuntimeSupervisorError("runtime_restarting")
+                if self._restart_failed:
+                    raise RuntimeSupervisorError("runtime_unavailable")
+                await self._retire_and_restart()
+                raise RuntimeSupervisorError("runtime_restarting")
             try:
                 async with asyncio.timeout(self._operation_timeout):
-                    process = await self._ensure_child()
                     if process.stdin is None or process.stdout is None:
                         raise RuntimeSupervisorError()
                     process.stdin.write(frame)
                     await process.stdin.drain()
                     response = await _read_frame(process.stdout, MAX_CHILD_RESPONSE_BYTES)
                 return _validated_response(response)
+            except RecoverableModelRequestError:
+                raise
             except asyncio.CancelledError:
-                await asyncio.shield(self._terminate_child())
+                await asyncio.shield(self._retire_and_restart())
                 raise
             except TimeoutError as error:
-                await self._terminate_child()
+                await self._retire_and_restart()
                 raise RuntimeSupervisorError("model_timeout") from error
             except RuntimeSupervisorError:
-                await self._terminate_child()
+                await self._retire_and_restart()
                 raise
             except (BrokenPipeError, ConnectionError, OSError) as error:
-                await self._terminate_child()
+                await self._retire_and_restart()
                 raise RuntimeSupervisorError() from error
         finally:
             self._capacity.release()
 
-    async def _ensure_child(self) -> asyncio.subprocess.Process:
-        if self._closed:
-            raise RuntimeSupervisorError("runtime_shutdown")
-        if self._process is not None and self._process.returncode is None:
-            return self._process
+    def _ready_process(self) -> asyncio.subprocess.Process | None:
+        restart = self._restart_task
+        process = self._process
+        if (
+            self._closed
+            or (restart is not None and not restart.done())
+            or process is None
+            or process.returncode is not None
+        ):
+            return None
+        return process
+
+    async def _start_child(self) -> asyncio.subprocess.Process:
+        async with self._lifecycle:
+            if self._closed:
+                raise RuntimeSupervisorError("runtime_shutdown")
+            if self._process is not None and self._process.returncode is None:
+                return self._process
+            await self._terminate_child_unlocked()
+            try:
+                self._process = await asyncio.create_subprocess_exec(
+                    *self._next_command(),
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    env=self._settings.child_environment(),
+                    close_fds=True,
+                    start_new_session=True,
+                )
+                if self._process.stdout is None:
+                    raise RuntimeSupervisorError()
+                async with asyncio.timeout(self._startup_timeout):
+                    ready = await _read_frame(self._process.stdout, 4096)
+                if ready != {"ready": True}:
+                    raise RuntimeSupervisorError("model_context_mismatch")
+                self._restart_failed = False
+                return self._process
+            except asyncio.CancelledError:
+                await asyncio.shield(self._terminate_child_unlocked())
+                raise
+            except TimeoutError as error:
+                await self._terminate_child_unlocked()
+                raise RuntimeSupervisorError("model_startup_timeout") from error
+            except RuntimeSupervisorError:
+                await self._terminate_child_unlocked()
+                raise
+            except (OSError, asyncio.IncompleteReadError) as error:
+                await self._terminate_child_unlocked()
+                raise RuntimeSupervisorError() from error
+
+    async def _retire_and_restart(self) -> None:
         await self._terminate_child()
+        self._schedule_restart()
+
+    def _schedule_restart(self) -> None:
+        if self._closed:
+            return
+        current = self._restart_task
+        if current is not None and not current.done():
+            return
+        self._restart_failed = False
+        task = asyncio.create_task(self._restart_once())
+        self._restart_task = task
+        task.add_done_callback(self._restart_finished)
+
+    async def _restart_once(self) -> None:
         try:
-            self._process = await asyncio.create_subprocess_exec(
-                *self._next_command(),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-                env=self._settings.child_environment(),
-                close_fds=True,
-                start_new_session=True,
-            )
-            if self._process.stdout is None:
-                raise RuntimeSupervisorError()
-            async with asyncio.timeout(self._startup_timeout):
-                ready = await _read_frame(self._process.stdout, 4096)
-            if ready != {"ready": True}:
-                raise RuntimeSupervisorError()
-            return self._process
-        except TimeoutError as error:
-            await self._terminate_child()
-            raise RuntimeSupervisorError("model_startup_timeout") from error
+            await self._start_child()
         except RuntimeSupervisorError:
-            await self._terminate_child()
-            raise
-        except (OSError, asyncio.IncompleteReadError) as error:
-            await self._terminate_child()
-            raise RuntimeSupervisorError() from error
+            # Readiness remains false. A bounded restart never loops or leaks details.
+            self._restart_failed = True
+            return
+
+    def _restart_finished(self, task: asyncio.Task[None]) -> None:
+        with contextlib.suppress(asyncio.CancelledError):
+            task.exception()
+        if self._restart_task is task:
+            self._restart_task = None
 
     def _next_command(self) -> tuple[str, ...]:
-        command = self._command() if callable(self._command) else self._command
+        try:
+            command = self._command() if callable(self._command) else self._command
+        except Exception as error:
+            raise RuntimeSupervisorError("invalid_child_command") from error
         if not command or not all(isinstance(item, str) and item for item in command):
             raise RuntimeSupervisorError("invalid_child_command")
         return command
 
     async def _terminate_child(self) -> None:
+        async with self._lifecycle:
+            await self._terminate_child_unlocked()
+
+    async def _terminate_child_unlocked(self) -> None:
         process, self._process = self._process, None
         if process is None:
             return
@@ -234,12 +320,13 @@ def _validated_response(value: Any) -> Any:
     if value.get("ok") is True:
         return value["result"]
     code = value.get("code")
+    if value.get("ok") is False and code == "model_input_too_large":
+        raise RecoverableModelRequestError(code)
     if (
         value.get("ok") is False
         and isinstance(code, str)
         and code
         in {
-            "model_input_too_large",
             "model_context_mismatch",
             "model_operation_failed",
             "invalid_request",

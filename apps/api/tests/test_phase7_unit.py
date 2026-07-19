@@ -13,6 +13,7 @@ import httpx
 import pytest
 from deptslm_runtime.main import app as runtime_app
 from deptslm_runtime.settings import FORBIDDEN_SUPERVISOR_VARIABLES
+from deptslm_runtime.supervisor import RecoverableModelRequestError
 from deptslm_worker.model_store import (
     MANIFEST_NAME,
     ModelStoreError,
@@ -200,6 +201,47 @@ def test_fake_runtime_is_authenticated_bounded_and_content_free(
         assert generated["citations"] == ["S1"]
         assert "S8" not in generated["answer"]
     assert tuple(tmp_path.rglob("*")) == before
+
+
+def test_runtime_http_returns_safe_recoverable_error_without_losing_readiness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _runtime_environment(monkeypatch, tmp_path)
+
+    class RecoverableSupervisor:
+        ready = True
+        calls = 0
+
+        async def start(self):
+            return None
+
+        async def close(self):
+            return None
+
+        async def request(self, _operation, _payload):
+            self.calls += 1
+            if self.calls == 1:
+                raise RecoverableModelRequestError("model_input_too_large")
+            return {"vector": [1.0]}
+
+    supervisor = RecoverableSupervisor()
+    monkeypatch.setattr("deptslm_runtime.main.ModelSupervisor", lambda _settings: supervisor)
+    with TestClient(runtime_app) as client:
+        rejected = client.post(
+            "/internal/v1/query-embedding",
+            headers=_runtime_headers(),
+            json={"question": "synthetic over-token input"},
+        )
+        assert rejected.status_code == 422
+        assert rejected.json() == {"detail": "Model input exceeds the reviewed token budget"}
+        assert client.get("/healthz").json() == {"status": "ready"}
+        accepted = client.post(
+            "/internal/v1/query-embedding",
+            headers=_runtime_headers(),
+            json={"question": "valid"},
+        )
+        assert accepted.status_code == 200
+        assert accepted.json() == {"vector": [1.0]}
 
 
 def test_runtime_rejects_identifiers_extra_fields_and_oversized_body(

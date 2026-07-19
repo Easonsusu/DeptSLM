@@ -138,13 +138,13 @@ Phase 7 additionally requires a long untracked `DEPTSLM_RAG_RUNTIME_TOKEN` and t
   python -m deptslm_worker.model_admin prepare-rag-models
 ```
 
-The generation contract is `Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca`, non-thinking mode, an exact 40,960-token model context, an 8,192-token operational input cap, and at most 512 new tokens; query embedding is capped at 2,048 tokens. Inputs are tokenized completely and never silently truncated. The internal runtime receives no database or Qdrant credentials and is not published on a host port. Its HTTP process supervises one persistent killable model child; timeout, cancellation, disconnect, shutdown, or invalid child output terminates and reaps the process group. The child receives neither the runtime bearer token nor other secrets or proxy settings.
+The generation contract is `Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca`, non-thinking mode, an exact 40,960-token model context, an 8,192-token operational input cap, and at most 512 new tokens; query embedding is capped at 2,048 tokens. Inputs are tokenized completely and never silently truncated. The internal runtime receives no database or Qdrant credentials and is not published on a host port. Its HTTP process supervises one persistent killable model child with separate startup and operation clocks. Over-token input is recoverable without reload; fatal timeout, cancellation, disconnect, shutdown, protocol, or child failures terminate and reap the process group and permit one bounded background replacement. Readiness is false and requests fail fast during replacement. The child receives neither the runtime bearer token nor other secrets or proxy settings.
 
 ## Safety and data isolation
 
 - Future department-owned records, documents, indexes, jobs, adapters, and conversations must be scoped and authorized by `department_id` at every storage and service boundary.
 - Retrieved document text is untrusted input. It must be quoted as context and must never be allowed to override system or developer instructions.
-- Questions, evidence, generated answers, and citation filenames reject bidi/zero-width spoofing and unsafe Unicode; citations use exact ASCII `[S1]` through `[S8]` labels only.
+- Questions, evidence, generated answers, and citation filenames reject all format controls, combining grapheme joiner, noncharacters, and other unsafe Unicode while preserving variation selectors, ordinary accents, and emoji. A focused lexer accepts only exact ASCII `[S1]` through `[S8]` citations and rejects paired or dangling source-like lookalikes without blocking ordinary bracket prose.
 - If retrieval returns no usable source, the assistant must say that it does not have enough information. It must not invent a department-specific answer.
 - Secrets, model weights, and runtime artifacts do not belong in Git history.
 

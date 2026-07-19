@@ -10,7 +10,7 @@ POST /departments/{department_id}/rag/answers
 
 All five active same-department roles may call it. The path value is only a selector: the API resolves the exact issuer/subject and current membership in PostgreSQL at admission and again before completion. `system_admin` has no cross-department bypass. The endpoint does not expose vector search, query vectors, chunks, prompts, or model controls.
 
-The request contains only `question`, normalized with Unicode NFC, trimmed, checked for forbidden controls, and limited to 2,000 characters. The response is either an answered result with reviewed citation metadata or the exact insufficient-information message. There is no conversation, message history, streaming, feedback, reranking, adapter selection, or training behavior.
+The request contains only `question`, normalized with Unicode NFC, trimmed, checked by the shared Unicode policy, and limited to 2,000 characters. The policy rejects format controls and citation-spoofing characters while retaining variation selectors, ordinary accents, and ordinary emoji. The response is either an answered result with reviewed citation metadata or the exact insufficient-information message. There is no conversation, message history, streaming, feedback, reranking, adapter selection, or training behavior.
 
 ## Retrieval and selection
 
@@ -37,6 +37,8 @@ The supplied-evidence set and cited subset are intentionally distinct. `selected
 Revision `0005_phase7_rag_answers` stores content-free run and citation provenance metadata. It stores counts, fixed model/prompt contracts, safe status/error codes, source labels, IDs, ranks, scores, and page/line provenance. It never stores question or answer text, prompts, evidence, chunk text, vectors, hashes, paths, tokens, model output, or dependency URLs.
 
 `rag.answer.start` is committed with the admitted run. `rag.answer.complete` is committed only with an applied answered or insufficient result and exact citation rows. Failures do not create a completion-success audit. Qdrant client-close failure after a committed result is reported only as a content-free process event and cannot rewrite that result; handled unexpected failures best-effort mark a still-running row failed with a stage-specific safe code. PostgreSQL, Qdrant, external artifacts, the supervised model child, runtime HTTP, and API HTTP do not share a transaction; post-generation artifact verification, final authorization, and PostgreSQL source authority reduce stale-state acceptance but do not claim distributed atomicity or an atomic filesystem/database snapshot.
+
+The internal model supervisor treats an over-token request as recoverable and keeps the same loaded child. Fatal runtime/protocol errors trigger one bounded background replacement; health stays not-ready and requests fail fast during replacement. Model startup and request execution have separate clocks, so reviewed cold-start loading time does not consume the operation budget.
 
 ## Insufficient information
 

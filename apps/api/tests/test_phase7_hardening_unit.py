@@ -10,6 +10,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from deptslm_runtime import model_child
 from deptslm_runtime.models import (
     RuntimeModelError,
     RuntimeModels,
@@ -27,6 +28,7 @@ from deptslm_runtime.settings import (
 )
 from deptslm_runtime.supervisor import (
     ModelSupervisor,
+    RecoverableModelRequestError,
     RuntimeBusyError,
     RuntimeSupervisorError,
     run_until_disconnect,
@@ -67,6 +69,13 @@ pytestmark = pytest.mark.unit
         "\u200d",
         "\u200e",
         "\u200f",
+        "\u00ad",
+        "\u034f",
+        "\u2061",
+        "\u2062",
+        "\u2063",
+        "\u2064",
+        "\U000e0001",
         "\ud800",
         "\ufdd0",
         "\U0010ffff",
@@ -102,6 +111,20 @@ def test_shared_text_policy_rejects_spoofing_and_noncharacters(unsafe: str) -> N
         "[Sx]",
         "[S-1]",
         "[S\u200b1]",
+        "[S01]",
+        "[S0]",
+        "[S9]",
+        "[S１]",
+        "[S1",
+        "S1]",
+        "Sx]",
+        "［S1",
+        "S1］",
+        "[S1］",
+        "［S1]",
+        "[S1" + "x" * 40 + "]",
+        "[S\u00ad1]",
+        "[S\u034f1]",
     ],
 )
 def test_citation_lookalikes_fail_closed(lookalike: str) -> None:
@@ -117,11 +140,14 @@ def test_citation_lookalikes_fail_closed(lookalike: str) -> None:
 
 
 def test_valid_emoji_combining_marks_brackets_and_plain_script_text_remain_supported() -> None:
-    assert normalize_question("Cafe\u0301 😀") == "Café 😀"
+    assert normalize_question("Cafe\u0301 ☕️ 😀") == "Café ☕️ 😀"
     result = validate_generation_response(
         {
             "status": "answered",
-            "answer": "Literal [Appendix] and <script>alert(1)</script> 😀 [S1].",
+            "answer": (
+                "Literal [Appendix], [Section 1], [equation x], [0, 1], normal (S1), "
+                "and <script>alert(1)</script> ☕️ 😀 [S1]."
+            ),
             "citations": ["S1"],
         },
         ("S1",),
@@ -133,6 +159,27 @@ def test_public_filename_uses_visible_deterministic_escaping() -> None:
     value = safe_public_filename("report\u202e\u200b.txt")
     assert value == "report\\u{202E}\\u{200B}.txt"
     assert "\u202e" not in value and "\u200b" not in value
+    bounded = safe_public_filename("a" * 505 + "\u202e" + "tail")
+    assert bounded == "a" * 505
+    assert len(bounded) <= 512 and not bounded.endswith("\\u{")
+
+
+@pytest.mark.parametrize("unsafe", ["\u00ad", "\u034f", "\u2063", "\U000e0001"])
+def test_public_filename_escapes_expanded_unicode_policy_without_partial_escape(
+    unsafe: str,
+) -> None:
+    rendered = safe_public_filename(f"report{unsafe}.txt")
+    assert unsafe not in rendered
+    assert f"\\u{{{ord(unsafe):04X}}}" in rendered
+
+
+def test_citation_lexer_handles_deep_unrelated_brackets_without_false_positive() -> None:
+    answer = "[" * 1000 + "Section 1" + "]" * 1000 + " is ordinary prose [S1]."
+    result = validate_generation_response(
+        {"status": "answered", "answer": answer, "citations": ["S1"]},
+        ("S1",),
+    )
+    assert result.citations == ("S1",)
 
 
 def test_actual_prompt_builder_confines_malicious_evidence_to_json_user_data() -> None:
@@ -276,6 +323,22 @@ def test_smaller_or_mutated_model_context_fails_closed() -> None:
         )
 
 
+def test_model_context_mismatch_prevents_child_readiness(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    writes = []
+
+    def mismatched_models(_root, _provider):
+        raise RuntimeModelError("model_context_mismatch")
+
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(model_child.os, "environ", settings.child_environment())
+    monkeypatch.setattr(model_child, "RuntimeModels", mismatched_models)
+    monkeypatch.setattr(model_child, "_write_frame", lambda *_args: writes.append("ready"))
+    assert model_child.main() == 2
+    assert writes == []
+
+
 def test_fake_provider_exercises_real_prompt_builder(monkeypatch: pytest.MonkeyPatch) -> None:
     seen = []
 
@@ -301,8 +364,13 @@ def _settings(tmp_path: Path) -> RuntimeSettings:
     )
 
 
-def _fixture_command(mode: str) -> tuple[str, ...]:
-    return (sys.executable, str(Path(__file__).with_name("runtime_child_fixture.py")), mode)
+def _fixture_command(mode: str, *arguments: str) -> tuple[str, ...]:
+    return (
+        sys.executable,
+        str(Path(__file__).with_name("runtime_child_fixture.py")),
+        mode,
+        *arguments,
+    )
 
 
 def _pid_exists(pid: int) -> bool:
@@ -311,6 +379,78 @@ def _pid_exists(pid: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+async def _wait_until_ready(supervisor: ModelSupervisor, timeout: float = 2) -> None:
+    async with asyncio.timeout(timeout):
+        while not supervisor.ready:
+            await asyncio.sleep(0.01)
+
+
+def test_recoverable_token_budget_error_reuses_the_same_child(tmp_path: Path) -> None:
+    (tmp_path / "model_cache").mkdir()
+    before = tuple(tmp_path.rglob("*"))
+
+    async def scenario() -> None:
+        supervisor = ModelSupervisor(
+            _settings(tmp_path),
+            command=_fixture_command("recoverable_once"),
+            operation_timeout_seconds=1,
+            startup_timeout_seconds=2,
+        )
+        await supervisor.start()
+        pid = supervisor.child_pid
+        with pytest.raises(RecoverableModelRequestError, match="model_input_too_large"):
+            await supervisor.request("query_embedding", {"question": "over-token"})
+        assert supervisor.ready and supervisor.child_pid == pid
+        assert await supervisor.request("query_embedding", {"question": "valid"}) == {
+            "vector": [1.0]
+        }
+        assert supervisor.child_pid == pid
+        await supervisor.close()
+
+    asyncio.run(scenario())
+    assert tuple(tmp_path.rglob("*")) == before
+
+
+def test_startup_timeout_is_separate_and_context_mismatch_never_becomes_ready(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        delayed = ModelSupervisor(
+            _settings(tmp_path),
+            command=_fixture_command("startup_hang", "0.2"),
+            operation_timeout_seconds=0.05,
+            startup_timeout_seconds=1,
+        )
+        await delayed.start()
+        assert delayed.ready
+        assert await delayed.request("query_embedding", {"question": "valid"}) == {"vector": [1.0]}
+        await delayed.close()
+
+        timeout = ModelSupervisor(
+            _settings(tmp_path),
+            command=_fixture_command("startup_hang", "1"),
+            operation_timeout_seconds=1,
+            startup_timeout_seconds=0.5,
+        )
+        with pytest.raises(RuntimeSupervisorError, match="model_startup_timeout"):
+            await timeout.start()
+        assert timeout.child_pid is None and not timeout.ready
+        await timeout.close()
+
+        mismatch = ModelSupervisor(
+            _settings(tmp_path),
+            command=_fixture_command("startup_context_mismatch"),
+            operation_timeout_seconds=1,
+            startup_timeout_seconds=1,
+        )
+        with pytest.raises(RuntimeSupervisorError, match="model_context_mismatch"):
+            await mismatch.start()
+        assert mismatch.child_pid is None and not mismatch.ready
+        await mismatch.close()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("operation", ["query_embedding", "generate"])
@@ -332,6 +472,10 @@ def test_timed_out_child_is_reaped_capacity_released_and_next_child_succeeds(
         with pytest.raises(RuntimeSupervisorError, match="model_timeout"):
             await supervisor.request(operation, {"question": "q", "evidence": []})
         assert old_pid is not None and not _pid_exists(old_pid)
+        assert not supervisor.ready
+        with pytest.raises(RuntimeSupervisorError, match="runtime_restarting"):
+            await supervisor.request("query_embedding", {"question": "too soon"})
+        await _wait_until_ready(supervisor)
         result = await supervisor.request("query_embedding", {"question": "next"})
         assert result == {"vector": [1.0]}
         await supervisor.close()
@@ -343,9 +487,10 @@ def test_timed_out_child_is_reaped_capacity_released_and_next_child_succeeds(
 
 def test_cancel_disconnect_shutdown_and_busy_paths_terminate_the_child(tmp_path: Path) -> None:
     async def scenario() -> None:
+        commands = iter((_fixture_command("hang"), _fixture_command("normal")))
         supervisor = ModelSupervisor(
             _settings(tmp_path),
-            command=_fixture_command("hang"),
+            command=lambda: next(commands),
             operation_timeout_seconds=30,
             startup_timeout_seconds=2,
         )
@@ -359,10 +504,13 @@ def test_cancel_disconnect_shutdown_and_busy_paths_terminate_the_child(tmp_path:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert pid is not None and not _pid_exists(pid)
+        await _wait_until_ready(supervisor)
+        await supervisor.close()
 
+        replacement_commands = iter((_fixture_command("hang"), _fixture_command("normal")))
         replacement = ModelSupervisor(
             _settings(tmp_path),
-            command=_fixture_command("hang"),
+            command=lambda: next(replacement_commands),
             operation_timeout_seconds=30,
             startup_timeout_seconds=2,
         )
@@ -379,7 +527,8 @@ def test_cancel_disconnect_shutdown_and_busy_paths_terminate_the_child(tmp_path:
                 replacement.request("generate", {"question": "q", "evidence": []}),
                 disconnected,
             )
-        assert replacement.child_pid is None
+        await _wait_until_ready(replacement)
+        await replacement.close()
 
         shutdown = ModelSupervisor(
             _settings(tmp_path),
@@ -397,19 +546,133 @@ def test_cancel_disconnect_shutdown_and_busy_paths_terminate_the_child(tmp_path:
     asyncio.run(scenario())
 
 
+def test_fatal_error_runs_one_background_restart_requests_fail_fast_and_shutdown_reaps(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        command_count = 0
+        commands = iter(
+            (
+                _fixture_command("fatal_once"),
+                _fixture_command("startup_hang", "0.2"),
+            )
+        )
+
+        def command() -> tuple[str, ...]:
+            nonlocal command_count
+            command_count += 1
+            return next(commands)
+
+        supervisor = ModelSupervisor(
+            _settings(tmp_path),
+            command=command,
+            operation_timeout_seconds=1,
+            startup_timeout_seconds=1,
+        )
+        await supervisor.start()
+        old_pid = supervisor.child_pid
+        with pytest.raises(RuntimeSupervisorError, match="model_operation_failed"):
+            await supervisor.request("query_embedding", {"question": "fatal"})
+        assert old_pid is not None and not _pid_exists(old_pid)
+        assert command_count <= 2 and not supervisor.ready
+        with pytest.raises(RuntimeSupervisorError, match="runtime_restarting"):
+            await supervisor.request("query_embedding", {"question": "fast failure"})
+        cancelled_probe = asyncio.create_task(
+            supervisor.request("query_embedding", {"question": "cancelled probe"})
+        )
+        cancelled_probe.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_probe
+        await _wait_until_ready(supervisor)
+        assert command_count == 2
+        replacement_pid = supervisor.child_pid
+        assert replacement_pid is not None and replacement_pid != old_pid
+        assert await supervisor.request("query_embedding", {"question": "healthy"}) == {
+            "vector": [1.0]
+        }
+        await supervisor.close()
+
+        shutdown_commands = iter(
+            (_fixture_command("fatal_once"), _fixture_command("startup_hang", "5"))
+        )
+        shutdown = ModelSupervisor(
+            _settings(tmp_path),
+            command=lambda: next(shutdown_commands),
+            operation_timeout_seconds=1,
+            startup_timeout_seconds=10,
+        )
+        await shutdown.start()
+        with pytest.raises(RuntimeSupervisorError):
+            await shutdown.request("query_embedding", {"question": "fatal"})
+        async with asyncio.timeout(2):
+            while shutdown.child_pid is None:
+                await asyncio.sleep(0.01)
+        pending_pid = shutdown.child_pid
+        await shutdown.close()
+        assert pending_pid is not None and not _pid_exists(pending_pid)
+        assert shutdown.child_pid is None and not shutdown.ready
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("replacement_mode", "replacement_arguments"),
+    [("startup_exit", ()), ("startup_hang", ("1",))],
+)
+def test_failed_background_replacement_is_not_retried_by_requests(
+    tmp_path: Path, replacement_mode: str, replacement_arguments: tuple[str, ...]
+) -> None:
+    async def scenario() -> None:
+        command_count = 0
+        commands = iter(
+            (
+                _fixture_command("fatal_once"),
+                _fixture_command(replacement_mode, *replacement_arguments),
+            )
+        )
+
+        def command() -> tuple[str, ...]:
+            nonlocal command_count
+            command_count += 1
+            return next(commands)
+
+        supervisor = ModelSupervisor(
+            _settings(tmp_path),
+            command=command,
+            operation_timeout_seconds=1,
+            startup_timeout_seconds=0.5,
+        )
+        await supervisor.start()
+        with pytest.raises(RuntimeSupervisorError, match="model_operation_failed"):
+            await supervisor.request("query_embedding", {"question": "fatal"})
+        async with asyncio.timeout(2):
+            while command_count < 2 or supervisor.restarting:
+                await asyncio.sleep(0.01)
+        assert not supervisor.ready and command_count == 2
+        with pytest.raises(RuntimeSupervisorError, match="runtime_unavailable"):
+            await supervisor.request("query_embedding", {"question": "no implicit retry"})
+        assert command_count == 2 and supervisor.child_pid is None
+        await supervisor.close()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("mode", ["exit", "malformed", "oversized"])
 def test_child_exit_malformed_and_oversized_output_fail_closed(tmp_path: Path, mode: str) -> None:
     async def scenario() -> None:
+        commands = iter((_fixture_command(mode), _fixture_command("normal")))
         supervisor = ModelSupervisor(
             _settings(tmp_path),
-            command=_fixture_command(mode),
+            command=lambda: next(commands),
             operation_timeout_seconds=1,
             startup_timeout_seconds=2,
         )
         await supervisor.start()
+        old_pid = supervisor.child_pid
         with pytest.raises(RuntimeSupervisorError):
             await supervisor.request("query_embedding", {"question": "q"})
-        assert supervisor.child_pid is None
+        assert old_pid is not None and not _pid_exists(old_pid)
+        await _wait_until_ready(supervisor)
         await supervisor.close()
 
     asyncio.run(scenario())

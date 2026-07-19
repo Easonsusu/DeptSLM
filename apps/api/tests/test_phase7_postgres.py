@@ -514,14 +514,31 @@ def test_insufficient_information_skips_generation(
         assert session.query(RagAnswerCitation).count() == 0
 
 
+@pytest.mark.parametrize(
+    ("invalid_answer", "expected_code"),
+    [
+        ("Dangling [S1", "invalid_citation"),
+        ("Dangling S1]", "invalid_citation"),
+        ("Leading zero [S01], valid [S1].", "invalid_citation"),
+        ("Unicode ［S1］, valid [S1].", "invalid_citation"),
+        ("Long [S1" + "x" * 40 + "], valid [S1].", "invalid_citation"),
+        ("Hidden [S\u00ad1], valid [S1].", "invalid_generation_response"),
+        ("Combining [S\u034f1], valid [S1].", "invalid_generation_response"),
+    ],
+)
 def test_invalid_generation_fails_without_answer_citations_or_completion_audit(
-    db: Session, engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    db: Session,
+    engine,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    invalid_answer: str,
+    expected_code: str,
 ) -> None:
     identities, department, document, extraction, chunk, indexing = _seed(db, tmp_path)
 
     class InvalidRuntime(_Runtime):
         def generate(self, _question, _evidence):
-            return {"status": "answered", "answer": "fabricated", "citations": ["S8"]}
+            return {"status": "answered", "answer": invalid_answer, "citations": ["S1"]}
 
     with _client(monkeypatch, tmp_path) as client:
         app.state.rag_runtime_client = InvalidRuntime()
@@ -535,7 +552,7 @@ def test_invalid_generation_fails_without_answer_citations_or_completion_audit(
     assert response.json() == {"detail": "Grounded answer unavailable"}
     with Session(engine) as session:
         run = session.query(RagAnswerRun).one()
-        assert (run.status, run.error_code) == ("failed", "invalid_citation")
+        assert (run.status, run.error_code) == ("failed", expected_code)
         assert session.query(RagAnswerCitation).count() == 0
         assert (
             session.query(PersistentAuditEvent).filter_by(action="rag.answer.complete").count() == 0
