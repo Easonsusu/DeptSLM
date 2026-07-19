@@ -1,4 +1,4 @@
-"""Validated public schemas through Phase 6."""
+"""Validated public schemas through Phase 8."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.auth import DepartmentRole, MembershipStatus
+from app.rag_feedback_domain import FeedbackSentiment, FeedbackStatus
 
 
 class ORMResponse(BaseModel):
@@ -239,3 +240,51 @@ class RagAnswerResponse(BaseModel):
     citations: list[RagCitationResponse]
     generation_model: str
     created_at: datetime
+
+
+class RagFeedbackSubmitRequest(BaseModel):
+    """Structured immutable feedback without comments or identity selectors."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sentiment: FeedbackSentiment
+    reason_codes: list[str] = Field(default_factory=list, max_length=5)
+    source_ids: list[str] = Field(default_factory=list, max_length=8)
+
+
+class RagFeedbackReviewRequest(BaseModel):
+    """Constrained reviewer transition with optimistic concurrency."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: FeedbackStatus
+    resolution_code: str | None = Field(default=None, max_length=64)
+    expected_version: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def reject_open_target(self) -> RagFeedbackReviewRequest:
+        if self.status is FeedbackStatus.OPEN:
+            raise ValueError("feedback cannot transition to open")
+        return self
+
+
+class RagFeedbackResponse(BaseModel):
+    """Content-free feedback metadata without submitter or reviewer identity."""
+
+    id: UUID
+    run_id: UUID
+    answer_status: str
+    sentiment: FeedbackSentiment
+    reason_codes: list[str]
+    source_ids: list[str]
+    status: FeedbackStatus
+    resolution_code: str | None
+    created_at: datetime
+    reviewed_at: datetime | None
+    expires_at: datetime
+    version: int
+
+
+class RagFeedbackListResponse(BaseModel):
+    items: list[RagFeedbackResponse]
+    next_cursor: str | None

@@ -2,6 +2,8 @@
 
 import { FormEvent, useState } from "react";
 
+import { RagFeedbackPanel } from "./RagFeedbackPanel";
+
 const MAX_QUESTION_CHARS = 2000;
 
 type Citation = {
@@ -111,6 +113,12 @@ export function RagAnswerPanel({ departmentId }: { departmentId: string }) {
               ))}
             </ol>
           )}
+          <RagFeedbackPanel
+            answerStatus={answer.status}
+            departmentId={departmentId}
+            runId={answer.id}
+            sourceIds={answer.citations.map((citation) => citation.source_id)}
+          />
         </article>
       )}
     </section>

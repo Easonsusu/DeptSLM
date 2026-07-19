@@ -141,6 +141,12 @@ All five active same-department roles may request one grounded answer. The URL d
 
 Transactional `rag.answer.start` records only content-free admitted-run metadata. `rag.answer.complete` is written only with an applied answered or insufficient result. Questions, answers, prompts, evidence, vectors, hashes, paths, raw model output, tokens, and dependency details are excluded from PostgreSQL, audit, and logs.
 
+## Phase 8 feedback boundary
+
+All five active roles may submit structured feedback only when their exact identity owns the completed same-department RAG run. Reviewer list/read/transition requires active same-department `system_admin`, `department_admin`, or `instructor`; purge requires same-department `system_admin` or `department_admin`. Every operation repeats membership resolution inside its database transaction, and `system_admin` has no cross-department bypass. Foreign or expired objects fail without disclosing existence.
+
+Feedback rows, reasons, and source targets carry exact non-null department/run scope. Targets must reference a persisted citation from that same scope. Public contracts expose no submitter or reviewer identity, content, filename, document/chunk/indexing metadata, or infrastructure detail. Feedback is immutable; review uses constrained forward-only transitions and optimistic versions. Expiry, visibility, and purge use PostgreSQL server time. Purge is explicit and bounded, deletes children before parents, preserves runs/citations, and appends transactional content-free audits. Feedback code has no Qdrant, artifact, extracted-text, RAG runtime, or model access and cannot alter retrieval, prompts, generation, evaluation, or training.
+
 ## Acceptance criteria for Phase 2
 
 - Authentication produces a server-validated user identity.

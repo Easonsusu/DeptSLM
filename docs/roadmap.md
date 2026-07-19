@@ -39,14 +39,15 @@ This roadmap separates foundational safety work from product implementation. A l
 - Add pinned offline Qwen3-Embedding integration, PostgreSQL indexing jobs, staged Qdrant publication, exact-attempt cleanup, and mandatory typed `department_id` payload filters.
 - Phase 6 merged its reviewed indexing, collection-schema, lease, cleanup, and future-retrieval authority boundaries.
 
-## Phase 7 — RAG chat with citations (current; not completed)
+## Phase 7 — RAG chat with citations (completed)
 
 - Add source-grounded Qwen3 answers, citation metadata, prompt-injection defenses, and insufficient-information behavior.
-- Phase 7 remains current until its implementation is reviewed and merged; it does not add conversations, history, streaming, reranking, adapters, or training.
+- Phase 7 merged its reviewed one-turn grounded-answer, citation, prompt-injection, and insufficient-information boundaries.
 
-## Phase 8 — Feedback collection
+## Phase 8 — Structured RAG feedback review (current; not completed)
 
-- Add department-scoped feedback, review status, retention, and audit metadata.
+- Add immutable department-scoped structured feedback, constrained review transitions, PostgreSQL-server-time retention, explicit purge, and transactional audit metadata.
+- Phase 8 remains current until its implementation is reviewed and merged. It does not add free text, evaluation, training data, automatic RAG changes, scheduled purge, or Phase 9 behavior.
 
 ## Phase 9 — Evaluation runner
 

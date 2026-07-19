@@ -2,7 +2,7 @@
 
 ## Status
 
-The Phase 7 API keeps upload, extraction, and indexing boundaries and adds one department-scoped grounded-answer request. It performs server-authorized retrieval and returns only answer text plus safe citation metadata. There is no public vector search, query-vector API, conversation history, streaming, reranking, training, or production identity integration.
+The Phase 8 API preserves the completed grounded-answer boundary and adds structured feedback submission and review metadata. Feedback routes use PostgreSQL only and expose no content or identity IDs. There is no public vector search, query-vector API, conversation history, streaming, reranking, evaluation, training, or production identity integration.
 
 For the default local configuration, the base URL is:
 
@@ -132,6 +132,20 @@ All five active same-department roles may submit `{"question":"..."}`; the quest
 An answered `200` response contains a run UUID, `status: "answered"`, plain answer text, the fixed generation-model display ID, creation time, and citations with server label, document/chunk IDs, original filename, ordinal, and page/line provenance. An inadequate-evidence result uses `status: "insufficient_information"`, the exact safe message, and an empty citation list. Internal scores, department/extraction/indexing IDs, identities, model revisions, hashes, paths, text chunks, vectors, prompts, raw output, URLs, and credentials are never public.
 
 The endpoint is intentionally synchronous and non-streaming. Dependency or source-state failures return a generic `503`; invalid question shape returns `422`. Questions, answers, prompts, evidence, and vectors are transient and are not stored. See [rag-answering.md](rag-answering.md).
+
+## Current structured-feedback endpoints
+
+- `PUT /departments/{department_id}/rag/answers/{run_id}/feedback`
+- `GET /departments/{department_id}/rag/answers/{run_id}/feedback`
+- `GET /departments/{department_id}/rag/feedback`
+- `GET /departments/{department_id}/rag/feedback/{feedback_id}`
+- `PATCH /departments/{department_id}/rag/feedback/{feedback_id}`
+
+All five active same-department roles may submit structured feedback only for their own completed run. A PUT accepts `sentiment`, reviewed `reason_codes`, and public citation `source_ids`; extra keys and arbitrary strings fail validation. First creation returns 201, an identical canonical replay returns 200 without mutation or audit, and a conflicting immutable replacement returns 409. The owner GET requires current active membership and hides expired or foreign feedback with 404.
+
+The reviewer queue and detail/mutation routes require active same-department `system_admin`, `department_admin`, or `instructor` membership. The queue supports exact status/sentiment filters, limit 1 through 100, oldest-first ordering, and an opaque filter-bound cursor. Review PATCH supports only the documented forward transitions and requires `expected_version`; stale or invalid transitions return 409. Expired and foreign records return safe 404. Authentication failures retain the 401 Bearer challenge; authorization 403 responses do not.
+
+Public responses contain feedback/run IDs, answer outcome, sentiment, reason codes, source labels, workflow state, reviewed resolution, timestamps, expiry, and version only. They omit user/reviewer identities, questions, answers, prompts, evidence, filenames, document/chunk/indexing details, hashes, paths, scores, vectors, URLs, database details, and credentials. Feedback does not change RAG behavior and is neither an evaluation result nor training data. See [rag-feedback.md](rag-feedback.md), [feedback-review.md](feedback-review.md), and [feedback-retention.md](feedback-retention.md).
 
 ## Future API conventions
 
