@@ -113,7 +113,9 @@ class IndexSettings(QdrantSettings):
 
 
 def _data_root(
-    raw: str, *, required_directories: tuple[str, ...] = ("extracted_text", "model_cache")
+    raw: str,
+    *,
+    required_directories: tuple[str, ...] = ("extracted_text", "model_cache"),
 ) -> Path:
     value = raw.strip()
     if not value:

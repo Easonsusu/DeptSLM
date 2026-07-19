@@ -25,6 +25,8 @@ Payload never contains chunk/normalized text, filenames, paths, hashes, users, i
 
 All direct client calls live in `deptslm_worker.qdrant_adapter`. Every adapter operation requires a typed `DepartmentScope`; no raw department string, optional/global scope, caller-provided filter, or caller-provided collection exists. Internally constructed filters always require exact `department_id`. Attempt count, inspection, activation, and deletion also require exact indexing and vector-attempt IDs. Search additionally requires `published=true` and the current embedding pipeline. Returned payloads and canonical UUIDs are validated; malformed or foreign values fail closed.
 
+Phase 7 does not add a second adapter or public search route. The API uses this same reviewed typed boundary for a bounded internal query and passes every candidate through the existing PostgreSQL retrieval authority. Qdrant scores and payloads alone never authorize evidence. The query vector is transient and is neither persisted nor returned.
+
 ## Staging and consistency
 
 Each claim receives a fresh random `vector_attempt_id`. Before every claim-owned Qdrant mutation, the worker requires an exact live PostgreSQL row, worker, claim token, vector attempt, scope, fixed model/vector contract, and server-time lease. Bounded upserts use `wait=true` and start with `published=false`. Finalization locks department, document, extraction, then indexing; revalidates PostgreSQL authority immediately before activation; verifies the exact staged count; activates only the exact scoped attempt; verifies the exact published count; then records PostgreSQL success and `document.vector_index.complete` in one database transaction.
@@ -36,3 +38,5 @@ Handled failure deletes only the current exact department/indexing/attempt point
 PostgreSQL cannot transactionally cancel a Qdrant request already in flight. A stale write completing after the final cleanup can remain physically unpublished, and activation followed by a failed PostgreSQL commit can leave a published orphan. Neither is retrieval authority: search requires `published=true` and the current pipeline, and every candidate must also match a committed succeeded PostgreSQL row, stored document, succeeded extraction, and exact chunk/attempt ownership. Soft deletion blocks the same authority even if vectors remain physically stored.
 
 The local single-node Compose service is a development convenience, not a production clustering, TLS, availability, backup, or tenant-security claim.
+
+An activated point remains physically possible after a failed PostgreSQL commit, and soft-deleted-document points may remain stored. Neither is answer authority: Phase 7 requires a committed succeeded indexing row, stored document, succeeded extraction, exact current attempt/chunk ownership, and unchanged selected artifacts before generation and accepted completion.

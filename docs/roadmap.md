@@ -34,14 +34,15 @@ This roadmap separates foundational safety work from product implementation. A l
 - Add a PostgreSQL queue, constrained parser subprocess, source verification, deterministic normalization/chunking, provenance, leases, quota enforcement, and safe failure handling.
 - Phase 5 merged its reviewed extraction, chunking, provenance, and lease boundary.
 
-## Phase 6 — Qdrant indexing and retrieval (current; not completed)
+## Phase 6 — Qdrant indexing and retrieval (completed)
 
 - Add pinned offline Qwen3-Embedding integration, PostgreSQL indexing jobs, staged Qdrant publication, exact-attempt cleanup, and mandatory typed `department_id` payload filters.
-- Phase 6 remains current until this pull request is reviewed and merged; public semantic search and RAG remain deferred.
+- Phase 6 merged its reviewed indexing, collection-schema, lease, cleanup, and future-retrieval authority boundaries.
 
-## Phase 7 — RAG chat with citations
+## Phase 7 — RAG chat with citations (current; not completed)
 
 - Add source-grounded Qwen3 answers, citation metadata, prompt-injection defenses, and insufficient-information behavior.
+- Phase 7 remains current until its implementation is reviewed and merged; it does not add conversations, history, streaming, reranking, adapters, or training.
 
 ## Phase 8 — Feedback collection
 

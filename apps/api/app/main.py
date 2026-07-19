@@ -54,6 +54,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     application.state.membership_resolver = SQLAlchemyMembershipResolver(session_factory)
     application.state.audit_sink = LoggingAuditSink()
     application.state.document_storage = DocumentStorage(settings.data_dir)
+    # Tests may inject reviewed fakes. Production constructs short-lived clients
+    # inside the answer service so no external call occurs during application startup.
+    application.state.rag_runtime_client = None
+    application.state.rag_qdrant = None
     try:
         yield
     finally:

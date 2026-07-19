@@ -1,4 +1,4 @@
-# Phase 6 Embedding Model
+# Embedding Model Through Phase 7
 
 ## Reviewed contract
 
@@ -29,4 +29,6 @@ Database URLs, Qdrant settings, authentication configuration, bearer tokens, dep
 
 The deterministic fake provider is permitted only when `ENVIRONMENT=test` is exact. It is never the default and startup rejects it in local development, preview, staging, production, unknown, missing, or misspelled environments. CI does not download the real model. A real-model smoke test is opt-in and must use an already prepared exact cache with networking disabled.
 
-Phase 6 adds no query-embedding API, reranker, generation model, RAG, LlamaIndex, or frontend model behavior.
+Phase 7 reuses the exact model and revision for query embeddings inside the private runtime. It prefixes the normalized question with the fixed reviewed instruction documented in [rag-answering.md](rag-answering.md), validates the normalized 1,024-dimensional vector in the API, and never exposes a query-embedding endpoint publicly. Chunk embedding remains unchanged. No reranker or LlamaIndex dependency is added.
+
+The private runtime also loads `Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca` from the same external integrity-manifest boundary. Both models are prepared explicitly with `prepare-rag-models`; normal indexing and RAG processes remain offline. The opt-in real-model smoke test requires both already prepared caches and never downloads them.

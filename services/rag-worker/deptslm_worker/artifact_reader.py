@@ -193,6 +193,29 @@ class Phase5ArtifactReader:
             if duplicate >= 0:
                 os.close(duplicate)
 
+    def verify_unchanged(self) -> None:
+        """Revalidate descriptor identity and exact content before releasing text."""
+
+        try:
+            for descriptor, expected in self.files.values():
+                actual = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(actual.st_mode)
+                    or actual.st_dev != expected.st_dev
+                    or actual.st_ino != expected.st_ino
+                    or actual.st_size != expected.st_size
+                    or actual.st_nlink != 1
+                    or actual.st_mtime_ns != expected.st_mtime_ns
+                ):
+                    raise ArtifactError()
+            if _hash_file(self.files["chunks.jsonl"][0]) != self.manifest["chunks_sha256"]:
+                raise ArtifactError()
+            self._validate_normalized()
+            if self._manifest() != self.manifest:
+                raise ArtifactError()
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+            raise ArtifactError() from error
+
     def close(self) -> None:
         for descriptor, _metadata in self.files.values():
             try:

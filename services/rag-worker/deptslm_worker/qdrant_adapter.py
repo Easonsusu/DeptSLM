@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -348,6 +349,9 @@ class DepartmentQdrant:
                 point_id = UUID(str(scored.id))
                 if point_id != UUID(payload["chunk_id"]):
                     raise QdrantBoundaryError("qdrant_verification_failed")
+                score = float(scored.score)
+                if not math.isfinite(score) or not -1.0 <= score <= 1.0:
+                    raise QdrantBoundaryError("qdrant_verification_failed")
                 hits.append(
                     VectorHit(
                         point_id=point_id,
@@ -356,7 +360,7 @@ class DepartmentQdrant:
                         indexing_id=UUID(payload["indexing_id"]),
                         vector_attempt_id=UUID(payload["vector_attempt_id"]),
                         chunk_ordinal=_nonnegative_integer(payload["ordinal"]),
-                        score=float(scored.score),
+                        score=score,
                     )
                 )
             return tuple(hits)

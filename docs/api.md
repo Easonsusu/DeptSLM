@@ -2,7 +2,7 @@
 
 ## Status
 
-The Phase 6 API keeps upload/extraction boundaries and adds department-scoped vector-indexing enqueue/retry plus safe status metadata. Long-running embedding and Qdrant work occurs only in the indexing worker. Extracted/chunk text, vectors, model paths, public search, RAG, training, and production identity integration remain unavailable.
+The Phase 7 API keeps upload, extraction, and indexing boundaries and adds one department-scoped grounded-answer request. It performs server-authorized retrieval and returns only answer text plus safe citation metadata. There is no public vector search, query-vector API, conversation history, streaming, reranking, training, or production identity integration.
 
 For the default local configuration, the base URL is:
 
@@ -123,6 +123,16 @@ Enqueue/retry accept same-department `system_admin`, `department_admin`, and `in
 
 Responses expose the fixed pipeline/model display ID/dimension/distance/schema, counts, state, safe error, attempt number, and public timestamps. They omit requestor/worker IDs, claim/vector-attempt IDs, lease, model revision/path, collection management, Qdrant URL/key, hashes, content, and vectors. API handlers never read artifacts, load models, or call Qdrant. There is no public search or query-vector route. See [vector-indexing.md](vector-indexing.md).
 
+## Current grounded-answer endpoint
+
+- `POST /departments/{department_id}/rag/answers`
+
+All five active same-department roles may submit `{"question":"..."}`; the question is NFC-normalized, trimmed, control-checked, and limited to 2,000 characters. Admission and completion each resolve current server-side membership. Cross-department selectors return `403` without a Bearer challenge, while missing/invalid authentication retains the `401` Bearer challenge.
+
+An answered `200` response contains a run UUID, `status: "answered"`, plain answer text, the fixed generation-model display ID, creation time, and citations with server label, document/chunk IDs, original filename, ordinal, and page/line provenance. An inadequate-evidence result uses `status: "insufficient_information"`, the exact safe message, and an empty citation list. Internal scores, department/extraction/indexing IDs, identities, model revisions, hashes, paths, text chunks, vectors, prompts, raw output, URLs, and credentials are never public.
+
+The endpoint is intentionally synchronous and non-streaming. Dependency or source-state failures return a generic `503`; invalid question shape returns `422`. Questions, answers, prompts, evidence, and vectors are transient and are not stored. See [rag-answering.md](rag-answering.md).
+
 ## Future API conventions
 
 The following conventions should be decided before business endpoints are introduced:
@@ -163,7 +173,7 @@ Names and paths below are conceptual and may change after contract design.
 
 Uploaded sources are stored beneath `DEPTSLM_DATA_DIR/uploads/<department_id>/<document_id>/source`, not in Git or arbitrary API-server paths. Extracted text remains deferred.
 
-### Chat and retrieval
+### Chat and retrieval beyond Phase 7
 
 - department-scoped conversations and messages
 - source-grounded query requests

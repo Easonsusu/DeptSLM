@@ -68,6 +68,8 @@ Phase 5 stages beneath `<root>/extracted_text/<department_id>/<document_id>/.sta
 
 Phase 6 model preparation stages and caches only beneath `model_cache`, then publishes one real-file directory named for the immutable reviewed revision with a complete integrity manifest. Ordinary indexing mounts `model_cache` and `extracted_text` read-only, operates offline, and writes vectors only to Qdrant service state. Qdrant payload is content-free; live state remains beneath external `service_state/qdrant` and portable snapshots beneath `vector_snapshots`. No model, vector, chunk artifact, Hugging Face cache, or Qdrant data may enter the checkout or process temporary storage.
 
+Phase 7 prepares the exact embedding and generation models through the same explicit external `model_cache` boundary. The private runtime mounts only that subdirectory read-only, and the API mounts `extracted_text` read-only while retaining its upload write boundary. Questions, answers, prompts, selected evidence, query vectors, and raw model output remain transient memory only and must not be written to the repository, temporary directories, home caches, logs, exports, or database fields.
+
 ## Never commit
 
 The following must never be committed, even to a private branch:
@@ -106,6 +108,8 @@ The Phase 5 parser receives the read-only immutable source-snapshot descriptor, 
 
 The Phase 6 embedding child receives only a reviewed model directory argument plus bounded sequence/text requests. It receives no database, Qdrant, authentication, department, document, extraction, user, or filename values. PostgreSQL stores indexing metadata but no text/vectors; Qdrant stores vectors with a content-free payload.
 
+The Phase 7 runtime receives only a bounded question and server-labeled selected evidence through an authenticated internal endpoint. It receives no database, Qdrant, API JWT, user identity, department ID, path, filename, or storage descriptor. PostgreSQL stores content-free run/citation metadata only.
+
 Do not hard-code a developer's absolute Google Drive path in source code, Docker files, tests, or committed environment templates. `.env.example` should contain a placeholder; each developer keeps the real value in an untracked `.env`.
 
 ## Docker Compose
@@ -129,6 +133,7 @@ Tests and CI must not depend on Google Drive. Each run should create a fresh tem
 - model preparation and normal indexing never write model or vector artifacts into the checkout or home cache;
 - Qdrant tests use the pinned isolated service and exact department/attempt filters;
 - failed, stale, shutdown, and reclaimed indexing attempts clean only their exact vector attempt and never become trusted.
+- grounded-answer tests use temporary verified extraction artifacts and fake offline models; no question, answer, prompt, evidence, vector, or raw model output remains in the checkout.
 
 ## Google Drive limitations
 

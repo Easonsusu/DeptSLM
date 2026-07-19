@@ -204,3 +204,38 @@ class VectorIndexingListResponse(BaseModel):
     items: list[VectorIndexingResponse]
     limit: int
     offset: int
+
+
+class RagAnswerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question: str
+
+    @field_validator("question")
+    @classmethod
+    def normalize_and_validate_question(cls, value: str) -> str:
+        from app.rag_domain import normalize_question
+
+        return normalize_question(value)
+
+
+class RagCitationResponse(BaseModel):
+    source_id: str
+    document_id: UUID
+    original_filename: str
+    chunk_id: UUID
+    ordinal: int
+    provenance_kind: str
+    page_start: int | None
+    page_end: int | None
+    line_start: int | None
+    line_end: int | None
+
+
+class RagAnswerResponse(BaseModel):
+    id: UUID
+    status: str
+    answer: str
+    citations: list[RagCitationResponse]
+    generation_model: str
+    created_at: datetime

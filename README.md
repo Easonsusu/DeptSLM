@@ -2,9 +2,9 @@
 
 DeptSLM is a university departmental small language model (SLM) customization platform. It is intended to let each department build an isolated assistant from its own approved documents, retrieval index, evaluation data, and eventually its own LoRA or QLoRA adapter.
 
-> **Phase 6 status:** Department-scoped PostgreSQL indexing jobs, pinned offline Qwen3 chunk embeddings, verified dense-only Qdrant schema, live-claim mutation gates, verified exact-attempt cleanup, and mandatory typed department filters are under review. No public search, RAG, reranking, generation, frontend indexing UI, fine-tuning, or production deployment is implemented.
+> **Phase 7 status:** A one-turn, department-scoped grounded-answer endpoint, citation metadata, and an isolated offline Qwen3 runtime are under review. There is no public vector-search endpoint, conversation history, streaming, reranking, adapter selection, fine-tuning, or production deployment.
 
-The API manages content-free upload, extraction, and indexing metadata. Parsing and embedding run in separate worker paths; extracted and chunk text remains external and has no API. Embedding IPC is byte-bounded, nonblocking, and interruptible. PostgreSQL succeeded state remains retrieval authority because PostgreSQL cannot transactionally fence an already in-flight Qdrant request. The subprocess boundaries are constrained but are not kernel-enforced malware sandboxes, and crash-time orphan reconciliation remains deferred.
+The API manages content-free upload, extraction, and indexing metadata. For an authorized one-turn answer it creates content-free run metadata, retrieves through the fixed department-scoped Qdrant adapter, cross-checks every candidate against PostgreSQL, reads only selected verified chunks, and calls a private model runtime. After generation it reauthorizes every supplied source—including uncited evidence—against exact PostgreSQL and artifact state, while returning and persisting only cited labels. Questions, answers, prompts, retrieved text, and vectors are not persisted. PostgreSQL succeeded state remains retrieval authority.
 
 ## Planned stack
 
@@ -27,6 +27,7 @@ DeptSLM/
 │   └── web/                  # Next.js application
 ├── services/
 │   ├── rag-worker/           # Extraction plus isolated Phase 6 indexing paths
+│   ├── rag-runtime/          # Private supervised Phase 7 model runtime
 │   └── training-worker/      # Future fine-tuning jobs
 ├── packages/
 │   └── shared/               # Future shared contracts and utilities
@@ -130,10 +131,20 @@ Phase 6 requires a long untracked `DEPTSLM_QDRANT_API_KEY`. Prepare the exact pi
 
 Model assets remain under `DEPTSLM_DATA_DIR/model_cache`. The indexing worker mounts only `extracted_text` and `model_cache` read-only and receives no API authentication secret. See [Vector indexing](docs/vector-indexing.md), [Qdrant boundary](docs/qdrant-boundary.md), and [Embedding model](docs/embedding-model.md).
 
+Phase 7 additionally requires a long untracked `DEPTSLM_RAG_RUNTIME_TOKEN` and the exact generation model. Preparation remains an explicit administrative action; the normal runtime is offline:
+
+```bash
+./scripts/compose.sh run --rm model-admin \
+  python -m deptslm_worker.model_admin prepare-rag-models
+```
+
+The generation contract is `Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca`, non-thinking mode, an exact 40,960-token model context, an 8,192-token operational input cap, and at most 512 new tokens; query embedding is capped at 2,048 tokens. Inputs are tokenized completely and never silently truncated. The internal runtime receives no database or Qdrant credentials and is not published on a host port. Its HTTP process supervises one persistent killable model child with separate startup and operation clocks. Over-token input is recoverable without reload; fatal timeout, cancellation, disconnect, shutdown, protocol, or child failures terminate and reap the process group and permit one bounded background replacement. Readiness is false and requests fail fast during replacement. The child receives neither the runtime bearer token nor other secrets or proxy settings.
+
 ## Safety and data isolation
 
 - Future department-owned records, documents, indexes, jobs, adapters, and conversations must be scoped and authorized by `department_id` at every storage and service boundary.
 - Retrieved document text is untrusted input. It must be quoted as context and must never be allowed to override system or developer instructions.
+- Questions, evidence, generated answers, and citation filenames reject all format controls, combining grapheme joiner, noncharacters, and other unsafe Unicode while preserving variation selectors, ordinary accents, and emoji. A focused lexer accepts only exact ASCII `[S1]` through `[S8]` citations and rejects paired or dangling source-like lookalikes without blocking ordinary bracket prose.
 - If retrieval returns no usable source, the assistant must say that it does not have enough information. It must not invent a department-specific answer.
 - Secrets, model weights, and runtime artifacts do not belong in Git history.
 
@@ -161,10 +172,14 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Vector indexing](docs/vector-indexing.md)
 - [Qdrant boundary](docs/qdrant-boundary.md)
 - [Embedding model](docs/embedding-model.md)
+- [Grounded RAG answering](docs/rag-answering.md)
+- [Prompt-injection boundary](docs/prompt-injection-boundary.md)
+- [Citation model](docs/citation-model.md)
+- [Internal RAG runtime](docs/rag-runtime.md)
 
 ## Current non-goals
 
-Phase 6 does not implement production OAuth/OIDC/SSO, platform administration, frontend ingestion/indexing UI, OCR, malware scanning, download/preview, public semantic search, RAG, reranking, generation, LlamaIndex, fine-tuning, or production deployment.
+Phase 7 does not implement production OAuth/OIDC/SSO, platform administration, conversation persistence, history, streaming, reranking, adapter selection, LlamaIndex, OCR, malware scanning, download/preview, fine-tuning, or production deployment.
 
 ## License
 

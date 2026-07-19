@@ -75,6 +75,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @deptslm/web typecheck
+      - run: pnpm --filter @deptslm/web test
       - run: pnpm --filter @deptslm/web build
       - name: Verify web checks leave the checkout clean
         shell: bash
@@ -127,6 +128,7 @@ jobs:
             apps/api/requirements.txt
             apps/api/requirements-dev.txt
             services/rag-worker/pyproject.toml
+            services/rag-runtime/pyproject.toml
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
         working-directory: apps/api
@@ -136,8 +138,8 @@ jobs:
       - name: Lint API
         working-directory: apps/api
         run: |
-          python -m ruff check app tests ../../services/rag-worker/deptslm_worker
-          python -m ruff format --check app tests ../../services/rag-worker/deptslm_worker
+          python -m ruff check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime
+          python -m ruff format --check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime
       - name: Run API tests with temporary storage
         working-directory: apps/api
         run: |
@@ -154,7 +156,7 @@ jobs:
             sleep 1
           done
           python -m alembic upgrade head
-          test "$(python -m alembic current | awk '{print $1}')" = "0004_phase6_vector_indexing"
+          test "$(python -m alembic current | awk '{print $1}')" = "0005_phase7_rag_answers"
           python -m pytest
       - name: Run one-shot worker smoke test
         working-directory: apps/api
@@ -208,7 +210,7 @@ jobs:
           test -x services/training-worker/entrypoint.sh
       - name: Build and inspect API migration image
         run: |
-          docker build --tag deptslm-api-ci apps/api
+          docker build --tag deptslm-api-ci --file apps/api/Dockerfile .
           docker run --rm --entrypoint python deptslm-api-ci -c '
           import pathlib
           import app.admin
@@ -220,10 +222,12 @@ jobs:
           assert pathlib.Path("/app/alembic/versions/0002_phase4_documents.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0003_phase5_extraction.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0004_phase6_vector_indexing.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0005_phase7_rag_answers.py").is_file()
           import importlib.util
           assert importlib.util.find_spec("pypdf") is None
-          assert importlib.util.find_spec("qdrant_client") is None
+          assert importlib.util.find_spec("qdrant_client") is not None
           assert importlib.util.find_spec("sentence_transformers") is None
+          assert importlib.util.find_spec("transformers") is None
           '
       - name: Build and inspect extraction worker image
         run: |
@@ -255,6 +259,56 @@ jobs:
             printf 'Forbidden model-weight-like files in indexing image:\n%s\n' "$weight_matches" >&2
             exit 1
           fi
+      - name: Build and inspect internal RAG runtime image
+        run: |
+          docker build --tag deptslm-rag-runtime-ci --file services/rag-runtime/Dockerfile .
+          docker run --rm --entrypoint python deptslm-rag-runtime-ci -I -c '
+          import importlib.util
+          import deptslm_runtime.model_child
+          import deptslm_runtime.main
+          import deptslm_runtime.supervisor
+          import sentence_transformers
+          import transformers
+          assert importlib.util.find_spec("qdrant_client") is None
+          assert importlib.util.find_spec("psycopg") is None
+          '
+          weight_matches="$(docker run --rm --entrypoint sh deptslm-rag-runtime-ci -c 'find / -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) ! -path "/usr/local/lib/python3.12/site-packages/distutils-precedence.pth" -print 2>/dev/null || true')"
+          if [[ -n "$weight_matches" ]]; then
+            printf 'Forbidden model-weight-like files in RAG runtime image:\n%s\n' "$weight_matches" >&2
+            exit 1
+          fi
+          runtime_data="$RUNNER_TEMP/deptslm-rag-runtime"
+          mkdir -p "$runtime_data/model_cache"
+          container_id="$(docker run --detach --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --publish 127.0.0.1:18010:8010 \
+            --volume "$runtime_data/model_cache:/runtime/deptslm/model_cache:ro" \
+            --env DEPTSLM_DATA_DIR=/runtime/deptslm \
+            --env DEPTSLM_RAG_RUNTIME_TOKEN=phase7-ci-runtime-token-0123456789-abcdef \
+            --env DEPTSLM_RAG_RUNTIME_PROVIDER=fake \
+            --env DEPTSLM_RAG_RUNTIME_MAX_CONCURRENCY=1 \
+            --env DEPTSLM_EMBEDDING_MODEL_REVISION=d23109d65ca9fdf61eef614209744716f337f50f \
+            --env DEPTSLM_GENERATION_MODEL_REVISION=c1899de289a04d12100db370d81485cdf75e47ca \
+            --env ENVIRONMENT=test \
+            deptslm-rag-runtime-ci)"
+          trap 'docker rm --force "$container_id" >/dev/null 2>&1 || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18010/healthz >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" == "30" ]]; then
+              echo "RAG runtime fake smoke test did not become ready." >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          curl --fail --silent \
+            --header 'Authorization: Bearer phase7-ci-runtime-token-0123456789-abcdef' \
+            --header 'Content-Type: application/json' \
+            --data '{"question":"Synthetic runtime smoke?"}' \
+            http://127.0.0.1:18010/internal/v1/query-embedding \
+            | python -c 'import json,sys; value=json.load(sys.stdin); assert len(value["vector"]) == 1024'
+          docker rm --force "$container_id" >/dev/null
+          trap - EXIT
       - name: Check raw streaming upload boundary
         run: |
           ! grep -R -E 'UploadFile|python-multipart|request\.body\(' apps/api/app apps/api/requirements*.txt
@@ -270,11 +324,22 @@ jobs:
           ! grep -E '@router\.(get|post).*search|/search|query_vector' apps/api/app/routes.py
           ! grep -E 'qdrant/qdrant:(latest|main)' docker-compose.yml .github/workflows/ci.yml
           grep -R -F 'd23109d65ca9fdf61eef614209744716f337f50f' apps/api/app services/rag-worker/deptslm_worker >/dev/null
+      - name: Check Phase 7 architecture boundaries
+        run: |
+          ! grep -E '@router\.(get|post).*search|/search|query_vector' apps/api/app/routes.py apps/api/app/schemas.py
+          ! sed -n '/^  rag-runtime:/,/^  training-worker:/p' docker-compose.yml | grep -E 'DATABASE(_TEST)?_URL|DEPTSLM_QDRANT_(URL|API_KEY)|DEPTSLM_AUTH_|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY'
+          ! grep -R -E 'dangerouslySetInnerHTML|localStorage|sessionStorage' apps/web/app
+          test "$(grep -R -l 'QdrantClient' services/rag-worker/deptslm_worker apps/api/app --include='*.py' | sort)" = "services/rag-worker/deptslm_worker/qdrant_adapter.py"
+          grep -R -F 'c1899de289a04d12100db370d81485cdf75e47ca' apps/api/app services/rag-runtime services/rag-worker/deptslm_worker >/dev/null
+          grep -R -F 'DEPTSLM_RAG_RUNTIME_TOKEN' services/rag-runtime/deptslm_runtime/settings.py >/dev/null
+          grep -R -F 'GENERATION_MODEL_CONTEXT_TOKENS = 40960' apps/api/app/rag_domain.py >/dev/null
+          grep -R -F 'MAX_GENERATION_INPUT_TOKENS = 8192' apps/api/app/rag_domain.py >/dev/null
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then
             export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-data"
             export DEPTSLM_QDRANT_API_KEY="phase6-ci-compose-key-0123456789"
+            export DEPTSLM_RAG_RUNTIME_TOKEN="phase7-ci-runtime-token-0123456789-abcdef"
             mkdir -p "$DEPTSLM_DATA_DIR"/{uploads,extracted_text,vector_snapshots,training_datasets,adapters,model_cache,eval_results,logs,exports}
             mkdir -p "$DEPTSLM_DATA_DIR/service_state/postgres"
             mkdir -p "$DEPTSLM_DATA_DIR/service_state/qdrant"

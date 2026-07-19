@@ -2,7 +2,7 @@
 
 ## Status and boundaries
 
-Phase 6 adds department-scoped PostgreSQL indexing jobs, pinned offline Qwen3 chunk embeddings, and a mandatory-filter Qdrant adapter to the Phase 5 extraction boundary. Public retrieval, RAG, generation, reranking, model serving, training, and adapter flows remain designs, not implemented capabilities.
+Phase 7 adds one-turn department-scoped grounded answers to the Phase 6 retrieval-authority boundary. The API owns authorization, Qdrant retrieval, PostgreSQL candidate validation, selected artifact reads, strict citation validation, and final revalidation. A private offline runtime owns query embedding and generation only. Public vector search, conversations, streaming, reranking, training, and adapter flows remain unimplemented.
 
 ## System context
 
@@ -25,10 +25,10 @@ flowchart TB
         QD[("Qdrant\ndepartment-filtered vectors")]
     end
 
-    subgraph RAGStack["RAG and inference (planned)"]
-        LI["LlamaIndex workflows"]
+    subgraph RAGStack["Phase 7 grounded inference"]
+        Retrieve["API retrieval authority"]
         Embed["Qwen3-Embedding"]
-        Runtime["Qwen3 model runtime"]
+        Runtime["Private Qwen3 runtime"]
     end
 
     subgraph TrainingStack["Adapter training (planned)"]
@@ -44,10 +44,12 @@ flowchart TB
     API -->|"enqueue and inspect jobs"| RAG
     API -->|"enqueue and inspect metadata"| Index
     API -->|"enqueue and inspect jobs"| Train
-    API -->|"department-scoped query"| LI
+    API -->|"typed department-scoped search"| QD
+    API -->|"PostgreSQL authority check"| PG
+    API -->|"bounded question and selected evidence"| Runtime
     Index -->|"offline document embeddings"| Embed
     Index -->|"scoped staged upserts"| QD
-    LI -->|"grounded prompt"| Runtime
+    Runtime -->|"strict JSON answer contract"| API
     Train --> Factory
     Factory -->|"produces"| Adapter
     Adapter -.->|"approved adapter only"| Runtime
@@ -77,15 +79,17 @@ PostgreSQL stores identities, departments, memberships, documents, extraction/ch
 
 Qdrant 1.13.4 is the Phase 6 vector store for chunks embedded with the pinned Qwen3 contract. The fixed collection accepts exactly one named vector, `dense`; the adapter performs no point operation until the complete vector and payload-index schema is verified. Every operation requires typed `DepartmentScope`; fixed internal filters always include exact `department_id`, and searchable operations also require current pipeline plus `published=true`. Claim-owned mutations additionally require a live exact PostgreSQL claim and fixed contract. Payload contains IDs/provenance only, never text or hashes. Direct client calls outside the reviewed adapter are forbidden. Public search remains deferred.
 
-### RAG worker and future LlamaIndex
+### Extraction/indexing workers and grounded answering
 
-The extraction path stream-copies each canonical source into a private verified claim snapshot and gives only that read-only descriptor to the installed constrained parser. It publishes exactly `normalized.txt`, `chunks.jsonl`, and `manifest.json`. The separate indexing path revalidates those artifacts incrementally, sends bounded requests to a secret-free offline embedding subprocess through interruptible nonblocking IPC, and stages content-free Qdrant points before exact-attempt activation. Reclaim verifies prior-attempt cleanup before processing and again before activation. Both use PostgreSQL server-time leases and exact stale cleanup. LlamaIndex, public retrieval, and query assembly remain future work.
+The extraction path stream-copies each canonical source into a private verified claim snapshot and gives only that read-only descriptor to the installed constrained parser. It publishes exactly `normalized.txt`, `chunks.jsonl`, and `manifest.json`. The separate indexing path revalidates those artifacts incrementally, sends bounded requests to a secret-free offline embedding subprocess through interruptible nonblocking IPC, and stages content-free Qdrant points before exact-attempt activation. Reclaim verifies prior-attempt cleanup before processing and again before activation. Both use PostgreSQL server-time leases and exact stale cleanup.
+
+For Phase 7, the API uses the same reviewed Qdrant adapter and PostgreSQL retrieval authority, then incrementally reads only selected exact chunks. It sends bounded evidence with server-owned labels to a private runtime, validates strict citations, and reauthorizes plus revalidates every supplied source before success; only the cited subset is returned and persisted. The runtime HTTP process supervises one persistent model child through bounded framed IPC. Startup and operation clocks are separate. Over-token inputs preserve the healthy loaded child; fatal operations terminate and reap it, then launch one bounded shared background replacement while readiness is false and new work fails fast. Disconnect/cancellation cannot leave a child or cancel that shared recovery. The model child receives a strict secret-free environment without the runtime bearer token. LlamaIndex is not introduced.
 
 Retrieved text is untrusted content. Prompt assembly must delimit it as evidence, prevent instructions in it from overriding higher-priority policy, and include only sources from the authorized department. If retrieval does not yield usable evidence, the assistant must state that it does not have enough information rather than generate a department-specific claim.
 
 ### Qwen3 and Qwen3-Embedding
 
-Qwen3 remains the future base SLM. Phase 6 fixes `Qwen/Qwen3-Embedding-0.6B` revision `d23109d65ca9fdf61eef614209744716f337f50f`, normalized 1024-dimensional output, and cosine distance. Normal workers load only verified external safetensors offline with remote code disabled. Hardware/bitwise reproducibility, production serving, and final licensing review remain operational limitations; weights and caches never enter Git.
+Phase 6 fixes `Qwen/Qwen3-Embedding-0.6B` revision `d23109d65ca9fdf61eef614209744716f337f50f`, normalized 1024-dimensional output, and cosine distance. Phase 7 fixes `Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca`, non-thinking mode, a 40,960-token pinned context contract, an 8,192-token operational generation-input limit, and a 512-token response reserve. Query embedding has a separate 2,048-token input limit. Complete tokenizer inputs are checked without truncation. Normal processes load only verified external safetensors offline with remote code disabled. Hardware/bitwise reproducibility, production serving, and final licensing review remain operational limitations; weights and caches never enter Git.
 
 ### LLaMA-Factory and the training worker
 
@@ -113,10 +117,10 @@ Phase 5 adds explicit failed-attempt retry, exact expired-claim staging recovery
 
 1. The API authenticates the caller and resolves the authorized department.
 2. Retrieval queries Qdrant with a mandatory `department_id` filter.
-3. The system evaluates whether retrieved passages are relevant enough to use.
-4. LlamaIndex assembles a prompt that treats passages as untrusted evidence, not instructions.
-5. Qwen3 generates an answer using an approved adapter only when one is configured for the same department.
-6. The response returns source metadata for supported claims. With no adequate source, it returns the defined insufficient-information behavior.
+3. PostgreSQL cross-checks every candidate and the API deterministically selects bounded sources above the provisional threshold.
+4. The API reads only selected verified artifacts and labels them as untrusted evidence.
+5. The private HTTP supervisor sends the request to its killable secret-free model child, which returns strict non-thinking JSON using no adapter and fixed token budgets.
+6. The API reloads the complete evidence set, validates citations, reauthorizes, and revalidates every supplied source before returning only the cited subset as safe metadata. With no adequate source, it returns the defined insufficient-information behavior without generation when possible.
 
 ### Adapter training and promotion
 

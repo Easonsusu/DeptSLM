@@ -9,7 +9,7 @@ DeptSLM is developed in small, reviewable phases. Contributors must preserve the
 3. Create a focused branch from current `main`.
 4. Keep planned capabilities separate from implemented behavior.
 
-Phase 5 extraction behavior remains in its PostgreSQL queue and constrained parser boundary. Phase 6 Qdrant work must use only the reviewed adapter, fixed collection/model contracts, typed `DepartmentScope`, exact-attempt cleanup, and offline external model cache. Do not add public search, RAG, reranking, generation, LlamaIndex, OCR, download, frontend, or training behavior.
+Phase 5 extraction behavior remains in its PostgreSQL queue and constrained parser boundary. Phase 6 Qdrant behavior must use only the reviewed adapter, fixed collection/model contracts, typed `DepartmentScope`, exact-attempt cleanup, and offline external model cache. Phase 7 may add only one-turn grounded answers through the reviewed retrieval authority and isolated model runtime. Do not add public vector search, conversations, history, streaming, reranking, adapters, LlamaIndex, OCR, download, or training behavior.
 
 ## Development setup
 
@@ -45,9 +45,10 @@ Run the smallest relevant checks. The current complete validation set is:
 
 ```bash
 python -m ruff check apps/api/app apps/api/tests
-python -m ruff check services/rag-worker/deptslm_worker
-python -m ruff format --check apps/api/app apps/api/tests services/rag-worker/deptslm_worker
+python -m ruff check services/rag-worker/deptslm_worker services/rag-runtime/deptslm_runtime
+python -m ruff format --check apps/api/app apps/api/tests services/rag-worker/deptslm_worker services/rag-runtime/deptslm_runtime
 python -m pytest apps/api
+pnpm --filter @deptslm/web test
 pnpm --filter @deptslm/web typecheck
 pnpm --filter @deptslm/web build
 bash -n scripts/setup_google_drive_storage.sh scripts/validate_data_dir.sh scripts/compose.sh
@@ -74,6 +75,8 @@ Document upload changes must keep raw bodies incremental, avoid multipart and pr
 Extraction changes must keep parsing out of API handlers, use the installed secret-free parser subprocess, reverify source bytes, preserve claim/lease ownership, and publish only beneath a fresh temporary `extracted_text` root in tests. Metadata APIs must never expose extracted or chunk text, hashes, paths, claim tokens, or worker identity.
 
 Indexing changes must revalidate the exact final Phase 5 allowlist incrementally, keep embedding/model dependencies out of the API and extraction image, use deterministic fake embeddings only in exact test environments, and keep all Qdrant calls department-filtered. Tests use temporary `extracted_text` and `model_cache` directories and an isolated collection; never download the real model in CI.
+
+Grounded-answer changes must keep the API as the only PostgreSQL/Qdrant authority, pass only bounded questions and selected evidence to the internal runtime, validate every model citation against server-issued labels, and persist no question, answer, prompt, evidence text, vector, hash, or path. The real two-model smoke test is explicit and opt-in only.
 
 ## Department and authentication safety
 

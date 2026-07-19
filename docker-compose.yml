@@ -21,7 +21,8 @@ services:
 
   api:
     build:
-      context: ./apps/api
+      context: .
+      dockerfile: apps/api/Dockerfile
     environment:
       API_PORT: "${API_PORT:-8000}"
       DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
@@ -32,18 +33,43 @@ services:
       DEPTSLM_DATA_DIR: /runtime/deptslm
       DEPTSLM_DOCUMENT_MAX_BYTES: "${DEPTSLM_DOCUMENT_MAX_BYTES:-26214400}"
       DEPTSLM_DEPARTMENT_DOCUMENT_QUOTA_BYTES: "${DEPTSLM_DEPARTMENT_DOCUMENT_QUOTA_BYTES:-1073741824}"
+      DEPTSLM_QDRANT_URL: "${DEPTSLM_QDRANT_URL:-http://qdrant:6333}"
+      DEPTSLM_QDRANT_API_KEY: "${DEPTSLM_QDRANT_API_KEY:?Set a non-placeholder Qdrant API key in the untracked .env file}"
+      DEPTSLM_QDRANT_COLLECTION: "${DEPTSLM_QDRANT_COLLECTION:-deptslm_chunks_qwen3_0_6b_1024_v1}"
+      DEPTSLM_QDRANT_TIMEOUT_SECONDS: "${DEPTSLM_QDRANT_TIMEOUT_SECONDS:-30}"
+      DEPTSLM_RAG_RUNTIME_URL: "${DEPTSLM_RAG_RUNTIME_URL:-http://rag-runtime:8010}"
+      DEPTSLM_RAG_RUNTIME_TOKEN: "${DEPTSLM_RAG_RUNTIME_TOKEN:?Set a separate RAG runtime token in the untracked .env file}"
+      DEPTSLM_RAG_CANDIDATE_LIMIT: "${DEPTSLM_RAG_CANDIDATE_LIMIT:-20}"
+      DEPTSLM_RAG_MAX_SOURCES: "${DEPTSLM_RAG_MAX_SOURCES:-8}"
+      DEPTSLM_RAG_MAX_SOURCES_PER_DOCUMENT: "${DEPTSLM_RAG_MAX_SOURCES_PER_DOCUMENT:-2}"
+      DEPTSLM_RAG_MAX_EVIDENCE_CHARS: "${DEPTSLM_RAG_MAX_EVIDENCE_CHARS:-6000}"
+      DEPTSLM_RAG_MIN_SCORE: "${DEPTSLM_RAG_MIN_SCORE:-0.45}"
+      DEPTSLM_RAG_REQUEST_TIMEOUT_SECONDS: "${DEPTSLM_RAG_REQUEST_TIMEOUT_SECONDS:-30}"
       ENVIRONMENT: "${ENVIRONMENT:-development}"
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
     volumes:
       - type: bind
-        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}"
-        target: /runtime/deptslm
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/uploads"
+        target: /runtime/deptslm/uploads
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/extracted_text"
+        target: /runtime/deptslm/extracted_text
+        read_only: true
         bind:
           create_host_path: false
     depends_on:
       postgres:
         condition: service_healthy
+      qdrant:
+        condition: service_started
+      rag-runtime:
+        condition: service_started
+    networks:
+      - default
+      - rag-internal
 
   postgres:
     image: postgres:16-alpine
@@ -174,6 +200,7 @@ services:
       DEPTSLM_DATA_DIR: /runtime/deptslm
       DEPTSLM_STORAGE_READ_ONLY: "0"
       ENVIRONMENT: "${ENVIRONMENT:-development}"
+      HF_TOKEN: "${HF_TOKEN:-}"
     cap_drop:
       - ALL
     security_opt:
@@ -207,6 +234,35 @@ services:
       qdrant:
         condition: service_started
 
+  rag-runtime:
+    build:
+      context: .
+      dockerfile: services/rag-runtime/Dockerfile
+    environment:
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      DEPTSLM_RAG_RUNTIME_TOKEN: "${DEPTSLM_RAG_RUNTIME_TOKEN:?Set a separate RAG runtime token in the untracked .env file}"
+      DEPTSLM_RAG_RUNTIME_PROVIDER: "${DEPTSLM_RAG_RUNTIME_PROVIDER:-real}"
+      DEPTSLM_RAG_RUNTIME_MAX_CONCURRENCY: "${DEPTSLM_RAG_RUNTIME_MAX_CONCURRENCY:-1}"
+      DEPTSLM_EMBEDDING_MODEL_REVISION: "${DEPTSLM_EMBEDDING_MODEL_REVISION:-d23109d65ca9fdf61eef614209744716f337f50f}"
+      DEPTSLM_GENERATION_MODEL_REVISION: "${DEPTSLM_GENERATION_MODEL_REVISION:-c1899de289a04d12100db370d81485cdf75e47ca}"
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/model_cache"
+        target: /runtime/deptslm/model_cache
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - rag-internal
+
   training-worker:
     build:
       context: ./services/training-worker
@@ -223,3 +279,7 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+networks:
+  rag-internal:
+    internal: true
