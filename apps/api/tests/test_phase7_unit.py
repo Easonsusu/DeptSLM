@@ -12,6 +12,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from deptslm_runtime.main import app as runtime_app
+from deptslm_runtime.settings import FORBIDDEN_SUPERVISOR_VARIABLES
 from deptslm_worker.model_store import (
     MANIFEST_NAME,
     ModelStoreError,
@@ -147,9 +148,8 @@ def test_rag_settings_reject_malformed_or_out_of_contract_values(
 
 
 def _runtime_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.delenv("DEPTSLM_QDRANT_URL", raising=False)
-    monkeypatch.delenv("DEPTSLM_QDRANT_API_KEY", raising=False)
+    for name in FORBIDDEN_SUPERVISOR_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
     (tmp_path / "model_cache").mkdir()
     monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("DEPTSLM_RAG_RUNTIME_TOKEN", RUNTIME_TOKEN)
