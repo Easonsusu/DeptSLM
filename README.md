@@ -4,7 +4,7 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 
 > **Phase 7 status:** A one-turn, department-scoped grounded-answer endpoint, citation metadata, and an isolated offline Qwen3 runtime are under review. There is no public vector-search endpoint, conversation history, streaming, reranking, adapter selection, fine-tuning, or production deployment.
 
-The API manages content-free upload, extraction, and indexing metadata. For an authorized one-turn answer it creates content-free run metadata, retrieves through the fixed department-scoped Qdrant adapter, cross-checks every candidate against PostgreSQL, reads only selected verified chunks, and calls a private model runtime. Questions, answers, prompts, retrieved text, and vectors are not persisted. PostgreSQL succeeded state remains retrieval authority.
+The API manages content-free upload, extraction, and indexing metadata. For an authorized one-turn answer it creates content-free run metadata, retrieves through the fixed department-scoped Qdrant adapter, cross-checks every candidate against PostgreSQL, reads only selected verified chunks, and calls a private model runtime. After generation it reauthorizes every supplied source—including uncited evidence—against exact PostgreSQL and artifact state, while returning and persisting only cited labels. Questions, answers, prompts, retrieved text, and vectors are not persisted. PostgreSQL succeeded state remains retrieval authority.
 
 ## Planned stack
 
@@ -27,6 +27,7 @@ DeptSLM/
 │   └── web/                  # Next.js application
 ├── services/
 │   ├── rag-worker/           # Extraction plus isolated Phase 6 indexing paths
+│   ├── rag-runtime/          # Private supervised Phase 7 model runtime
 │   └── training-worker/      # Future fine-tuning jobs
 ├── packages/
 │   └── shared/               # Future shared contracts and utilities
@@ -137,12 +138,13 @@ Phase 7 additionally requires a long untracked `DEPTSLM_RAG_RUNTIME_TOKEN` and t
   python -m deptslm_worker.model_admin prepare-rag-models
 ```
 
-The generation contract is `Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca`, non-thinking mode, and at most 512 new tokens. The internal runtime receives no database or Qdrant credentials and is not published on a host port.
+The generation contract is `Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca`, non-thinking mode, an exact 40,960-token model context, an 8,192-token operational input cap, and at most 512 new tokens; query embedding is capped at 2,048 tokens. Inputs are tokenized completely and never silently truncated. The internal runtime receives no database or Qdrant credentials and is not published on a host port. Its HTTP process supervises one persistent killable model child; timeout, cancellation, disconnect, shutdown, or invalid child output terminates and reaps the process group. The child receives neither the runtime bearer token nor other secrets or proxy settings.
 
 ## Safety and data isolation
 
 - Future department-owned records, documents, indexes, jobs, adapters, and conversations must be scoped and authorized by `department_id` at every storage and service boundary.
 - Retrieved document text is untrusted input. It must be quoted as context and must never be allowed to override system or developer instructions.
+- Questions, evidence, generated answers, and citation filenames reject bidi/zero-width spoofing and unsafe Unicode; citations use exact ASCII `[S1]` through `[S8]` labels only.
 - If retrieval returns no usable source, the assistant must say that it does not have enough information. It must not invent a department-specific answer.
 - Secrets, model weights, and runtime artifacts do not belong in Git history.
 

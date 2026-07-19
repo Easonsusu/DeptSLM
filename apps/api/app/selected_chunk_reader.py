@@ -15,7 +15,12 @@ from deptslm_worker.artifact_reader import (
 from deptslm_worker.vector_retrieval import AuthorizedVectorHit
 
 from app.authorization import DepartmentScope
-from app.rag_domain import MAX_SOURCE_CHARS, EvidenceSource, RagContractError
+from app.rag_domain import (
+    MAX_SOURCE_CHARS,
+    EvidenceSource,
+    RagContractError,
+    validate_safe_text,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +85,10 @@ def load_selected_chunks(
         text = text_by_chunk.get(hit.chunk_id)
         if not isinstance(text, str) or not text:
             raise RagContractError("source_artifact_mismatch")
+        try:
+            validate_safe_text(text, field="evidence")
+        except ValueError as error:
+            raise RagContractError("source_artifact_mismatch") from error
         bounded = text[: min(MAX_SOURCE_CHARS, remaining)]
         if not bounded:
             break

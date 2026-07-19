@@ -11,6 +11,54 @@ from app.rag_domain import GENERATION_MODEL_REVISION
 from app.vector_index_domain import EMBEDDING_MODEL_REVISION
 
 PLACEHOLDERS = frozenset({"changeme", "change-me", "placeholder", "secret", "token"})
+FORBIDDEN_SUPERVISOR_VARIABLES = frozenset(
+    {
+        "DATABASE_URL",
+        "DATABASE_TEST_URL",
+        "DEPTSLM_QDRANT_URL",
+        "DEPTSLM_QDRANT_API_KEY",
+        "DEPTSLM_AUTH_MODE",
+        "DEPTSLM_AUTH_ISSUER",
+        "DEPTSLM_AUTH_AUDIENCE",
+        "DEPTSLM_AUTH_SECRET",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AZURE_CLIENT_SECRET",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_API_KEY",
+    }
+)
+CHILD_ENVIRONMENT_NAMES = frozenset(
+    {
+        "DEPTSLM_DATA_DIR",
+        "DEPTSLM_RAG_RUNTIME_PROVIDER",
+        "DEPTSLM_EMBEDDING_MODEL_REVISION",
+        "DEPTSLM_GENERATION_MODEL_REVISION",
+        "ENVIRONMENT",
+        "HF_HUB_OFFLINE",
+        "TRANSFORMERS_OFFLINE",
+        "HF_DATASETS_OFFLINE",
+        "TOKENIZERS_PARALLELISM",
+        "PYTHONIOENCODING",
+        "PYTHONUNBUFFERED",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PYTHONPATH",
+        "__CF_USER_TEXT_ENCODING",
+    }
+)
 
 
 class RuntimeConfigurationError(RuntimeError):
@@ -27,11 +75,9 @@ class RuntimeSettings:
 
     @classmethod
     def from_environment(cls) -> RuntimeSettings:
-        if any(
-            os.getenv(name)
-            for name in ("DATABASE_URL", "DEPTSLM_QDRANT_URL", "DEPTSLM_QDRANT_API_KEY")
-        ):
-            raise RuntimeConfigurationError("Database and Qdrant configuration is forbidden.")
+        present = sorted(name for name in FORBIDDEN_SUPERVISOR_VARIABLES if os.getenv(name))
+        if present:
+            raise RuntimeConfigurationError("Forbidden runtime configuration is present.")
         root = Path(os.getenv("DEPTSLM_DATA_DIR", "").strip()).expanduser()
         if not root.is_absolute():
             raise RuntimeConfigurationError("DEPTSLM_DATA_DIR must be an absolute runtime root.")
@@ -85,9 +131,35 @@ class RuntimeSettings:
         if not raw_concurrency.isascii() or not raw_concurrency.isdecimal():
             raise RuntimeConfigurationError("Runtime concurrency must be an ASCII decimal.")
         concurrency = int(raw_concurrency)
-        if not 1 <= concurrency <= 4:
-            raise RuntimeConfigurationError("Runtime concurrency is outside reviewed bounds.")
+        if concurrency != 1:
+            raise RuntimeConfigurationError("Runtime concurrency must remain one.")
         return cls(resolved, token, provider, environment, concurrency)
+
+    def child_environment(self) -> dict[str, str]:
+        """Build the exact model-child allowlist without the HTTP bearer token."""
+
+        values = {
+            "DEPTSLM_DATA_DIR": str(self.data_dir),
+            "DEPTSLM_RAG_RUNTIME_PROVIDER": self.provider,
+            "DEPTSLM_EMBEDDING_MODEL_REVISION": EMBEDDING_MODEL_REVISION,
+            "DEPTSLM_GENERATION_MODEL_REVISION": GENERATION_MODEL_REVISION,
+            "ENVIRONMENT": self.environment,
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "HF_DATASETS_OFFLINE": "1",
+            "TOKENIZERS_PARALLELISM": "false",
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUNBUFFERED": "1",
+            "HOME": "/nonexistent",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+        }
+        source_path = _source_pythonpath(Path(__file__).resolve())
+        if source_path is not None:
+            values["PYTHONPATH"] = source_path
+        if not set(values) <= CHILD_ENVIRONMENT_NAMES:
+            raise RuntimeConfigurationError("Model child environment is outside the allowlist.")
+        return values
 
 
 def _find_repository_root(start: Path) -> Path | None:
@@ -97,3 +169,17 @@ def _find_repository_root(start: Path) -> Path | None:
         ):
             return candidate.resolve()
     return None
+
+
+def _source_pythonpath(start: Path) -> str | None:
+    repository = _find_repository_root(start)
+    if repository is None:
+        return None
+    roots = (
+        repository / "apps" / "api",
+        repository / "services" / "rag-worker",
+        repository / "services" / "rag-runtime",
+    )
+    if not all(root.is_dir() for root in roots):
+        return None
+    return os.pathsep.join(str(root) for root in roots)

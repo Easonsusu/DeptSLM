@@ -35,7 +35,15 @@ from app.rag_domain import (
 from app.rag_runtime_client import RagRuntimeClient
 from app.rag_settings import RagConfigurationError, RagSettings
 from app.selected_chunk_reader import load_selected_chunks
-from app.vector_index_domain import EMBEDDING_DIMENSION, EMBEDDING_MODEL_REVISION
+from app.vector_index_domain import (
+    EMBEDDING_DIMENSION,
+    EMBEDDING_DISTANCE,
+    EMBEDDING_MODEL_ID,
+    EMBEDDING_MODEL_REVISION,
+    EMBEDDING_PIPELINE_VERSION,
+    QDRANT_COLLECTION,
+    VECTOR_SCHEMA_VERSION,
+)
 
 pytestmark = pytest.mark.unit
 RUNTIME_TOKEN = "phase7-runtime-unit-token-0123456789-abcdef"
@@ -191,16 +199,6 @@ def test_fake_runtime_is_authenticated_bounded_and_content_free(
         ).json()
         assert generated["citations"] == ["S1"]
         assert "S8" not in generated["answer"]
-        runtime_app.state.capacity.acquire()
-        try:
-            busy = client.post(
-                "/internal/v1/query-embedding",
-                headers=_runtime_headers(),
-                json={"question": "busy"},
-            )
-            assert busy.status_code == 503
-        finally:
-            runtime_app.state.capacity.release()
     assert tuple(tmp_path.rglob("*")) == before
 
 
@@ -311,27 +309,39 @@ def _artifact(tmp_path: Path):
     )
     output_size = sum(path.stat().st_size for path in root.iterdir())
     hit = AuthorizedVectorHit(
-        document_id,
-        extraction_id,
-        indexing_id,
-        0,
-        0.9,
-        chunk_id,
-        attempt,
-        "synthetic.txt",
-        1,
-        manifest["normalized_sha256"],
-        len(encoded),
-        output_size,
-        0,
-        len(text),
-        len(encoded),
-        chunk["content_sha256"],
-        "line",
-        None,
-        None,
-        1,
-        1,
+        document_id=document_id,
+        extraction_id=extraction_id,
+        indexing_id=indexing_id,
+        chunk_ordinal=0,
+        score=0.9,
+        chunk_id=chunk_id,
+        vector_attempt_id=attempt,
+        original_filename="synthetic.txt",
+        extraction_pipeline_version="phase5-extraction-v1",
+        normalization_version="phase5-normalization-v1",
+        chunking_version="phase5-character-chunker-v1",
+        extraction_chunk_count=1,
+        normalized_sha256=manifest["normalized_sha256"],
+        normalized_byte_size=len(encoded),
+        output_byte_size=output_size,
+        indexing_expected_chunk_count=1,
+        indexing_point_count=1,
+        embedding_pipeline_version=EMBEDDING_PIPELINE_VERSION,
+        embedding_model_id=EMBEDDING_MODEL_ID,
+        embedding_model_revision=EMBEDDING_MODEL_REVISION,
+        embedding_dimension=EMBEDDING_DIMENSION,
+        distance=EMBEDDING_DISTANCE,
+        vector_schema_version=VECTOR_SCHEMA_VERSION,
+        qdrant_collection=QDRANT_COLLECTION,
+        chunk_char_start=0,
+        chunk_char_end=len(text),
+        chunk_byte_size=len(encoded),
+        chunk_content_sha256=chunk["content_sha256"],
+        provenance_kind="line",
+        page_start=None,
+        page_end=None,
+        line_start=1,
+        line_end=1,
     )
     return scope, hit
 

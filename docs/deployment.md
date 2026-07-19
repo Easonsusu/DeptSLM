@@ -16,7 +16,7 @@ DeptSLM is not production ready. Phase 7 adds one-turn grounded answers, content
 | `indexing-worker` | Phase 6 embedding/indexing jobs | Read-only extracted/model mounts, offline pinned model, typed department Qdrant adapter; no public retrieval. |
 | `model-admin` | Explicit model preparation | Writes only the external model cache when invoked; receives no database or Qdrant credentials. |
 | `vector-admin` | Explicit Qdrant bootstrap | Verifies the fixed collection contract; receives no database, model-cache, or document access. |
-| `rag-runtime` | Private Phase 7 inference | Offline query embedding and non-thinking generation; no database/Qdrant/API-auth credentials or host port. |
+| `rag-runtime` | Private Phase 7 inference | HTTP supervisor plus one killable persistent model child; offline query embedding and non-thinking generation; no database/Qdrant/API-auth credentials or host port. |
 | `training-worker` | Future LLaMA-Factory jobs | Structural placeholder; no fine-tuning is implemented. |
 
 Phase 6 pins `Qwen/Qwen3-Embedding-0.6B` at immutable revision `d23109d65ca9fdf61eef614209744716f337f50f`; Phase 7 pins `Qwen/Qwen3-0.6B` at revision `c1899de289a04d12100db370d81485cdf75e47ca`. Explicit administration downloads them outside Git while normal processes stay offline. LlamaIndex and LLaMA-Factory remain future components. pypdf remains extraction-only; model inference dependencies remain outside API/extraction/indexing images.
@@ -151,7 +151,9 @@ Prepare both exact Phase 7 models and start the private runtime as part of the s
 ./scripts/compose.sh up --build rag-runtime api web
 ```
 
-The runtime mounts only external `model_cache` read-only and joins only the internal RAG network. The API receives its private URL/token plus Qdrant access for reviewed retrieval, but contains no Transformers or sentence-transformers dependency. The runtime receives none of the API database, Qdrant, JWT, upload, or extraction settings.
+The runtime mounts only external `model_cache` read-only and joins only the internal RAG network. The API receives its private URL/token plus Qdrant access for reviewed retrieval, but contains no Transformers or sentence-transformers dependency. The runtime receives none of the API database, Qdrant, JWT, upload, or extraction settings. Do not add database, Qdrant, app-auth, Hugging Face token, cloud credential, or proxy variables to the runtime service: startup fails closed. The HTTP bearer token remains only in the supervisor and is omitted from the model child environment.
+
+Model execution is single-concurrency by contract. The supervisor uses bounded framed IPC and fixed deadlines; timeout, disconnect, cancellation, shutdown, malformed output, or child failure terminates and reaps the process group before a clean child may serve another request. Generation tokenizes the complete chat template without truncation, caps operational input at 8,192 tokens, reserves 512 new tokens within the exact 40,960-token model context, and caps query-embedding input at 2,048 tokens.
 
 Stop local services with:
 
@@ -175,7 +177,7 @@ CI must not depend on a developer's Google Drive or reuse real data. It should c
 
 GitHub Actions provides PostgreSQL 16 and Qdrant 1.13.4 with isolated test credentials. Locally, run `python -m pytest -m "not postgres and not qdrant"` without services, or provide isolated PostgreSQL/Qdrant settings. Neither suite silently skips in CI, and the fake embedding provider is accepted only with exact `ENVIRONMENT=test`. CI never downloads the real model.
 
-CI builds API, extraction-worker, indexing-worker, and private RAG-runtime targets. It verifies migration `0005_phase7_rag_answers`, confirms dependency/credential isolation and absence of model weights, runs extraction/indexing empty-queue smoke tests, exercises Qdrant bootstrap/tenant isolation/retrieval authority, and runs PostgreSQL migration/API/final-revalidation coverage with temporary `uploads`, `extracted_text`, and `model_cache`. Fake models are allowed only in exact test mode; the real two-model smoke remains opt-in. CI never uses Google Drive or downloads a model.
+CI builds API, extraction-worker, indexing-worker, and private RAG-runtime targets. It verifies migration `0005_phase7_rag_answers`, confirms dependency/credential isolation and absence of model weights, runs extraction/indexing empty-queue and fake-runtime request smoke tests, exercises Qdrant bootstrap/tenant isolation/retrieval authority, and runs PostgreSQL migration/API/all-evidence final-revalidation coverage with temporary `uploads`, `extracted_text`, and `model_cache`. Controlled child tests prove timeout/restart, cancellation/shutdown, framing bounds, capacity release, and a child environment without the runtime token or other secrets. Fake models are allowed only in exact test mode; the real two-model smoke remains opt-in. CI never uses Google Drive or downloads a model.
 
 At minimum, future deployment checks should cover:
 

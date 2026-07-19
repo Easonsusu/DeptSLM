@@ -734,8 +734,9 @@ class RagAnswerRun(Base):
             "(status = 'insufficient_information' AND finished_at IS NOT NULL "
             "AND retrieval_candidate_count IS NOT NULL "
             "AND retrieval_authorized_count IS NOT NULL "
-            "AND selected_source_count = 0 "
+            "AND selected_source_count BETWEEN 0 AND 8 "
             "AND retrieval_candidate_count >= retrieval_authorized_count "
+            "AND retrieval_authorized_count >= selected_source_count "
             "AND error_code IS NULL) OR status <> 'insufficient_information'",
             name="ck_rag_run_insufficient_lifecycle",
         ),

@@ -264,7 +264,9 @@ jobs:
           docker build --tag deptslm-rag-runtime-ci --file services/rag-runtime/Dockerfile .
           docker run --rm --entrypoint python deptslm-rag-runtime-ci -I -c '
           import importlib.util
+          import deptslm_runtime.model_child
           import deptslm_runtime.main
+          import deptslm_runtime.supervisor
           import sentence_transformers
           import transformers
           assert importlib.util.find_spec("qdrant_client") is None
@@ -275,6 +277,38 @@ jobs:
             printf 'Forbidden model-weight-like files in RAG runtime image:\n%s\n' "$weight_matches" >&2
             exit 1
           fi
+          runtime_data="$RUNNER_TEMP/deptslm-rag-runtime"
+          mkdir -p "$runtime_data/model_cache"
+          container_id="$(docker run --detach --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --publish 127.0.0.1:18010:8010 \
+            --volume "$runtime_data/model_cache:/runtime/deptslm/model_cache:ro" \
+            --env DEPTSLM_DATA_DIR=/runtime/deptslm \
+            --env DEPTSLM_RAG_RUNTIME_TOKEN=phase7-ci-runtime-token-0123456789-abcdef \
+            --env DEPTSLM_RAG_RUNTIME_PROVIDER=fake \
+            --env DEPTSLM_RAG_RUNTIME_MAX_CONCURRENCY=1 \
+            --env DEPTSLM_EMBEDDING_MODEL_REVISION=d23109d65ca9fdf61eef614209744716f337f50f \
+            --env DEPTSLM_GENERATION_MODEL_REVISION=c1899de289a04d12100db370d81485cdf75e47ca \
+            --env ENVIRONMENT=test \
+            deptslm-rag-runtime-ci)"
+          trap 'docker rm --force "$container_id" >/dev/null 2>&1 || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18010/healthz >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" == "30" ]]; then
+              echo "RAG runtime fake smoke test did not become ready." >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          curl --fail --silent \
+            --header 'Authorization: Bearer phase7-ci-runtime-token-0123456789-abcdef' \
+            --header 'Content-Type: application/json' \
+            --data '{"question":"Synthetic runtime smoke?"}' \
+            http://127.0.0.1:18010/internal/v1/query-embedding \
+            | python -c 'import json,sys; value=json.load(sys.stdin); assert len(value["vector"]) == 1024'
+          docker rm --force "$container_id" >/dev/null
+          trap - EXIT
       - name: Check raw streaming upload boundary
         run: |
           ! grep -R -E 'UploadFile|python-multipart|request\.body\(' apps/api/app apps/api/requirements*.txt
@@ -293,10 +327,13 @@ jobs:
       - name: Check Phase 7 architecture boundaries
         run: |
           ! grep -E '@router\.(get|post).*search|/search|query_vector' apps/api/app/routes.py apps/api/app/schemas.py
-          ! sed -n '/^  rag-runtime:/,/^  training-worker:/p' docker-compose.yml | grep -E 'DATABASE_URL|DEPTSLM_QDRANT_(URL|API_KEY)'
+          ! sed -n '/^  rag-runtime:/,/^  training-worker:/p' docker-compose.yml | grep -E 'DATABASE(_TEST)?_URL|DEPTSLM_QDRANT_(URL|API_KEY)|DEPTSLM_AUTH_|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY'
           ! grep -R -E 'dangerouslySetInnerHTML|localStorage|sessionStorage' apps/web/app
           test "$(grep -R -l 'QdrantClient' services/rag-worker/deptslm_worker apps/api/app --include='*.py' | sort)" = "services/rag-worker/deptslm_worker/qdrant_adapter.py"
           grep -R -F 'c1899de289a04d12100db370d81485cdf75e47ca' apps/api/app services/rag-runtime services/rag-worker/deptslm_worker >/dev/null
+          grep -R -F 'DEPTSLM_RAG_RUNTIME_TOKEN' services/rag-runtime/deptslm_runtime/settings.py >/dev/null
+          grep -R -F 'GENERATION_MODEL_CONTEXT_TOKENS = 40960' apps/api/app/rag_domain.py >/dev/null
+          grep -R -F 'MAX_GENERATION_INPUT_TOKENS = 8192' apps/api/app/rag_domain.py >/dev/null
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then

@@ -83,13 +83,13 @@ Qdrant 1.13.4 is the Phase 6 vector store for chunks embedded with the pinned Qw
 
 The extraction path stream-copies each canonical source into a private verified claim snapshot and gives only that read-only descriptor to the installed constrained parser. It publishes exactly `normalized.txt`, `chunks.jsonl`, and `manifest.json`. The separate indexing path revalidates those artifacts incrementally, sends bounded requests to a secret-free offline embedding subprocess through interruptible nonblocking IPC, and stages content-free Qdrant points before exact-attempt activation. Reclaim verifies prior-attempt cleanup before processing and again before activation. Both use PostgreSQL server-time leases and exact stale cleanup.
 
-For Phase 7, the API uses the same reviewed Qdrant adapter and PostgreSQL retrieval authority, then incrementally reads only selected exact chunks. It sends bounded evidence with server-owned labels to a private runtime, validates strict citations, and reauthorizes plus revalidates cited sources before success. LlamaIndex is not introduced.
+For Phase 7, the API uses the same reviewed Qdrant adapter and PostgreSQL retrieval authority, then incrementally reads only selected exact chunks. It sends bounded evidence with server-owned labels to a private runtime, validates strict citations, and reauthorizes plus revalidates every supplied source before success; only the cited subset is returned and persisted. The runtime HTTP process supervises one persistent model child through bounded framed IPC. Fixed deadlines, disconnect/cancellation handling, process-group termination, and clean restart make inference killable; the model child receives a strict secret-free environment without the runtime bearer token. LlamaIndex is not introduced.
 
 Retrieved text is untrusted content. Prompt assembly must delimit it as evidence, prevent instructions in it from overriding higher-priority policy, and include only sources from the authorized department. If retrieval does not yield usable evidence, the assistant must state that it does not have enough information rather than generate a department-specific claim.
 
 ### Qwen3 and Qwen3-Embedding
 
-Phase 6 fixes `Qwen/Qwen3-Embedding-0.6B` revision `d23109d65ca9fdf61eef614209744716f337f50f`, normalized 1024-dimensional output, and cosine distance. Phase 7 fixes `Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca`, non-thinking mode, and a 512-token response cap. Normal processes load only verified external safetensors offline with remote code disabled. Hardware/bitwise reproducibility, production serving, and final licensing review remain operational limitations; weights and caches never enter Git.
+Phase 6 fixes `Qwen/Qwen3-Embedding-0.6B` revision `d23109d65ca9fdf61eef614209744716f337f50f`, normalized 1024-dimensional output, and cosine distance. Phase 7 fixes `Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca`, non-thinking mode, a 40,960-token pinned context contract, an 8,192-token operational generation-input limit, and a 512-token response reserve. Query embedding has a separate 2,048-token input limit. Complete tokenizer inputs are checked without truncation. Normal processes load only verified external safetensors offline with remote code disabled. Hardware/bitwise reproducibility, production serving, and final licensing review remain operational limitations; weights and caches never enter Git.
 
 ### LLaMA-Factory and the training worker
 
@@ -119,8 +119,8 @@ Phase 5 adds explicit failed-attempt retry, exact expired-claim staging recovery
 2. Retrieval queries Qdrant with a mandatory `department_id` filter.
 3. PostgreSQL cross-checks every candidate and the API deterministically selects bounded sources above the provisional threshold.
 4. The API reads only selected verified artifacts and labels them as untrusted evidence.
-5. The private Qwen3 runtime returns strict non-thinking JSON using no adapter.
-6. The API validates citations, reauthorizes, and revalidates every cited source before returning safe metadata. With no adequate source, it returns the defined insufficient-information behavior without generation when possible.
+5. The private HTTP supervisor sends the request to its killable secret-free model child, which returns strict non-thinking JSON using no adapter and fixed token budgets.
+6. The API reloads the complete evidence set, validates citations, reauthorizes, and revalidates every supplied source before returning only the cited subset as safe metadata. With no adequate source, it returns the defined insufficient-information behavior without generation when possible.
 
 ### Adapter training and promotion
 

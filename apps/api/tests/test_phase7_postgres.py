@@ -329,18 +329,18 @@ class _Runtime:
 
 
 class _Qdrant:
-    def __init__(self, hit=None):
-        self.hit = hit
+    def __init__(self, hit=None, *, hits=None):
+        self.hits = tuple(hits) if hits is not None else (() if hit is None else (hit,))
 
     def verify_collection(self):
         return None
 
     def search_published(self, _scope, _query, *, limit):
         assert limit == 20
-        return () if self.hit is None else (self.hit,)
+        return self.hits
 
 
-def _hit(document, extraction, chunk, indexing):
+def _hit(document, extraction, chunk, indexing, *, score=0.9):
     return VectorHit(
         point_id=chunk.id,
         document_id=document.id,
@@ -348,8 +348,99 @@ def _hit(document, extraction, chunk, indexing):
         indexing_id=indexing.id,
         vector_attempt_id=indexing.vector_attempt_id,
         chunk_ordinal=chunk.ordinal,
-        score=0.9,
+        score=score,
     )
+
+
+def _add_source(
+    db: Session,
+    tmp_path: Path,
+    department: Department,
+    actor: UserIdentity,
+    *,
+    filename: str,
+    text_value: str,
+):
+    source = text_value.encode()
+    document = Document(
+        department_id=department.id,
+        uploaded_by_user_id=actor.id,
+        original_filename=filename,
+        media_type="text/plain",
+        byte_size=len(source),
+        sha256=hashlib.sha256(source).hexdigest(),
+    )
+    db.add(document)
+    db.flush()
+    now = datetime.now(UTC)
+    extraction = DocumentExtraction(
+        department_id=department.id,
+        document_id=document.id,
+        requested_by_user_id=actor.id,
+        status="succeeded",
+        pipeline_version="phase5-extraction-v1",
+        parser_name="python-utf8",
+        parser_version="3.12",
+        normalization_version="phase5-normalization-v1",
+        chunking_version="phase5-character-chunker-v1",
+        source_sha256=document.sha256,
+        source_byte_size=document.byte_size,
+        normalized_sha256=hashlib.sha256(source).hexdigest(),
+        normalized_byte_size=len(source),
+        output_byte_size=1,
+        chunk_count=1,
+        worker_id=uuid4(),
+        claim_token=uuid4(),
+        claimed_at=now,
+        started_at=now,
+        finished_at=now,
+    )
+    db.add(extraction)
+    db.flush()
+    chunk = DocumentChunk(
+        department_id=department.id,
+        document_id=document.id,
+        extraction_id=extraction.id,
+        ordinal=0,
+        char_start=0,
+        char_end=len(text_value),
+        byte_size=len(source),
+        content_sha256=hashlib.sha256(source).hexdigest(),
+        provenance_kind="line",
+        line_start=1,
+        line_end=1,
+    )
+    db.add(chunk)
+    db.flush()
+    indexing = DocumentVectorIndexing(
+        department_id=department.id,
+        document_id=document.id,
+        extraction_id=extraction.id,
+        requested_by_user_id=actor.id,
+        status="succeeded",
+        embedding_pipeline_version=EMBEDDING_PIPELINE_VERSION,
+        embedding_model_id=EMBEDDING_MODEL_ID,
+        embedding_model_revision=EMBEDDING_MODEL_REVISION,
+        embedding_dimension=EMBEDDING_DIMENSION,
+        distance=EMBEDDING_DISTANCE,
+        vector_schema_version=VECTOR_SCHEMA_VERSION,
+        qdrant_collection=QDRANT_COLLECTION,
+        expected_chunk_count=1,
+        point_count=1,
+        worker_id=uuid4(),
+        claim_token=uuid4(),
+        vector_attempt_id=uuid4(),
+        claimed_at=now,
+        started_at=now,
+        finished_at=now,
+    )
+    db.add(indexing)
+    db.flush()
+    extraction.output_byte_size = _write_artifact(
+        tmp_path, department, document, extraction, chunk, source
+    )
+    db.commit()
+    return document, extraction, chunk, indexing
 
 
 def test_all_roles_receive_safe_answer_and_transactional_citations(
@@ -539,6 +630,370 @@ def test_artifact_change_during_generation_prevents_answer_return(
         run = session.query(RagAnswerRun).one()
         assert (run.status, run.error_code) == ("failed", "source_artifact_mismatch")
         assert session.query(RagAnswerCitation).count() == 0
+        assert (
+            session.query(PersistentAuditEvent).filter_by(action="rag.answer.complete").count() == 0
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["document_deleted", "extraction_unavailable", "indexing_attempt", "chunk_metadata"],
+)
+def test_uncited_supplied_source_database_change_invalidates_answer(
+    db: Session,
+    engine,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    identities, department, document1, extraction1, chunk1, indexing1 = _seed(db, tmp_path)
+    document2, extraction2, chunk2, indexing2 = _add_source(
+        db,
+        tmp_path,
+        department,
+        identities["department_admin"],
+        filename="uncited.txt",
+        text_value="The uncited supplied source may influence generation.",
+    )
+
+    class MutatingRuntime(_Runtime):
+        def generate(self, question, evidence):
+            assert [item.label for item in evidence] == ["S1", "S2"]
+            with Session(engine) as session:
+                if mutation == "document_deleted":
+                    row = session.get(Document, document2.id)
+                    row.status = "deleted"
+                    row.deleted_at = datetime.now(UTC)
+                    row.deleted_by_user_id = identities["department_admin"].id
+                elif mutation == "extraction_unavailable":
+                    row = session.get(DocumentExtraction, extraction2.id)
+                    row.status = "failed"
+                    row.normalized_sha256 = None
+                    row.normalized_byte_size = None
+                    row.output_byte_size = None
+                    row.chunk_count = None
+                    row.error_code = "document_unavailable"
+                elif mutation == "indexing_attempt":
+                    session.get(DocumentVectorIndexing, indexing2.id).vector_attempt_id = uuid4()
+                else:
+                    session.get(DocumentChunk, chunk2.id).content_sha256 = "0" * 64
+                session.commit()
+            return super().generate(question, evidence)
+
+    with _client(monkeypatch, tmp_path) as client:
+        app.state.rag_runtime_client = MutatingRuntime()
+        app.state.rag_qdrant = _Qdrant(
+            hits=(
+                _hit(document1, extraction1, chunk1, indexing1, score=0.9),
+                _hit(document2, extraction2, chunk2, indexing2, score=0.8),
+            )
+        )
+        response = client.post(
+            f"/departments/{department.id}/rag/answers",
+            headers=_headers(identities["instructor"].subject),
+            json={"question": "Use both supplied sources safely"},
+        )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Grounded answer unavailable"}
+    with Session(engine) as session:
+        run = session.query(RagAnswerRun).one()
+        assert run.status == "failed"
+        assert session.query(RagAnswerCitation).count() == 0
+        assert (
+            session.query(PersistentAuditEvent).filter_by(action="rag.answer.complete").count() == 0
+        )
+
+
+def test_uncited_supplied_source_artifact_change_invalidates_answer(
+    db: Session, engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    identities, department, document1, extraction1, chunk1, indexing1 = _seed(db, tmp_path)
+    document2, extraction2, chunk2, indexing2 = _add_source(
+        db,
+        tmp_path,
+        department,
+        identities["department_admin"],
+        filename="uncited-artifact.txt",
+        text_value="This second source is supplied but not cited.",
+    )
+    artifact = (
+        tmp_path
+        / "extracted_text"
+        / str(department.id)
+        / str(document2.id)
+        / str(extraction2.id)
+        / "chunks.jsonl"
+    )
+
+    class MutatingRuntime(_Runtime):
+        def generate(self, question, evidence):
+            assert len(evidence) == 2
+            artifact.write_text("{}\n")
+            return super().generate(question, evidence)
+
+    with _client(monkeypatch, tmp_path) as client:
+        app.state.rag_runtime_client = MutatingRuntime()
+        app.state.rag_qdrant = _Qdrant(
+            hits=(
+                _hit(document1, extraction1, chunk1, indexing1, score=0.9),
+                _hit(document2, extraction2, chunk2, indexing2, score=0.8),
+            )
+        )
+        response = client.post(
+            f"/departments/{department.id}/rag/answers",
+            headers=_headers(identities["viewer"].subject),
+            json={"question": "Detect uncited artifact replacement"},
+        )
+    assert response.status_code == 503
+    with Session(engine) as session:
+        assert session.query(RagAnswerRun).one().error_code == "source_artifact_mismatch"
+        assert session.query(RagAnswerCitation).count() == 0
+
+
+def test_valid_cited_and_uncited_sources_persist_only_cited_subset(
+    db: Session, engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    identities, department, document1, extraction1, chunk1, indexing1 = _seed(db, tmp_path)
+    document2, extraction2, chunk2, indexing2 = _add_source(
+        db,
+        tmp_path,
+        department,
+        identities["department_admin"],
+        filename="valid-uncited.txt",
+        text_value="Valid supplementary evidence.",
+    )
+    with _client(monkeypatch, tmp_path) as client:
+        app.state.rag_runtime_client = _Runtime()
+        app.state.rag_qdrant = _Qdrant(
+            hits=(
+                _hit(document1, extraction1, chunk1, indexing1, score=0.9),
+                _hit(document2, extraction2, chunk2, indexing2, score=0.8),
+            )
+        )
+        response = client.post(
+            f"/departments/{department.id}/rag/answers",
+            headers=_headers(identities["student"].subject),
+            json={"question": "Use valid evidence"},
+        )
+    assert response.status_code == 200
+    assert [item["source_id"] for item in response.json()["citations"]] == ["S1"]
+    with Session(engine) as session:
+        run = session.query(RagAnswerRun).one()
+        assert (run.status, run.selected_source_count) == ("answered", 2)
+        citation = session.query(RagAnswerCitation).one()
+        assert citation.chunk_id == chunk1.id
+
+
+def test_generated_insufficient_result_revalidates_and_counts_all_supplied_sources(
+    db: Session, engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    identities, department, document1, extraction1, chunk1, indexing1 = _seed(db, tmp_path)
+    document2, extraction2, chunk2, indexing2 = _add_source(
+        db,
+        tmp_path,
+        department,
+        identities["department_admin"],
+        filename="insufficient-context.txt",
+        text_value="Valid evidence that still may not answer the question.",
+    )
+
+    class InsufficientRuntime(_Runtime):
+        def generate(self, _question, evidence):
+            assert len(evidence) == 2
+            return {"status": "insufficient_information", "answer": "", "citations": []}
+
+    with _client(monkeypatch, tmp_path) as client:
+        app.state.rag_runtime_client = InsufficientRuntime()
+        app.state.rag_qdrant = _Qdrant(
+            hits=(
+                _hit(document1, extraction1, chunk1, indexing1, score=0.9),
+                _hit(document2, extraction2, chunk2, indexing2, score=0.8),
+            )
+        )
+        response = client.post(
+            f"/departments/{department.id}/rag/answers",
+            headers=_headers(identities["student"].subject),
+            json={"question": "Unsupported conclusion?"},
+        )
+    assert response.status_code == 200
+    assert response.json()["status"] == "insufficient_information"
+    with Session(engine) as session:
+        run = session.query(RagAnswerRun).one()
+        assert (run.status, run.selected_source_count) == ("insufficient_information", 2)
+        assert session.query(RagAnswerCitation).count() == 0
+
+
+def test_generated_insufficient_result_fails_if_supplied_source_changes(
+    db: Session, engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    identities, department, document1, extraction1, chunk1, indexing1 = _seed(db, tmp_path)
+    document2, extraction2, chunk2, indexing2 = _add_source(
+        db,
+        tmp_path,
+        department,
+        identities["department_admin"],
+        filename="changed-insufficient.txt",
+        text_value="This source will become unavailable after influencing generation.",
+    )
+
+    class MutatingInsufficientRuntime(_Runtime):
+        def generate(self, _question, evidence):
+            assert len(evidence) == 2
+            with Session(engine) as session:
+                row = session.get(Document, document2.id)
+                row.status = "deleted"
+                row.deleted_at = datetime.now(UTC)
+                row.deleted_by_user_id = identities["department_admin"].id
+                session.commit()
+            return {"status": "insufficient_information", "answer": "", "citations": []}
+
+    with _client(monkeypatch, tmp_path) as client:
+        app.state.rag_runtime_client = MutatingInsufficientRuntime()
+        app.state.rag_qdrant = _Qdrant(
+            hits=(
+                _hit(document1, extraction1, chunk1, indexing1, score=0.9),
+                _hit(document2, extraction2, chunk2, indexing2, score=0.8),
+            )
+        )
+        response = client.post(
+            f"/departments/{department.id}/rag/answers",
+            headers=_headers(identities["viewer"].subject),
+            json={"question": "Unsupported after source change?"},
+        )
+    assert response.status_code == 503
+    with Session(engine) as session:
+        assert session.query(RagAnswerRun).one().status == "failed"
+        assert session.query(RagAnswerCitation).count() == 0
+
+
+def test_unrelated_source_change_does_not_invalidate_supplied_evidence(
+    db: Session, engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    identities, department, document1, extraction1, chunk1, indexing1 = _seed(db, tmp_path)
+    unrelated, *_ = _add_source(
+        db,
+        tmp_path,
+        department,
+        identities["department_admin"],
+        filename="unrelated.txt",
+        text_value="This source is never retrieved or supplied.",
+    )
+
+    class MutatingRuntime(_Runtime):
+        def generate(self, question, evidence):
+            with Session(engine) as session:
+                row = session.get(Document, unrelated.id)
+                row.status = "deleted"
+                row.deleted_at = datetime.now(UTC)
+                row.deleted_by_user_id = identities["department_admin"].id
+                session.commit()
+            return super().generate(question, evidence)
+
+    with _client(monkeypatch, tmp_path) as client:
+        app.state.rag_runtime_client = MutatingRuntime()
+        app.state.rag_qdrant = _Qdrant(_hit(document1, extraction1, chunk1, indexing1))
+        response = client.post(
+            f"/departments/{department.id}/rag/answers",
+            headers=_headers(identities["department_admin"].subject),
+            json={"question": "Ignore unrelated changes"},
+        )
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize("outcome", ["answered", "insufficient", "invalid_generation"])
+def test_qdrant_close_failure_never_overrides_committed_or_original_outcome(
+    db: Session,
+    engine,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    identities, department, document, extraction, chunk, indexing = _seed(db, tmp_path)
+
+    class ClosingQdrant(_Qdrant):
+        def close(self):
+            raise RuntimeError("must remain content-free")
+
+    qdrant = ClosingQdrant(
+        hits=() if outcome == "insufficient" else (_hit(document, extraction, chunk, indexing),)
+    )
+    monkeypatch.setattr("app.rag_answer_services.DepartmentQdrant", lambda *_args: qdrant)
+
+    class InvalidRuntime(_Runtime):
+        def generate(self, _question, _evidence):
+            return {"status": "answered", "answer": "invalid", "citations": ["S8"]}
+
+    runtime = InvalidRuntime() if outcome == "invalid_generation" else _Runtime()
+    with _client(monkeypatch, tmp_path) as client:
+        app.state.rag_runtime_client = runtime
+        app.state.rag_qdrant = None
+        response = client.post(
+            f"/departments/{department.id}/rag/answers",
+            headers=_headers(identities["viewer"].subject),
+            json={"question": "Close consistency"},
+        )
+    if outcome == "invalid_generation":
+        assert response.status_code == 503
+        expected = ("failed", "invalid_citation")
+    else:
+        assert response.status_code == 200
+        expected = (
+            "insufficient_information" if outcome == "insufficient" else "answered",
+            None,
+        )
+    with Session(engine) as session:
+        run = session.query(RagAnswerRun).one()
+        assert (run.status, run.error_code) == expected
+
+
+@pytest.mark.parametrize(
+    ("stage", "expected_code"),
+    [
+        ("query", "query_embedding_failed"),
+        ("generation", "generation_failed"),
+        ("artifact", "source_artifact_mismatch"),
+    ],
+)
+def test_unexpected_stage_exception_marks_run_failed_without_success_audit(
+    db: Session,
+    engine,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stage: str,
+    expected_code: str,
+) -> None:
+    identities, department, document, extraction, chunk, indexing = _seed(db, tmp_path)
+
+    class UnexpectedRuntime(_Runtime):
+        def query_embedding(self, question):
+            if stage == "query":
+                raise RuntimeError("secret dependency detail")
+            return super().query_embedding(question)
+
+        def generate(self, question, evidence):
+            if stage == "generation":
+                raise RuntimeError("secret model detail")
+            return super().generate(question, evidence)
+
+    if stage == "artifact":
+        monkeypatch.setattr(
+            "app.rag_answer_services.load_selected_chunks",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("secret path")),
+        )
+    with _client(monkeypatch, tmp_path) as client:
+        app.state.rag_runtime_client = UnexpectedRuntime()
+        app.state.rag_qdrant = _Qdrant(_hit(document, extraction, chunk, indexing))
+        response = client.post(
+            f"/departments/{department.id}/rag/answers",
+            headers=_headers(identities["instructor"].subject),
+            json={"question": "Unexpected failure"},
+        )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Grounded answer unavailable"}
+    assert "secret" not in response.text
+    with Session(engine) as session:
+        run = session.query(RagAnswerRun).one()
+        assert (run.status, run.error_code) == ("failed", expected_code)
         assert (
             session.query(PersistentAuditEvent).filter_by(action="rag.answer.complete").count() == 0
         )

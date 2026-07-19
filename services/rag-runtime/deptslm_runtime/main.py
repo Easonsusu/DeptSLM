@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import hmac
 import json
-import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -18,18 +16,28 @@ from app.rag_domain import (
     PROMPT_VERSION,
     SOURCE_LABEL,
     normalize_question,
+    validate_safe_text,
 )
-from deptslm_runtime.models import RuntimeModelError, RuntimeModels
 from deptslm_runtime.settings import RuntimeSettings
+from deptslm_runtime.supervisor import (
+    ModelSupervisor,
+    RuntimeBusyError,
+    RuntimeSupervisorError,
+    run_until_disconnect,
+)
 
 
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     settings = RuntimeSettings.from_environment()
     application.state.settings = settings
-    application.state.models = RuntimeModels(settings.data_dir, settings.provider)
-    application.state.capacity = threading.BoundedSemaphore(settings.max_concurrency)
-    yield
+    supervisor = ModelSupervisor(settings)
+    application.state.supervisor = supervisor
+    await supervisor.start()
+    try:
+        yield
+    finally:
+        await supervisor.close()
 
 
 app = FastAPI(title="DeptSLM internal RAG runtime", lifespan=lifespan)
@@ -37,6 +45,8 @@ app = FastAPI(title="DeptSLM internal RAG runtime", lifespan=lifespan)
 
 @app.get("/healthz")
 def health() -> dict[str, str]:
+    if not app.state.supervisor.ready:
+        raise HTTPException(503, "Runtime unavailable")
     return {"status": "ready"}
 
 
@@ -52,11 +62,7 @@ async def query_embedding(request: Request) -> dict[str, list[float]]:
         raise HTTPException(400, "Invalid request") from None
     if question != value["question"]:
         raise HTTPException(400, "Invalid request")
-    return await asyncio.to_thread(
-        _with_capacity,
-        request,
-        lambda: {"vector": request.app.state.models.embed_question(question)},
-    )
+    return await _run_model(request, "query_embedding", {"question": question})
 
 
 @app.post("/internal/v1/generate")
@@ -100,13 +106,13 @@ async def generate(request: Request) -> dict:
             raise HTTPException(400, "Invalid request")
         labels.append(label)
         total += len(text)
+        try:
+            validate_safe_text(text, field="evidence", max_chars=MAX_SOURCE_CHARS)
+        except ValueError:
+            raise HTTPException(400, "Invalid request") from None
     if labels != [f"S{index}" for index in range(1, len(labels) + 1)] or total > 6000:
         raise HTTPException(400, "Invalid request")
-    return await asyncio.to_thread(
-        _with_capacity,
-        request,
-        lambda: request.app.state.models.generate(question, evidence),
-    )
+    return await _run_model(request, "generate", {"question": question, "evidence": evidence})
 
 
 def _authorize(request: Request) -> None:
@@ -134,13 +140,13 @@ async def _json_body(request: Request):
         raise HTTPException(400, "Invalid request") from None
 
 
-def _with_capacity(request: Request, operation):
-    capacity = request.app.state.capacity
-    if not capacity.acquire(blocking=False):
-        raise HTTPException(503, "Runtime busy")
+async def _run_model(request: Request, operation: str, payload: dict):
     try:
-        return operation()
-    except RuntimeModelError:
+        return await run_until_disconnect(
+            request.app.state.supervisor.request(operation, payload),
+            request.is_disconnected,
+        )
+    except RuntimeBusyError:
+        raise HTTPException(503, "Runtime busy") from None
+    except RuntimeSupervisorError:
         raise HTTPException(503, "Runtime operation failed") from None
-    finally:
-        capacity.release()

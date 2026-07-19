@@ -9,7 +9,13 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.rag_domain import GENERATION_MODEL_ID, GENERATION_MODEL_REVISION
+from app.rag_domain import (
+    GENERATION_MODEL_CONTEXT_TOKENS,
+    GENERATION_MODEL_ID,
+    GENERATION_MODEL_REVISION,
+    GENERATION_NEW_TOKEN_RESERVE,
+    MAX_GENERATION_INPUT_TOKENS,
+)
 from app.vector_index_domain import (
     EMBEDDING_DIMENSION,
     EMBEDDING_MODEL_ID,
@@ -75,6 +81,9 @@ def validate_generation_model_store(data_dir: Path) -> ModelLocation:
         "safetensors_only": True,
         "trust_remote_code": False,
         "enable_thinking": False,
+        "context_tokens": GENERATION_MODEL_CONTEXT_TOKENS,
+        "maximum_input_tokens": MAX_GENERATION_INPUT_TOKENS,
+        "maximum_new_tokens": GENERATION_NEW_TOKEN_RESERVE,
     }
     return _validate_store(
         data_dir,
@@ -154,6 +163,9 @@ def build_generation_manifest(location: Path) -> dict:
             "safetensors_only": True,
             "trust_remote_code": False,
             "enable_thinking": False,
+            "context_tokens": GENERATION_MODEL_CONTEXT_TOKENS,
+            "maximum_input_tokens": MAX_GENERATION_INPUT_TOKENS,
+            "maximum_new_tokens": GENERATION_NEW_TOKEN_RESERVE,
         },
     )
 
