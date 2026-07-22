@@ -4,13 +4,13 @@ The Phase 8 reviewer workflow exposes structured, content-free feedback metadata
 
 ## Queue and reads
 
-`GET /departments/{department_id}/rag/feedback` lists non-expired records oldest first by `(created_at, id)`. Optional exact `status` and `sentiment` filters and a limit from 1 through 100 are supported. Pagination uses an opaque cursor bound to the department, selected filters, and ordering; offset pagination and cross-filter cursor reuse are rejected.
+`GET /departments/{department_id}/rag/feedback` lists non-expired records oldest first by `(created_at, id)`. Optional exact `status` and `sentiment` filters and a limit from 1 through 100 are supported. The service validates the limit independently of FastAPI before cursor parsing or SQL construction. Pagination uses an opaque cursor bound to the department, selected filters, and ordering; offset pagination and cross-filter cursor reuse are rejected.
 
-`GET /departments/{department_id}/rag/feedback/{feedback_id}` returns one non-expired same-department record. Foreign and expired IDs return a safe 404. Responses contain only the run identifier, answer outcome, sentiment, reviewed reason codes, public source labels, workflow state, reviewed resolution, timestamps, and version. They contain no identity, question, answer, source text, filename, or document metadata.
+`GET /departments/{department_id}/rag/feedback/{feedback_id}` returns one non-expired same-department record. Foreign and expired IDs return a safe 404. Owner detail, reviewer detail, and reviewer pages each select the parent, answer status, ordered reasons, and ordered source labels in one PostgreSQL statement. Eligibility uses PostgreSQL `statement_timestamp()`, so the statement snapshot either returns one complete canonical pre-purge view or no row; it never combines a pre-purge parent with post-purge missing children. Purge may proceed after the read statement completes without creating a partial response. Responses contain only the run identifier, answer outcome, sentiment, reviewed reason codes, public source labels, workflow state, reviewed resolution, timestamps, and version. They contain no identity, question, answer, source text, filename, or document metadata.
 
 ## Transitions
 
-`PATCH /departments/{department_id}/rag/feedback/{feedback_id}` requires `expected_version` and permits:
+`PATCH /departments/{department_id}/rag/feedback/{feedback_id}` has a 2,048-byte pre-JSON body limit, requires a strict non-boolean integer `expected_version`, accepts only reviewed resolution identifiers, and permits:
 
 - `open` to `triaged`, `resolved`, or `dismissed`
 - `triaged` to `resolved` or `dismissed`

@@ -5,10 +5,16 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from app.auth import DepartmentRole, MembershipStatus
-from app.rag_feedback_domain import FeedbackSentiment, FeedbackStatus
+from app.rag_feedback_domain import (
+    FeedbackReasonCode,
+    FeedbackResolutionCode,
+    FeedbackSentiment,
+    FeedbackSourceId,
+    FeedbackStatus,
+)
 
 
 class ORMResponse(BaseModel):
@@ -248,8 +254,8 @@ class RagFeedbackSubmitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sentiment: FeedbackSentiment
-    reason_codes: list[str] = Field(default_factory=list, max_length=5)
-    source_ids: list[str] = Field(default_factory=list, max_length=8)
+    reason_codes: list[FeedbackReasonCode] = Field(default_factory=list, max_length=5)
+    source_ids: list[FeedbackSourceId] = Field(default_factory=list, max_length=8)
 
 
 class RagFeedbackReviewRequest(BaseModel):
@@ -258,8 +264,8 @@ class RagFeedbackReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     status: FeedbackStatus
-    resolution_code: str | None = Field(default=None, max_length=64)
-    expected_version: int = Field(ge=1)
+    resolution_code: FeedbackResolutionCode | None = None
+    expected_version: StrictInt = Field(ge=1)
 
     @model_validator(mode="after")
     def reject_open_target(self) -> RagFeedbackReviewRequest:

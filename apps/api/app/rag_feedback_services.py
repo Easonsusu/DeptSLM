@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import and_, delete, func, or_, select
+from sqlalchemy import String, and_, delete, func, or_, select
+from sqlalchemy.dialects.postgresql import aggregate_order_by, array
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -40,6 +41,8 @@ REVIEWER_ROLES = frozenset(
     }
 )
 PURGE_ROLES = frozenset({DepartmentRole.SYSTEM_ADMIN, DepartmentRole.DEPARTMENT_ADMIN})
+MAX_REVIEW_LIST_LIMIT = 100
+MAX_PURGE_LIMIT = 1000
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +83,12 @@ def _service_call(operation):
         raise ServiceError(409, "Feedback conflict") from error
     except SQLAlchemyError as error:
         raise ServiceError(503, "Database unavailable") from error
+
+
+def _validate_limit(value: object, *, maximum: int, detail: str) -> int:
+    if type(value) is not int or not 1 <= value <= maximum:
+        raise ServiceError(422, detail)
+    return value
 
 
 def _canonical_or_error(
@@ -149,6 +158,109 @@ def _stored_contract(session: Session, feedback: RagAnswerFeedback) -> Canonical
         )
     )
     return CanonicalFeedback(feedback.sentiment, reasons, source_ids)
+
+
+def _feedback_snapshot_statement():
+    reason_codes = (
+        select(
+            func.coalesce(
+                func.array_agg(
+                    aggregate_order_by(
+                        RagAnswerFeedbackReason.reason_code,
+                        RagAnswerFeedbackReason.rank,
+                    )
+                ),
+                array([], type_=String),
+            )
+        )
+        .where(
+            RagAnswerFeedbackReason.feedback_id == RagAnswerFeedback.id,
+            RagAnswerFeedbackReason.department_id == RagAnswerFeedback.department_id,
+            RagAnswerFeedbackReason.run_id == RagAnswerFeedback.run_id,
+        )
+        .correlate(RagAnswerFeedback)
+        .scalar_subquery()
+        .label("reason_codes")
+    )
+    source_ids = (
+        select(
+            func.coalesce(
+                func.array_agg(
+                    aggregate_order_by(
+                        RagAnswerCitation.source_label,
+                        RagAnswerFeedbackSourceTarget.rank,
+                    )
+                ),
+                array([], type_=String),
+            )
+        )
+        .select_from(RagAnswerFeedbackSourceTarget)
+        .join(
+            RagAnswerCitation,
+            and_(
+                RagAnswerCitation.id == RagAnswerFeedbackSourceTarget.citation_id,
+                RagAnswerCitation.department_id == RagAnswerFeedbackSourceTarget.department_id,
+                RagAnswerCitation.run_id == RagAnswerFeedbackSourceTarget.run_id,
+            ),
+        )
+        .where(
+            RagAnswerFeedbackSourceTarget.feedback_id == RagAnswerFeedback.id,
+            RagAnswerFeedbackSourceTarget.department_id == RagAnswerFeedback.department_id,
+            RagAnswerFeedbackSourceTarget.run_id == RagAnswerFeedback.run_id,
+        )
+        .correlate(RagAnswerFeedback)
+        .scalar_subquery()
+        .label("source_ids")
+    )
+    return select(
+        RagAnswerFeedback,
+        RagAnswerRun.status.label("answer_status"),
+        reason_codes,
+        source_ids,
+    ).join(
+        RagAnswerRun,
+        and_(
+            RagAnswerRun.id == RagAnswerFeedback.run_id,
+            RagAnswerRun.department_id == RagAnswerFeedback.department_id,
+        ),
+    )
+
+
+def _snapshot_response(
+    feedback: RagAnswerFeedback,
+    *,
+    answer_status: str,
+    reason_codes: list[str],
+    source_ids: list[str],
+) -> RagFeedbackResponse:
+    reasons = tuple(reason_codes)
+    sources = tuple(source_ids)
+    try:
+        canonical = canonicalize_feedback(
+            answer_status=answer_status,
+            sentiment=FeedbackSentiment(feedback.sentiment),
+            reason_codes=reasons,
+            source_ids=sources,
+            available_source_ids=sources,
+        )
+    except (FeedbackContractError, ValueError):
+        raise ServiceError(404, "Feedback not found") from None
+    if canonical.reason_codes != reasons or canonical.source_ids != sources:
+        raise ServiceError(404, "Feedback not found")
+    return RagFeedbackResponse(
+        id=feedback.id,
+        run_id=feedback.run_id,
+        answer_status=answer_status,
+        sentiment=feedback.sentiment,
+        reason_codes=list(reasons),
+        source_ids=list(sources),
+        status=feedback.status,
+        resolution_code=feedback.resolution_code,
+        created_at=feedback.created_at,
+        reviewed_at=feedback.reviewed_at,
+        expires_at=feedback.expires_at,
+        version=feedback.version,
+    )
 
 
 def _response(
@@ -311,25 +423,19 @@ def read_own_feedback(
             audit_action="rag.feedback.owner_read.authorization",
         )
         row = session.execute(
-            select(RagAnswerFeedback, RagAnswerRun.status)
-            .join(
-                RagAnswerRun,
-                and_(
-                    RagAnswerRun.id == RagAnswerFeedback.run_id,
-                    RagAnswerRun.department_id == RagAnswerFeedback.department_id,
-                ),
-            )
-            .where(
+            _feedback_snapshot_statement().where(
                 RagAnswerFeedback.department_id == request_scope.department.value,
                 RagAnswerFeedback.run_id == run_id,
                 RagAnswerFeedback.submitted_by_user_id == authorization.identity.id,
                 RagAnswerRun.requested_by_user_id == authorization.identity.id,
-                RagAnswerFeedback.expires_at > func.clock_timestamp(),
+                RagAnswerFeedback.expires_at > func.statement_timestamp(),
             )
         ).one_or_none()
         if row is None:
             raise ServiceError(404, "Feedback not found")
-        return _response(session, row[0], answer_status=row[1])
+        return _snapshot_response(
+            row[0], answer_status=row[1], reason_codes=row[2], source_ids=row[3]
+        )
 
     return _service_call(operation)
 
@@ -344,6 +450,8 @@ def list_feedback_for_review(
     limit: int,
     cursor: str | None,
 ) -> FeedbackPage:
+    limit = _validate_limit(limit, maximum=MAX_REVIEW_LIST_LIMIT, detail="Invalid feedback limit")
+
     def operation() -> FeedbackPage:
         authorize_transaction(
             session,
@@ -366,19 +474,9 @@ def list_feedback_for_review(
                 )
             except FeedbackContractError as error:
                 raise ServiceError(422, "Invalid feedback cursor") from error
-        statement = (
-            select(RagAnswerFeedback, RagAnswerRun.status)
-            .join(
-                RagAnswerRun,
-                and_(
-                    RagAnswerRun.id == RagAnswerFeedback.run_id,
-                    RagAnswerRun.department_id == RagAnswerFeedback.department_id,
-                ),
-            )
-            .where(
-                RagAnswerFeedback.department_id == request_scope.department.value,
-                RagAnswerFeedback.expires_at > func.clock_timestamp(),
-            )
+        statement = _feedback_snapshot_statement().where(
+            RagAnswerFeedback.department_id == request_scope.department.value,
+            RagAnswerFeedback.expires_at > func.statement_timestamp(),
         )
         if status_value is not None:
             statement = statement.where(RagAnswerFeedback.status == status_value)
@@ -414,8 +512,13 @@ def list_feedback_for_review(
             )
         return FeedbackPage(
             tuple(
-                _response(session, item, answer_status=answer_status)
-                for item, answer_status in visible
+                _snapshot_response(
+                    item,
+                    answer_status=answer_status,
+                    reason_codes=reason_codes,
+                    source_ids=source_ids,
+                )
+                for item, answer_status, reason_codes, source_ids in visible
             ),
             next_cursor,
         )
@@ -439,23 +542,17 @@ def read_feedback_for_review(
             audit_action="rag.feedback.review_read.authorization",
         )
         row = session.execute(
-            select(RagAnswerFeedback, RagAnswerRun.status)
-            .join(
-                RagAnswerRun,
-                and_(
-                    RagAnswerRun.id == RagAnswerFeedback.run_id,
-                    RagAnswerRun.department_id == RagAnswerFeedback.department_id,
-                ),
-            )
-            .where(
+            _feedback_snapshot_statement().where(
                 RagAnswerFeedback.id == feedback_id,
                 RagAnswerFeedback.department_id == request_scope.department.value,
-                RagAnswerFeedback.expires_at > func.clock_timestamp(),
+                RagAnswerFeedback.expires_at > func.statement_timestamp(),
             )
         ).one_or_none()
         if row is None:
             raise ServiceError(404, "Feedback not found")
-        return _response(session, row[0], answer_status=row[1])
+        return _snapshot_response(
+            row[0], answer_status=row[1], reason_codes=row[2], source_ids=row[3]
+        )
 
     return _service_call(operation)
 
@@ -532,6 +629,8 @@ def purge_feedback_batch(
     apply: bool,
 ) -> PurgeResult:
     """Inspect or delete one bounded oldest-first expired batch."""
+
+    limit = _validate_limit(limit, maximum=MAX_PURGE_LIMIT, detail="Invalid purge limit")
 
     def operation() -> PurgeResult:
         authorization = authorize_transaction(

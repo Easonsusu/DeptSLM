@@ -27,35 +27,73 @@ class FeedbackStatus(StrEnum):
     DISMISSED = "dismissed"
 
 
+class FeedbackReasonCode(StrEnum):
+    CLEAR = "clear"
+    COMPLETE = "complete"
+    WELL_SUPPORTED = "well_supported"
+    USEFUL_CITATIONS = "useful_citations"
+    INCORRECT = "incorrect"
+    UNSUPPORTED_CLAIM = "unsupported_claim"
+    MISSING_INFORMATION = "missing_information"
+    WRONG_CITATION = "wrong_citation"
+    IRRELEVANT_SOURCE = "irrelevant_source"
+    UNSAFE_CONTENT = "unsafe_content"
+    FORMATTING_PROBLEM = "formatting_problem"
+    INSUFFICIENT_WHEN_EXPECTED = "insufficient_when_expected"
+    OTHER_UNSPECIFIED = "other_unspecified"
+
+
+class FeedbackSourceId(StrEnum):
+    S1 = "S1"
+    S2 = "S2"
+    S3 = "S3"
+    S4 = "S4"
+    S5 = "S5"
+    S6 = "S6"
+    S7 = "S7"
+    S8 = "S8"
+
+
+class FeedbackResolutionCode(StrEnum):
+    CONFIRMED_QUALITY_ISSUE = "confirmed_quality_issue"
+    CONFIRMED_SAFETY_ISSUE = "confirmed_safety_issue"
+    ADDRESSED_EXTERNALLY = "addressed_externally"
+    NO_ACTION_REQUIRED = "no_action_required"
+    DUPLICATE = "duplicate"
+    NOT_REPRODUCIBLE = "not_reproducible"
+    OUT_OF_SCOPE = "out_of_scope"
+    NO_ISSUE_FOUND = "no_issue_found"
+
+
 HELPFUL_REASON_ORDER = (
-    "clear",
-    "complete",
-    "well_supported",
-    "useful_citations",
+    FeedbackReasonCode.CLEAR.value,
+    FeedbackReasonCode.COMPLETE.value,
+    FeedbackReasonCode.WELL_SUPPORTED.value,
+    FeedbackReasonCode.USEFUL_CITATIONS.value,
 )
 NEGATIVE_REASON_ORDER = (
-    "incorrect",
-    "unsupported_claim",
-    "missing_information",
-    "wrong_citation",
-    "irrelevant_source",
-    "unsafe_content",
-    "formatting_problem",
-    "insufficient_when_expected",
-    "other_unspecified",
+    FeedbackReasonCode.INCORRECT.value,
+    FeedbackReasonCode.UNSUPPORTED_CLAIM.value,
+    FeedbackReasonCode.MISSING_INFORMATION.value,
+    FeedbackReasonCode.WRONG_CITATION.value,
+    FeedbackReasonCode.IRRELEVANT_SOURCE.value,
+    FeedbackReasonCode.UNSAFE_CONTENT.value,
+    FeedbackReasonCode.FORMATTING_PROBLEM.value,
+    FeedbackReasonCode.INSUFFICIENT_WHEN_EXPECTED.value,
+    FeedbackReasonCode.OTHER_UNSPECIFIED.value,
 )
 REASON_ORDER = HELPFUL_REASON_ORDER + NEGATIVE_REASON_ORDER
 RESOLVED_CODES = (
-    "confirmed_quality_issue",
-    "confirmed_safety_issue",
-    "addressed_externally",
-    "no_action_required",
+    FeedbackResolutionCode.CONFIRMED_QUALITY_ISSUE.value,
+    FeedbackResolutionCode.CONFIRMED_SAFETY_ISSUE.value,
+    FeedbackResolutionCode.ADDRESSED_EXTERNALLY.value,
+    FeedbackResolutionCode.NO_ACTION_REQUIRED.value,
 )
 DISMISSED_CODES = (
-    "duplicate",
-    "not_reproducible",
-    "out_of_scope",
-    "no_issue_found",
+    FeedbackResolutionCode.DUPLICATE.value,
+    FeedbackResolutionCode.NOT_REPRODUCIBLE.value,
+    FeedbackResolutionCode.OUT_OF_SCOPE.value,
+    FeedbackResolutionCode.NO_ISSUE_FOUND.value,
 )
 RESOLUTION_CODES = RESOLVED_CODES + DISMISSED_CODES
 TARGETING_REASONS = frozenset({"wrong_citation", "irrelevant_source"})

@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from uuid import uuid4
 
 import jwt
 import pytest
 from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, inspect, select, text
+from sqlalchemy import delete, func, inspect, select, text
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -23,6 +26,7 @@ from alembic import command
 from app.auth import AuthenticatedPrincipal
 from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.database import create_database_engine, create_session_factory
+from app.feedback_purge import FeedbackPurgeSettings
 from app.main import app
 from app.models import (
     Base,
@@ -47,7 +51,14 @@ from app.rag_domain import (
     PROMPT_VERSION,
 )
 from app.rag_feedback_domain import FeedbackSentiment, FeedbackStatus
-from app.rag_feedback_services import purge_feedback_batch, review_feedback, submit_feedback
+from app.rag_feedback_services import (
+    list_feedback_for_review,
+    purge_feedback_batch,
+    read_feedback_for_review,
+    read_own_feedback,
+    review_feedback,
+    submit_feedback,
+)
 from app.services import ServiceError
 from app.vector_index_domain import (
     EMBEDDING_DIMENSION,
@@ -1030,6 +1041,15 @@ def test_review_queue_cursor_filters_and_expiry_visibility(
         created_at=datetime.now(UTC) - timedelta(minutes=2),
         sentiment="report",
     )
+    db.add(
+        RagAnswerFeedbackReason(
+            feedback_id=second.id,
+            department_id=department.id,
+            run_id=second_run.id,
+            rank=1,
+            reason_code="insufficient_when_expected",
+        )
+    )
     expired_owner = _identity(db, department, role="viewer", subject=f"expired-{uuid4().hex}")
     expired_run = _run(db, department, expired_owner, "insufficient_information")
     expired = _feedback(
@@ -1156,6 +1176,514 @@ def test_expired_owner_feedback_is_hidden_before_purge(
             headers=_headers(owner.subject),
         )
     assert response.status_code == 404
+
+
+def test_purge_command_uses_only_database_settings(
+    db: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    department, _foreign, owner, _other, admin, *_rest, answered, _insufficient, _ = _seed(db)
+    created = datetime.now(UTC) - timedelta(days=2)
+    feedback = _feedback(
+        db,
+        department,
+        answered,
+        owner,
+        created_at=created,
+        expires_at=created + timedelta(days=1),
+    )
+    feedback_id = feedback.id
+    db.commit()
+    monkeypatch.setenv("DATABASE_URL", _database_url())
+    monkeypatch.delenv("DEPTSLM_DATA_DIR", raising=False)
+    for name in (
+        "DEPTSLM_QDRANT_URL",
+        "DEPTSLM_RAG_RUNTIME_URL",
+        "DEPTSLM_EMBEDDING_MODEL_REVISION",
+        "DEPTSLM_GENERATION_MODEL_REVISION",
+        "DEPTSLM_RAG_FEEDBACK_RETENTION_DAYS",
+    ):
+        monkeypatch.setenv(name, "invalid-and-unused")
+    monkeypatch.setattr(
+        "app.admin.Settings.from_environment",
+        lambda: pytest.fail("full settings must not load for purge"),
+    )
+    from app.admin import main
+
+    assert (
+        main(
+            [
+                "purge-rag-feedback",
+                "--department-id",
+                str(department.id),
+                "--actor-issuer",
+                ISSUER,
+                "--actor-subject",
+                admin.subject,
+                "--apply",
+            ]
+        )
+        == 0
+    )
+    assert "Purged feedback count: 1" in capsys.readouterr().out
+    db.expire_all()
+    assert db.get(RagAnswerFeedback, feedback_id) is None
+    assert FeedbackPurgeSettings.from_environment().database_url == _database_url()
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_status"),
+    [
+        (b"", 400),
+        (b"\xff", 400),
+        (b"{", 400),
+        (b"[]", 400),
+        (b'{} {"second":true}', 400),
+        (
+            json.dumps(
+                {
+                    "sentiment": "helpful",
+                    "reason_codes": [],
+                    "source_ids": [],
+                    "unknown": "x" * 5000,
+                }
+            ).encode(),
+            413,
+        ),
+    ],
+)
+def test_rejected_submit_bodies_create_no_feedback_or_audit(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    body: bytes,
+    expected_status: int,
+) -> None:
+    department, _foreign, owner, *_rest, answered, _insufficient, _ = _seed(db)
+    with _client(monkeypatch, tmp_path) as client:
+        response = client.put(
+            f"/departments/{department.id}/rag/answers/{answered.id}/feedback",
+            headers={**_headers(owner.subject), "Content-Type": "application/json"},
+            content=body,
+        )
+    assert response.status_code == expected_status
+    assert response.json()["detail"] in {
+        "Invalid feedback request body",
+        "Feedback request body too large",
+    }
+    assert db.scalar(select(func.count()).select_from(RagAnswerFeedback)) == 0
+    assert (
+        db.scalar(
+            select(func.count())
+            .select_from(PersistentAuditEvent)
+            .where(PersistentAuditEvent.action == "rag.feedback.submit")
+        )
+        == 0
+    )
+
+
+def test_chunked_multimegabyte_submit_is_rejected_before_model_or_service(
+    db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    department, _foreign, owner, *_rest, answered, _insufficient, _ = _seed(db)
+    model_calls: list[object] = []
+    service_calls: list[object] = []
+
+    def reject_model(cls, payload):
+        model_calls.append(payload)
+        pytest.fail("oversized body reached model validation")
+
+    def reject_service(*args, **kwargs):
+        service_calls.append((args, kwargs))
+        pytest.fail("oversized body reached feedback service")
+
+    monkeypatch.setattr(
+        "app.routes.RagFeedbackSubmitRequest.model_validate",
+        classmethod(reject_model),
+    )
+    monkeypatch.setattr("app.routes.submit_feedback", reject_service)
+
+    def content():
+        yield b'{"sentiment":"unhelpful","reason_codes":['
+        for index in range(5):
+            if index:
+                yield b","
+            yield b'"sensitive-marker-' + b"x" * (1024 * 1024) + b'"'
+        yield b'],"source_ids":[]}'
+
+    with _client(monkeypatch, tmp_path) as client:
+        response = client.put(
+            f"/departments/{department.id}/rag/answers/{answered.id}/feedback",
+            headers={**_headers(owner.subject), "Content-Type": "application/json"},
+            content=content(),
+        )
+    assert response.status_code == 413
+    assert model_calls == service_calls == []
+    assert "sensitive-marker" not in response.text
+    assert "sensitive-marker" not in caplog.text
+    assert db.scalar(select(func.count()).select_from(RagAnswerFeedback)) == 0
+
+
+def test_feedback_submit_body_exact_limit_and_one_byte_over(
+    db: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from app.feedback_request_body import FEEDBACK_SUBMIT_BODY_MAX_BYTES
+
+    department, _foreign, owner, *_rest, answered, _insufficient, _ = _seed(db)
+    raw = b'{"sentiment":"helpful","reason_codes":[],"source_ids":[]}'
+    exact = raw + b" " * (FEEDBACK_SUBMIT_BODY_MAX_BYTES - len(raw))
+    with _client(monkeypatch, tmp_path) as client:
+        accepted = client.put(
+            f"/departments/{department.id}/rag/answers/{answered.id}/feedback",
+            headers={**_headers(owner.subject), "Content-Type": "application/json"},
+            content=exact,
+        )
+        rejected = client.put(
+            f"/departments/{department.id}/rag/answers/{answered.id}/feedback",
+            headers={**_headers(owner.subject), "Content-Type": "application/json"},
+            content=exact + b" ",
+        )
+    assert accepted.status_code == 201
+    assert rejected.status_code == 413
+    assert db.scalar(select(func.count()).select_from(RagAnswerFeedback)) == 1
+
+
+def test_chunked_oversized_review_and_strict_version_do_not_mutate(
+    db: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    department, _foreign, owner, _other, admin, *_rest, answered, _insufficient, _ = _seed(db)
+    feedback = _feedback(db, department, answered, owner)
+    db.commit()
+
+    def oversized_content():
+        yield b'{"status":"resolved","resolution_code":"'
+        yield b"x" * 4096
+        yield b'","expected_version":1}'
+
+    path = f"/departments/{department.id}/rag/feedback/{feedback.id}"
+    with _client(monkeypatch, tmp_path) as client:
+        oversized = client.patch(
+            path,
+            headers={**_headers(admin.subject), "Content-Type": "application/json"},
+            content=oversized_content(),
+        )
+        boolean_version = client.patch(
+            path,
+            headers=_headers(admin.subject),
+            json={"status": "triaged", "resolution_code": None, "expected_version": True},
+        )
+    assert oversized.status_code == 413
+    assert boolean_version.status_code == 422
+    db.expire_all()
+    assert db.get(RagAnswerFeedback, feedback.id).status == "open"
+    assert (
+        db.scalar(
+            select(func.count())
+            .select_from(PersistentAuditEvent)
+            .where(PersistentAuditEvent.action == "rag.feedback.review")
+        )
+        == 0
+    )
+
+
+def _attach_negative_feedback_contract(
+    db: Session,
+    feedback: RagAnswerFeedback,
+    citation: RagAnswerCitation,
+) -> None:
+    feedback.sentiment = "unhelpful"
+    db.add(
+        RagAnswerFeedbackReason(
+            feedback_id=feedback.id,
+            department_id=feedback.department_id,
+            run_id=feedback.run_id,
+            rank=1,
+            reason_code="wrong_citation",
+        )
+    )
+    db.add(
+        RagAnswerFeedbackSourceTarget(
+            feedback_id=feedback.id,
+            department_id=feedback.department_id,
+            run_id=feedback.run_id,
+            citation_id=citation.id,
+            rank=1,
+        )
+    )
+
+
+def _wait_for_server_expiry(factory, expires_at: datetime) -> None:
+    while True:
+        with factory.begin() as session:
+            if session.scalar(select(func.clock_timestamp())) >= expires_at:
+                return
+        time.sleep(0.02)
+
+
+@pytest.mark.parametrize("read_kind", ["owner", "reviewer_detail", "reviewer_list"])
+def test_feedback_read_snapshot_remains_complete_while_expiry_purge_commits(
+    db: Session, engine, read_kind: str
+) -> None:
+    department, _foreign, owner, _other, admin, *_rest, answered, _insufficient, citations = _seed(
+        db
+    )
+    created = datetime.now(UTC) - timedelta(days=1)
+    expires_at = datetime.now(UTC) + timedelta(seconds=3)
+    feedback = _feedback(
+        db,
+        department,
+        answered,
+        owner,
+        created_at=created,
+        expires_at=expires_at,
+        sentiment="unhelpful",
+    )
+    _attach_negative_feedback_contract(db, feedback, citations[0])
+    db.commit()
+    factory = create_session_factory(engine)
+    selected = Event()
+    release = Event()
+    department_id = department.id
+    feedback_id = feedback.id
+    run_id = answered.id
+
+    def reader():
+        with factory.begin() as session:
+            connection = session.connection()
+
+            def pause_after_snapshot(conn, cursor, statement, parameters, context, executemany):
+                del conn, cursor, parameters, context, executemany
+                if " AS reason_codes" in statement and not selected.is_set():
+                    selected.set()
+                    assert release.wait(10)
+
+            sqlalchemy_event.listen(connection, "after_cursor_execute", pause_after_snapshot)
+            if read_kind == "owner":
+                return read_own_feedback(
+                    session,
+                    AuthenticatedPrincipal(owner.subject, ISSUER),
+                    DepartmentRequestScope(DepartmentScope(department_id)),
+                    run_id,
+                )
+            if read_kind == "reviewer_detail":
+                return read_feedback_for_review(
+                    session,
+                    AuthenticatedPrincipal(admin.subject, ISSUER),
+                    DepartmentRequestScope(DepartmentScope(department_id)),
+                    feedback_id,
+                )
+            return list_feedback_for_review(
+                session,
+                AuthenticatedPrincipal(admin.subject, ISSUER),
+                DepartmentRequestScope(DepartmentScope(department_id)),
+                status=None,
+                sentiment=None,
+                limit=25,
+                cursor=None,
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(reader)
+        assert selected.wait(10)
+        _wait_for_server_expiry(factory, expires_at)
+        with factory.begin() as session:
+            result = purge_feedback_batch(
+                session,
+                AuthenticatedPrincipal(admin.subject, ISSUER),
+                DepartmentRequestScope(DepartmentScope(department_id)),
+                limit=1,
+                apply=True,
+            )
+        assert result.purged_count == 1
+        release.set()
+        response = future.result(timeout=10)
+    item = response.items[0] if read_kind == "reviewer_list" else response
+    assert item.reason_codes == ["wrong_citation"]
+    assert item.source_ids == ["S1"]
+    db.expire_all()
+    assert db.get(RagAnswerFeedback, feedback_id) is None
+    assert db.get(RagAnswerFeedbackReason, (feedback_id, 1)) is None
+    assert db.get(RagAnswerFeedbackSourceTarget, (feedback_id, 1)) is None
+    assert (
+        db.scalar(
+            select(func.count())
+            .select_from(PersistentAuditEvent)
+            .where(PersistentAuditEvent.action == "rag.feedback.purge")
+        )
+        == 1
+    )
+
+
+def test_review_waiting_on_lock_rechecks_server_time_after_expiry(db: Session, engine) -> None:
+    department, _foreign, owner, _other, admin, *_rest, answered, _insufficient, _ = _seed(db)
+    created = datetime.now(UTC) - timedelta(days=1)
+    expires_at = datetime.now(UTC) + timedelta(seconds=3)
+    feedback = _feedback(
+        db,
+        department,
+        answered,
+        owner,
+        created_at=created,
+        expires_at=expires_at,
+    )
+    db.commit()
+    factory = create_session_factory(engine)
+    department_id = department.id
+    feedback_id = feedback.id
+
+    def reviewer():
+        try:
+            with factory.begin() as session:
+                review_feedback(
+                    session,
+                    AuthenticatedPrincipal(admin.subject, ISSUER),
+                    DepartmentRequestScope(DepartmentScope(department_id)),
+                    feedback_id,
+                    new_status=FeedbackStatus.TRIAGED,
+                    resolution_code=None,
+                    expected_version=1,
+                )
+        except ServiceError as error:
+            return error.status_code
+        return 200
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with factory.begin() as blocker:
+            blocker.execute(
+                select(RagAnswerFeedback)
+                .where(RagAnswerFeedback.id == feedback_id)
+                .with_for_update()
+            ).scalar_one()
+            future = pool.submit(reviewer)
+            _wait_for_server_expiry(factory, expires_at)
+        result = future.result(timeout=10)
+    assert result == 404
+    db.expire_all()
+    assert db.get(RagAnswerFeedback, feedback_id).status == "open"
+    assert (
+        db.scalar(
+            select(func.count())
+            .select_from(PersistentAuditEvent)
+            .where(PersistentAuditEvent.action == "rag.feedback.review")
+        )
+        == 0
+    )
+
+
+def test_owner_read_snapshot_is_complete_during_review_transition(db: Session, engine) -> None:
+    department, _foreign, owner, _other, admin, *_rest, answered, _insufficient, citations = _seed(
+        db
+    )
+    feedback = _feedback(db, department, answered, owner, sentiment="unhelpful")
+    _attach_negative_feedback_contract(db, feedback, citations[0])
+    db.commit()
+    factory = create_session_factory(engine)
+    selected = Event()
+    release = Event()
+    department_id = department.id
+    feedback_id = feedback.id
+    run_id = answered.id
+
+    def owner_reader():
+        with factory.begin() as session:
+            connection = session.connection()
+
+            def pause_after_snapshot(conn, cursor, statement, parameters, context, executemany):
+                del conn, cursor, parameters, context, executemany
+                if " AS reason_codes" in statement and not selected.is_set():
+                    selected.set()
+                    assert release.wait(10)
+
+            sqlalchemy_event.listen(connection, "after_cursor_execute", pause_after_snapshot)
+            return read_own_feedback(
+                session,
+                AuthenticatedPrincipal(owner.subject, ISSUER),
+                DepartmentRequestScope(DepartmentScope(department_id)),
+                run_id,
+            )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(owner_reader)
+        assert selected.wait(10)
+        with factory.begin() as session:
+            reviewed = review_feedback(
+                session,
+                AuthenticatedPrincipal(admin.subject, ISSUER),
+                DepartmentRequestScope(DepartmentScope(department_id)),
+                feedback_id,
+                new_status=FeedbackStatus.TRIAGED,
+                resolution_code=None,
+                expected_version=1,
+            )
+        release.set()
+        response = future.result(timeout=10)
+    assert reviewed.status == FeedbackStatus.TRIAGED
+    assert response.status == FeedbackStatus.OPEN
+    assert response.version == 1
+    assert response.reason_codes == ["wrong_citation"]
+    assert response.source_ids == ["S1"]
+    db.expire_all()
+    assert db.get(RagAnswerFeedback, feedback_id).status == "triaged"
+
+
+def test_unrelated_expired_purge_does_not_alter_active_feedback_read(db: Session, engine) -> None:
+    department, _foreign, owner, other, admin, *_rest, answered, _insufficient, citations = _seed(
+        db
+    )
+    active = _feedback(db, department, answered, owner, sentiment="unhelpful")
+    _attach_negative_feedback_contract(db, active, citations[0])
+    expired_run = _run(db, department, other, "insufficient_information")
+    created = datetime.now(UTC) - timedelta(days=2)
+    expired = _feedback(
+        db,
+        department,
+        expired_run,
+        other,
+        created_at=created,
+        expires_at=created + timedelta(days=1),
+    )
+    active_id = active.id
+    expired_id = expired.id
+    db.commit()
+    factory = create_session_factory(engine)
+    barrier = Barrier(2)
+    department_id = department.id
+
+    def read_active():
+        with factory.begin() as session:
+            barrier.wait()
+            return read_feedback_for_review(
+                session,
+                AuthenticatedPrincipal(admin.subject, ISSUER),
+                DepartmentRequestScope(DepartmentScope(department_id)),
+                active.id,
+            )
+
+    def purge_expired():
+        with factory.begin() as session:
+            barrier.wait()
+            return purge_feedback_batch(
+                session,
+                AuthenticatedPrincipal(admin.subject, ISSUER),
+                DepartmentRequestScope(DepartmentScope(department_id)),
+                limit=1,
+                apply=True,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        read_future = pool.submit(read_active)
+        purge_future = pool.submit(purge_expired)
+        response = read_future.result(timeout=10)
+        purge = purge_future.result(timeout=10)
+    assert response.id == active.id
+    assert response.reason_codes == ["wrong_citation"]
+    assert response.source_ids == ["S1"]
+    assert purge.purged_count == 1
+    db.expire_all()
+    assert db.get(RagAnswerFeedback, active_id) is not None
+    assert db.get(RagAnswerFeedback, expired_id) is None
 
 
 def test_membership_revocation_prevents_review_without_audit(

@@ -166,7 +166,7 @@ Do not add a volume-deletion flag unless destruction of local service state is e
 
 ## Structured-feedback retention
 
-Compose passes `DEPTSLM_RAG_FEEDBACK_RETENTION_DAYS` only to the API. It adds no service, secret, mount, or automatic job. Expired feedback is hidden using PostgreSQL server time before physical deletion. An active same-department system or department administrator must invoke `python -m app.admin purge-rag-feedback` explicitly; see [feedback-retention.md](feedback-retention.md). Local Compose scheduling, PostgreSQL storage, backups, and audit retention are not a production privacy or retention guarantee.
+Compose passes `DEPTSLM_RAG_FEEDBACK_RETENTION_DAYS` only to the API. It adds no service, secret, mount, or automatic job. Expired feedback is hidden using one PostgreSQL statement-time visibility snapshot before physical deletion. An active same-department system or department administrator must invoke `python -m app.admin purge-rag-feedback` explicitly. That command loads only `DATABASE_URL`; it neither requires nor inspects `DEPTSLM_DATA_DIR` or any runtime mount. See [feedback-retention.md](feedback-retention.md). Local Compose scheduling, PostgreSQL storage, backups, and audit retention are not a production privacy or retention guarantee.
 
 ## Runtime mounts and persistence
 

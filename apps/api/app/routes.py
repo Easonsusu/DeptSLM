@@ -7,6 +7,7 @@ from typing import Annotated
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from pydantic import ValidationError
 
 from app.audit import AuditResult
 from app.auth import AuthenticatedPrincipal
@@ -32,6 +33,12 @@ from app.extraction_services import (
     list_extractions,
     read_extraction,
     retry_extraction,
+)
+from app.feedback_request_body import (
+    FEEDBACK_REVIEW_BODY_MAX_BYTES,
+    FEEDBACK_SUBMIT_BODY_MAX_BYTES,
+    FeedbackBodyError,
+    read_bounded_json_object,
 )
 from app.rag_answer_services import (
     RagAnswerServiceError,
@@ -98,6 +105,17 @@ def _raise(error: ServiceError) -> None:
 
 def _raise_upload(error: UploadError) -> None:
     raise HTTPException(error.status_code, error.detail) from None
+
+
+async def _validated_feedback_body(request: Request, model, *, maximum_bytes: int):
+    try:
+        payload = await read_bounded_json_object(request, maximum_bytes=maximum_bytes)
+    except FeedbackBodyError as error:
+        raise HTTPException(error.status_code, error.detail) from None
+    try:
+        return model.model_validate(payload)
+    except ValidationError:
+        raise HTTPException(422, "Invalid feedback request") from None
 
 
 @router.get("/departments", response_model=DepartmentListResponse, tags=["departments"])
@@ -679,15 +697,19 @@ async def post_rag_answer(
     response_model=RagFeedbackResponse,
     tags=["rag-feedback"],
 )
-def put_rag_feedback(
+async def put_rag_feedback(
     run_id: UUID,
-    body: RagFeedbackSubmitRequest,
     response: Response,
     request: Request,
     session: DatabaseSession,
     principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
     request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
 ) -> RagFeedbackResponse:
+    body = await _validated_feedback_body(
+        request,
+        RagFeedbackSubmitRequest,
+        maximum_bytes=FEEDBACK_SUBMIT_BODY_MAX_BYTES,
+    )
     try:
         result = submit_feedback(
             session,
@@ -695,8 +717,8 @@ def put_rag_feedback(
             request_scope,
             run_id,
             sentiment=body.sentiment,
-            reason_codes=body.reason_codes,
-            source_ids=body.source_ids,
+            reason_codes=[item.value for item in body.reason_codes],
+            source_ids=[item.value for item in body.source_ids],
             retention_days=request.app.state.settings.rag_feedback_retention_days,
         )
         response.status_code = 201 if result.created else 200
@@ -773,13 +795,18 @@ def get_rag_feedback_for_review(
     response_model=RagFeedbackResponse,
     tags=["rag-feedback-review"],
 )
-def patch_rag_feedback_for_review(
+async def patch_rag_feedback_for_review(
     feedback_id: UUID,
-    body: RagFeedbackReviewRequest,
+    request: Request,
     session: DatabaseSession,
     principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
     request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
 ) -> RagFeedbackResponse:
+    body = await _validated_feedback_body(
+        request,
+        RagFeedbackReviewRequest,
+        maximum_bytes=FEEDBACK_REVIEW_BODY_MAX_BYTES,
+    )
     try:
         return review_feedback(
             session,
@@ -787,7 +814,9 @@ def patch_rag_feedback_for_review(
             request_scope,
             feedback_id,
             new_status=body.status,
-            resolution_code=body.resolution_code,
+            resolution_code=(
+                body.resolution_code.value if body.resolution_code is not None else None
+            ),
             expected_version=body.expected_version,
         )
     except ServiceError as error:

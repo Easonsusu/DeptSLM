@@ -11,11 +11,13 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
-from app.auth import AuthenticatedPrincipal
-from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.database import create_database_engine, create_session_factory
+from app.feedback_purge import (
+    FeedbackPurgeConfigurationError,
+    FeedbackPurgeSettings,
+    purge_rag_feedback,
+)
 from app.models import Department, Membership, PersistentAuditEvent, UserIdentity
-from app.rag_feedback_services import PurgeResult, purge_feedback_batch
 from app.services import ServiceError
 from app.settings import ALLOWED_HS256_ENVIRONMENTS, ConfigurationError, Settings
 
@@ -128,34 +130,6 @@ def _purge_limit(raw: str) -> int:
     return value
 
 
-def purge_rag_feedback(
-    settings: Settings,
-    *,
-    department_id: UUID,
-    actor_issuer: str,
-    actor_subject: str,
-    limit: int,
-    apply: bool,
-) -> PurgeResult:
-    """Authorize and process one deterministic PostgreSQL-only feedback batch."""
-
-    if not actor_issuer.strip() or not actor_subject.strip():
-        raise BootstrapError("Actor issuer and subject must be non-empty.")
-    engine = create_database_engine(settings.database_url)
-    factory = create_session_factory(engine)
-    try:
-        with factory.begin() as session:
-            return purge_feedback_batch(
-                session,
-                AuthenticatedPrincipal(actor_subject, actor_issuer),
-                DepartmentRequestScope(DepartmentScope(department_id)),
-                limit=limit,
-                apply=apply,
-            )
-    finally:
-        engine.dispose()
-
-
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -177,7 +151,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"Bootstrapped department {department.slug} ({department.id}).")
             return 0
-        settings = Settings.from_environment()
+        settings = FeedbackPurgeSettings.from_environment()
         result = purge_rag_feedback(
             settings,
             department_id=args.department_id,
@@ -186,7 +160,12 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.limit,
             apply=args.apply,
         )
-    except (BootstrapError, ConfigurationError, ServiceError) as error:
+    except (
+        BootstrapError,
+        ConfigurationError,
+        FeedbackPurgeConfigurationError,
+        ServiceError,
+    ) as error:
         print(str(error), file=sys.stderr)
         return 1
     if result.applied:

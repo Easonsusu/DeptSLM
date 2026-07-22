@@ -338,6 +338,11 @@ jobs:
       - name: Check Phase 8 feedback isolation
         run: |
           ! grep -E -i 'qdrant|RagRuntimeClient|Phase5ArtifactReader|selected_chunk_reader|torch|transformers|sentence_transformers|model_store' apps/api/app/rag_feedback_*.py
+          ! grep -E 'from app\.settings import|from app import settings|import app\.settings|DEPTSLM_DATA_DIR|DocumentStorage|RagSettings|Qdrant|model_cache|uploads|extracted_text' apps/api/app/feedback_purge.py
+          grep -F 'FeedbackPurgeSettings.from_environment()' apps/api/app/admin.py >/dev/null
+          grep -F 'FEEDBACK_SUBMIT_BODY_MAX_BYTES = 4096' apps/api/app/feedback_request_body.py >/dev/null
+          grep -F 'FEEDBACK_REVIEW_BODY_MAX_BYTES = 2048' apps/api/app/feedback_request_body.py >/dev/null
+          grep -F 'func.statement_timestamp()' apps/api/app/rag_feedback_services.py >/dev/null
           ! grep -R -E 'dangerouslySetInnerHTML|localStorage|sessionStorage|indexedDB' apps/web/app
           ! grep -R -E '<textarea|type="text"' apps/web/app/components/RagFeedbackPanel.tsx apps/web/app/components/FeedbackReviewQueue.tsx
           ! grep -E '@router\.(get|post).*search|/search|query_vector' apps/api/app/routes.py apps/api/app/schemas.py

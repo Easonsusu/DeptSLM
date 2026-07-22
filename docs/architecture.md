@@ -73,7 +73,7 @@ The arrows describe intended responsibilities and do not imply that a production
 
 ### PostgreSQL
 
-PostgreSQL stores identities, departments, memberships, documents, extraction/chunk metadata, vector-indexing and RAG run metadata, structured feedback metadata, and safe mutation audit events. It is the reviewed extraction/indexing queue: workers claim with `SKIP LOCKED` and finite non-revivable leases. Feedback uses exact run/citation foreign keys, immutable submission, optimistic review versions, and server-time expiry. Questions, answers, prompts, evidence, text, vectors, credentials, and filesystem paths never enter PostgreSQL.
+PostgreSQL stores identities, departments, memberships, documents, extraction/chunk metadata, vector-indexing and RAG run metadata, structured feedback metadata, and safe mutation audit events. It is the reviewed extraction/indexing queue: workers claim with `SKIP LOCKED` and finite non-revivable leases. Feedback uses exact run/citation foreign keys, immutable submission, optimistic review versions, and server-time expiry. Feedback response statements aggregate the parent, run outcome, reasons, and sources in one PostgreSQL snapshot, preventing purge races from producing partial responses. The purge command has a database-only settings loader and never inspects runtime storage. Questions, answers, prompts, evidence, text, vectors, credentials, and filesystem paths never enter PostgreSQL.
 
 ### Qdrant
 

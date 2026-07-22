@@ -10,6 +10,7 @@ import pytest
 
 from app import admin
 from app.admin import _purge_limit
+from app.feedback_purge import FeedbackPurgeSettings
 from app.models import (
     RagAnswerFeedback,
     RagAnswerFeedbackReason,
@@ -286,7 +287,7 @@ def test_purge_cli_dry_run_output_is_content_free(
 ) -> None:
     department_id = uuid4()
     now = datetime.now(UTC)
-    monkeypatch.setattr(admin.Settings, "from_environment", lambda: object())
+    monkeypatch.setattr(FeedbackPurgeSettings, "from_environment", lambda: object())
     monkeypatch.setattr(
         admin,
         "purge_rag_feedback",
