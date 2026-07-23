@@ -165,6 +165,180 @@ footer {
   color: #7a2e24;
 }
 
+.feedbackPanel {
+  margin-top: 26px;
+  border-top: 1px solid var(--line);
+  padding-top: 24px;
+}
+
+.feedbackPanel h2 {
+  margin-bottom: 8px;
+  font-size: 1.45rem;
+}
+
+.feedbackPanel > p {
+  color: var(--muted);
+}
+
+.choiceRow,
+.feedbackMeta,
+.resolutionActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.choiceRow button,
+.feedbackSubmit,
+.reviewQueue button {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: white;
+  color: var(--ink);
+  padding: 10px 15px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.choiceRow button[aria-pressed="true"],
+.feedbackSubmit,
+.reviewQueue button {
+  background: var(--ink);
+  color: white;
+}
+
+.choiceRow button:disabled,
+.feedbackSubmit:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.feedbackPanel form {
+  margin-top: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.feedbackPanel fieldset {
+  margin: 0 0 18px;
+  border: 0;
+  padding: 0;
+}
+
+.feedbackPanel legend {
+  margin-bottom: 10px;
+  font-weight: 750;
+}
+
+.checkboxGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+}
+
+.checkboxGrid label,
+.sourceChoice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-weight: 550;
+}
+
+.feedbackSuccess,
+.queueMessage {
+  margin-top: 16px;
+  border-radius: 14px;
+  background: var(--green-light);
+  padding: 14px;
+  color: var(--green) !important;
+}
+
+.reviewQueue {
+  width: min(980px, calc(100% - 48px));
+  margin: 64px auto 120px;
+}
+
+.reviewQueue h1 {
+  max-width: 900px;
+  font-size: clamp(3rem, 7vw, 5.7rem);
+}
+
+.reviewFilters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-bottom: 28px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--surface);
+  padding: 20px;
+}
+
+.reviewFilters label,
+.resolutionActions label {
+  display: grid;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.reviewFilters select,
+.resolutionActions select {
+  min-height: 42px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: white;
+  color: var(--ink);
+  padding: 0 12px;
+  font: inherit;
+}
+
+.feedbackQueueList {
+  display: grid;
+  gap: 16px;
+  margin: 24px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.feedbackQueueList > li {
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--surface);
+  padding: 22px;
+}
+
+.feedbackMeta {
+  margin-bottom: 14px;
+}
+
+.feedbackMeta span,
+.feedbackMeta strong {
+  border-radius: 999px;
+  background: var(--green-light);
+  padding: 6px 10px;
+  font-size: 0.78rem;
+}
+
+.feedbackQueueList p {
+  color: var(--muted);
+}
+
+.resolutionActions {
+  align-items: end;
+  margin-top: 14px;
+}
+
+.loadMore {
+  display: block;
+  margin-inline: auto;
+}
+
 .nav {
   display: flex;
   align-items: center;
@@ -529,6 +703,16 @@ footer p {
 
   .capabilities {
     padding-block: 78px;
+  }
+
+  .ragPanel,
+  .reviewQueue {
+    width: min(100% - 30px, 980px);
+    margin-top: 36px;
+  }
+
+  .checkboxGrid {
+    grid-template-columns: 1fr;
   }
 
   footer {

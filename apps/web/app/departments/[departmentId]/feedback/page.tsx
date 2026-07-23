@@ -1,6 +1,6 @@
-import { RagAnswerPanel } from "../../components/RagAnswerPanel";
+import { FeedbackReviewQueue } from "../../../components/FeedbackReviewQueue";
 
-export default async function DepartmentAnswerPage({
+export default async function DepartmentFeedbackPage({
   params,
 }: {
   params: Promise<{ departmentId: string }>;
@@ -13,11 +13,9 @@ export default async function DepartmentAnswerPage({
           <span className="brandMark" aria-hidden="true">D</span>
           DeptSLM
         </a>
-        <a className="phaseBadge" href={`/departments/${departmentId}/feedback`}>
-          Phase 8 review
-        </a>
+        <span className="phaseBadge">Phase 8</span>
       </nav>
-      <RagAnswerPanel departmentId={departmentId} />
+      <FeedbackReviewQueue departmentId={departmentId} />
     </main>
   );
 }

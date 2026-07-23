@@ -1,4 +1,4 @@
-"""PostgreSQL persistence models through Phase 7."""
+"""PostgreSQL persistence models through Phase 8."""
 
 from __future__ import annotations
 
@@ -88,6 +88,35 @@ RAG_ANSWER_ERROR_CODES = (
     "invalid_citation",
     "department_unavailable",
     "database_unavailable",
+)
+RAG_FEEDBACK_SENTIMENTS = ("helpful", "unhelpful", "report")
+RAG_FEEDBACK_STATUSES = ("open", "triaged", "resolved", "dismissed")
+RAG_FEEDBACK_REASON_CODES = (
+    "clear",
+    "complete",
+    "well_supported",
+    "useful_citations",
+    "incorrect",
+    "unsupported_claim",
+    "missing_information",
+    "wrong_citation",
+    "irrelevant_source",
+    "unsafe_content",
+    "formatting_problem",
+    "insufficient_when_expected",
+    "other_unspecified",
+)
+RAG_FEEDBACK_RESOLVED_CODES = (
+    "confirmed_quality_issue",
+    "confirmed_safety_issue",
+    "addressed_externally",
+    "no_action_required",
+)
+RAG_FEEDBACK_DISMISSED_CODES = (
+    "duplicate",
+    "not_reproducible",
+    "out_of_scope",
+    "no_issue_found",
 )
 
 
@@ -851,6 +880,7 @@ class RagAnswerCitation(Base):
         UniqueConstraint("run_id", "source_label", name="uq_rag_citation_run_label"),
         UniqueConstraint("run_id", "rank", name="uq_rag_citation_run_rank"),
         UniqueConstraint("run_id", "chunk_id", name="uq_rag_citation_run_chunk"),
+        UniqueConstraint("id", "department_id", "run_id", name="uq_rag_citation_id_department_run"),
         Index("ix_rag_citation_department_run", "department_id", "run_id"),
     )
 
@@ -870,6 +900,161 @@ class RagAnswerCitation(Base):
     page_end: Mapped[int | None] = mapped_column(Integer)
     line_start: Mapped[int | None] = mapped_column(Integer)
     line_end: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = utc_timestamp()
+
+
+class RagAnswerFeedback(Base):
+    """Immutable structured feedback metadata for one completed answer run."""
+
+    __tablename__ = "rag_answer_feedback"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "department_id"],
+            ["rag_answer_runs.id", "rag_answer_runs.department_id"],
+            name="fk_rag_feedback_run_scope",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("id", "department_id", "run_id", name="uq_rag_feedback_id_department_run"),
+        UniqueConstraint(
+            "department_id",
+            "run_id",
+            "submitted_by_user_id",
+            name="uq_rag_feedback_owner",
+        ),
+        CheckConstraint(
+            "sentiment IN ('helpful','unhelpful','report')",
+            name="ck_rag_feedback_sentiment",
+        ),
+        CheckConstraint(
+            "status IN ('open','triaged','resolved','dismissed')",
+            name="ck_rag_feedback_status",
+        ),
+        CheckConstraint("version > 0", name="ck_rag_feedback_version"),
+        CheckConstraint("expires_at > created_at", name="ck_rag_feedback_expiry"),
+        CheckConstraint(
+            "(status = 'open' AND reviewed_by_user_id IS NULL AND reviewed_at IS NULL "
+            "AND resolution_code IS NULL) OR "
+            "(status = 'triaged' AND reviewed_by_user_id IS NOT NULL "
+            "AND reviewed_at IS NOT NULL AND resolution_code IS NULL) OR "
+            "(status = 'resolved' AND reviewed_by_user_id IS NOT NULL "
+            "AND reviewed_at IS NOT NULL AND resolution_code IN "
+            "('confirmed_quality_issue','confirmed_safety_issue','addressed_externally',"
+            "'no_action_required')) OR "
+            "(status = 'dismissed' AND reviewed_by_user_id IS NOT NULL "
+            "AND reviewed_at IS NOT NULL AND resolution_code IN "
+            "('duplicate','not_reproducible','out_of_scope','no_issue_found'))",
+            name="ck_rag_feedback_lifecycle",
+        ),
+        Index(
+            "ix_rag_feedback_owner_lookup",
+            "department_id",
+            "run_id",
+            "submitted_by_user_id",
+        ),
+        Index(
+            "ix_rag_feedback_review_queue",
+            "department_id",
+            "status",
+            "created_at",
+            "id",
+        ),
+        Index(
+            "ix_rag_feedback_expiry_purge",
+            "department_id",
+            "expires_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    run_id: Mapped[UUID] = mapped_column(nullable=False)
+    submitted_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    sentiment: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    resolution_code: Mapped[str | None] = mapped_column(String(64))
+    reviewed_by_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT")
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class RagAnswerFeedbackReason(Base):
+    """Server-ordered reviewed reason code without free text."""
+
+    __tablename__ = "rag_answer_feedback_reasons"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["feedback_id", "department_id", "run_id"],
+            [
+                "rag_answer_feedback.id",
+                "rag_answer_feedback.department_id",
+                "rag_answer_feedback.run_id",
+            ],
+            name="fk_rag_feedback_reason_parent_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("rank BETWEEN 1 AND 5", name="ck_rag_feedback_reason_rank"),
+        CheckConstraint(
+            "reason_code IN ('clear','complete','well_supported','useful_citations',"
+            "'incorrect','unsupported_claim','missing_information','wrong_citation',"
+            "'irrelevant_source','unsafe_content','formatting_problem',"
+            "'insufficient_when_expected','other_unspecified')",
+            name="ck_rag_feedback_reason_code",
+        ),
+        UniqueConstraint("feedback_id", "reason_code", name="uq_rag_feedback_reason_code"),
+    )
+
+    feedback_id: Mapped[UUID] = mapped_column(primary_key=True)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    run_id: Mapped[UUID] = mapped_column(nullable=False)
+    rank: Mapped[int] = mapped_column(primary_key=True)
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = utc_timestamp()
+
+
+class RagAnswerFeedbackSourceTarget(Base):
+    """Exact citation target from the same feedback run and department."""
+
+    __tablename__ = "rag_answer_feedback_source_targets"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["feedback_id", "department_id", "run_id"],
+            [
+                "rag_answer_feedback.id",
+                "rag_answer_feedback.department_id",
+                "rag_answer_feedback.run_id",
+            ],
+            name="fk_rag_feedback_target_parent_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["citation_id", "department_id", "run_id"],
+            [
+                "rag_answer_citations.id",
+                "rag_answer_citations.department_id",
+                "rag_answer_citations.run_id",
+            ],
+            name="fk_rag_feedback_target_citation_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("rank BETWEEN 1 AND 8", name="ck_rag_feedback_target_rank"),
+        UniqueConstraint("feedback_id", "citation_id", name="uq_rag_feedback_target_citation"),
+    )
+
+    feedback_id: Mapped[UUID] = mapped_column(primary_key=True)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    run_id: Mapped[UUID] = mapped_column(nullable=False)
+    citation_id: Mapped[UUID] = mapped_column(nullable=False)
+    rank: Mapped[int] = mapped_column(primary_key=True)
     created_at: Mapped[datetime] = utc_timestamp()
 
 

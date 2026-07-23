@@ -12,6 +12,9 @@ from app.rag_settings import RagConfigurationError, RagSettings
 DEFAULT_DOCUMENT_MAX_BYTES = 26_214_400
 DEFAULT_DEPARTMENT_DOCUMENT_QUOTA_BYTES = 1_073_741_824
 DOCUMENT_MAX_BYTES_HARD_LIMIT = 104_857_600
+DEFAULT_RAG_FEEDBACK_RETENTION_DAYS = 180
+MIN_RAG_FEEDBACK_RETENTION_DAYS = 30
+MAX_RAG_FEEDBACK_RETENTION_DAYS = 730
 
 ALLOWED_HS256_ENVIRONMENTS = frozenset({"local", "development", "dev", "test"})
 DISALLOWED_AUTH_SECRET_PLACEHOLDERS = frozenset(
@@ -44,6 +47,7 @@ class Settings:
     auth_secret: str | None
     document_max_bytes: int
     department_document_quota_bytes: int
+    rag_feedback_retention_days: int
     rag: RagSettings | None
 
     @classmethod
@@ -118,6 +122,12 @@ class Settings:
                 "DEPTSLM_DEPARTMENT_DOCUMENT_QUOTA_BYTES must be greater than or equal "
                 "to DEPTSLM_DOCUMENT_MAX_BYTES."
             )
+        rag_feedback_retention_days = _bounded_ascii_decimal(
+            "DEPTSLM_RAG_FEEDBACK_RETENTION_DAYS",
+            DEFAULT_RAG_FEEDBACK_RETENTION_DAYS,
+            minimum=MIN_RAG_FEEDBACK_RETENTION_DAYS,
+            maximum=MAX_RAG_FEEDBACK_RETENTION_DAYS,
+        )
 
         database_url = os.getenv("DATABASE_URL", "").strip()
         if not database_url:
@@ -155,6 +165,7 @@ class Settings:
             auth_secret=auth_secret,
             document_max_bytes=document_max_bytes,
             department_document_quota_bytes=department_document_quota_bytes,
+            rag_feedback_retention_days=rag_feedback_retention_days,
             rag=rag,
         )
 
@@ -168,6 +179,18 @@ def _positive_ascii_decimal(name: str, default: int) -> int:
     value = int(raw)
     if value <= 0:
         raise ConfigurationError(f"{name} must be greater than zero.")
+    return value
+
+
+def _bounded_ascii_decimal(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    if not raw or not raw.isascii() or not raw.isdecimal():
+        raise ConfigurationError(f"{name} must be an ASCII decimal integer.")
+    value = int(raw)
+    if not minimum <= value <= maximum:
+        raise ConfigurationError(f"{name} must be between {minimum} and {maximum}.")
     return value
 
 

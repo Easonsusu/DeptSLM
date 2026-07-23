@@ -2,9 +2,11 @@
 
 DeptSLM is a university departmental small language model (SLM) customization platform. It is intended to let each department build an isolated assistant from its own approved documents, retrieval index, evaluation data, and eventually its own LoRA or QLoRA adapter.
 
-> **Phase 7 status:** A one-turn, department-scoped grounded-answer endpoint, citation metadata, and an isolated offline Qwen3 runtime are under review. There is no public vector-search endpoint, conversation history, streaming, reranking, adapter selection, fine-tuning, or production deployment.
+> **Phase 8 status:** Structured department-scoped RAG feedback, a constrained reviewer queue, PostgreSQL-server-time retention, explicit purge, and transactional audit metadata are under review. Phase 7 grounded answers are complete. Feedback contains no free text or answer content and never changes RAG, evaluation, or training behavior automatically.
 
 The API manages content-free upload, extraction, and indexing metadata. For an authorized one-turn answer it creates content-free run metadata, retrieves through the fixed department-scoped Qdrant adapter, cross-checks every candidate against PostgreSQL, reads only selected verified chunks, and calls a private model runtime. After generation it reauthorizes every supplied source—including uncited evidence—against exact PostgreSQL and artifact state, while returning and persisting only cited labels. Questions, answers, prompts, retrieved text, and vectors are not persisted. PostgreSQL succeeded state remains retrieval authority.
+
+Phase 8 feedback is immutable structured PostgreSQL metadata attached to the original requester's completed run. Submit and review JSON are stream-bounded to 4,096 and 2,048 bytes before decoding, with exact reviewed identifiers. Identical canonical PUT replay is idempotent; reviewer transitions are versioned and constrained. Feedback reads assemble complete parent/reason/source metadata in one PostgreSQL statement-time snapshot. Expired feedback becomes inaccessible before explicit authorized batch purge, whose narrow settings loader requires only `DATABASE_URL` and no runtime storage mount. Persistent audit rows may outlive purged feedback, backup deletion is not claimed, and local Compose is not a production privacy or retention claim.
 
 ## Planned stack
 
@@ -176,10 +178,13 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Prompt-injection boundary](docs/prompt-injection-boundary.md)
 - [Citation model](docs/citation-model.md)
 - [Internal RAG runtime](docs/rag-runtime.md)
+- [Structured RAG feedback](docs/rag-feedback.md)
+- [Feedback review](docs/feedback-review.md)
+- [Feedback retention and purge](docs/feedback-retention.md)
 
 ## Current non-goals
 
-Phase 7 does not implement production OAuth/OIDC/SSO, platform administration, conversation persistence, history, streaming, reranking, adapter selection, LlamaIndex, OCR, malware scanning, download/preview, fine-tuning, or production deployment.
+Phase 8 does not implement free-text comments, reviewer notes, answer history or replay, automatic triage, RAG behavior changes, evaluation, training data, adapters, scheduled purge, cross-department dashboards, production OAuth/OIDC/SSO, or production deployment.
 
 ## License
 

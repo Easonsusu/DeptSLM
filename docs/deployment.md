@@ -1,8 +1,8 @@
 # Deployment and Local Development
 
-## Phase 7 status
+## Phase 8 status
 
-DeptSLM is not production ready. Phase 7 adds one-turn grounded answers, content-free citation metadata, and a private offline model runtime to the Phase 6 retrieval-authority foundation. Public vector search, conversations, history, streaming, reranking, malware scanning, OCR, training, production identity/storage, secrets management, backups, clustering, and production operations remain deferred.
+DeptSLM is not production ready. Phase 8 adds PostgreSQL-only structured feedback, review, retention, and explicit purge to the completed Phase 7 grounded-answer boundary. Public vector search, conversations, history, streaming, reranking, automated evaluation, scheduled purge, malware scanning, OCR, training, production identity/storage, secrets management, backups, clustering, and production operations remain deferred.
 
 ## Planned local services
 
@@ -63,6 +63,7 @@ Set these values as appropriate for the local environment:
 - `DEPTSLM_EMBEDDING_MODEL_REVISION`: exact immutable reviewed SHA
 - `DEPTSLM_GENERATION_MODEL_REVISION`: exact immutable reviewed generation SHA
 - `DEPTSLM_RAG_RUNTIME_TOKEN`: long non-placeholder untracked internal bearer token
+- `DEPTSLM_RAG_FEEDBACK_RETENTION_DAYS`: strict feedback retention in days, default `180`, allowed `30` through `730`
 - `API_PORT`: API host port, normally `8000`
 - `WEB_PORT`: web host port, normally `3000`
 - `ENVIRONMENT`: local environment name, normally `development`
@@ -163,6 +164,10 @@ Stop local services with:
 
 Do not add a volume-deletion flag unless destruction of local service state is explicitly intended and reviewed.
 
+## Structured-feedback retention
+
+Compose passes `DEPTSLM_RAG_FEEDBACK_RETENTION_DAYS` only to the API. It adds no service, secret, mount, or automatic job. Expired feedback is hidden using one PostgreSQL statement-time visibility snapshot before physical deletion. An active same-department system or department administrator must invoke `python -m app.admin purge-rag-feedback` explicitly. That command loads only `DATABASE_URL`; it neither requires nor inspects `DEPTSLM_DATA_DIR` or any runtime mount. See [feedback-retention.md](feedback-retention.md). Local Compose scheduling, PostgreSQL storage, backups, and audit retention are not a production privacy or retention guarantee.
+
 ## Runtime mounts and persistence
 
 Services that write file artifacts must receive `DEPTSLM_DATA_DIR` explicitly and use only its approved subdirectories. A missing value must fail clearly; Compose or application code must not create fallback directories in the checkout. Department-owned paths must be isolated by a validated `department_id` in future phases.
@@ -177,7 +182,7 @@ CI must not depend on a developer's Google Drive or reuse real data. It should c
 
 GitHub Actions provides PostgreSQL 16 and Qdrant 1.13.4 with isolated test credentials. Locally, run `python -m pytest -m "not postgres and not qdrant"` without services, or provide isolated PostgreSQL/Qdrant settings. Neither suite silently skips in CI, and the fake embedding provider is accepted only with exact `ENVIRONMENT=test`. CI never downloads the real model.
 
-CI builds API, extraction-worker, indexing-worker, and private RAG-runtime targets. It verifies migration `0005_phase7_rag_answers`, confirms dependency/credential isolation and absence of model weights, runs extraction/indexing empty-queue and fake-runtime request smoke tests, exercises Qdrant bootstrap/tenant isolation/retrieval authority, and runs PostgreSQL migration/API/all-evidence final-revalidation coverage with temporary `uploads`, `extracted_text`, and `model_cache`. Controlled child tests prove timeout/restart, cancellation/shutdown, framing bounds, capacity release, and a child environment without the runtime token or other secrets. Fake models are allowed only in exact test mode; the real two-model smoke remains opt-in. CI never uses Google Drive or downloads a model.
+CI builds API, extraction-worker, indexing-worker, and private RAG-runtime targets. It verifies migration `0006_phase8_rag_feedback`, confirms dependency/credential isolation and absence of model weights, runs extraction/indexing empty-queue and fake-runtime request smoke tests, exercises Qdrant bootstrap/tenant isolation/retrieval authority, and runs PostgreSQL migration/API/feedback-retention coverage with temporary `uploads`, `extracted_text`, and `model_cache`. Controlled child tests prove timeout/restart, cancellation/shutdown, framing bounds, capacity release, and a child environment without the runtime token or other secrets. Feedback tests prove PostgreSQL-only isolation and content-free schemas; they require no storage mount. Fake models are allowed only in exact test mode; real-model smokes remain opt-in. CI never uses Google Drive or downloads a model.
 
 At minimum, future deployment checks should cover:
 

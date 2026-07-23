@@ -78,6 +78,8 @@ Indexing changes must revalidate the exact final Phase 5 allowlist incrementally
 
 Grounded-answer changes must keep the API as the only PostgreSQL/Qdrant authority, pass only bounded questions and selected evidence to the internal runtime, validate every model citation against server-issued labels, and persist no question, answer, prompt, evidence text, vector, hash, or path. The real two-model smoke test is explicit and opt-in only.
 
+Structured-feedback changes must remain PostgreSQL-only and content-free. Accept reviewed enums and exact same-run citation labels only; never add comments, notes, question/answer fields, browser persistence, Qdrant/runtime/artifact access, or automatic effects on RAG, evaluation, datasets, or training. Tests must cover all-role owner submission, tenant denial, immutable idempotency, reviewer transitions and version conflicts, PostgreSQL-server-time expiry, explicit authorized purge, safe audits, and frontend free-text/persistence prohibitions.
+
 ## Department and authentication safety
 
 - Derive allowed departments from authenticated membership; do not trust a client-supplied `department_id` by itself.

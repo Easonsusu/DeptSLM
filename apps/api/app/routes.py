@@ -1,4 +1,4 @@
-"""Department-scoped control-plane routes through Phase 6."""
+"""Department-scoped control-plane routes through Phase 8."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import asyncio
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from pydantic import ValidationError
 
 from app.audit import AuditResult
 from app.auth import AuthenticatedPrincipal
@@ -33,9 +34,23 @@ from app.extraction_services import (
     read_extraction,
     retry_extraction,
 )
+from app.feedback_request_body import (
+    FEEDBACK_REVIEW_BODY_MAX_BYTES,
+    FEEDBACK_SUBMIT_BODY_MAX_BYTES,
+    FeedbackBodyError,
+    read_bounded_json_object,
+)
 from app.rag_answer_services import (
     RagAnswerServiceError,
     answer_question,
+)
+from app.rag_feedback_domain import FeedbackSentiment, FeedbackStatus
+from app.rag_feedback_services import (
+    list_feedback_for_review,
+    read_feedback_for_review,
+    read_own_feedback,
+    review_feedback,
+    submit_feedback,
 )
 from app.schemas import (
     ChunkListResponse,
@@ -54,6 +69,10 @@ from app.schemas import (
     MembershipUpdate,
     RagAnswerRequest,
     RagAnswerResponse,
+    RagFeedbackListResponse,
+    RagFeedbackResponse,
+    RagFeedbackReviewRequest,
+    RagFeedbackSubmitRequest,
     VectorIndexingListResponse,
     VectorIndexingResponse,
 )
@@ -86,6 +105,17 @@ def _raise(error: ServiceError) -> None:
 
 def _raise_upload(error: UploadError) -> None:
     raise HTTPException(error.status_code, error.detail) from None
+
+
+async def _validated_feedback_body(request: Request, model, *, maximum_bytes: int):
+    try:
+        payload = await read_bounded_json_object(request, maximum_bytes=maximum_bytes)
+    except FeedbackBodyError as error:
+        raise HTTPException(error.status_code, error.detail) from None
+    try:
+        return model.model_validate(payload)
+    except ValidationError:
+        raise HTTPException(422, "Invalid feedback request") from None
 
 
 @router.get("/departments", response_model=DepartmentListResponse, tags=["departments"])
@@ -660,3 +690,134 @@ async def post_rag_answer(
         _raise(error)
     except RagAnswerServiceError:
         raise HTTPException(503, "Grounded answer unavailable") from None
+
+
+@router.put(
+    "/departments/{department_id}/rag/answers/{run_id}/feedback",
+    response_model=RagFeedbackResponse,
+    tags=["rag-feedback"],
+)
+async def put_rag_feedback(
+    run_id: UUID,
+    response: Response,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> RagFeedbackResponse:
+    body = await _validated_feedback_body(
+        request,
+        RagFeedbackSubmitRequest,
+        maximum_bytes=FEEDBACK_SUBMIT_BODY_MAX_BYTES,
+    )
+    try:
+        result = submit_feedback(
+            session,
+            principal,
+            request_scope,
+            run_id,
+            sentiment=body.sentiment,
+            reason_codes=[item.value for item in body.reason_codes],
+            source_ids=[item.value for item in body.source_ids],
+            retention_days=request.app.state.settings.rag_feedback_retention_days,
+        )
+        response.status_code = 201 if result.created else 200
+        return result.response
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/rag/answers/{run_id}/feedback",
+    response_model=RagFeedbackResponse,
+    tags=["rag-feedback"],
+)
+def get_own_rag_feedback(
+    run_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> RagFeedbackResponse:
+    try:
+        return read_own_feedback(session, principal, request_scope, run_id)
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/rag/feedback",
+    response_model=RagFeedbackListResponse,
+    tags=["rag-feedback-review"],
+)
+def get_rag_feedback_queue(
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    status_filter: Annotated[FeedbackStatus | None, Query(alias="status")] = None,
+    sentiment: FeedbackSentiment | None = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    cursor: Annotated[str | None, Query(max_length=1024)] = None,
+) -> RagFeedbackListResponse:
+    try:
+        page = list_feedback_for_review(
+            session,
+            principal,
+            request_scope,
+            status=status_filter,
+            sentiment=sentiment,
+            limit=limit,
+            cursor=cursor,
+        )
+        return RagFeedbackListResponse(items=list(page.items), next_cursor=page.next_cursor)
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/rag/feedback/{feedback_id}",
+    response_model=RagFeedbackResponse,
+    tags=["rag-feedback-review"],
+)
+def get_rag_feedback_for_review(
+    feedback_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> RagFeedbackResponse:
+    try:
+        return read_feedback_for_review(session, principal, request_scope, feedback_id)
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.patch(
+    "/departments/{department_id}/rag/feedback/{feedback_id}",
+    response_model=RagFeedbackResponse,
+    tags=["rag-feedback-review"],
+)
+async def patch_rag_feedback_for_review(
+    feedback_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> RagFeedbackResponse:
+    body = await _validated_feedback_body(
+        request,
+        RagFeedbackReviewRequest,
+        maximum_bytes=FEEDBACK_REVIEW_BODY_MAX_BYTES,
+    )
+    try:
+        return review_feedback(
+            session,
+            principal,
+            request_scope,
+            feedback_id,
+            new_status=body.status,
+            resolution_code=(
+                body.resolution_code.value if body.resolution_code is not None else None
+            ),
+            expected_version=body.expected_version,
+        )
+    except ServiceError as error:
+        _raise(error)

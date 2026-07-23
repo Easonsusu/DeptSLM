@@ -156,7 +156,7 @@ jobs:
             sleep 1
           done
           python -m alembic upgrade head
-          test "$(python -m alembic current | awk '{print $1}')" = "0005_phase7_rag_answers"
+          test "$(python -m alembic current | awk '{print $1}')" = "0006_phase8_rag_feedback"
           python -m pytest
       - name: Run one-shot worker smoke test
         working-directory: apps/api
@@ -223,6 +223,7 @@ jobs:
           assert pathlib.Path("/app/alembic/versions/0003_phase5_extraction.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0004_phase6_vector_indexing.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0005_phase7_rag_answers.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0006_phase8_rag_feedback.py").is_file()
           import importlib.util
           assert importlib.util.find_spec("pypdf") is None
           assert importlib.util.find_spec("qdrant_client") is not None
@@ -334,6 +335,17 @@ jobs:
           grep -R -F 'DEPTSLM_RAG_RUNTIME_TOKEN' services/rag-runtime/deptslm_runtime/settings.py >/dev/null
           grep -R -F 'GENERATION_MODEL_CONTEXT_TOKENS = 40960' apps/api/app/rag_domain.py >/dev/null
           grep -R -F 'MAX_GENERATION_INPUT_TOKENS = 8192' apps/api/app/rag_domain.py >/dev/null
+      - name: Check Phase 8 feedback isolation
+        run: |
+          ! grep -E -i 'qdrant|RagRuntimeClient|Phase5ArtifactReader|selected_chunk_reader|torch|transformers|sentence_transformers|model_store' apps/api/app/rag_feedback_*.py
+          ! grep -E 'from app\.settings import|from app import settings|import app\.settings|DEPTSLM_DATA_DIR|DocumentStorage|RagSettings|Qdrant|model_cache|uploads|extracted_text' apps/api/app/feedback_purge.py
+          grep -F 'FeedbackPurgeSettings.from_environment()' apps/api/app/admin.py >/dev/null
+          grep -F 'FEEDBACK_SUBMIT_BODY_MAX_BYTES = 4096' apps/api/app/feedback_request_body.py >/dev/null
+          grep -F 'FEEDBACK_REVIEW_BODY_MAX_BYTES = 2048' apps/api/app/feedback_request_body.py >/dev/null
+          grep -F 'func.statement_timestamp()' apps/api/app/rag_feedback_services.py >/dev/null
+          ! grep -R -E 'dangerouslySetInnerHTML|localStorage|sessionStorage|indexedDB' apps/web/app
+          ! grep -R -E '<textarea|type="text"' apps/web/app/components/RagFeedbackPanel.tsx apps/web/app/components/FeedbackReviewQueue.tsx
+          ! grep -E '@router\.(get|post).*search|/search|query_vector' apps/api/app/routes.py apps/api/app/schemas.py
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then

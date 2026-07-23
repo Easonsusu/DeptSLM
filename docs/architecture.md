@@ -2,7 +2,7 @@
 
 ## Status and boundaries
 
-Phase 7 adds one-turn department-scoped grounded answers to the Phase 6 retrieval-authority boundary. The API owns authorization, Qdrant retrieval, PostgreSQL candidate validation, selected artifact reads, strict citation validation, and final revalidation. A private offline runtime owns query embedding and generation only. Public vector search, conversations, streaming, reranking, training, and adapter flows remain unimplemented.
+Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or the private runtime. Public vector search, conversations, streaming, reranking, evaluation, training, and adapter flows remain unimplemented.
 
 ## System context
 
@@ -73,7 +73,7 @@ The arrows describe intended responsibilities and do not imply that a production
 
 ### PostgreSQL
 
-PostgreSQL stores identities, departments, memberships, documents, extraction/chunk metadata, vector-indexing job metadata, and safe mutation audit events. It is the reviewed extraction/indexing queue: workers claim with `SKIP LOCKED` and finite non-revivable leases. Text, vectors, credentials, and filesystem paths never enter PostgreSQL.
+PostgreSQL stores identities, departments, memberships, documents, extraction/chunk metadata, vector-indexing and RAG run metadata, structured feedback metadata, and safe mutation audit events. It is the reviewed extraction/indexing queue: workers claim with `SKIP LOCKED` and finite non-revivable leases. Feedback uses exact run/citation foreign keys, immutable submission, optimistic review versions, and server-time expiry. Feedback response statements aggregate the parent, run outcome, reasons, and sources in one PostgreSQL snapshot, preventing purge races from producing partial responses. The purge command has a database-only settings loader and never inspects runtime storage. Questions, answers, prompts, evidence, text, vectors, credentials, and filesystem paths never enter PostgreSQL.
 
 ### Qdrant
 

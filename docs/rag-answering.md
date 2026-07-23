@@ -10,7 +10,7 @@ POST /departments/{department_id}/rag/answers
 
 All five active same-department roles may call it. The path value is only a selector: the API resolves the exact issuer/subject and current membership in PostgreSQL at admission and again before completion. `system_admin` has no cross-department bypass. The endpoint does not expose vector search, query vectors, chunks, prompts, or model controls.
 
-The request contains only `question`, normalized with Unicode NFC, trimmed, checked by the shared Unicode policy, and limited to 2,000 characters. The policy rejects format controls and citation-spoofing characters while retaining variation selectors, ordinary accents, and ordinary emoji. The response is either an answered result with reviewed citation metadata or the exact insufficient-information message. There is no conversation, message history, streaming, feedback, reranking, adapter selection, or training behavior.
+The request contains only `question`, normalized with Unicode NFC, trimmed, checked by the shared Unicode policy, and limited to 2,000 characters. The policy rejects format controls and citation-spoofing characters while retaining variation selectors, ordinary accents, and ordinary emoji. The response is either an answered result with reviewed citation metadata or the exact insufficient-information message. There is no conversation, message history, streaming, reranking, adapter selection, or training behavior. Phase 8 feedback is a separate structured PostgreSQL workflow: it stores no question or answer and cannot change this retrieval or generation path.
 
 ## Retrieval and selection
 
@@ -52,4 +52,4 @@ The same safe result is accepted from the strict model contract. The service nev
 
 ## Limitations
 
-The prompt-injection defense is layered validation, not a proof that a language model cannot be manipulated. Threshold calibration, quality evaluation, production rate limiting, TLS, secrets management, model distribution, observability, reconciliation, and hardware sizing remain deferred. See [prompt-injection-boundary.md](prompt-injection-boundary.md), [citation-model.md](citation-model.md), and [rag-runtime.md](rag-runtime.md).
+The prompt-injection defense is layered validation, not a proof that a language model cannot be manipulated. Structured user feedback does not establish correctness and is not an evaluation result or training data. Threshold calibration, Phase 9 quality evaluation, production rate limiting, TLS, secrets management, model distribution, observability, reconciliation, and hardware sizing remain deferred. See [prompt-injection-boundary.md](prompt-injection-boundary.md), [citation-model.md](citation-model.md), [rag-feedback.md](rag-feedback.md), and [rag-runtime.md](rag-runtime.md).
