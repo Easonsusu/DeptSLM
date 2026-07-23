@@ -27,6 +27,19 @@ from app.document_services import (
 )
 from app.document_storage import DocumentStorageError
 from app.document_upload import UploadError, parse_upload_metadata, stream_upload
+from app.evaluation_domain import MAX_CANCEL_BODY_BYTES, MAX_RUN_BODY_BYTES
+from app.evaluation_request_body import (
+    EvaluationBodyError,
+    read_bounded_evaluation_object,
+)
+from app.evaluation_services import (
+    cancel_evaluation_run,
+    enqueue_evaluation_run,
+    list_evaluation_runs,
+    list_evaluation_suites,
+    read_evaluation_run,
+    read_evaluation_suite,
+)
 from app.extraction_services import (
     enqueue_extraction,
     list_chunks,
@@ -61,6 +74,12 @@ from app.schemas import (
     DepartmentUpdate,
     DocumentListResponse,
     DocumentResponse,
+    EvaluationRunCancelRequest,
+    EvaluationRunCreateRequest,
+    EvaluationRunListResponse,
+    EvaluationRunResponse,
+    EvaluationSuiteListResponse,
+    EvaluationSuiteResponse,
     ExtractionListResponse,
     ExtractionResponse,
     MembershipCreate,
@@ -116,6 +135,17 @@ async def _validated_feedback_body(request: Request, model, *, maximum_bytes: in
         return model.model_validate(payload)
     except ValidationError:
         raise HTTPException(422, "Invalid feedback request") from None
+
+
+async def _validated_evaluation_body(request: Request, model, *, maximum_bytes: int):
+    try:
+        payload = await read_bounded_evaluation_object(request, maximum_bytes=maximum_bytes)
+    except EvaluationBodyError as error:
+        raise HTTPException(error.status_code, error.detail) from None
+    try:
+        return model.model_validate(payload)
+    except ValidationError:
+        raise HTTPException(422, "Invalid evaluation request") from None
 
 
 @router.get("/departments", response_model=DepartmentListResponse, tags=["departments"])
@@ -818,6 +848,141 @@ async def patch_rag_feedback_for_review(
                 body.resolution_code.value if body.resolution_code is not None else None
             ),
             expected_version=body.expected_version,
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/evaluation-suites",
+    response_model=EvaluationSuiteListResponse,
+    tags=["evaluations"],
+)
+def get_evaluation_suites(
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    cursor: Annotated[str | None, Query(max_length=1024)] = None,
+) -> EvaluationSuiteListResponse:
+    try:
+        page = list_evaluation_suites(session, principal, request_scope, limit=limit, cursor=cursor)
+        return EvaluationSuiteListResponse(items=list(page.items), next_cursor=page.next_cursor)
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/evaluation-suites/{suite_id}",
+    response_model=EvaluationSuiteResponse,
+    tags=["evaluations"],
+)
+def get_evaluation_suite(
+    suite_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> EvaluationSuiteResponse:
+    try:
+        return EvaluationSuiteResponse.model_validate(
+            read_evaluation_suite(session, principal, request_scope, suite_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/evaluation-suites/{suite_id}/runs",
+    response_model=EvaluationRunResponse,
+    status_code=202,
+    tags=["evaluations"],
+)
+async def post_evaluation_run(
+    suite_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> EvaluationRunResponse:
+    await _validated_evaluation_body(
+        request, EvaluationRunCreateRequest, maximum_bytes=MAX_RUN_BODY_BYTES
+    )
+    try:
+        return EvaluationRunResponse.model_validate(
+            enqueue_evaluation_run(
+                session,
+                principal,
+                request_scope,
+                suite_id,
+                code_revision=request.app.state.settings.evaluation_code_revision,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/evaluation-runs",
+    response_model=EvaluationRunListResponse,
+    tags=["evaluations"],
+)
+def get_evaluation_runs(
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    cursor: Annotated[str | None, Query(max_length=1024)] = None,
+) -> EvaluationRunListResponse:
+    try:
+        page = list_evaluation_runs(session, principal, request_scope, limit=limit, cursor=cursor)
+        return EvaluationRunListResponse(items=list(page.items), next_cursor=page.next_cursor)
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/evaluation-runs/{run_id}",
+    response_model=EvaluationRunResponse,
+    tags=["evaluations"],
+)
+def get_evaluation_run(
+    run_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> EvaluationRunResponse:
+    try:
+        return EvaluationRunResponse.model_validate(
+            read_evaluation_run(session, principal, request_scope, run_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/evaluation-runs/{run_id}/cancel",
+    response_model=EvaluationRunResponse,
+    tags=["evaluations"],
+)
+async def post_evaluation_run_cancel(
+    run_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> EvaluationRunResponse:
+    body = await _validated_evaluation_body(
+        request, EvaluationRunCancelRequest, maximum_bytes=MAX_CANCEL_BODY_BYTES
+    )
+    try:
+        return EvaluationRunResponse.model_validate(
+            cancel_evaluation_run(
+                session,
+                principal,
+                request_scope,
+                run_id,
+                expected_version=body.expected_version,
+            )
         )
     except ServiceError as error:
         _raise(error)

@@ -44,14 +44,15 @@ This roadmap separates foundational safety work from product implementation. A l
 - Add source-grounded Qwen3 answers, citation metadata, prompt-injection defenses, and insufficient-information behavior.
 - Phase 7 merged its reviewed one-turn grounded-answer, citation, prompt-injection, and insufficient-information boundaries.
 
-## Phase 8 — Structured RAG feedback review (current; not completed)
+## Phase 8 — Structured RAG feedback review (completed)
 
 - Add immutable department-scoped structured feedback, constrained review transitions, PostgreSQL-server-time retention, explicit purge, and transactional audit metadata.
-- Phase 8 remains current until its implementation is reviewed and merged. It does not add free text, evaluation, training data, automatic RAG changes, scheduled purge, or Phase 9 behavior.
+- Phase 8 merged its reviewed feedback isolation, retention, purge, and review boundaries.
 
-## Phase 9 — Evaluation runner
+## Phase 9 — Evaluation runner (current; not completed)
 
-- Add reproducible retrieval and answer evaluations with external result storage and explicit quality gates.
+- Add department-scoped immutable external suites, exact production-policy reuse, deterministic retrieval and answer metrics, content-free result artifacts, and explicit Decimal quality gates.
+- Phase 9 remains current until this implementation is reviewed and merged. It adds no LLM judge, feedback-derived data, production changes, training data, or Phase 10 behavior.
 
 ## Phase 10 — SFT dataset builder
 

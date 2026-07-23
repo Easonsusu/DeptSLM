@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,7 @@ class Settings:
     document_max_bytes: int
     department_document_quota_bytes: int
     rag_feedback_retention_days: int
+    evaluation_code_revision: str | None
     rag: RagSettings | None
 
     @classmethod
@@ -128,6 +130,15 @@ class Settings:
             minimum=MIN_RAG_FEEDBACK_RETENTION_DAYS,
             maximum=MAX_RAG_FEEDBACK_RETENTION_DAYS,
         )
+        evaluation_code_revision = _optional_environment("DEPTSLM_EVALUATION_CODE_REVISION")
+        if (
+            evaluation_code_revision is not None
+            and re.fullmatch(r"[0-9a-f]{40}", evaluation_code_revision) is None
+        ):
+            raise ConfigurationError(
+                "DEPTSLM_EVALUATION_CODE_REVISION must be an exact lowercase "
+                "40-character Git commit SHA."
+            )
 
         database_url = os.getenv("DATABASE_URL", "").strip()
         if not database_url:
@@ -166,6 +177,7 @@ class Settings:
             document_max_bytes=document_max_bytes,
             department_document_quota_bytes=department_document_quota_bytes,
             rag_feedback_retention_days=rag_feedback_retention_days,
+            evaluation_code_revision=evaluation_code_revision,
             rag=rag,
         )
 

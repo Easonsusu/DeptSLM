@@ -139,6 +139,9 @@ Tests and CI must not depend on Google Drive. Each run should create a fresh tem
 - failed, stale, shutdown, and reclaimed indexing attempts clean only their exact vector attempt and never become trusted.
 - grounded-answer tests use temporary verified extraction artifacts and fake offline models; no question, answer, prompt, evidence, vector, or raw model output remains in the checkout.
 - feedback tests use isolated PostgreSQL state only and verify that no free text, feedback content artifact, Qdrant/runtime access, or browser persistence is introduced.
+- evaluation tests create temporary `extracted_text` and `eval_results` roots, use synthetic suites and a fake runtime, and prove that questions, accepted/generated answers, prompts, evidence, vectors, and raw output never enter PostgreSQL or result artifacts.
+
+Phase 9 final suite files are exactly `manifest.json` and `cases.jsonl`; final run files are exactly `manifest.json`, `summary.json`, and `case_results.jsonl`. Suite content remains private and has no public download API. Run artifacts are numeric and content-free. UUID-only department/resource paths, private permissions, no-follow checks, exclusive staging, digest verification, exact-attempt cleanup, and atomic rename are required. External publication and PostgreSQL state are compensating rather than transactionally atomic.
 
 ## Google Drive limitations
 

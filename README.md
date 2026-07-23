@@ -2,11 +2,13 @@
 
 DeptSLM is a university departmental small language model (SLM) customization platform. It is intended to let each department build an isolated assistant from its own approved documents, retrieval index, evaluation data, and eventually its own LoRA or QLoRA adapter.
 
-> **Phase 8 status:** Structured department-scoped RAG feedback, a constrained reviewer queue, PostgreSQL-server-time retention, explicit purge, and transactional audit metadata are under review. Phase 7 grounded answers are complete. Feedback contains no free text or answer content and never changes RAG, evaluation, or training behavior automatically.
+> **Phase 9 status:** The internal department-scoped evaluation runner is under review. It imports immutable external suites, reuses the exact Phase 7 production policy, computes deterministic metrics and explicit Decimal gates, and publishes content-free numeric results. Phase 8 feedback is complete and is not evaluation ground truth.
 
 The API manages content-free upload, extraction, and indexing metadata. For an authorized one-turn answer it creates content-free run metadata, retrieves through the fixed department-scoped Qdrant adapter, cross-checks every candidate against PostgreSQL, reads only selected verified chunks, and calls a private model runtime. After generation it reauthorizes every supplied source—including uncited evidence—against exact PostgreSQL and artifact state, while returning and persisting only cited labels. Questions, answers, prompts, retrieved text, and vectors are not persisted. PostgreSQL succeeded state remains retrieval authority.
 
 Phase 8 feedback is immutable structured PostgreSQL metadata attached to the original requester's completed run. Submit and review JSON are stream-bounded to 4,096 and 2,048 bytes before decoding, with exact reviewed identifiers. Identical canonical PUT replay is idempotent; reviewer transitions are versioned and constrained. Feedback reads assemble complete parent/reason/source metadata in one PostgreSQL statement-time snapshot. Expired feedback becomes inaccessible before explicit authorized batch purge, whose narrow settings loader requires only `DATABASE_URL` and no runtime storage mount. Persistent audit rows may outlive purged feedback, backup deletion is not claimed, and local Compose is not a production privacy or retention claim.
+
+Phase 9 evaluation suite questions and accepted answers remain only in immutable department-scoped external suite artifacts. PostgreSQL stores metadata and numeric metrics only; generated answers, prompts, evidence, vectors, and runtime output are not persisted anywhere. The evaluator uses the exact production retrieval, prompt, generation, citation, and final-authority path. It has no model stack or Hugging Face token and delegates model work to the existing private runtime. Fixed seeds improve repeatability but do not guarantee bit-identical generation across execution environments. No gate changes production automatically.
 
 ## Planned stack
 
@@ -142,6 +144,18 @@ Phase 7 additionally requires a long untracked `DEPTSLM_RAG_RUNTIME_TOKEN` and t
 
 The generation contract is `Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca`, non-thinking mode, an exact 40,960-token model context, an 8,192-token operational input cap, and at most 512 new tokens; query embedding is capped at 2,048 tokens. Inputs are tokenized completely and never silently truncated. The internal runtime receives no database or Qdrant credentials and is not published on a host port. Its HTTP process supervises one persistent killable model child with separate startup and operation clocks. Over-token input is recoverable without reload; fatal timeout, cancellation, disconnect, shutdown, protocol, or child failures terminate and reap the process group and permit one bounded background replacement. Readiness is false and requests fail fast during replacement. The child receives neither the runtime bearer token nor other secrets or proxy settings.
 
+Validate or import a reviewed suite and run the evaluator with:
+
+```bash
+./scripts/compose.sh run --rm api python -m app.evaluation_admin import-suite \
+  --department-id <UUID> --actor-issuer <issuer> --actor-subject <subject> \
+  --source-directory <absolute-path>
+./scripts/compose.sh run --rm evaluator-worker \
+  python -m deptslm_worker.evaluator --once
+```
+
+The import command is dry-run unless `--apply` is supplied. Suite inputs are limited to 500 cases and 16 MiB.
+
 ## Safety and data isolation
 
 - Future department-owned records, documents, indexes, jobs, adapters, and conversations must be scoped and authorized by `department_id` at every storage and service boundary.
@@ -181,10 +195,15 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Structured RAG feedback](docs/rag-feedback.md)
 - [Feedback review](docs/feedback-review.md)
 - [Feedback retention and purge](docs/feedback-retention.md)
+- [Evaluation suites](docs/evaluation-suites.md)
+- [Evaluation runner](docs/evaluation-runner.md)
+- [Evaluation metrics](docs/evaluation-metrics.md)
+- [Evaluation quality gates](docs/evaluation-quality-gates.md)
+- [Evaluation artifacts](docs/evaluation-artifacts.md)
 
 ## Current non-goals
 
-Phase 8 does not implement free-text comments, reviewer notes, answer history or replay, automatic triage, RAG behavior changes, evaluation, training data, adapters, scheduled purge, cross-department dashboards, production OAuth/OIDC/SSO, or production deployment.
+Phase 9 does not implement LLM judging, semantic grading, public raw results, a frontend dashboard, feedback-derived cases, automatic threshold or RAG changes, training datasets, SFT, adapters, model promotion, cross-department benchmarking, production OAuth/OIDC/SSO, or production deployment.
 
 ## License
 

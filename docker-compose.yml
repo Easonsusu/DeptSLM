@@ -46,6 +46,7 @@ services:
       DEPTSLM_RAG_MIN_SCORE: "${DEPTSLM_RAG_MIN_SCORE:-0.45}"
       DEPTSLM_RAG_REQUEST_TIMEOUT_SECONDS: "${DEPTSLM_RAG_REQUEST_TIMEOUT_SECONDS:-30}"
       DEPTSLM_RAG_FEEDBACK_RETENTION_DAYS: "${DEPTSLM_RAG_FEEDBACK_RETENTION_DAYS:-180}"
+      DEPTSLM_EVALUATION_CODE_REVISION: "${DEPTSLM_EVALUATION_CODE_REVISION:-}"
       ENVIRONMENT: "${ENVIRONMENT:-development}"
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
@@ -59,6 +60,11 @@ services:
         source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/extracted_text"
         target: /runtime/deptslm/extracted_text
         read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/eval_results"
+        target: /runtime/deptslm/eval_results
         bind:
           create_host_path: false
     depends_on:
@@ -189,6 +195,63 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_started
+
+  evaluator-worker:
+    build:
+      context: .
+      dockerfile: services/rag-worker/Dockerfile
+      target: evaluator
+    command: ["python", "-m", "deptslm_worker.evaluator", "--poll"]
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      DEPTSLM_STORAGE_READ_ONLY: "1"
+      DEPTSLM_QDRANT_URL: "${DEPTSLM_QDRANT_URL:-http://qdrant:6333}"
+      DEPTSLM_QDRANT_API_KEY: "${DEPTSLM_QDRANT_API_KEY:?Set a non-placeholder Qdrant API key in the untracked .env file}"
+      DEPTSLM_QDRANT_COLLECTION: "${DEPTSLM_QDRANT_COLLECTION:-deptslm_chunks_qwen3_0_6b_1024_v1}"
+      DEPTSLM_QDRANT_TIMEOUT_SECONDS: "${DEPTSLM_QDRANT_TIMEOUT_SECONDS:-30}"
+      DEPTSLM_RAG_RUNTIME_URL: "${DEPTSLM_RAG_RUNTIME_URL:-http://rag-runtime:8010}"
+      DEPTSLM_RAG_RUNTIME_TOKEN: "${DEPTSLM_RAG_RUNTIME_TOKEN:?Set a separate RAG runtime token in the untracked .env file}"
+      DEPTSLM_RAG_CANDIDATE_LIMIT: "${DEPTSLM_RAG_CANDIDATE_LIMIT:-20}"
+      DEPTSLM_RAG_MAX_SOURCES: "${DEPTSLM_RAG_MAX_SOURCES:-8}"
+      DEPTSLM_RAG_MAX_SOURCES_PER_DOCUMENT: "${DEPTSLM_RAG_MAX_SOURCES_PER_DOCUMENT:-2}"
+      DEPTSLM_RAG_MAX_EVIDENCE_CHARS: "${DEPTSLM_RAG_MAX_EVIDENCE_CHARS:-6000}"
+      DEPTSLM_RAG_MIN_SCORE: "${DEPTSLM_RAG_MIN_SCORE:-0.45}"
+      DEPTSLM_RAG_REQUEST_TIMEOUT_SECONDS: "${DEPTSLM_RAG_REQUEST_TIMEOUT_SECONDS:-30}"
+      DEPTSLM_EVALUATION_WORKER_ID: "${DEPTSLM_EVALUATION_WORKER_ID:-00000000-0000-0000-0000-000000000009}"
+      DEPTSLM_EVALUATION_POLL_SECONDS: "${DEPTSLM_EVALUATION_POLL_SECONDS:-5}"
+      DEPTSLM_EVALUATION_LEASE_SECONDS: "${DEPTSLM_EVALUATION_LEASE_SECONDS:-300}"
+      DEPTSLM_EVALUATION_HEARTBEAT_SECONDS: "${DEPTSLM_EVALUATION_HEARTBEAT_SECONDS:-30}"
+      DEPTSLM_EVALUATION_OPERATION_TIMEOUT_SECONDS: "${DEPTSLM_EVALUATION_OPERATION_TIMEOUT_SECONDS:-120}"
+      DEPTSLM_EVALUATION_CODE_REVISION: "${DEPTSLM_EVALUATION_CODE_REVISION:?Set the exact lowercase 40-character code revision}"
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/extracted_text"
+        target: /runtime/deptslm/extracted_text
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/eval_results"
+        target: /runtime/deptslm/eval_results
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      rag-runtime:
+        condition: service_started
+    networks:
+      - default
+      - rag-internal
 
   model-admin:
     profiles: ["admin"]

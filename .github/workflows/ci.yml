@@ -144,7 +144,7 @@ jobs:
         working-directory: apps/api
         run: |
           export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-data"
-          mkdir -p "$DEPTSLM_DATA_DIR/uploads" "$DEPTSLM_DATA_DIR/extracted_text" "$DEPTSLM_DATA_DIR/model_cache"
+          mkdir -p "$DEPTSLM_DATA_DIR/uploads" "$DEPTSLM_DATA_DIR/extracted_text" "$DEPTSLM_DATA_DIR/eval_results" "$DEPTSLM_DATA_DIR/model_cache"
           for attempt in {1..30}; do
             if curl --fail --silent --header "api-key: $DEPTSLM_TEST_QDRANT_API_KEY" "$DEPTSLM_TEST_QDRANT_URL/healthz" >/dev/null; then
               break
@@ -156,7 +156,7 @@ jobs:
             sleep 1
           done
           python -m alembic upgrade head
-          test "$(python -m alembic current | awk '{print $1}')" = "0006_phase8_rag_feedback"
+          test "$(python -m alembic current | awk '{print $1}')" = "0007_phase9_evaluation_runner"
           python -m pytest
       - name: Run one-shot worker smoke test
         working-directory: apps/api
@@ -178,6 +178,21 @@ jobs:
           mkdir -p "$DEPTSLM_DATA_DIR/extracted_text" "$DEPTSLM_DATA_DIR/model_cache"
           python -m deptslm_worker.vector_admin bootstrap
           python -m deptslm_worker.indexer --once
+      - name: Run one-shot evaluator worker smoke test
+        working-directory: apps/api
+        env:
+          ENVIRONMENT: test
+          DEPTSLM_QDRANT_URL: http://localhost:6333
+          DEPTSLM_QDRANT_API_KEY: phase6-ci-qdrant-key-0123456789
+          DEPTSLM_QDRANT_COLLECTION: deptslm_chunks_qwen3_0_6b_1024_v1
+          DEPTSLM_RAG_RUNTIME_URL: http://localhost:8010
+          DEPTSLM_RAG_RUNTIME_TOKEN: phase9-ci-runtime-token-0123456789-abcdef
+          DEPTSLM_EVALUATION_WORKER_ID: 00000000-0000-0000-0000-000000000009
+          DEPTSLM_EVALUATION_CODE_REVISION: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        run: |
+          export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-evaluator-smoke"
+          mkdir -p "$DEPTSLM_DATA_DIR/extracted_text" "$DEPTSLM_DATA_DIR/eval_results"
+          python -m deptslm_worker.evaluator --once
       - name: Verify API checks leave the checkout clean
         shell: bash
         run: |
@@ -224,6 +239,9 @@ jobs:
           assert pathlib.Path("/app/alembic/versions/0004_phase6_vector_indexing.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0005_phase7_rag_answers.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0006_phase8_rag_feedback.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0007_phase9_evaluation_runner.py").is_file()
+          import app.evaluation_admin
+          import app.evaluation_services
           import importlib.util
           assert importlib.util.find_spec("pypdf") is None
           assert importlib.util.find_spec("qdrant_client") is not None
@@ -258,6 +276,25 @@ jobs:
           weight_matches="$(docker run --rm --entrypoint sh deptslm-indexing-worker-ci -c 'find / -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) ! -path "/usr/local/lib/python3.12/site-packages/distutils-precedence.pth" -print 2>/dev/null || true')"
           if [[ -n "$weight_matches" ]]; then
             printf 'Forbidden model-weight-like files in indexing image:\n%s\n' "$weight_matches" >&2
+            exit 1
+          fi
+      - name: Build and inspect evaluator worker image
+        run: |
+          docker build --target evaluator --tag deptslm-evaluator-worker-ci --file services/rag-worker/Dockerfile .
+          docker run --rm --entrypoint python deptslm-evaluator-worker-ci -I -c '
+          import importlib.util
+          import deptslm_worker.evaluator
+          import deptslm_worker.evaluation_pipeline
+          import deptslm_worker.evaluation_queue
+          import qdrant_client
+          assert importlib.util.find_spec("torch") is None
+          assert importlib.util.find_spec("transformers") is None
+          assert importlib.util.find_spec("sentence_transformers") is None
+          assert importlib.util.find_spec("huggingface_hub") is None
+          '
+          weight_matches="$(docker run --rm --entrypoint sh deptslm-evaluator-worker-ci -c 'find / -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) ! -path "/usr/local/lib/python3.12/site-packages/distutils-precedence.pth" -print 2>/dev/null || true')"
+          if [[ -n "$weight_matches" ]]; then
+            printf 'Forbidden model-weight-like files in evaluator image:\n%s\n' "$weight_matches" >&2
             exit 1
           fi
       - name: Build and inspect internal RAG runtime image
@@ -346,12 +383,27 @@ jobs:
           ! grep -R -E 'dangerouslySetInnerHTML|localStorage|sessionStorage|indexedDB' apps/web/app
           ! grep -R -E '<textarea|type="text"' apps/web/app/components/RagFeedbackPanel.tsx apps/web/app/components/FeedbackReviewQueue.tsx
           ! grep -E '@router\.(get|post).*search|/search|query_vector' apps/api/app/routes.py apps/api/app/schemas.py
+      - name: Check Phase 9 evaluation isolation
+        run: |
+          ! grep -E -i 'rag_answer_feedback|rag_feedback_services|feedback_purge' apps/api/app/evaluation_*.py services/rag-worker/deptslm_worker/evaluation_*.py
+          ! grep -E -i 'torch|transformers|sentence_transformers|huggingface_hub|model_store' services/rag-worker/deptslm_worker/evaluation_*.py
+          ! grep -E 'QdrantClient|qdrant_client' services/rag-worker/deptslm_worker/evaluation_*.py
+          ! grep -E '@router\.(get|post).*evaluation.*(cases|artifact|download)' apps/api/app/routes.py
+          ! grep -E '@router\.(get|post).*search|/search|query_vector' apps/api/app/routes.py apps/api/app/schemas.py
+          grep -F 'execute_rag_policy' apps/api/app/rag_answer_services.py services/rag-worker/deptslm_worker/evaluation_pipeline.py >/dev/null
+          grep -F 'verify_canonical_suite_authority_without_open_transaction' services/rag-worker/deptslm_worker/evaluation_pipeline.py >/dev/null
+          evaluator_compose="$(sed -n '/^  evaluator-worker:/,/^  model-admin:/p' docker-compose.yml)"
+          ! grep -E 'uploads|model_cache|training_datasets|adapters|exports|HF_TOKEN|HUGGING_FACE_HUB_TOKEN' <<<"$evaluator_compose"
+          grep -F '/extracted_text' <<<"$evaluator_compose" >/dev/null
+          grep -F 'read_only: true' <<<"$evaluator_compose" >/dev/null
+          grep -F '/eval_results' <<<"$evaluator_compose" >/dev/null
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then
             export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-data"
             export DEPTSLM_QDRANT_API_KEY="phase6-ci-compose-key-0123456789"
             export DEPTSLM_RAG_RUNTIME_TOKEN="phase7-ci-runtime-token-0123456789-abcdef"
+            export DEPTSLM_EVALUATION_CODE_REVISION="9999999999999999999999999999999999999999"
             mkdir -p "$DEPTSLM_DATA_DIR"/{uploads,extracted_text,vector_snapshots,training_datasets,adapters,model_cache,eval_results,logs,exports}
             mkdir -p "$DEPTSLM_DATA_DIR/service_state/postgres"
             mkdir -p "$DEPTSLM_DATA_DIR/service_state/qdrant"

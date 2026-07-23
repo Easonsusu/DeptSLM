@@ -64,12 +64,20 @@ def _execute(models: RuntimeModels, request: Any) -> Any:
     if operation == "query_embedding" and set(payload) == {"question"}:
         question = _question(payload["question"])
         return {"vector": models.embed_question(question)}
-    if operation == "generate" and set(payload) == {"question", "evidence"}:
+    if operation == "generate" and set(payload) in (
+        {"question", "evidence"},
+        {"question", "evidence", "seed"},
+    ):
         question = _question(payload["question"])
         evidence = payload["evidence"]
         if not isinstance(evidence, list):
             raise RuntimeModelError("invalid_request")
-        return models.generate(question, evidence)
+        seed = payload.get("seed")
+        if seed is not None and (
+            isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= (1 << 63) - 1
+        ):
+            raise RuntimeModelError("invalid_request")
+        return models.generate(question, evidence, seed=seed)
     raise RuntimeModelError("invalid_request")
 
 
