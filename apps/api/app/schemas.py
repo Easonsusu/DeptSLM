@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
@@ -293,4 +294,96 @@ class RagFeedbackResponse(BaseModel):
 
 class RagFeedbackListResponse(BaseModel):
     items: list[RagFeedbackResponse]
+    next_cursor: str | None
+
+
+class EvaluationSuiteResponse(ORMResponse):
+    """Content-free suite metadata and immutable Decimal gate thresholds."""
+
+    id: UUID
+    department_id: UUID
+    status: str
+    suite_contract_version: str
+    artifact_contract_version: str
+    metric_contract_version: str
+    answer_normalization_version: str
+    gate_policy_version: str
+    case_count: int
+    answered_case_count: int
+    insufficient_case_count: int
+    retrieval_recall_at_5_min: Decimal
+    retrieval_mrr_at_20_min: Decimal
+    answer_status_accuracy_min: Decimal
+    citation_precision_min: Decimal
+    citation_recall_min: Decimal
+    normalized_exact_match_min: Decimal
+    character_f1_min: Decimal
+    invalid_contract_rate_max: Decimal
+    version: int
+    archived_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class EvaluationSuiteListResponse(BaseModel):
+    items: list[EvaluationSuiteResponse]
+    next_cursor: str | None
+
+
+class EvaluationRunCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class EvaluationRunCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: StrictInt = Field(ge=1)
+
+
+class EvaluationRunResponse(ORMResponse):
+    """Numeric run status without content, identities, claims, hashes, or paths."""
+
+    id: UUID
+    department_id: UUID
+    suite_id: UUID
+    status: str
+    gate_status: str
+    runner_contract_version: str
+    code_revision: str
+    query_embedding_pipeline_version: str
+    query_embedding_model_id: str
+    query_embedding_dimension: int
+    query_embedding_distance: str
+    generation_model_id: str
+    prompt_version: str
+    answer_contract_version: str
+    qdrant_collection: str
+    vector_schema_version: str
+    base_seed: int
+    case_count: int
+    completed_case_count: int
+    answered_case_count: int
+    insufficient_case_count: int
+    retrieval_recall_at_5: Decimal | None
+    retrieval_recall_at_10: Decimal | None
+    retrieval_recall_at_20: Decimal | None
+    retrieval_mrr_at_20: Decimal | None
+    answer_status_accuracy: Decimal | None
+    citation_precision: Decimal | None
+    citation_recall: Decimal | None
+    normalized_exact_match: Decimal | None
+    character_f1: Decimal | None
+    invalid_contract_rate: Decimal | None
+    failed_gate_count: int | None
+    error_code: str | None
+    attempt_number: int
+    started_at: datetime | None
+    finished_at: datetime | None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class EvaluationRunListResponse(BaseModel):
+    items: list[EvaluationRunResponse]
     next_cursor: str | None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -86,6 +87,24 @@ class _StartedRun:
     created_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class EphemeralRagOutcome:
+    """Transient production-policy outcome for public finalization or evaluation."""
+
+    status: str
+    answer: str
+    citation_labels: tuple[str, ...]
+    candidate_count: int
+    authorized_count: int
+    authorized_candidate_ids: tuple[UUID, ...]
+    supplied: tuple[LoadedEvidence, ...]
+
+    @property
+    def cited_chunk_ids(self) -> tuple[UUID, ...]:
+        by_label = {item.source.label: item.hit.chunk_id for item in self.supplied}
+        return tuple(by_label[label] for label in self.citation_labels)
+
+
 def answer_question(
     factory: sessionmaker[Session],
     settings: RagSettings,
@@ -108,65 +127,32 @@ def answer_question(
     candidate_count = None
     authorized_count = None
     stage = "query_embedding"
+
+    def record_stage(value: str) -> None:
+        nonlocal stage
+        stage = value
+
     try:
-        query = runtime_client.query_embedding(question)
-        try:
-            query_vector = validate_vector(query)
-        except EmbeddingError as error:
-            raise RagContractError("invalid_query_embedding") from error
-        stage = "retrieval"
         if adapter is None:
             adapter = DepartmentQdrant(
                 settings.qdrant_url,
                 settings.qdrant_api_key,
                 settings.qdrant_timeout_seconds,
             )
-        adapter.verify_collection()
-        search = search_authorized_result(
+        outcome = execute_rag_policy(
             factory,
+            settings,
+            data_dir,
+            request_scope.department,
+            question,
+            runtime_client,
             adapter,
-            request_scope.department,
-            query_vector,
-            limit=settings.candidate_limit,
+            stage_callback=record_stage,
         )
-        candidate_count = search.candidate_count
-        authorized_count = len(search.hits)
-        selected = _select_hits(search.hits, settings)
-        if not selected:
-            stage = "finalization"
-            return _finalize_insufficient(
-                factory,
-                principal,
-                request_scope,
-                started,
-                candidate_count,
-                authorized_count,
-            )
-        stage = "artifact_loading"
-        loaded = load_selected_chunks(
-            data_dir,
-            request_scope.department,
-            selected,
-            max_evidence_chars=settings.max_evidence_chars,
-        )
-        stage = "generation"
-        generation = validate_generation_response(
-            runtime_client.generate(question, tuple(item.source for item in loaded)),
-            tuple(item.source.label for item in loaded),
-        )
-        stage = "artifact_loading"
-        reloaded = load_selected_chunks(
-            data_dir,
-            request_scope.department,
-            selected,
-            max_evidence_chars=settings.max_evidence_chars,
-        )
-        if tuple((item.hit.chunk_id, item.source.label, item.source.text) for item in reloaded) != (
-            tuple((item.hit.chunk_id, item.source.label, item.source.text) for item in loaded)
-        ):
-            raise RagContractError("source_changed")
+        candidate_count = outcome.candidate_count
+        authorized_count = outcome.authorized_count
         stage = "finalization"
-        if generation.status == "insufficient_information":
+        if outcome.status == "insufficient_information":
             return _finalize_insufficient(
                 factory,
                 principal,
@@ -174,7 +160,7 @@ def answer_question(
                 started,
                 candidate_count,
                 authorized_count,
-                reloaded,
+                outcome.supplied,
             )
         return _finalize_answered(
             factory,
@@ -183,9 +169,9 @@ def answer_question(
             started,
             candidate_count,
             authorized_count,
-            generation.answer,
-            reloaded,
-            generation.citations,
+            outcome.answer,
+            outcome.supplied,
+            outcome.citation_labels,
         )
     except ServiceError:
         _fail_run(factory, started.id, request_scope.department, "department_unavailable")
@@ -245,6 +231,121 @@ def answer_question(
                 adapter.close()
             except Exception:
                 logger.warning("rag_process qdrant_close_failed")
+
+
+def execute_rag_policy(
+    factory: sessionmaker[Session],
+    settings: RagSettings,
+    data_dir: Path,
+    scope,
+    question: str,
+    runtime: RagRuntimeClient,
+    qdrant: DepartmentQdrant,
+    *,
+    seed: int | None = None,
+    stage_callback: Callable[[str], None] | None = None,
+) -> EphemeralRagOutcome:
+    """Execute the exact production retrieval, selection, artifact, and answer policy."""
+
+    _report_stage(stage_callback, "query_embedding")
+    query = runtime.query_embedding(question)
+    try:
+        query_vector = validate_vector(query)
+    except EmbeddingError as error:
+        raise RagContractError("invalid_query_embedding") from error
+    _report_stage(stage_callback, "retrieval")
+    qdrant.verify_collection()
+    search = search_authorized_result(
+        factory,
+        qdrant,
+        scope,
+        query_vector,
+        limit=settings.candidate_limit,
+    )
+    candidate_ids = tuple(hit.chunk_id for hit in search.hits)
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise RagContractError("retrieval_authority_failed")
+    selected = _select_hits(search.hits, settings)
+    if not selected:
+        return EphemeralRagOutcome(
+            "insufficient_information",
+            INSUFFICIENT_INFORMATION_MESSAGE,
+            (),
+            search.candidate_count,
+            len(search.hits),
+            candidate_ids,
+            (),
+        )
+    _report_stage(stage_callback, "artifact_loading")
+    loaded = load_selected_chunks(
+        data_dir,
+        scope,
+        selected,
+        max_evidence_chars=settings.max_evidence_chars,
+    )
+    _report_stage(stage_callback, "generation")
+    runtime_value = (
+        runtime.generate(question, tuple(item.source for item in loaded))
+        if seed is None
+        else runtime.generate(question, tuple(item.source for item in loaded), seed=seed)
+    )
+    generation = validate_generation_response(
+        runtime_value,
+        tuple(item.source.label for item in loaded),
+    )
+    _report_stage(stage_callback, "artifact_loading")
+    reloaded = load_selected_chunks(
+        data_dir,
+        scope,
+        selected,
+        max_evidence_chars=settings.max_evidence_chars,
+    )
+    if tuple((item.hit.chunk_id, item.source.label, item.source.text) for item in reloaded) != (
+        tuple((item.hit.chunk_id, item.source.label, item.source.text) for item in loaded)
+    ):
+        raise RagContractError("source_changed")
+    if generation.status == "insufficient_information":
+        return EphemeralRagOutcome(
+            generation.status,
+            INSUFFICIENT_INFORMATION_MESSAGE,
+            (),
+            search.candidate_count,
+            len(search.hits),
+            candidate_ids,
+            reloaded,
+        )
+    return EphemeralRagOutcome(
+        generation.status,
+        generation.answer,
+        generation.citations,
+        search.candidate_count,
+        len(search.hits),
+        candidate_ids,
+        reloaded,
+    )
+
+
+def _report_stage(callback: Callable[[str], None] | None, stage: str) -> None:
+    if callback is not None:
+        callback(stage)
+
+
+def revalidate_ephemeral_sources(
+    factory: sessionmaker[Session],
+    scope,
+    supplied: tuple[LoadedEvidence, ...],
+) -> None:
+    """Apply the same exact locked PostgreSQL final source authority as production."""
+
+    if not supplied:
+        return
+    try:
+        with factory.begin() as session:
+            _lock_and_revalidate_sources(session, scope, supplied)
+    except RagContractError:
+        raise
+    except SQLAlchemyError as error:
+        raise RagContractError("database_unavailable") from error
 
 
 def _start_run(factory, settings, principal, request_scope, question_chars) -> _StartedRun:

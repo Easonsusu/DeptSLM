@@ -144,6 +144,12 @@ The repository is for source code only. All file-based runtime artifacts derive 
 
 PostgreSQL and Qdrant are service state. The Compose stack is for local development only; before either stores real data, its persistence, backup, and recovery design must be reviewed to ensure no runtime files are written into the repository and that department deletion and retention requirements can be met.
 
+## Phase 9 evaluation boundary
+
+The internal evaluator is a metadata control plane plus a dedicated non-model worker. Immutable suites and content-free result artifacts live beneath external `eval_results`; PostgreSQL stores suite/run/case-result metadata and numeric metrics only. The evaluator reuses the exact Phase 7 production pipeline and delegates embedding and generation to the existing internal runtime. It mounts `extracted_text` read-only and `eval_results` read-write, with no uploads, model cache, training data, adapters, exports, model stack, or Hugging Face token.
+
+PostgreSQL claims, Qdrant retrieval, Phase 5 artifacts, result publication, and the runtime do not share a transaction. Short authority transactions, exact snapshot verification, claim ownership, and final revalidation fail closed but do not establish distributed atomicity or production availability. Phase 8 feedback is not read.
+
 ## Deferred decisions
 
 - Authentication provider, SSO integration, and role model

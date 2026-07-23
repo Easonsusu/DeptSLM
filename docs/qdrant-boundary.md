@@ -40,3 +40,5 @@ PostgreSQL cannot transactionally cancel a Qdrant request already in flight. A s
 The local single-node Compose service is a development convenience, not a production clustering, TLS, availability, backup, or tenant-security claim.
 
 An activated point remains physically possible after a failed PostgreSQL commit, and soft-deleted-document points may remain stored. Neither is answer authority: Phase 7 requires a committed succeeded indexing row, stored document, succeeded extraction, exact current attempt/chunk ownership, and unchanged selected artifacts before generation and accepted completion.
+
+Phase 9 adds no Qdrant client or filter. Evaluation calls the same typed `DepartmentScope` production retrieval path, fixed `published=true` and current-pipeline filter, and PostgreSQL succeeded-state candidate authority. Authorized candidate UUIDs exist ephemerally only for deterministic scoring and never enter PostgreSQL, public APIs, or result artifacts.

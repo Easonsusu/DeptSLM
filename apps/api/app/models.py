@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -117,6 +118,33 @@ RAG_FEEDBACK_DISMISSED_CODES = (
     "not_reproducible",
     "out_of_scope",
     "no_issue_found",
+)
+EVALUATION_SUITE_STATUSES = ("active", "archived")
+EVALUATION_RUN_STATUSES = ("queued", "running", "succeeded", "failed", "cancelled")
+EVALUATION_GATE_STATUSES = ("pending", "passed", "failed")
+EVALUATION_CASE_EXPECTED_STATUSES = ("answered", "insufficient_information")
+EVALUATION_CASE_ACTUAL_STATUSES = ("answered", "insufficient_information", "failed")
+EVALUATION_ERROR_CODES = (
+    "suite_artifact_missing",
+    "suite_artifact_mismatch",
+    "suite_contract_invalid",
+    "suite_source_stale",
+    "department_unavailable",
+    "requester_unauthorized",
+    "database_unavailable",
+    "qdrant_unavailable",
+    "retrieval_authority_failed",
+    "source_artifact_missing",
+    "source_artifact_mismatch",
+    "runtime_unavailable",
+    "runtime_timeout",
+    "invalid_query_embedding",
+    "generation_failed",
+    "invalid_generation_response",
+    "invalid_citation",
+    "result_publication_failed",
+    "claim_lost",
+    "cancelled",
 )
 
 
@@ -1055,6 +1083,425 @@ class RagAnswerFeedbackSourceTarget(Base):
     run_id: Mapped[UUID] = mapped_column(nullable=False)
     citation_id: Mapped[UUID] = mapped_column(nullable=False)
     rank: Mapped[int] = mapped_column(primary_key=True)
+    created_at: Mapped[datetime] = utc_timestamp()
+
+
+class EvaluationSuite(Base):
+    """Immutable department-owned evaluation suite metadata."""
+
+    __tablename__ = "evaluation_suites"
+    __table_args__ = (
+        UniqueConstraint("id", "department_id", name="uq_evaluation_suite_department"),
+        CheckConstraint("status IN ('active','archived')", name="ck_evaluation_suite_status"),
+        CheckConstraint(
+            "suite_contract_version = 'phase9-evaluation-suite-v1'",
+            name="ck_evaluation_suite_contract",
+        ),
+        CheckConstraint(
+            "artifact_contract_version = 'phase9-evaluation-artifact-v1'",
+            name="ck_evaluation_suite_artifact_contract",
+        ),
+        CheckConstraint(
+            "metric_contract_version = 'phase9-deterministic-metrics-v1'",
+            name="ck_evaluation_suite_metric_contract",
+        ),
+        CheckConstraint(
+            "answer_normalization_version = 'phase9-answer-normalization-v1'",
+            name="ck_evaluation_suite_normalization_contract",
+        ),
+        CheckConstraint(
+            "gate_policy_version = 'phase9-quality-gates-v1'",
+            name="ck_evaluation_suite_gate_contract",
+        ),
+        CheckConstraint("case_count BETWEEN 1 AND 500", name="ck_evaluation_suite_case_count"),
+        CheckConstraint(
+            "answered_case_count >= 0 AND insufficient_case_count >= 0 "
+            "AND answered_case_count + insufficient_case_count = case_count",
+            name="ck_evaluation_suite_case_totals",
+        ),
+        CheckConstraint(
+            "answered_case_count > 0",
+            name="ck_evaluation_suite_applicable_metrics",
+        ),
+        CheckConstraint(
+            "artifact_manifest_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND canonical_cases_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_evaluation_suite_hashes",
+        ),
+        CheckConstraint(
+            "canonical_cases_byte_size BETWEEN 1 AND 16777216",
+            name="ck_evaluation_suite_artifact_size",
+        ),
+        CheckConstraint(
+            "retrieval_recall_at_5_min BETWEEN 0 AND 1 "
+            "AND retrieval_mrr_at_20_min BETWEEN 0 AND 1 "
+            "AND answer_status_accuracy_min BETWEEN 0 AND 1 "
+            "AND citation_precision_min BETWEEN 0 AND 1 "
+            "AND citation_recall_min BETWEEN 0 AND 1 "
+            "AND normalized_exact_match_min BETWEEN 0 AND 1 "
+            "AND character_f1_min BETWEEN 0 AND 1 "
+            "AND invalid_contract_rate_max BETWEEN 0 AND 1",
+            name="ck_evaluation_suite_gate_ranges",
+        ),
+        CheckConstraint("version > 0", name="ck_evaluation_suite_version"),
+        CheckConstraint(
+            "(status = 'active' AND archived_at IS NULL) OR "
+            "(status = 'archived' AND archived_at IS NOT NULL)",
+            name="ck_evaluation_suite_lifecycle",
+        ),
+        Index(
+            "ix_evaluation_suite_department_status_created",
+            "department_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(
+        ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False
+    )
+    imported_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    suite_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    artifact_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    metric_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    answer_normalization_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    gate_policy_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    case_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    answered_case_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    insufficient_case_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    artifact_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_cases_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    canonical_cases_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    retrieval_recall_at_5_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    retrieval_mrr_at_20_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    answer_status_accuracy_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    citation_precision_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    citation_recall_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    normalized_exact_match_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    character_f1_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    invalid_contract_rate_max: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class EvaluationRun(Base):
+    """Content-free metadata and claim state for one evaluation execution."""
+
+    __tablename__ = "evaluation_runs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["suite_id", "department_id"],
+            ["evaluation_suites.id", "evaluation_suites.department_id"],
+            name="fk_evaluation_run_suite_scope",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "id", "department_id", "suite_id", name="uq_evaluation_run_department_suite"
+        ),
+        CheckConstraint(
+            "status IN ('queued','running','succeeded','failed','cancelled')",
+            name="ck_evaluation_run_status",
+        ),
+        CheckConstraint(
+            "gate_status IN ('pending','passed','failed')",
+            name="ck_evaluation_run_gate_status",
+        ),
+        CheckConstraint(
+            "runner_contract_version = 'phase9-evaluation-runner-v1'",
+            name="ck_evaluation_run_runner_contract",
+        ),
+        CheckConstraint(
+            "code_revision ~ '^[0-9a-f]{40}$'",
+            name="ck_evaluation_run_code_revision",
+        ),
+        CheckConstraint(
+            "query_embedding_pipeline_version = 'phase7-qwen3-query-embedding-v1' "
+            "AND query_embedding_model_id = 'Qwen/Qwen3-Embedding-0.6B' "
+            "AND query_embedding_model_revision = "
+            "'d23109d65ca9fdf61eef614209744716f337f50f' "
+            "AND query_embedding_dimension = 1024 "
+            "AND query_embedding_distance = 'cosine'",
+            name="ck_evaluation_run_embedding_contract",
+        ),
+        CheckConstraint(
+            "generation_model_id = 'Qwen/Qwen3-0.6B' "
+            "AND generation_model_revision = "
+            "'c1899de289a04d12100db370d81485cdf75e47ca' "
+            "AND prompt_version = 'phase7-grounded-answer-prompt-v1' "
+            "AND answer_contract_version = 'phase7-grounded-answer-v1'",
+            name="ck_evaluation_run_generation_contract",
+        ),
+        CheckConstraint(
+            "qdrant_collection = 'deptslm_chunks_qwen3_0_6b_1024_v1' "
+            "AND vector_schema_version = 'phase6-qdrant-chunks-v1'",
+            name="ck_evaluation_run_vector_contract",
+        ),
+        CheckConstraint(
+            "base_seed BETWEEN 0 AND 9223372036854775807",
+            name="ck_evaluation_run_seed",
+        ),
+        CheckConstraint(
+            "case_count BETWEEN 1 AND 500 AND completed_case_count BETWEEN 0 AND case_count "
+            "AND answered_case_count >= 0 AND insufficient_case_count >= 0 "
+            "AND answered_case_count + insufficient_case_count <= completed_case_count",
+            name="ck_evaluation_run_counts",
+        ),
+        CheckConstraint(
+            "(retrieval_recall_at_5 IS NULL OR retrieval_recall_at_5 BETWEEN 0 AND 1) "
+            "AND (retrieval_recall_at_10 IS NULL OR retrieval_recall_at_10 BETWEEN 0 AND 1) "
+            "AND (retrieval_recall_at_20 IS NULL OR retrieval_recall_at_20 BETWEEN 0 AND 1) "
+            "AND (retrieval_mrr_at_20 IS NULL OR retrieval_mrr_at_20 BETWEEN 0 AND 1) "
+            "AND (answer_status_accuracy IS NULL OR answer_status_accuracy BETWEEN 0 AND 1) "
+            "AND (citation_precision IS NULL OR citation_precision BETWEEN 0 AND 1) "
+            "AND (citation_recall IS NULL OR citation_recall BETWEEN 0 AND 1) "
+            "AND (normalized_exact_match IS NULL OR normalized_exact_match BETWEEN 0 AND 1) "
+            "AND (character_f1 IS NULL OR character_f1 BETWEEN 0 AND 1) "
+            "AND (invalid_contract_rate IS NULL OR invalid_contract_rate BETWEEN 0 AND 1)",
+            name="ck_evaluation_run_metric_ranges",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            "'suite_artifact_missing','suite_artifact_mismatch','suite_contract_invalid',"
+            "'suite_source_stale','department_unavailable','requester_unauthorized',"
+            "'database_unavailable','qdrant_unavailable','retrieval_authority_failed',"
+            "'source_artifact_missing','source_artifact_mismatch','runtime_unavailable',"
+            "'runtime_timeout','invalid_query_embedding','generation_failed',"
+            "'invalid_generation_response','invalid_citation','result_publication_failed',"
+            "'claim_lost','cancelled')",
+            name="ck_evaluation_run_error_code",
+        ),
+        CheckConstraint(
+            "(result_manifest_sha256 IS NULL OR "
+            "result_manifest_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(result_summary_sha256 IS NULL OR result_summary_sha256 ~ '^[0-9a-f]{64}$') "
+            "AND (case_results_sha256 IS NULL OR case_results_sha256 ~ '^[0-9a-f]{64}$') "
+            "AND (case_results_byte_size IS NULL OR case_results_byte_size > 0)",
+            name="ck_evaluation_run_artifacts",
+        ),
+        CheckConstraint("attempt_number > 0 AND version > 0", name="ck_evaluation_run_versions"),
+        CheckConstraint(
+            "(status = 'queued' AND gate_status = 'pending' "
+            "AND worker_id IS NULL AND claim_token IS NULL AND claimed_at IS NULL "
+            "AND lease_expires_at IS NULL AND started_at IS NULL AND finished_at IS NULL "
+            "AND cancellation_requested_at IS NULL "
+            "AND completed_case_count = 0 AND answered_case_count = 0 "
+            "AND insufficient_case_count = 0 AND failed_gate_count IS NULL "
+            "AND result_manifest_sha256 IS NULL AND result_summary_sha256 IS NULL "
+            "AND case_results_sha256 IS NULL AND case_results_byte_size IS NULL "
+            "AND error_code IS NULL) OR status <> 'queued'",
+            name="ck_evaluation_run_queued_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'running' AND gate_status = 'pending' "
+            "AND worker_id IS NOT NULL AND claim_token IS NOT NULL "
+            "AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL "
+            "AND started_at IS NOT NULL AND finished_at IS NULL "
+            "AND failed_gate_count IS NULL AND result_manifest_sha256 IS NULL "
+            "AND result_summary_sha256 IS NULL AND case_results_sha256 IS NULL "
+            "AND case_results_byte_size IS NULL AND error_code IS NULL) "
+            "OR status <> 'running'",
+            name="ck_evaluation_run_running_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'succeeded' AND gate_status IN ('passed','failed') "
+            "AND worker_id IS NULL AND claim_token IS NULL AND lease_expires_at IS NULL "
+            "AND finished_at IS NOT NULL AND completed_case_count = case_count "
+            "AND cancellation_requested_at IS NULL "
+            "AND answered_case_count + insufficient_case_count = case_count "
+            "AND retrieval_recall_at_5 IS NOT NULL AND retrieval_recall_at_10 IS NOT NULL "
+            "AND retrieval_recall_at_20 IS NOT NULL AND retrieval_mrr_at_20 IS NOT NULL "
+            "AND answer_status_accuracy IS NOT NULL AND citation_precision IS NOT NULL "
+            "AND citation_recall IS NOT NULL AND normalized_exact_match IS NOT NULL "
+            "AND character_f1 IS NOT NULL AND invalid_contract_rate IS NOT NULL "
+            "AND failed_gate_count IS NOT NULL AND failed_gate_count BETWEEN 0 AND 8 "
+            "AND result_manifest_sha256 IS NOT NULL AND result_summary_sha256 IS NOT NULL "
+            "AND case_results_sha256 IS NOT NULL AND case_results_byte_size IS NOT NULL "
+            "AND error_code IS NULL) OR status <> 'succeeded'",
+            name="ck_evaluation_run_succeeded_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'failed' AND gate_status = 'pending' "
+            "AND worker_id IS NULL AND claim_token IS NULL AND lease_expires_at IS NULL "
+            "AND finished_at IS NOT NULL AND error_code IS NOT NULL "
+            "AND cancellation_requested_at IS NULL "
+            "AND failed_gate_count IS NULL AND result_manifest_sha256 IS NULL "
+            "AND result_summary_sha256 IS NULL AND case_results_sha256 IS NULL "
+            "AND case_results_byte_size IS NULL) OR status <> 'failed'",
+            name="ck_evaluation_run_failed_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'cancelled' AND gate_status = 'pending' "
+            "AND worker_id IS NULL AND claim_token IS NULL AND lease_expires_at IS NULL "
+            "AND finished_at IS NOT NULL AND error_code = 'cancelled' "
+            "AND cancellation_requested_at IS NOT NULL "
+            "AND failed_gate_count IS NULL AND result_manifest_sha256 IS NULL "
+            "AND result_summary_sha256 IS NULL AND case_results_sha256 IS NULL "
+            "AND case_results_byte_size IS NULL) OR status <> 'cancelled'",
+            name="ck_evaluation_run_cancelled_lifecycle",
+        ),
+        Index(
+            "ix_evaluation_run_department_status_created",
+            "department_id",
+            "status",
+            "created_at",
+        ),
+        Index("ix_evaluation_run_suite_created", "department_id", "suite_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    suite_id: Mapped[UUID] = mapped_column(nullable=False)
+    requested_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    gate_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    runner_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    query_embedding_pipeline_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    query_embedding_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    query_embedding_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    query_embedding_dimension: Mapped[int] = mapped_column(Integer, nullable=False)
+    query_embedding_distance: Mapped[str] = mapped_column(String(16), nullable=False)
+    generation_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    generation_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    answer_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    qdrant_collection: Mapped[str] = mapped_column(String(128), nullable=False)
+    vector_schema_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    base_seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    case_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_case_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    answered_case_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    insufficient_case_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    retrieval_recall_at_5: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    retrieval_recall_at_10: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    retrieval_recall_at_20: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    retrieval_mrr_at_20: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    answer_status_accuracy: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    citation_precision: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    citation_recall: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    normalized_exact_match: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    character_f1: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    invalid_contract_rate: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    failed_gate_count: Mapped[int | None] = mapped_column(Integer)
+    result_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    result_summary_sha256: Mapped[str | None] = mapped_column(String(64))
+    case_results_sha256: Mapped[str | None] = mapped_column(String(64))
+    case_results_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    worker_id: Mapped[UUID | None] = mapped_column()
+    claim_token: Mapped[UUID | None] = mapped_column()
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class EvaluationCaseResult(Base):
+    """Numeric and content-free per-case evaluation outcome."""
+
+    __tablename__ = "evaluation_case_results"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "department_id", "suite_id"],
+            [
+                "evaluation_runs.id",
+                "evaluation_runs.department_id",
+                "evaluation_runs.suite_id",
+            ],
+            name="fk_evaluation_case_result_run_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "expected_status IN ('answered','insufficient_information')",
+            name="ck_evaluation_case_expected_status",
+        ),
+        CheckConstraint(
+            "actual_status IN ('answered','insufficient_information','failed')",
+            name="ck_evaluation_case_actual_status",
+        ),
+        CheckConstraint(
+            "relevant_chunk_count >= 0 AND retrieved_relevant_at_5 >= 0 "
+            "AND retrieved_relevant_at_10 >= retrieved_relevant_at_5 "
+            "AND retrieved_relevant_at_20 >= retrieved_relevant_at_10 "
+            "AND retrieved_relevant_at_20 <= relevant_chunk_count "
+            "AND cited_count >= 0 AND cited_relevant_count BETWEEN 0 AND cited_count "
+            "AND cited_relevant_count <= relevant_chunk_count",
+            name="ck_evaluation_case_counts",
+        ),
+        CheckConstraint(
+            "reciprocal_rank_at_20 BETWEEN 0 AND 1 "
+            "AND citation_precision BETWEEN 0 AND 1 "
+            "AND citation_recall BETWEEN 0 AND 1 "
+            "AND normalized_exact_match IN (0,1) "
+            "AND character_f1 BETWEEN 0 AND 1",
+            name="ck_evaluation_case_metrics",
+        ),
+        CheckConstraint(
+            "(expected_status = 'answered' AND relevant_chunk_count BETWEEN 1 AND 8) OR "
+            "(expected_status = 'insufficient_information' AND relevant_chunk_count = 0)",
+            name="ck_evaluation_case_expected_contract",
+        ),
+        CheckConstraint(
+            "(actual_status = 'failed' AND error_code IS NOT NULL) OR "
+            "(actual_status <> 'failed' AND error_code IS NULL)",
+            name="ck_evaluation_case_error_lifecycle",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            "'suite_artifact_missing','suite_artifact_mismatch','suite_contract_invalid',"
+            "'suite_source_stale','department_unavailable','requester_unauthorized',"
+            "'database_unavailable','qdrant_unavailable','retrieval_authority_failed',"
+            "'source_artifact_missing','source_artifact_mismatch','runtime_unavailable',"
+            "'runtime_timeout','invalid_query_embedding','generation_failed',"
+            "'invalid_generation_response','invalid_citation','result_publication_failed',"
+            "'claim_lost','cancelled')",
+            name="ck_evaluation_case_error_code",
+        ),
+        Index(
+            "ix_evaluation_case_result_department_run",
+            "department_id",
+            "run_id",
+        ),
+    )
+
+    run_id: Mapped[UUID] = mapped_column(primary_key=True)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    suite_id: Mapped[UUID] = mapped_column(nullable=False)
+    case_id: Mapped[UUID] = mapped_column(primary_key=True)
+    expected_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    actual_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    relevant_chunk_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    retrieved_relevant_at_5: Mapped[int] = mapped_column(Integer, nullable=False)
+    retrieved_relevant_at_10: Mapped[int] = mapped_column(Integer, nullable=False)
+    retrieved_relevant_at_20: Mapped[int] = mapped_column(Integer, nullable=False)
+    reciprocal_rank_at_20: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    status_correct: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    cited_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    cited_relevant_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    citation_precision: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    citation_recall: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    normalized_exact_match: Mapped[Decimal] = mapped_column(Numeric(1, 0), nullable=False)
+    character_f1: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    answer_contract_valid: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    case_gate_passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = utc_timestamp()
 
 

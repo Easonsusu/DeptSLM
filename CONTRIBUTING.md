@@ -80,6 +80,8 @@ Grounded-answer changes must keep the API as the only PostgreSQL/Qdrant authorit
 
 Structured-feedback changes must remain PostgreSQL-only and content-free. Accept reviewed enums and exact same-run citation labels only; never add comments, notes, question/answer fields, browser persistence, Qdrant/runtime/artifact access, or automatic effects on RAG, evaluation, datasets, or training. Tests must cover all-role owner submission, tenant denial, immutable idempotency, reviewer transitions and version conflicts, PostgreSQL-server-time expiry, explicit authorized purge, safe audits, and frontend free-text/persistence prohibitions.
 
+Evaluation changes must reuse the exact Phase 7 retrieval, prompt, runtime, answer, citation, and final-source authority implementation. Suite content stays in `DEPTSLM_DATA_DIR/eval_results`; PostgreSQL and result artifacts remain content-free. Never add evaluator-only search, prompts, model parameters, feedback imports, LLM judges, public case/artifact endpoints, or automatic production/training effects. Tests must cover suite parsing and source staleness, same-department evaluator roles, cursor binding, claims and cancellation, deterministic metrics and Decimal gates, exact publication, non-persistence, and evaluator image isolation.
+
 ## Department and authentication safety
 
 - Derive allowed departments from authenticated membership; do not trust a client-supplied `department_id` by itself.

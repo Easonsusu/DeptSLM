@@ -222,3 +222,6 @@ No Phase 0 file should be interpreted as a production security or availability g
 - **A worker exits without work:** `--once` intentionally succeeds on an empty queue. Use the matching `--poll` command for extraction or indexing.
 - **The indexer reports model unavailable:** run the explicit pinned preparation command. Never copy model weights into Git or enable network fallback.
 - **Qdrant schema mismatch:** verify the fixed collection and payload indexes. Bootstrap never deletes/recreates a mismatch; repair requires a separately reviewed operational decision.
+- **The evaluator exits at startup:** provide a non-zero `DEPTSLM_EVALUATION_WORKER_ID`, an exact lowercase 40-character `DEPTSLM_EVALUATION_CODE_REVISION`, the existing Phase 7 Qdrant/runtime settings, and mounted `extracted_text` read-only plus `eval_results` read-write. Do not mount model cache or provide Hugging Face tokens.
+
+The evaluator image is non-root, read-only, capability-dropped, has no host port, and contains no Torch, Transformers, sentence-transformers, model weights, or automatic model preparation. Local Compose, deterministic fake-runtime tests, and fixed-seed runs are development evidence only; they do not establish production evaluation validity, determinism, privacy, availability, or performance.
