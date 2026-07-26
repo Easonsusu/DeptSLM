@@ -991,6 +991,7 @@ def test_evaluator_one_case_fake_runtime_smoke_is_content_free(
         "_supervise_authority",
         lambda *_args, **_kwargs: authority,
     )
+
     def stage_result(_factory, _settings, _scope, _job, manifest, summary, scores, _stop):
         rendered = json.dumps({"manifest": manifest, "summary": summary}, default=str)
         assert "Synthetic question?" not in rendered

@@ -16,9 +16,9 @@ import pytest
 from alembic.config import Config
 from deptslm_worker.evaluation_queue import (
     EvaluationQueueError,
+    _expected_result_manifest,
     cancel_owned,
     claim_next,
-    _expected_result_manifest,
     fail_owned,
     finalize_success,
     require_live_claim,
@@ -75,9 +75,9 @@ from app.models import (
     DocumentExtraction,
     DocumentVectorIndexing,
     EvaluationCaseResult,
-    EvaluationSuiteImportAttempt,
     EvaluationRun,
     EvaluationSuite,
+    EvaluationSuiteImportAttempt,
     Membership,
     PersistentAuditEvent,
     UserIdentity,
@@ -1169,7 +1169,10 @@ def test_unrelated_department_change_does_not_invalidate_finalization(
         summary_value={"failed_gate_count": 0},
         scores=(score,),
     )
-    published = store.publish(staged, frozenset({"manifest.json", "summary.json", "case_results.jsonl"}))
+    published = store.publish(
+        staged,
+        frozenset({"manifest.json", "summary.json", "case_results.jsonl"}),
+    )
     finalize_success(
         factory,
         store,
@@ -1275,7 +1278,10 @@ def test_quality_gate_failure_finishes_succeeded_and_audited(
         summary_value={"failed_gate_count": 6},
         scores=(score,),
     )
-    published = store.publish(staged, frozenset({"manifest.json", "summary.json", "case_results.jsonl"}))
+    published = store.publish(
+        staged,
+        frozenset({"manifest.json", "summary.json", "case_results.jsonl"}),
+    )
     monkeypatch.setattr(
         "deptslm_worker.evaluation_queue.revalidate_canonical_suite_authority_in_transaction",
         lambda *_args, **_kwargs: None,
