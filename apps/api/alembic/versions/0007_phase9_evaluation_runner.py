@@ -34,6 +34,7 @@ ERROR_CODES = (
     "invalid_generation_response",
     "invalid_citation",
     "result_publication_failed",
+    "artifact_reconciliation_failed",
     "claim_lost",
     "cancelled",
 )
@@ -147,6 +148,54 @@ def upgrade() -> None:
     )
 
     op.create_table(
+        "evaluation_suite_import_attempts",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("department_id", sa.Uuid(), nullable=False),
+        sa.Column("imported_by_user_id", sa.Uuid(), nullable=False),
+        sa.Column("suite_id", sa.Uuid(), nullable=False),
+        sa.Column("stage_id", sa.Uuid(), nullable=False),
+        sa.Column("status", sa.String(16), nullable=False),
+        sa.Column("artifact_manifest_sha256", sa.String(64), nullable=True),
+        sa.Column("canonical_cases_sha256", sa.String(64), nullable=True),
+        sa.Column("canonical_cases_byte_size", sa.BigInteger(), nullable=True),
+        sa.Column("staged_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("published_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("committed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("failed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("abandoned_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("version", sa.Integer(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.CheckConstraint(
+            "status IN ('registered','staged','published','committed','failed','abandoned')",
+            name="ck_evaluation_suite_import_attempt_status",
+        ),
+        sa.CheckConstraint(
+            "artifact_manifest_sha256 IS NULL OR artifact_manifest_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_evaluation_suite_import_attempt_manifest_hash",
+        ),
+        sa.CheckConstraint(
+            "canonical_cases_sha256 IS NULL OR canonical_cases_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_evaluation_suite_import_attempt_cases_hash",
+        ),
+        sa.CheckConstraint(
+            "canonical_cases_byte_size IS NULL OR canonical_cases_byte_size > 0",
+            name="ck_evaluation_suite_import_attempt_cases_size",
+        ),
+        sa.CheckConstraint("version > 0", name="ck_evaluation_suite_import_attempt_version"),
+        sa.ForeignKeyConstraint(["department_id"], ["departments.id"], ondelete="RESTRICT"),
+        sa.ForeignKeyConstraint(["imported_by_user_id"], ["user_identities.id"], ondelete="RESTRICT"),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("suite_id"),
+        sa.UniqueConstraint("stage_id"),
+    )
+    op.create_index(
+        "ix_evaluation_suite_import_attempt_department_status_created",
+        "evaluation_suite_import_attempts",
+        ["department_id", "status", "created_at"],
+    )
+
+    op.create_table(
         "evaluation_runs",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("department_id", sa.Uuid(), nullable=False),
@@ -189,6 +238,7 @@ def upgrade() -> None:
         sa.Column("case_results_byte_size", sa.BigInteger(), nullable=True),
         sa.Column("error_code", sa.String(64), nullable=True),
         sa.Column("attempt_number", sa.Integer(), nullable=False),
+        sa.Column("publication_attempt_id", sa.Uuid(), nullable=True),
         sa.Column("worker_id", sa.Uuid(), nullable=True),
         sa.Column("claim_token", sa.Uuid(), nullable=True),
         sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
@@ -285,14 +335,14 @@ def upgrade() -> None:
             "AND insufficient_case_count = 0 AND failed_gate_count IS NULL "
             "AND result_manifest_sha256 IS NULL AND result_summary_sha256 IS NULL "
             "AND case_results_sha256 IS NULL AND case_results_byte_size IS NULL "
-            "AND error_code IS NULL) OR status <> 'queued'",
+            "AND publication_attempt_id IS NULL AND error_code IS NULL) OR status <> 'queued'",
             name="ck_evaluation_run_queued_lifecycle",
         ),
         sa.CheckConstraint(
             "(status = 'running' AND gate_status = 'pending' "
             "AND worker_id IS NOT NULL AND claim_token IS NOT NULL "
             "AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL "
-            "AND started_at IS NOT NULL AND finished_at IS NULL "
+            "AND started_at IS NOT NULL AND finished_at IS NULL AND publication_attempt_id IS NOT NULL "
             "AND failed_gate_count IS NULL AND result_manifest_sha256 IS NULL "
             "AND result_summary_sha256 IS NULL AND case_results_sha256 IS NULL "
             "AND case_results_byte_size IS NULL AND error_code IS NULL) "
@@ -313,7 +363,7 @@ def upgrade() -> None:
             "AND failed_gate_count IS NOT NULL AND failed_gate_count BETWEEN 0 AND 8 "
             "AND result_manifest_sha256 IS NOT NULL AND result_summary_sha256 IS NOT NULL "
             "AND case_results_sha256 IS NOT NULL AND case_results_byte_size IS NOT NULL "
-            "AND error_code IS NULL) OR status <> 'succeeded'",
+            "AND publication_attempt_id IS NOT NULL AND error_code IS NULL) OR status <> 'succeeded'",
             name="ck_evaluation_run_succeeded_lifecycle",
         ),
         sa.CheckConstraint(
@@ -451,5 +501,10 @@ def downgrade() -> None:
     op.drop_index("ix_evaluation_run_suite_created", table_name="evaluation_runs")
     op.drop_index("ix_evaluation_run_department_status_created", table_name="evaluation_runs")
     op.drop_table("evaluation_runs")
+    op.drop_index(
+        "ix_evaluation_suite_import_attempt_department_status_created",
+        table_name="evaluation_suite_import_attempts",
+    )
+    op.drop_table("evaluation_suite_import_attempts")
     op.drop_index("ix_evaluation_suite_department_status_created", table_name="evaluation_suites")
     op.drop_table("evaluation_suites")

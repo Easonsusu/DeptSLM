@@ -79,6 +79,7 @@ SAFE_EVALUATION_ERROR_CODES = frozenset(
         "invalid_generation_response",
         "invalid_citation",
         "result_publication_failed",
+        "artifact_reconciliation_failed",
         "claim_lost",
         "cancelled",
     }

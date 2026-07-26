@@ -11,14 +11,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.authorization import DepartmentScope
-from app.evaluation_artifacts import (
-    RUN_FILES,
-    EvaluationArtifactStore,
-    StagedArtifact,
-)
+from app.evaluation_artifacts import EvaluationArtifactStore, PublishedArtifact, StagedArtifact
 from app.evaluation_domain import (
+    ANSWER_NORMALIZATION_VERSION,
+    GATE_POLICY_VERSION,
+    METRIC_CONTRACT_VERSION,
     RUNNER_CONTRACT_VERSION,
     SAFE_EVALUATION_ERROR_CODES,
+    SEED_DERIVATION_VERSION,
     AggregateMetrics,
     EvaluationCaseScore,
     EvaluationContractError,
@@ -60,6 +60,8 @@ class ClaimedEvaluationRun:
     base_seed: int
     case_count: int
     code_revision: str
+    publication_attempt_id: UUID | None = None
+    stale_publication_attempt_id: UUID | None = None
 
 
 def claim_next(
@@ -113,12 +115,15 @@ def claim_next(
                 _terminal_failure(row, now, "department_unavailable")
                 return None
             stale = row.claim_token if row.status == "running" else None
-            if stale is not None:
+            stale_publication = row.publication_attempt_id
+            if stale_publication is not None:
                 row.attempt_number += 1
             claim_token = uuid4()
+            publication_attempt_id = uuid4()
             row.status = "running"
             row.worker_id = worker_id
             row.claim_token = claim_token
+            row.publication_attempt_id = publication_attempt_id
             row.claimed_at = now
             row.lease_expires_at = now + timedelta(seconds=lease_seconds)
             row.started_at = row.started_at or now
@@ -130,16 +135,18 @@ def claim_next(
             row.version += 1
             session.flush()
             return ClaimedEvaluationRun(
-                row.id,
-                row.department_id,
-                row.suite_id,
-                row.requested_by_user_id,
-                worker_id,
-                claim_token,
-                stale,
-                row.base_seed,
-                row.case_count,
-                row.code_revision,
+                id=row.id,
+                department_id=row.department_id,
+                suite_id=row.suite_id,
+                requested_by_user_id=row.requested_by_user_id,
+                worker_id=worker_id,
+                claim_token=claim_token,
+                stale_claim_token=stale,
+                base_seed=row.base_seed,
+                case_count=row.case_count,
+                code_revision=row.code_revision,
+                publication_attempt_id=publication_attempt_id,
+                stale_publication_attempt_id=stale_publication,
             )
     except SQLAlchemyError as error:
         raise EvaluationQueueError() from error
@@ -306,7 +313,7 @@ def finalize_success(
     factory: sessionmaker[Session],
     store: EvaluationArtifactStore,
     job: ClaimedEvaluationRun,
-    staged: StagedArtifact,
+    published_artifact: PublishedArtifact,
     scores: tuple[EvaluationCaseScore, ...],
     metrics: AggregateMetrics,
     gate: GateEvaluation,
@@ -314,7 +321,6 @@ def finalize_success(
     authority: GroundTruthAuthoritySnapshot,
 ) -> None:
     scope = DepartmentScope(job.department_id)
-    published = False
     try:
         with factory.begin() as session:
             department = session.execute(
@@ -342,6 +348,8 @@ def finalize_success(
                 raise EvaluationQueueError("claim_lost")
             if run.cancellation_requested_at is not None:
                 raise EvaluationQueueError("cancelled")
+            if run.publication_attempt_id != job.publication_attempt_id:
+                raise EvaluationQueueError("claim_lost")
             if not _requester_authorized(
                 session,
                 job.department_id,
@@ -366,8 +374,26 @@ def finalize_success(
                 cases,
                 authority,
             )
-            published_artifact = store.publish(staged, RUN_FILES)
-            published = True
+            verified_artifact = store.verify_published_run(
+                scope,
+                job.id,
+                expected_manifest=_expected_result_manifest(job),
+                expected=StagedArtifact(
+                    published_artifact.path,
+                    published_artifact.path,
+                    published_artifact.manifest,
+                    published_artifact.payload,
+                    tuple(
+                        (name, digest)
+                        for name, digest in (
+                            ("manifest.json", published_artifact.manifest),
+                            ("case_results.jsonl", published_artifact.payload),
+                            ("summary.json", published_artifact.summary),
+                        )
+                        if digest is not None
+                    ),
+                ),
+            )
             for score in scores:
                 session.add(
                     EvaluationCaseResult(
@@ -393,12 +419,12 @@ def finalize_success(
                 item.expected_status == "insufficient_information" for item in scores
             )
             run.failed_gate_count = gate.failed_count
-            if published_artifact.summary is None:
+            if verified_artifact.summary is None:
                 raise EvaluationQueueError("result_publication_failed")
-            run.result_manifest_sha256 = published_artifact.manifest.sha256
-            run.result_summary_sha256 = published_artifact.summary.sha256
-            run.case_results_sha256 = published_artifact.payload.sha256
-            run.case_results_byte_size = published_artifact.payload.byte_size
+            run.result_manifest_sha256 = verified_artifact.manifest.sha256
+            run.result_summary_sha256 = verified_artifact.summary.sha256
+            run.case_results_sha256 = verified_artifact.payload.sha256
+            run.case_results_byte_size = verified_artifact.payload.byte_size
             run.worker_id = None
             run.claim_token = None
             run.lease_expires_at = None
@@ -419,17 +445,32 @@ def finalize_success(
             )
             session.flush()
     except EvaluationQueueError:
-        if published:
-            store.remove_final(scope, job.id, suite=False)
         raise
     except EvaluationContractError:
-        if published:
-            store.remove_final(scope, job.id, suite=False)
         raise
     except SQLAlchemyError as error:
-        if published:
-            store.remove_final(scope, job.id, suite=False)
         raise EvaluationQueueError("database_unavailable") from error
+
+
+def reconcile_stale_publication(
+    factory: sessionmaker[Session],
+    store: EvaluationArtifactStore,
+    job: ClaimedEvaluationRun,
+) -> None:
+    """A replacement removes only a manifest-proven predecessor publication."""
+
+    if job.stale_publication_attempt_id is None:
+        return
+    require_live_claim(factory, job)
+    try:
+        store.remove_owned_run_final(
+            DepartmentScope(job.department_id),
+            job.id,
+            job.stale_publication_attempt_id,
+        )
+    except EvaluationContractError as error:
+        raise EvaluationQueueError("artifact_reconciliation_failed") from error
+    require_live_claim(factory, job)
 
 
 def validate_claim_authority(
@@ -502,6 +543,7 @@ def _owned_claim(job: ClaimedEvaluationRun):
         EvaluationRun.status == "running",
         EvaluationRun.worker_id == job.worker_id,
         EvaluationRun.claim_token == job.claim_token,
+        EvaluationRun.publication_attempt_id == job.publication_attempt_id,
     )
 
 
@@ -528,6 +570,26 @@ def _fixed_contract(job: ClaimedEvaluationRun):
         EvaluationRun.qdrant_collection == contract["qdrant_collection"],
         EvaluationRun.vector_schema_version == contract["vector_schema_version"],
     )
+
+
+def _expected_result_manifest(job: ClaimedEvaluationRun) -> dict[str, object]:
+    if job.publication_attempt_id is None:
+        raise EvaluationQueueError("result_publication_failed")
+    return {
+        "run_id": str(job.id),
+        "suite_id": str(job.suite_id),
+        "department_id": str(job.department_id),
+        "publication_attempt_id": str(job.publication_attempt_id),
+        "metric_contract_version": METRIC_CONTRACT_VERSION,
+        "runner_contract_version": RUNNER_CONTRACT_VERSION,
+        "answer_normalization_version": ANSWER_NORMALIZATION_VERSION,
+        "gate_policy_version": GATE_POLICY_VERSION,
+        "seed_derivation_version": SEED_DERIVATION_VERSION,
+        "base_seed": job.base_seed,
+        "code_revision": job.code_revision,
+        "case_count": job.case_count,
+        **dict(production_contract()),
+    }
 
 
 def _terminal_failure(row: EvaluationRun, now, code: str) -> None:

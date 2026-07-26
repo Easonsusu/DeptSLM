@@ -18,6 +18,8 @@ from deptslm_worker.evaluation_queue import (
     EvaluationQueueError,
     cancel_owned,
     claim_next,
+    _expected_result_manifest,
+    fail_owned,
     finalize_success,
     require_live_claim,
 )
@@ -61,6 +63,7 @@ from app.evaluation_suites import (
     archive_suite,
     capture_canonical_suite_authority,
     import_suite,
+    reconcile_artifacts,
 )
 from app.extraction_domain import CHUNKING_VERSION, NORMALIZATION_VERSION, PIPELINE_VERSION
 from app.main import app
@@ -72,6 +75,7 @@ from app.models import (
     DocumentExtraction,
     DocumentVectorIndexing,
     EvaluationCaseResult,
+    EvaluationSuiteImportAttempt,
     EvaluationRun,
     EvaluationSuite,
     Membership,
@@ -119,6 +123,7 @@ def db(engine) -> Session:
         session.execute(delete(EvaluationCaseResult))
         session.execute(delete(EvaluationRun))
         session.execute(delete(EvaluationSuite))
+        session.execute(delete(EvaluationSuiteImportAttempt))
         session.execute(delete(DocumentVectorIndexing))
         session.execute(delete(DocumentChunk))
         session.execute(delete(DocumentExtraction))
@@ -146,7 +151,12 @@ def test_00_phase9_migration_paths_and_orm_sync(engine) -> None:
             "0007_phase9_evaluation_runner"
         )
     inspector = inspect(engine)
-    tables = {"evaluation_suites", "evaluation_runs", "evaluation_case_results"}
+    tables = {
+        "evaluation_suites",
+        "evaluation_suite_import_attempts",
+        "evaluation_runs",
+        "evaluation_case_results",
+    }
     assert tables <= set(inspector.get_table_names())
     for table in tables:
         assert {column["name"] for column in inspector.get_columns(table)} == {
@@ -382,6 +392,7 @@ def _ground_truth_suite(
         _suite_manifest(
             department_id=department.id,
             suite_id=suite_id,
+            import_attempt_id=uuid4(),
             gates=gates,
             case_count=1,
             answered=1,
@@ -594,6 +605,64 @@ def test_archive_suite_dry_run_reauthorizes_without_mutation_or_audit(db: Sessio
             )
             is None
         )
+
+
+def test_reconcile_artifacts_is_dry_run_by_default_and_removes_only_owned_failure(
+    db: Session, engine, tmp_path: Path
+) -> None:
+    department = _department(db, "phase9-reconcile")
+    actor = _identity(db, department, "department_admin", "reconcile-admin")
+    suite = _suite(db, department, actor)
+    run = enqueue_evaluation_run(
+        db,
+        _principal(actor),
+        _scope(department),
+        suite.id,
+        code_revision=CODE_REVISION,
+    )
+    db.commit()
+    factory = create_session_factory(engine)
+    job = claim_next(factory, uuid4(), 300, CODE_REVISION)
+    assert job is not None and job.publication_attempt_id is not None
+    root = tmp_path / "runtime"
+    (root / "eval_results").mkdir(parents=True)
+    store = EvaluationArtifactStore(root)
+    score = _score_for_finalization()
+    staged, _summary = store.stage_run(
+        DepartmentScope(department.id),
+        suite.id,
+        run.id,
+        job.publication_attempt_id,
+        manifest_value=_expected_result_manifest(job),
+        summary_value={"failed_gate_count": 0},
+        scores=(score,),
+    )
+    store.publish(staged, frozenset({"manifest.json", "summary.json", "case_results.jsonl"}))
+    assert fail_owned(factory, job, "generation_failed")
+    with factory.begin() as session:
+        row = session.get(EvaluationRun, run.id)
+        row.updated_at = datetime.now(UTC) - timedelta(minutes=2)
+    dry = reconcile_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department.id,
+        actor_issuer=ISSUER,
+        actor_subject=actor.subject,
+        limit=10,
+    )
+    assert len(dry) == 1 and dry[0].owned and not dry[0].applied
+    assert staged.final_path.exists()
+    applied = reconcile_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department.id,
+        actor_issuer=ISSUER,
+        actor_subject=actor.subject,
+        limit=10,
+        apply=True,
+    )
+    assert len(applied) == 1 and applied[0].applied
+    assert not staged.final_path.exists()
 
 
 def test_import_lock_releases_database_locks_during_artifact_scan_and_detects_change(
@@ -887,8 +956,8 @@ def test_final_authority_requester_revocation_blocks_publication_and_completion_
         DepartmentScope(department.id),
         suite.id,
         run.id,
-        job.claim_token,
-        manifest_value={"case_count": 1},
+        job.publication_attempt_id,
+        manifest_value=_expected_result_manifest(job),
         summary_value={"failed_gate_count": 0},
         scores=(score,),
     )
@@ -995,8 +1064,8 @@ def test_final_all_ground_truth_authority_blocks_races_without_success(
         DepartmentScope(department.id),
         suite.id,
         run.id,
-        job.claim_token,
-        manifest_value={"case_count": 1},
+        job.publication_attempt_id,
+        manifest_value=_expected_result_manifest(job),
         summary_value={"failed_gate_count": 0},
         scores=(score,),
     )
@@ -1095,16 +1164,17 @@ def test_unrelated_department_change_does_not_invalidate_finalization(
         DepartmentScope(department.id),
         suite.id,
         run.id,
-        job.claim_token,
-        manifest_value={"case_count": 1},
+        job.publication_attempt_id,
+        manifest_value=_expected_result_manifest(job),
         summary_value={"failed_gate_count": 0},
         scores=(score,),
     )
+    published = store.publish(staged, frozenset({"manifest.json", "summary.json", "case_results.jsonl"}))
     finalize_success(
         factory,
         store,
         job,
-        staged,
+        published,
         (score,),
         metrics,
         gate,
@@ -1200,11 +1270,12 @@ def test_quality_gate_failure_finishes_succeeded_and_audited(
         DepartmentScope(department.id),
         suite.id,
         run.id,
-        job.claim_token,
-        manifest_value={"case_count": 1},
+        job.publication_attempt_id,
+        manifest_value=_expected_result_manifest(job),
         summary_value={"failed_gate_count": 6},
         scores=(score,),
     )
+    published = store.publish(staged, frozenset({"manifest.json", "summary.json", "case_results.jsonl"}))
     monkeypatch.setattr(
         "deptslm_worker.evaluation_queue.revalidate_canonical_suite_authority_in_transaction",
         lambda *_args, **_kwargs: None,
@@ -1213,7 +1284,7 @@ def test_quality_gate_failure_finishes_succeeded_and_audited(
         factory,
         store,
         job,
-        staged,
+        published,
         (score,),
         metrics,
         gate,

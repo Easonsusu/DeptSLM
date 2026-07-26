@@ -1086,6 +1086,61 @@ class RagAnswerFeedbackSourceTarget(Base):
     created_at: Mapped[datetime] = utc_timestamp()
 
 
+class EvaluationSuiteImportAttempt(Base):
+    """Durable, content-free ownership record for an external suite publication."""
+
+    __tablename__ = "evaluation_suite_import_attempts"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('registered','staged','published','committed','failed','abandoned')",
+            name="ck_evaluation_suite_import_attempt_status",
+        ),
+        CheckConstraint(
+            "artifact_manifest_sha256 IS NULL OR artifact_manifest_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_evaluation_suite_import_attempt_manifest_hash",
+        ),
+        CheckConstraint(
+            "canonical_cases_sha256 IS NULL OR canonical_cases_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_evaluation_suite_import_attempt_cases_hash",
+        ),
+        CheckConstraint(
+            "canonical_cases_byte_size IS NULL OR canonical_cases_byte_size > 0",
+            name="ck_evaluation_suite_import_attempt_cases_size",
+        ),
+        CheckConstraint("version > 0", name="ck_evaluation_suite_import_attempt_version"),
+        Index(
+            "ix_evaluation_suite_import_attempt_department_status_created",
+            "department_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(
+        ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False
+    )
+    imported_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    suite_id: Mapped[UUID] = mapped_column(nullable=False, unique=True)
+    stage_id: Mapped[UUID] = mapped_column(nullable=False, unique=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="registered")
+    artifact_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    canonical_cases_sha256: Mapped[str | None] = mapped_column(String(64))
+    canonical_cases_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    staged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    abandoned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class EvaluationSuite(Base):
     """Immutable department-owned evaluation suite metadata."""
 
@@ -1296,7 +1351,7 @@ class EvaluationRun(Base):
             "AND insufficient_case_count = 0 AND failed_gate_count IS NULL "
             "AND result_manifest_sha256 IS NULL AND result_summary_sha256 IS NULL "
             "AND case_results_sha256 IS NULL AND case_results_byte_size IS NULL "
-            "AND error_code IS NULL) OR status <> 'queued'",
+            "AND publication_attempt_id IS NULL AND error_code IS NULL) OR status <> 'queued'",
             name="ck_evaluation_run_queued_lifecycle",
         ),
         CheckConstraint(
@@ -1304,6 +1359,7 @@ class EvaluationRun(Base):
             "AND worker_id IS NOT NULL AND claim_token IS NOT NULL "
             "AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL "
             "AND started_at IS NOT NULL AND finished_at IS NULL "
+            "AND publication_attempt_id IS NOT NULL "
             "AND failed_gate_count IS NULL AND result_manifest_sha256 IS NULL "
             "AND result_summary_sha256 IS NULL AND case_results_sha256 IS NULL "
             "AND case_results_byte_size IS NULL AND error_code IS NULL) "
@@ -1324,7 +1380,8 @@ class EvaluationRun(Base):
             "AND failed_gate_count IS NOT NULL AND failed_gate_count BETWEEN 0 AND 8 "
             "AND result_manifest_sha256 IS NOT NULL AND result_summary_sha256 IS NOT NULL "
             "AND case_results_sha256 IS NOT NULL AND case_results_byte_size IS NOT NULL "
-            "AND error_code IS NULL) OR status <> 'succeeded'",
+            "AND publication_attempt_id IS NOT NULL AND error_code IS NULL) "
+            "OR status <> 'succeeded'",
             name="ck_evaluation_run_succeeded_lifecycle",
         ),
         CheckConstraint(
@@ -1399,6 +1456,7 @@ class EvaluationRun(Base):
     case_results_byte_size: Mapped[int | None] = mapped_column(BigInteger)
     error_code: Mapped[str | None] = mapped_column(String(64))
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    publication_attempt_id: Mapped[UUID | None] = mapped_column()
     worker_id: Mapped[UUID | None] = mapped_column()
     claim_token: Mapped[UUID | None] = mapped_column()
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

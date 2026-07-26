@@ -588,7 +588,8 @@ def test_result_publication_hash_rechecks_final_bytes_after_rename(
     monkeypatch.setattr(evaluation_artifacts.os, "chmod", mutate_after_rename)
     with pytest.raises(EvaluationContractError):
         store.publish(staged, RUN_FILES)
-    assert not staged.final_path.exists()
+    assert staged.final_path.exists()
+    store.remove_final(scope, UUID(staged.final_path.name), suite=False)
 
 
 def test_publication_hashes_match_exact_final_bytes(tmp_path: Path) -> None:
@@ -627,6 +628,7 @@ def test_canonical_suite_descriptor_detects_mutation_during_same_descriptor_read
     manifest = {
         "suite_id": suite_id,
         "department_id": scope.value,
+        "import_attempt_id": uuid4(),
         "suite_contract_version": SUITE_CONTRACT_VERSION,
         "metric_contract_version": METRIC_CONTRACT_VERSION,
         "answer_normalization_version": ANSWER_NORMALIZATION_VERSION,
@@ -669,6 +671,7 @@ def test_canonical_suite_descriptor_rejects_manifest_path_replacement(
     manifest = {
         "suite_id": suite_id,
         "department_id": scope.value,
+        "import_attempt_id": uuid4(),
         "suite_contract_version": SUITE_CONTRACT_VERSION,
         "metric_contract_version": METRIC_CONTRACT_VERSION,
         "answer_normalization_version": ANSWER_NORMALIZATION_VERSION,
@@ -935,6 +938,7 @@ def test_evaluator_one_case_fake_runtime_smoke_is_content_free(
         base_seed=9,
         case_count=1,
         code_revision="9" * 40,
+        publication_attempt_id=uuid4(),
     )
     suite = SimpleNamespace(
         id=suite_id,
@@ -986,6 +990,19 @@ def test_evaluator_one_case_fake_runtime_smoke_is_content_free(
         evaluation_pipeline,
         "_supervise_authority",
         lambda *_args, **_kwargs: authority,
+    )
+    def stage_result(_factory, _settings, _scope, _job, manifest, summary, scores, _stop):
+        rendered = json.dumps({"manifest": manifest, "summary": summary}, default=str)
+        assert "Synthetic question?" not in rendered
+        assert "Synthetic answer." not in rendered
+        captured["scores"] = tuple(scores)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(evaluation_pipeline, "_supervise_result_stage", stage_result)
+    monkeypatch.setattr(
+        evaluation_pipeline,
+        "_supervise_result_publish",
+        lambda *_args, **_kwargs: SimpleNamespace(),
     )
 
     def execute_case(_factory, _settings, _scope, _question, seed, *_args):

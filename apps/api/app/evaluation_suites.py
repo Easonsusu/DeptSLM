@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import unicodedata
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -15,7 +16,7 @@ from deptslm_worker.artifact_reader import (
     Phase5ArtifactReader,
     verify_artifact_authority_identity,
 )
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -47,7 +48,9 @@ from app.models import (
     DocumentChunk,
     DocumentExtraction,
     DocumentVectorIndexing,
+    EvaluationRun,
     EvaluationSuite,
+    EvaluationSuiteImportAttempt,
 )
 from app.rag_domain import MAX_QUESTION_CHARS, normalize_question, validate_safe_text
 from app.services import ServiceError, append_mutation_audit, authorize_transaction
@@ -68,6 +71,8 @@ EVALUATOR_ROLES = frozenset(
         DepartmentRole.INSTRUCTOR,
     }
 )
+RECONCILER_ROLES = frozenset({DepartmentRole.SYSTEM_ADMIN, DepartmentRole.DEPARTMENT_ADMIN})
+RECONCILIATION_MINIMUM_AGE_SECONDS = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +164,40 @@ class SuiteArchiveSettings:
         return cls(database_url)
 
 
+@dataclass(frozen=True, slots=True)
+class ArtifactReconcileSettings:
+    database_url: str
+    data_dir: Path
+
+    @classmethod
+    def from_environment(cls) -> ArtifactReconcileSettings:
+        database_url = os.getenv("DATABASE_URL", "").strip()
+        raw_data_dir = os.getenv("DEPTSLM_DATA_DIR", "").strip()
+        if not database_url.startswith("postgresql+psycopg://"):
+            raise SuiteImportConfigurationError(
+                "DATABASE_URL must use the postgresql+psycopg driver."
+            )
+        if not raw_data_dir:
+            raise SuiteImportConfigurationError("DEPTSLM_DATA_DIR is required.")
+        data_dir = Path(raw_data_dir).expanduser()
+        if not data_dir.is_absolute() or not data_dir.is_dir():
+            raise SuiteImportConfigurationError(
+                "DEPTSLM_DATA_DIR must be an existing absolute directory."
+            )
+        return cls(database_url, data_dir.resolve())
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactReconcileItem:
+    resource_type: str
+    resource_id: UUID
+    status: str
+    created_at: object
+    final_present: bool
+    owned: bool
+    applied: bool
+
+
 def import_suite(
     settings: SuiteImportSettings,
     *,
@@ -191,11 +230,12 @@ def import_suite(
     store = EvaluationArtifactStore(settings.data_dir)
     suite_id = uuid4()
     stage_id = uuid4()
+    import_attempt_id = uuid4()
     staged = None
     published = False
     try:
         with factory.begin() as session:
-            authorize_transaction(
+            authorization = authorize_transaction(
                 session,
                 principal,
                 request_scope,
@@ -203,6 +243,17 @@ def import_suite(
                 lock=True,
                 audit_action="evaluation.suite.import.authorization",
             )
+            if apply:
+                session.add(
+                    EvaluationSuiteImportAttempt(
+                        id=import_attempt_id,
+                        department_id=department_id,
+                        imported_by_user_id=authorization.identity.id,
+                        suite_id=suite_id,
+                        stage_id=stage_id,
+                        status="registered",
+                    )
+                )
             snapshots, validations = _ground_truth_snapshot_metadata(session, scope, cases)
         verified_artifacts = _verify_ground_truth_artifacts(settings.data_dir, scope, validations)
         verified = GroundTruthAuthoritySnapshot(snapshots, verified_artifacts)
@@ -212,6 +263,7 @@ def import_suite(
         manifest = _suite_manifest(
             department_id=department_id,
             suite_id=suite_id,
+            import_attempt_id=import_attempt_id,
             gates=gates,
             case_count=len(cases),
             answered=answered,
@@ -224,6 +276,26 @@ def import_suite(
                 suite_id, department_id, len(cases), answered, insufficient, False
             )
 
+        with factory.begin() as session:
+            attempt = session.execute(
+                select(EvaluationSuiteImportAttempt)
+                .where(
+                    EvaluationSuiteImportAttempt.id == import_attempt_id,
+                    EvaluationSuiteImportAttempt.department_id == department_id,
+                    EvaluationSuiteImportAttempt.status == "registered",
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if attempt is None:
+                raise EvaluationContractError("artifact_reconciliation_failed")
+            now = session.execute(select(_clock_timestamp())).scalar_one()
+            attempt.status = "staged"
+            attempt.artifact_manifest_sha256 = staged.manifest.sha256
+            attempt.canonical_cases_sha256 = staged.payload.sha256
+            attempt.canonical_cases_byte_size = staged.payload.byte_size
+            attempt.staged_at = now
+            attempt.version += 1
+
         try:
             current = capture_ground_truth_authority(
                 factory,
@@ -233,6 +305,29 @@ def import_suite(
             )
             if current != verified:
                 raise EvaluationContractError("suite_source_stale")
+            published_artifact = store.publish(staged, frozenset({"manifest.json", "cases.jsonl"}))
+            published_artifact = store.verify_published_suite(
+                scope,
+                suite_id,
+                expected_manifest=manifest,
+                expected=staged,
+            )
+            published = True
+            with factory.begin() as session:
+                attempt = session.execute(
+                    select(EvaluationSuiteImportAttempt)
+                    .where(
+                        EvaluationSuiteImportAttempt.id == import_attempt_id,
+                        EvaluationSuiteImportAttempt.department_id == department_id,
+                        EvaluationSuiteImportAttempt.status == "staged",
+                    )
+                    .with_for_update()
+                ).scalar_one_or_none()
+                if attempt is None:
+                    raise EvaluationContractError("artifact_reconciliation_failed")
+                attempt.status = "published"
+                attempt.published_at = session.execute(select(_clock_timestamp())).scalar_one()
+                attempt.version += 1
             with factory.begin() as session:
                 authorization = authorize_transaction(
                     session,
@@ -242,6 +337,16 @@ def import_suite(
                     lock=True,
                     audit_action="evaluation.suite.import.authorization",
                 )
+                attempt = session.execute(
+                    select(EvaluationSuiteImportAttempt)
+                    .where(
+                        EvaluationSuiteImportAttempt.id == import_attempt_id,
+                        EvaluationSuiteImportAttempt.department_id == department_id,
+                    )
+                    .with_for_update()
+                ).scalar_one_or_none()
+                if attempt is None or attempt.status != "published":
+                    raise EvaluationContractError("artifact_reconciliation_failed")
                 revalidate_ground_truth_authority_in_transaction(
                     session,
                     settings.data_dir,
@@ -278,17 +383,49 @@ def import_suite(
                     resource_type="evaluation_suite",
                     resource_id=suite.id,
                 )
-                published_artifact = store.publish(
-                    staged, frozenset({"manifest.json", "cases.jsonl"})
-                )
                 suite.artifact_manifest_sha256 = published_artifact.manifest.sha256
                 suite.canonical_cases_sha256 = published_artifact.payload.sha256
                 suite.canonical_cases_byte_size = published_artifact.payload.byte_size
-                published = True
+                now = session.execute(select(_clock_timestamp())).scalar_one()
+                attempt.status = "committed"
+                attempt.published_at = attempt.published_at or now
+                attempt.committed_at = now
+                attempt.version += 1
                 session.flush()
         except Exception:
             if published:
-                store.remove_final(scope, suite_id, suite=True)
+                try:
+                    with factory() as session:
+                        status = session.scalar(
+                            select(EvaluationSuiteImportAttempt.status).where(
+                                EvaluationSuiteImportAttempt.id == import_attempt_id,
+                                EvaluationSuiteImportAttempt.department_id == department_id,
+                            )
+                        )
+                    if status != "committed":
+                        store.remove_owned_suite_final(scope, suite_id, import_attempt_id)
+                except (SQLAlchemyError, EvaluationContractError):
+                    pass
+            else:
+                try:
+                    with factory.begin() as session:
+                        attempt = session.execute(
+                            select(EvaluationSuiteImportAttempt)
+                            .where(
+                                EvaluationSuiteImportAttempt.id == import_attempt_id,
+                                EvaluationSuiteImportAttempt.department_id == department_id,
+                                EvaluationSuiteImportAttempt.status.in_(("registered", "staged")),
+                            )
+                            .with_for_update()
+                        ).scalar_one_or_none()
+                        if attempt is not None:
+                            attempt.status = "failed"
+                            attempt.failed_at = session.execute(
+                                select(_clock_timestamp())
+                            ).scalar_one()
+                            attempt.version += 1
+                except SQLAlchemyError:
+                    pass
             raise
         return SuiteImportResult(suite_id, department_id, len(cases), answered, insufficient, True)
     except (ServiceError, EvaluationContractError):
@@ -354,6 +491,185 @@ def archive_suite(
         raise
     except SQLAlchemyError as error:
         raise ServiceError(503, "Database unavailable") from error
+
+
+def reconcile_artifacts(
+    factory: sessionmaker[Session],
+    *,
+    data_dir: Path,
+    department_id: UUID,
+    actor_issuer: str,
+    actor_subject: str,
+    limit: int,
+    apply: bool = False,
+) -> tuple[ArtifactReconcileItem, ...]:
+    """Bounded metadata-led recovery; dry-run never mutates storage or PostgreSQL."""
+
+    if not 1 <= limit <= 100:
+        raise EvaluationContractError()
+    scope = DepartmentScope(department_id)
+    request_scope = DepartmentRequestScope(scope)
+    principal = AuthenticatedPrincipal(actor_subject, actor_issuer)
+    store = EvaluationArtifactStore(data_dir)
+    try:
+        with factory.begin() as session:
+            authorize_transaction(
+                session,
+                principal,
+                request_scope,
+                RECONCILER_ROLES,
+                lock=True,
+                audit_action="evaluation.artifact.reconcile.authorization",
+            )
+            cutoff = session.scalar(
+                select(
+                    func.clock_timestamp() - timedelta(seconds=RECONCILIATION_MINIMUM_AGE_SECONDS)
+                )
+            )
+            runs = tuple(
+                session.execute(
+                    select(
+                        EvaluationRun.id,
+                        EvaluationRun.status,
+                        EvaluationRun.created_at,
+                        EvaluationRun.publication_attempt_id,
+                    )
+                    .where(
+                        EvaluationRun.department_id == department_id,
+                        EvaluationRun.status != "succeeded",
+                        EvaluationRun.publication_attempt_id.is_not(None),
+                        EvaluationRun.updated_at <= cutoff,
+                    )
+                    .order_by(EvaluationRun.created_at, EvaluationRun.id)
+                    .limit(limit)
+                )
+            )
+            remaining = max(0, limit - len(runs))
+            attempts = tuple(
+                session.execute(
+                    select(
+                        EvaluationSuiteImportAttempt.id,
+                        EvaluationSuiteImportAttempt.suite_id,
+                        EvaluationSuiteImportAttempt.status,
+                        EvaluationSuiteImportAttempt.created_at,
+                    )
+                    .where(
+                        EvaluationSuiteImportAttempt.department_id == department_id,
+                        EvaluationSuiteImportAttempt.status != "committed",
+                        EvaluationSuiteImportAttempt.updated_at <= cutoff,
+                    )
+                    .order_by(
+                        EvaluationSuiteImportAttempt.created_at, EvaluationSuiteImportAttempt.id
+                    )
+                    .limit(remaining)
+                )
+            )
+        items: list[ArtifactReconcileItem] = []
+        removals: list[tuple[str, UUID, UUID]] = []
+        for run_id, status, created_at, publication_attempt_id in runs:
+            try:
+                owned = store.run_final_owned_by(scope, run_id, publication_attempt_id)
+                present = owned or (store.runs / str(department_id) / str(run_id)).exists()
+            except EvaluationContractError:
+                owned, present = False, True
+            applied_item = False
+            if apply and owned:
+                with factory.begin() as session:
+                    authorize_transaction(
+                        session,
+                        principal,
+                        request_scope,
+                        RECONCILER_ROLES,
+                        lock=True,
+                        audit_action="evaluation.artifact.reconcile.authorization",
+                    )
+                    current = session.execute(
+                        select(EvaluationRun)
+                        .where(
+                            EvaluationRun.id == run_id,
+                            EvaluationRun.department_id == department_id,
+                            EvaluationRun.status != "succeeded",
+                            EvaluationRun.publication_attempt_id == publication_attempt_id,
+                        )
+                        .with_for_update()
+                    ).scalar_one_or_none()
+                    if current is not None:
+                        store.remove_owned_run_final(scope, run_id, publication_attempt_id)
+                        applied_item = True
+                        removals.append(("evaluation_run", run_id, publication_attempt_id))
+            items.append(
+                ArtifactReconcileItem(
+                    "evaluation_run", run_id, status, created_at, present, owned, applied_item
+                )
+            )
+        for attempt_id, suite_id, status, created_at in attempts:
+            try:
+                owned = store.suite_final_owned_by(scope, suite_id, attempt_id)
+                present = owned or (store.suites / str(department_id) / str(suite_id)).exists()
+            except EvaluationContractError:
+                owned, present = False, True
+            applied_item = False
+            if apply and owned:
+                with factory.begin() as session:
+                    authorize_transaction(
+                        session,
+                        principal,
+                        request_scope,
+                        RECONCILER_ROLES,
+                        lock=True,
+                        audit_action="evaluation.artifact.reconcile.authorization",
+                    )
+                    current = session.execute(
+                        select(EvaluationSuiteImportAttempt)
+                        .where(
+                            EvaluationSuiteImportAttempt.id == attempt_id,
+                            EvaluationSuiteImportAttempt.department_id == department_id,
+                            EvaluationSuiteImportAttempt.status != "committed",
+                        )
+                        .with_for_update()
+                    ).scalar_one_or_none()
+                    if current is not None:
+                        store.remove_owned_suite_final(scope, suite_id, attempt_id)
+                        current.status = "abandoned"
+                        current.abandoned_at = session.scalar(select(_clock_timestamp()))
+                        current.version += 1
+                        applied_item = True
+                        removals.append(("evaluation_suite_import_attempt", attempt_id, suite_id))
+            items.append(
+                ArtifactReconcileItem(
+                    "evaluation_suite_import_attempt",
+                    attempt_id,
+                    status,
+                    created_at,
+                    present,
+                    owned,
+                    applied_item,
+                )
+            )
+        if apply and removals:
+            with factory.begin() as session:
+                authorization = authorize_transaction(
+                    session,
+                    principal,
+                    request_scope,
+                    RECONCILER_ROLES,
+                    lock=True,
+                    audit_action="evaluation.artifact.reconcile.authorization",
+                )
+                append_mutation_audit(
+                    session,
+                    actor=authorization.identity,
+                    actor_subject=principal.subject,
+                    request_scope=request_scope,
+                    action="evaluation.artifact.reconcile",
+                    resource_type="department",
+                    resource_id=department_id,
+                )
+        return tuple(items)
+    except (ServiceError, EvaluationContractError):
+        raise
+    except SQLAlchemyError as error:
+        raise EvaluationContractError("database_unavailable") from error
 
 
 def capture_canonical_suite_authority(
@@ -773,6 +1089,7 @@ def _suite_manifest(
     *,
     department_id: UUID,
     suite_id: UUID,
+    import_attempt_id: UUID,
     gates: QualityGates,
     case_count: int,
     answered: int,
@@ -781,6 +1098,7 @@ def _suite_manifest(
     return {
         "suite_id": str(suite_id),
         "department_id": str(department_id),
+        "import_attempt_id": str(import_attempt_id),
         "suite_contract_version": SUITE_CONTRACT_VERSION,
         "metric_contract_version": METRIC_CONTRACT_VERSION,
         "answer_normalization_version": ANSWER_NORMALIZATION_VERSION,

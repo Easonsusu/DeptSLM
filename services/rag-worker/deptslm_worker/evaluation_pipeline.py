@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.authorization import DepartmentScope
 from app.database import create_database_engine, create_session_factory
-from app.evaluation_artifacts import EvaluationArtifactStore
+from app.evaluation_artifacts import EvaluationArtifactStore, PublishedArtifact, StagedArtifact
 from app.evaluation_domain import (
     ANSWER_NORMALIZATION_VERSION,
     ARTIFACT_CONTRACT_VERSION,
@@ -50,6 +50,7 @@ from deptslm_worker.evaluation_queue import (
     EvaluationQueueError,
     fail_owned,
     finalize_success,
+    reconcile_stale_publication,
     record_progress,
     renew_lease,
     require_live_claim,
@@ -91,11 +92,13 @@ def process_evaluation_run(
 ) -> bool:
     scope = DepartmentScope(job.department_id)
     staged = None
+    published = None
     try:
         require_live_claim(factory, job)
-        if job.stale_claim_token is not None:
-            store.cleanup_stage(scope, job.id, job.stale_claim_token, suite=False)
+        if job.stale_publication_attempt_id is not None:
+            store.cleanup_stage(scope, job.id, job.stale_publication_attempt_id, suite=False)
             require_live_claim(factory, job)
+        reconcile_stale_publication(factory, store, job)
         suite = validate_claim_authority(factory, job)
         suite_execution = _supervise_suite_load(
             factory,
@@ -164,15 +167,20 @@ def process_evaluation_run(
         if should_stop():
             raise _WorkerStopped()
         manifest, summary = _result_values(job, metrics, gates, gate)
-        staged, _summary_digest = store.stage_run(
+        staged = _supervise_result_stage(
+            factory,
+            settings,
             scope,
-            job.suite_id,
-            job.id,
-            job.claim_token,
-            manifest_value=manifest,
-            summary_value=summary,
-            scores=tuple(scores),
+            job,
+            manifest,
+            summary,
+            tuple(scores),
+            should_stop,
         )
+        require_live_claim(factory, job)
+        if should_stop():
+            raise _WorkerStopped()
+        published = _supervise_result_publish(factory, settings, job, staged, should_stop)
         require_live_claim(factory, job)
         if should_stop():
             raise _WorkerStopped()
@@ -180,7 +188,7 @@ def process_evaluation_run(
             factory,
             store,
             job,
-            staged,
+            published,
             tuple(scores),
             metrics,
             gate,
@@ -193,10 +201,16 @@ def process_evaluation_run(
         if staged is not None:
             try:
                 require_live_claim(factory, job)
-                store.cleanup_stage(scope, job.id, job.claim_token, suite=False)
+                store.cleanup_stage(scope, job.id, job.publication_attempt_id, suite=False)
             except (EvaluationQueueError, EvaluationContractError):
                 pass
         _event(job, "processing", "denied", "worker_shutdown")
+        if published is not None:
+            try:
+                require_live_claim(factory, job, allow_cancellation=True)
+                store.remove_owned_run_final(scope, job.id, job.publication_attempt_id)
+            except (EvaluationQueueError, EvaluationContractError):
+                pass
         return False
     except EvaluationQueueError as error:
         code = error.code
@@ -216,12 +230,135 @@ def process_evaluation_run(
     if staged is not None:
         try:
             require_live_claim(factory, job, allow_cancellation=True)
-            store.cleanup_stage(scope, job.id, job.claim_token, suite=False)
+            store.cleanup_stage(scope, job.id, job.publication_attempt_id, suite=False)
+        except (EvaluationQueueError, EvaluationContractError):
+            pass
+    if published is not None:
+        try:
+            require_live_claim(factory, job, allow_cancellation=True)
+            store.remove_owned_run_final(scope, job.id, job.publication_attempt_id)
         except (EvaluationQueueError, EvaluationContractError):
             pass
     fail_owned(factory, job, code)
     _event(job, "complete", "denied", code)
     return False
+
+
+def _result_stage_process_entry(
+    connection,
+    settings: EvaluationSettings,
+    scope: DepartmentScope,
+    suite_id: UUID,
+    run_id: UUID,
+    publication_attempt_id: UUID,
+    manifest: dict[str, object],
+    summary: dict[str, object],
+    scores: tuple,
+) -> None:
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    connection.send(("ready",))
+    try:
+        staged, _summary = EvaluationArtifactStore(settings.data_dir).stage_run(
+            scope,
+            suite_id,
+            run_id,
+            publication_attempt_id,
+            manifest_value=manifest,
+            summary_value=summary,
+            scores=scores,
+        )
+        connection.send(("result", staged))
+    except EvaluationContractError as error:
+        connection.send(("failure", error.code))
+    except BaseException:
+        connection.send(("failure", "result_publication_failed"))
+    finally:
+        connection.close()
+
+
+def _supervise_result_stage(
+    factory: sessionmaker[Session],
+    settings: EvaluationSettings,
+    scope: DepartmentScope,
+    job: ClaimedEvaluationRun,
+    manifest: dict[str, object],
+    summary: dict[str, object],
+    scores: tuple,
+    should_stop: Callable[[], bool],
+) -> StagedArtifact:
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_result_stage_process_entry,
+        args=(
+            child,
+            settings,
+            scope,
+            job.suite_id,
+            job.id,
+            job.publication_attempt_id,
+            manifest,
+            summary,
+            scores,
+        ),
+        daemon=False,
+    )
+    process.start()
+    child.close()
+    result = _wait_for_supervised_process(
+        factory, settings, job, should_stop, parent, process, StagedArtifact
+    )
+    if not isinstance(result, StagedArtifact):
+        raise EvaluationQueueError("result_publication_failed")
+    return result
+
+
+def _result_publish_process_entry(
+    connection, settings: EvaluationSettings, staged: StagedArtifact
+) -> None:
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    connection.send(("ready",))
+    try:
+        published = EvaluationArtifactStore(settings.data_dir).publish(
+            staged, frozenset({"manifest.json", "summary.json", "case_results.jsonl"})
+        )
+        connection.send(("result", published))
+    except EvaluationContractError as error:
+        connection.send(("failure", error.code))
+    except BaseException:
+        connection.send(("failure", "result_publication_failed"))
+    finally:
+        connection.close()
+
+
+def _supervise_result_publish(
+    factory: sessionmaker[Session],
+    settings: EvaluationSettings,
+    job: ClaimedEvaluationRun,
+    staged: StagedArtifact,
+    should_stop: Callable[[], bool],
+) -> PublishedArtifact:
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_result_publish_process_entry,
+        args=(child, settings, staged),
+        daemon=False,
+    )
+    process.start()
+    child.close()
+    result = _wait_for_supervised_process(
+        factory, settings, job, should_stop, parent, process, PublishedArtifact
+    )
+    if not isinstance(result, PublishedArtifact):
+        raise EvaluationQueueError("result_publication_failed")
+    return result
 
 
 def _suite_process_entry(
@@ -643,6 +780,7 @@ def _result_values(job, metrics, gates, gate):
         "run_id": str(job.id),
         "suite_id": str(job.suite_id),
         "department_id": str(job.department_id),
+        "publication_attempt_id": str(job.publication_attempt_id),
         "metric_contract_version": METRIC_CONTRACT_VERSION,
         "runner_contract_version": RUNNER_CONTRACT_VERSION,
         "answer_normalization_version": ANSWER_NORMALIZATION_VERSION,

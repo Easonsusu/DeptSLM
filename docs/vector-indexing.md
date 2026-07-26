@@ -34,6 +34,8 @@ One secret-free offline embedding subprocess loads the pinned model once per job
 
 Cleanup is permitted only after the fixed collection schema was accepted and only while the exact PostgreSQL claim remains live. Exact deletion uses department, indexing, and vector-attempt filters, then requires both unpublished and published zero counts. On graceful shutdown, the process group stops, the exact current attempt is cleaned, and the job requeues only if the lease is still valid. A hard crash relies on expiry; reclaim preserves the old attempt ID, performs verified cleanup before processing, and repeats the same old-attempt cleanup immediately before activating the replacement. Any model, artifact, database, Qdrant, point-count, claim, or cleanup failure prevents success.
 
+Phase 9 does not add an evaluator-specific Qdrant path. It continues to reuse this exact department-scoped adapter and PostgreSQL authority boundary.
+
 ## Soft deletion and limitations
 
 Document soft deletion cancels queued indexing attempts with `document_unavailable` in the same PostgreSQL transaction. Running workers fail finalization after document revalidation. No Qdrant call occurs in deletion. Succeeded vectors may remain physically retained, but the internal retrieval cross-check rejects deleted documents; automatic physical purge is deferred.

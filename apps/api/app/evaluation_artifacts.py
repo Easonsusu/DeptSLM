@@ -16,6 +16,7 @@ from uuid import UUID
 from app.authorization import DepartmentScope
 from app.evaluation_domain import (
     ARTIFACT_CONTRACT_VERSION,
+    GATE_NAMES,
     MAX_CASE_JSONL_LINE_BYTES,
     MAX_SUITE_INPUT_BYTES,
     EvaluationCaseScore,
@@ -108,13 +109,13 @@ class EvaluationArtifactStore:
         scope: DepartmentScope,
         suite_id: UUID,
         run_id: UUID,
-        claim_token: UUID,
+        publication_attempt_id: UUID,
         *,
         manifest_value: dict[str, object],
         summary_value: dict[str, object],
         scores: Iterable[EvaluationCaseScore],
     ) -> tuple[StagedArtifact, ArtifactDigest]:
-        stage = self._stage_directory(self.staging_runs, scope, run_id, claim_token)
+        stage = self._stage_directory(self.staging_runs, scope, run_id, publication_attempt_id)
         final = self._final_directory(self.runs, scope, run_id)
         try:
             case_digest = _write_lines(
@@ -168,10 +169,8 @@ class EvaluationArtifactStore:
         _ensure_parent(staged.final_path)
         if staged.final_path.exists():
             raise EvaluationContractError("result_publication_failed")
-        renamed = False
         try:
             os.rename(staged.path, staged.final_path)
-            renamed = True
             os.chmod(staged.final_path, 0o700)
             verified = _verify_expected_files(staged.final_path, allowlist, expected)
             return PublishedArtifact(
@@ -181,12 +180,8 @@ class EvaluationArtifactStore:
                 verified.get("summary.json"),
             )
         except EvaluationContractError:
-            if renamed:
-                _safe_remove_tree(staged.final_path)
             raise
         except OSError as error:
-            if renamed:
-                _safe_remove_tree(staged.final_path)
             raise EvaluationContractError("result_publication_failed") from error
 
     def cleanup_stage(
@@ -202,6 +197,148 @@ class EvaluationArtifactStore:
         path = root / str(scope.value) / str(resource_id)
         _require_beneath(root, path)
         _safe_remove_tree(path)
+
+    def verify_published_run(
+        self,
+        scope: DepartmentScope,
+        run_id: UUID,
+        *,
+        expected_manifest: dict[str, object],
+        expected: StagedArtifact | None = None,
+    ) -> PublishedArtifact:
+        """Re-open a final result through no-follow descriptors and bind it to one attempt."""
+
+        path = self._final_directory(self.runs, scope, run_id)
+        verified = (
+            _verify_expected_files(
+                path,
+                RUN_FILES,
+                dict(expected.files) if expected is not None else {},
+            )
+            if expected is not None
+            else _verify_run_files(path)
+        )
+        manifest = _read_manifest(path)
+        _validate_run_manifest_shape(manifest)
+        required_manifest = dict(expected_manifest)
+        required_manifest["artifact_contract_version"] = ARTIFACT_CONTRACT_VERSION
+        required_manifest["files"] = {
+            "summary.json": {
+                "sha256": verified["summary.json"].sha256,
+                "byte_size": verified["summary.json"].byte_size,
+            },
+            "case_results.jsonl": {
+                "sha256": verified["case_results.jsonl"].sha256,
+                "byte_size": verified["case_results.jsonl"].byte_size,
+            },
+        }
+        if manifest != required_manifest:
+            raise EvaluationContractError("result_publication_failed")
+        return PublishedArtifact(
+            path,
+            verified["manifest.json"],
+            verified["case_results.jsonl"],
+            verified["summary.json"],
+        )
+
+    def remove_owned_run_final(
+        self,
+        scope: DepartmentScope,
+        run_id: UUID,
+        publication_attempt_id: UUID,
+    ) -> bool:
+        """Remove only a final directory whose closed manifest proves exact ownership."""
+
+        path = self._final_directory(self.runs, scope, run_id)
+        if not path.exists():
+            return False
+        manifest = _read_manifest(path)
+        _validate_run_manifest_shape(manifest)
+        if (
+            manifest.get("department_id") != str(scope.value)
+            or manifest.get("run_id") != str(run_id)
+            or manifest.get("publication_attempt_id") != str(publication_attempt_id)
+        ):
+            raise EvaluationContractError("result_publication_failed")
+        _safe_remove_tree(path)
+        return True
+
+    def verify_published_suite(
+        self,
+        scope: DepartmentScope,
+        suite_id: UUID,
+        *,
+        expected_manifest: dict[str, object],
+        expected: StagedArtifact,
+    ) -> PublishedArtifact:
+        path = self._final_directory(self.suites, scope, suite_id)
+        verified = _verify_expected_files(path, SUITE_FILES, dict(expected.files))
+        manifest = _read_suite_manifest(path)
+        _validate_suite_manifest_shape(manifest)
+        required = dict(expected_manifest)
+        required["artifact_contract_version"] = ARTIFACT_CONTRACT_VERSION
+        required["files"] = {
+            "cases.jsonl": {
+                "sha256": verified["cases.jsonl"].sha256,
+                "byte_size": verified["cases.jsonl"].byte_size,
+            }
+        }
+        if manifest != required:
+            raise EvaluationContractError("result_publication_failed")
+        return PublishedArtifact(
+            path,
+            verified["manifest.json"],
+            verified["cases.jsonl"],
+            None,
+        )
+
+    def run_final_owned_by(
+        self, scope: DepartmentScope, run_id: UUID, publication_attempt_id: UUID
+    ) -> bool:
+        path = self._final_directory(self.runs, scope, run_id)
+        if not path.exists():
+            return False
+        manifest = _read_manifest(path)
+        _validate_run_manifest_shape(manifest)
+        return (
+            manifest.get("department_id") == str(scope.value)
+            and manifest.get("run_id") == str(run_id)
+            and manifest.get("publication_attempt_id") == str(publication_attempt_id)
+        )
+
+    def remove_owned_suite_final(
+        self,
+        scope: DepartmentScope,
+        suite_id: UUID,
+        import_attempt_id: UUID,
+    ) -> bool:
+        path = self._final_directory(self.suites, scope, suite_id)
+        if not path.exists():
+            return False
+        manifest = _read_suite_manifest(path)
+        _validate_suite_manifest_shape(manifest)
+        if (
+            manifest.get("department_id") != str(scope.value)
+            or manifest.get("suite_id") != str(suite_id)
+            or manifest.get("import_attempt_id") != str(import_attempt_id)
+        ):
+            raise EvaluationContractError("result_publication_failed")
+        _safe_remove_tree(path)
+        return True
+
+    def suite_final_owned_by(
+        self, scope: DepartmentScope, suite_id: UUID, import_attempt_id: UUID
+    ) -> bool:
+        path = self._final_directory(self.suites, scope, suite_id)
+        if not path.exists():
+            return False
+        manifest = _read_suite_manifest(path)
+        _validate_suite_manifest_shape(manifest)
+        return (
+            manifest.get("department_id") == str(scope.value)
+            and manifest.get("suite_id") == str(suite_id)
+            and manifest.get("import_attempt_id") == str(import_attempt_id)
+        )
 
     def iter_suite_cases(
         self,
@@ -234,6 +371,10 @@ class EvaluationArtifactStore:
                 cases_sha256=cases_sha256,
                 cases_byte_size=cases_byte_size,
             )
+            if manifest_value.get("suite_id") != str(suite_id) or manifest_value.get(
+                "department_id"
+            ) != str(scope.value):
+                raise EvaluationContractError("suite_artifact_mismatch")
             cases_descriptor, cases_metadata = _open_regular_at(directory, "cases.jsonl")
             try:
                 yield from _iter_json_lines_descriptor(
@@ -743,6 +884,229 @@ def _validate_published_manifest(
             raise EvaluationContractError("result_publication_failed")
 
 
+def _read_manifest(path: Path) -> dict[str, object]:
+    directory = _open_directory(path)
+    try:
+        _verify_directory_descriptor(directory, RUN_FILES)
+        descriptor, metadata = _open_regular_at(directory, "manifest.json")
+        try:
+            raw, _digest = _read_bounded_descriptor(descriptor, metadata, maximum=64 * 1024)
+            _verify_path_identity(directory, "manifest.json", metadata)
+            return _parse_json_object(raw)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+
+
+def _read_suite_manifest(path: Path) -> dict[str, object]:
+    directory = _open_directory(path)
+    try:
+        _verify_directory_descriptor(directory, SUITE_FILES)
+        descriptor, metadata = _open_regular_at(directory, "manifest.json")
+        try:
+            raw, _digest = _read_bounded_descriptor(descriptor, metadata, maximum=64 * 1024)
+            _verify_path_identity(directory, "manifest.json", metadata)
+            return _parse_json_object(raw)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+
+
+def _verify_run_files(path: Path) -> dict[str, ArtifactDigest]:
+    manifest = _read_manifest(path)
+    _validate_run_manifest_shape(manifest)
+    files = manifest["files"]
+    assert isinstance(files, dict)
+    expected = {
+        name: ArtifactDigest(value["sha256"], value["byte_size"])
+        for name, value in files.items()
+        if isinstance(value, dict)
+        and isinstance(value.get("sha256"), str)
+        and isinstance(value.get("byte_size"), int)
+    }
+    if set(expected) != {"summary.json", "case_results.jsonl"}:
+        raise EvaluationContractError("result_publication_failed")
+    # The manifest digest is not self-declared. Re-open it in the verifier and
+    # let descriptor hashing establish it together with both payload digests.
+    directory = _open_directory(path)
+    try:
+        descriptor, metadata = _open_regular_at(directory, "manifest.json")
+        try:
+            _raw, manifest_digest = _read_bounded_descriptor(
+                descriptor, metadata, maximum=64 * 1024
+            )
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+    expected["manifest.json"] = manifest_digest
+    return _verify_expected_files(path, RUN_FILES, expected)
+
+
+def _validate_digest_value(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"sha256", "byte_size"}
+        and isinstance(value["sha256"], str)
+        and len(value["sha256"]) == 64
+        and all(character in "0123456789abcdef" for character in value["sha256"])
+        and isinstance(value["byte_size"], int)
+        and not isinstance(value["byte_size"], bool)
+        and value["byte_size"] > 0
+    )
+
+
+def _valid_uuid(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return UUID(value).int != 0
+    except ValueError:
+        return False
+
+
+def _validate_suite_manifest_shape(value: dict[str, object]) -> None:
+    expected_keys = {
+        "suite_id",
+        "department_id",
+        "import_attempt_id",
+        "suite_contract_version",
+        "metric_contract_version",
+        "answer_normalization_version",
+        "gate_policy_version",
+        "case_count",
+        "answered_case_count",
+        "insufficient_case_count",
+        "gates",
+        "artifact_contract_version",
+        "files",
+    }
+    if (
+        set(value) != expected_keys
+        or value.get("artifact_contract_version") != ARTIFACT_CONTRACT_VERSION
+    ):
+        raise EvaluationContractError("suite_artifact_mismatch")
+    if not all(
+        _valid_uuid(value.get(name)) for name in ("suite_id", "department_id", "import_attempt_id")
+    ):
+        raise EvaluationContractError("suite_artifact_mismatch")
+    if not all(
+        isinstance(value.get(name), int) and not isinstance(value.get(name), bool)
+        for name in ("case_count", "answered_case_count", "insufficient_case_count")
+    ):
+        raise EvaluationContractError("suite_artifact_mismatch")
+    gates = value.get("gates")
+    files = value.get("files")
+    if (
+        not isinstance(gates, dict)
+        or set(gates) != set(GATE_NAMES)
+        or not isinstance(files, dict)
+        or set(files) != {"cases.jsonl"}
+        or not _validate_digest_value(files.get("cases.jsonl"))
+    ):
+        raise EvaluationContractError("suite_artifact_mismatch")
+
+
+def _validate_run_manifest_shape(value: dict[str, object]) -> None:
+    expected_keys = {
+        "run_id",
+        "suite_id",
+        "department_id",
+        "publication_attempt_id",
+        "metric_contract_version",
+        "runner_contract_version",
+        "answer_normalization_version",
+        "gate_policy_version",
+        "seed_derivation_version",
+        "base_seed",
+        "code_revision",
+        "case_count",
+        "query_embedding_pipeline_version",
+        "query_embedding_model_id",
+        "query_embedding_model_revision",
+        "query_embedding_dimension",
+        "query_embedding_distance",
+        "generation_model_id",
+        "generation_model_revision",
+        "prompt_version",
+        "answer_contract_version",
+        "qdrant_collection",
+        "vector_schema_version",
+        "artifact_contract_version",
+        "files",
+    }
+    if (
+        set(value) != expected_keys
+        or value.get("artifact_contract_version") != ARTIFACT_CONTRACT_VERSION
+    ):
+        raise EvaluationContractError("result_publication_failed")
+    if not all(
+        _valid_uuid(value.get(name))
+        for name in ("run_id", "suite_id", "department_id", "publication_attempt_id")
+    ):
+        raise EvaluationContractError("result_publication_failed")
+    if (
+        not isinstance(value.get("base_seed"), int)
+        or isinstance(value.get("base_seed"), bool)
+        or not isinstance(value.get("case_count"), int)
+        or isinstance(value.get("case_count"), bool)
+        or not isinstance(value.get("query_embedding_dimension"), int)
+        or isinstance(value.get("query_embedding_dimension"), bool)
+        or not isinstance(value.get("code_revision"), str)
+        or len(value["code_revision"]) != 40
+        or any(character not in "0123456789abcdef" for character in value["code_revision"])
+    ):
+        raise EvaluationContractError("result_publication_failed")
+    files = value.get("files")
+    if (
+        not isinstance(files, dict)
+        or set(files) != {"summary.json", "case_results.jsonl"}
+        or not all(_validate_digest_value(files.get(name)) for name in files)
+    ):
+        raise EvaluationContractError("result_publication_failed")
+
+
+def _validate_run_summary_shape(value: dict[str, object]) -> None:
+    metric_keys = {
+        "retrieval_recall_at_5",
+        "retrieval_recall_at_10",
+        "retrieval_recall_at_20",
+        "retrieval_mrr_at_20",
+        "answer_status_accuracy",
+        "citation_precision",
+        "citation_recall",
+        "normalized_exact_match",
+        "character_f1",
+        "invalid_contract_rate",
+    }
+    expected = {
+        "case_count",
+        "metrics",
+        "gates",
+        "gate_results",
+        "gate_status",
+        "failed_gate_count",
+    }
+    if set(value) != expected:
+        raise EvaluationContractError("result_publication_failed")
+    if not isinstance(value.get("case_count"), int) or isinstance(value.get("case_count"), bool):
+        raise EvaluationContractError("result_publication_failed")
+    if (
+        not isinstance(value.get("metrics"), dict)
+        or set(value["metrics"]) != metric_keys
+        or not isinstance(value.get("gates"), dict)
+        or set(value["gates"]) != set(GATE_NAMES)
+        or not isinstance(value.get("gate_results"), dict)
+        or set(value["gate_results"]) != set(GATE_NAMES)
+        or value.get("gate_status") not in {"passed", "failed"}
+        or not isinstance(value.get("failed_gate_count"), int)
+        or isinstance(value.get("failed_gate_count"), bool)
+    ):
+        raise EvaluationContractError("result_publication_failed")
+
+
 def _parse_json_object(raw: bytes) -> dict[str, object]:
     try:
         value = json.loads(raw.decode("utf-8"))
@@ -759,24 +1123,7 @@ def _validate_canonical_suite_manifest(
     cases_sha256: str,
     cases_byte_size: int,
 ) -> None:
-    expected_keys = {
-        "suite_id",
-        "department_id",
-        "suite_contract_version",
-        "metric_contract_version",
-        "answer_normalization_version",
-        "gate_policy_version",
-        "case_count",
-        "answered_case_count",
-        "insufficient_case_count",
-        "gates",
-        "artifact_contract_version",
-        "files",
-    }
-    if set(value) != expected_keys or value.get("artifact_contract_version") != (
-        ARTIFACT_CONTRACT_VERSION
-    ):
-        raise EvaluationContractError("suite_artifact_mismatch")
+    _validate_suite_manifest_shape(value)
     if value.get("files") != {
         "cases.jsonl": {
             "sha256": cases_sha256,

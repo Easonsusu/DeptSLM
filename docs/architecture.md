@@ -4,6 +4,8 @@
 
 Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 adds an internal department-scoped evaluation runner under review: it reuses the exact Phase 7 policy, stores only metadata and numeric metrics, and keeps suites/results in external runtime storage. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or the private runtime. Public vector search, conversations, streaming, reranking, training, and adapter flows remain unimplemented.
 
+Phase 9 publication is deliberately non-atomic across PostgreSQL and external storage. A server-generated publication attempt UUID binds each staged and final result manifest to the exact run attempt. Result staging and publication run in killable leased children; PostgreSQL writes the succeeded state only after descriptor-relative no-follow final-artifact verification. Reclaim and the administrator-only `reconcile-artifacts` command delete only an exact manifest-proven, non-succeeded attempt. They never delete unknown or mismatched artifacts. A crash after an external rename can therefore leave an untrusted orphan, but never an authoritative result.
+
 ## System context
 
 DeptSLM is planned as a department-isolated monorepo application. The web client will call a FastAPI control plane. PostgreSQL will hold application metadata and authorization relationships; Qdrant will hold embeddings with department-scoped payloads. Long-running ingestion and training work will live outside request handlers. File-based artifacts will be stored outside the checkout under `DEPTSLM_DATA_DIR`.
