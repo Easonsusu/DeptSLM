@@ -10,6 +10,7 @@ from uuid import UUID
 from app.database import create_database_engine, create_session_factory
 from app.evaluation_domain import EvaluationContractError
 from app.evaluation_suites import (
+    SuiteArchiveSettings,
     SuiteImportConfigurationError,
     SuiteImportSettings,
     archive_suite,
@@ -49,8 +50,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        settings = SuiteImportSettings.from_environment()
         if args.command == "import-suite":
+            settings = SuiteImportSettings.from_environment()
             result = import_suite(
                 settings,
                 department_id=args.department_id,
@@ -67,22 +68,22 @@ def main(argv: list[str] | None = None) -> int:
                 f"{result.insufficient_case_count} insufficient)."
             )
             return 0
-        if not args.apply:
-            print(f"Would archive evaluation suite {args.suite_id}.")
-            return 0
+        settings = SuiteArchiveSettings.from_environment()
         engine = create_database_engine(settings.database_url)
         factory = create_session_factory(engine)
         try:
-            archive_suite(
+            applied = archive_suite(
                 factory,
                 department_id=args.department_id,
                 suite_id=args.suite_id,
                 actor_issuer=args.actor_issuer,
                 actor_subject=args.actor_subject,
+                apply=args.apply,
             )
         finally:
             engine.dispose()
-        print(f"Archived evaluation suite {args.suite_id}.")
+        verb = "Archived" if applied else "Validated archive for"
+        print(f"{verb} evaluation suite {args.suite_id}.")
         return 0
     except (
         EvaluationContractError,

@@ -9,7 +9,7 @@ eval_results/
   staging/{suites,runs}/...
 ```
 
-Paths use server-owned UUIDs only. Operations reject symlinks and unknown entries, use private permissions, exclusive staging, no-follow descriptors where available, bounded incremental JSONL, SHA-256 and byte-size verification, and atomic final rename. Final artifacts are immutable. Cleanup is restricted to the exact department/resource/attempt staging path.
+Paths use server-owned UUIDs only. Operations reject symlinks, hard links, path replacement, and unknown entries; use private permissions, exclusive staging, descriptor-relative no-follow handles, bounded incremental JSONL, SHA-256 and byte-size verification, and atomic final rename. Hashing and parsing use the same open descriptor. Staging is reverified immediately before rename, and every final file is rehashed through verified descriptors after rename; PostgreSQL stores only those final digests. Final artifacts are immutable. Cleanup is restricted to the exact department/resource/attempt staging path.
 
 Suite content may contain questions, accepted answers, and server-owned ground-truth snapshots, but remains external and has no public download API. Run artifacts are content-free: manifests contain fixed contracts and digests, summaries contain numeric aggregates and exact gate results, and case results contain only case UUID, statuses, counts, numeric metrics, booleans, and safe error codes.
 

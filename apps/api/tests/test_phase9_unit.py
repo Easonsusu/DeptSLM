@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import multiprocessing
 import os
+import signal
+import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -25,6 +29,7 @@ from app.evaluation_artifacts import (
     SUITE_FILES,
     ArtifactDigest,
     EvaluationArtifactStore,
+    PublishedArtifact,
     canonical_json_bytes,
     validate_suite_source_directory,
 )
@@ -49,9 +54,18 @@ from app.evaluation_domain import (
     parse_quality_gates,
     score_case,
 )
-from app.evaluation_suites import _compare_canonical_snapshots, _parse_cases
+from app.evaluation_suites import (
+    GroundTruthAuthoritySnapshot,
+    SuiteArchiveSettings,
+    _compare_canonical_snapshots,
+    _parse_cases,
+)
 from app.models import EvaluationCaseResult, EvaluationRun, EvaluationSuite
-from app.rag_answer_services import EphemeralRagOutcome
+from app.rag_answer_services import (
+    RagPolicyEvaluationError,
+    SafeRetrievalTrace,
+    execute_rag_policy,
+)
 from app.rag_domain import EvidenceSource, RagContractError
 from app.rag_runtime_client import RagRuntimeClient
 
@@ -188,6 +202,137 @@ def test_duplicate_candidates_fail_the_case_contract() -> None:
     )
     assert not score.answer_contract_valid
     assert score.error_code == "retrieval_authority_failed"
+
+
+@pytest.mark.parametrize(
+    ("runtime_value", "expected_code"),
+    [
+        ({"invalid": True}, "invalid_generation_response"),
+        (
+            {"status": "unknown", "answer": "", "citations": []},
+            "invalid_generation_response",
+        ),
+        (
+            {"status": "answered", "answer": "Forged [S2]", "citations": ["S2"]},
+            "invalid_citation",
+        ),
+        (
+            {
+                "status": "answered",
+                "answer": "Duplicate [S1]",
+                "citations": ["S1", "S1"],
+            },
+            "invalid_citation",
+        ),
+        (
+            {
+                "status": "answered",
+                "answer": "<think>hidden</think> [S1]",
+                "citations": ["S1"],
+            },
+            "invalid_generation_response",
+        ),
+    ],
+)
+def test_generation_contract_failures_preserve_safe_retrieval_trace(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_value: dict[str, object],
+    expected_code: str,
+) -> None:
+    from app import rag_answer_services
+
+    relevant = uuid4()
+    foreign = uuid4()
+    document_id = uuid4()
+    hit = SimpleNamespace(
+        chunk_id=relevant,
+        document_id=document_id,
+        score=0.9,
+    )
+    search = SimpleNamespace(candidate_count=2, hits=(hit,))
+    loaded = SimpleNamespace(
+        hit=hit,
+        source=EvidenceSource("S1", "Synthetic evidence."),
+    )
+    monkeypatch.setattr(
+        rag_answer_services,
+        "search_authorized_result",
+        lambda *_args, **_kwargs: search,
+    )
+    monkeypatch.setattr(
+        rag_answer_services,
+        "load_selected_chunks",
+        lambda *_args, **_kwargs: (loaded,),
+    )
+
+    class Runtime:
+        @staticmethod
+        def query_embedding(_question):
+            return [1.0] + [0.0] * 1023
+
+        @staticmethod
+        def generate(*_args, **_kwargs):
+            return runtime_value
+
+    class Qdrant:
+        @staticmethod
+        def verify_collection():
+            return None
+
+    settings = SimpleNamespace(
+        candidate_limit=20,
+        minimum_score=Decimal("0.45"),
+        max_sources=8,
+        max_sources_per_document=2,
+        max_evidence_chars=6000,
+    )
+    with pytest.raises(RagPolicyEvaluationError) as caught:
+        execute_rag_policy(
+            object(),
+            settings,
+            Path("/unused"),
+            DepartmentScope(uuid4()),
+            "Synthetic question?",
+            Runtime(),
+            Qdrant(),
+        )
+    assert caught.value.code == expected_code
+    assert caught.value.trace.authorized_candidate_ids == (relevant,)
+    score = score_case(
+        case_id=uuid4(),
+        expected_status="answered",
+        relevant_chunk_ids=(relevant,),
+        accepted_answers=("Synthetic answer.",),
+        actual_status="failed",
+        generated_answer="",
+        authorized_candidate_ids=caught.value.trace.authorized_candidate_ids,
+        cited_chunk_ids=(),
+        answer_contract_valid=False,
+        error_code=caught.value.code,
+    )
+    assert score.retrieved_relevant_at_5 == 1
+    assert score.reciprocal_rank_at_20 == Decimal(1)
+    assert not score.answer_contract_valid
+    assert foreign not in caught.value.trace.authorized_candidate_ids
+
+
+def test_partial_retrieval_metrics_survive_invalid_generation() -> None:
+    relevant = (uuid4(), uuid4())
+    trace = SafeRetrievalTrace(3, 2, (uuid4(), relevant[1]), (relevant[1],))
+    score = score_case(
+        case_id=uuid4(),
+        expected_status="answered",
+        relevant_chunk_ids=relevant,
+        accepted_answers=("Synthetic answer.",),
+        actual_status="failed",
+        generated_answer="",
+        authorized_candidate_ids=trace.authorized_candidate_ids,
+        cited_chunk_ids=(),
+        answer_contract_valid=False,
+        error_code="invalid_generation_response",
+    )
+    assert score.retrieved_relevant_at_5 == 1
+    assert score.reciprocal_rank_at_20 == Decimal("0.5")
 
 
 def test_insufficient_case_requires_zero_citations_for_a_valid_contract() -> None:
@@ -390,6 +535,197 @@ def test_result_artifact_contains_only_numeric_content_free_case_fields(
         assert prohibited not in combined
 
 
+@pytest.mark.parametrize("name", ["summary.json", "case_results.jsonl"])
+def test_result_publication_artifact_integrity_rejects_mutated_staged_files(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    staged, _summary = store.stage_run(
+        scope,
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        manifest_value={"case_count": 1},
+        summary_value={"metrics": {"character_f1": Decimal(1)}},
+        scores=(_score(),),
+    )
+    (staged.path / name).write_bytes(b'{"changed":true}\n')
+    with pytest.raises(EvaluationContractError) as caught:
+        store.publish(staged, RUN_FILES)
+    assert caught.value.code == "result_publication_failed"
+    assert not staged.final_path.exists()
+
+
+def test_result_publication_hash_rechecks_final_bytes_after_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app import evaluation_artifacts
+
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    staged, _summary = store.stage_run(
+        scope,
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        manifest_value={"case_count": 1},
+        summary_value={"metrics": {"character_f1": Decimal(1)}},
+        scores=(_score(),),
+    )
+    original_chmod = evaluation_artifacts.os.chmod
+
+    def mutate_after_rename(path, mode):
+        original_chmod(path, mode)
+        candidate = Path(path)
+        if candidate == staged.final_path:
+            (candidate / "summary.json").write_bytes(b'{"changed":true}\n')
+
+    monkeypatch.setattr(evaluation_artifacts.os, "chmod", mutate_after_rename)
+    with pytest.raises(EvaluationContractError):
+        store.publish(staged, RUN_FILES)
+    assert not staged.final_path.exists()
+
+
+def test_publication_hashes_match_exact_final_bytes(tmp_path: Path) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    staged, _summary = store.stage_run(
+        scope,
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        manifest_value={"case_count": 1},
+        summary_value={"metrics": {"character_f1": Decimal(1)}},
+        scores=(_score(),),
+    )
+    published = store.publish(staged, RUN_FILES)
+    assert isinstance(published, PublishedArtifact)
+    for name, digest in {
+        "manifest.json": published.manifest,
+        "summary.json": published.summary,
+        "case_results.jsonl": published.payload,
+    }.items():
+        assert digest is not None
+        content = (published.path / name).read_bytes()
+        assert digest.sha256 == hashlib.sha256(content).hexdigest()
+        assert digest.byte_size == len(content)
+
+
+def test_canonical_suite_descriptor_detects_mutation_during_same_descriptor_read(
+    tmp_path: Path,
+) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    suite_id = uuid4()
+    manifest = {
+        "suite_id": suite_id,
+        "department_id": scope.value,
+        "suite_contract_version": SUITE_CONTRACT_VERSION,
+        "metric_contract_version": METRIC_CONTRACT_VERSION,
+        "answer_normalization_version": ANSWER_NORMALIZATION_VERSION,
+        "gate_policy_version": GATE_POLICY_VERSION,
+        "case_count": 2,
+        "answered_case_count": 1,
+        "insufficient_case_count": 1,
+        "gates": _gates(),
+    }
+    lines = (
+        canonical_json_bytes({"case_id": str(uuid4())}) + b"\n",
+        canonical_json_bytes({"case_id": str(uuid4())}) + b"\n",
+    )
+    staged = store.stage_suite(scope, suite_id, uuid4(), manifest, lines)
+    published = store.publish(staged, SUITE_FILES)
+    iterator = store.iter_suite_cases(
+        scope,
+        suite_id,
+        manifest_sha256=published.manifest.sha256,
+        cases_sha256=published.payload.sha256,
+        cases_byte_size=published.payload.byte_size,
+    )
+    next(iterator)
+    with (published.path / "cases.jsonl").open("ab") as handle:
+        handle.write(b"{}\n")
+    with pytest.raises(EvaluationContractError):
+        tuple(iterator)
+
+
+def test_canonical_suite_descriptor_rejects_manifest_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app import evaluation_artifacts
+
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    suite_id = uuid4()
+    manifest = {
+        "suite_id": suite_id,
+        "department_id": scope.value,
+        "suite_contract_version": SUITE_CONTRACT_VERSION,
+        "metric_contract_version": METRIC_CONTRACT_VERSION,
+        "answer_normalization_version": ANSWER_NORMALIZATION_VERSION,
+        "gate_policy_version": GATE_POLICY_VERSION,
+        "case_count": 1,
+        "answered_case_count": 1,
+        "insufficient_case_count": 0,
+        "gates": _gates(),
+    }
+    staged = store.stage_suite(
+        scope,
+        suite_id,
+        uuid4(),
+        manifest,
+        (canonical_json_bytes({"case_id": str(uuid4())}) + b"\n",),
+    )
+    published = store.publish(staged, SUITE_FILES)
+    original = evaluation_artifacts._read_bounded_descriptor
+    replaced = False
+
+    def replace_manifest(descriptor, metadata, *, maximum):
+        nonlocal replaced
+        result = original(descriptor, metadata, maximum=maximum)
+        if not replaced:
+            replaced = True
+            replacement = published.path / "replacement.json"
+            replacement.write_bytes((published.path / "manifest.json").read_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, published.path / "manifest.json")
+        return result
+
+    monkeypatch.setattr(evaluation_artifacts, "_read_bounded_descriptor", replace_manifest)
+    with pytest.raises(EvaluationContractError):
+        tuple(
+            store.iter_suite_cases(
+                scope,
+                suite_id,
+                manifest_sha256=published.manifest.sha256,
+                cases_sha256=published.payload.sha256,
+                cases_byte_size=published.payload.byte_size,
+            )
+        )
+
+
+def test_suite_source_rejects_hard_links(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    source = tmp_path / "source"
+    repository.mkdir()
+    source.mkdir()
+    (source / "suite.json").write_text("{}")
+    original = tmp_path / "cases"
+    original.write_text("{}\n")
+    os.link(original, source / "cases.jsonl")
+    with pytest.raises(EvaluationContractError):
+        validate_suite_source_directory(source, repository)
+
+
 def test_suite_source_rejects_symlink_unknown_entry_and_repository_path(
     tmp_path: Path,
 ) -> None:
@@ -514,7 +850,7 @@ def test_phase9_uses_production_policy_and_never_imports_feedback_or_qdrant_clie
     )
     assert "execute_rag_policy(" in public_service
     assert "execute_rag_policy(" in evaluator
-    assert "verify_canonical_suite_authority_without_open_transaction" in evaluator
+    assert "capture_canonical_suite_authority" in evaluator
     for prohibited in (
         "rag_answer_feedback",
         "rag_feedback_services",
@@ -523,6 +859,31 @@ def test_phase9_uses_production_policy_and_never_imports_feedback_or_qdrant_clie
         "RagAnswerRun(",
     ):
         assert prohibited not in evaluation_sources
+
+
+def test_api_has_no_evaluation_artifact_mount_or_runtime_directory() -> None:
+    root = Path(__file__).resolve().parents[3]
+    compose = (root / "docker-compose.yml").read_text()
+    api = compose.split("  api:\n", 1)[1].split("  postgres:\n", 1)[0]
+    evaluator = compose.split("  evaluator-worker:\n", 1)[1].split("  model-admin:\n", 1)[0]
+    assert "eval_results" not in api
+    assert evaluator.count("/eval_results") == 2
+    assert "/extracted_text" in evaluator and "read_only: true" in evaluator
+    for service, following in (
+        ("web", "api"),
+        ("rag-worker", "indexing-worker"),
+        ("indexing-worker", "evaluator-worker"),
+        ("rag-runtime", "networks"),
+    ):
+        block = compose.split(f"  {service}:\n", 1)[1].split(f"  {following}:\n", 1)[0]
+        assert "eval_results" not in block
+    api_dockerfile = (root / "apps" / "api" / "Dockerfile").read_text()
+    assert "eval_results" not in api_dockerfile
+    public_modules = "\n".join(
+        (root / "apps" / "api" / "app" / name).read_text()
+        for name in ("routes.py", "evaluation_services.py", "settings.py")
+    )
+    assert "EvaluationArtifactStore" not in public_modules
 
 
 def test_runtime_client_seed_is_private_bounded_and_optional() -> None:
@@ -612,31 +973,33 @@ def test_evaluator_one_case_fake_runtime_smoke_is_content_free(
             captured["scores"] = tuple(scores)
             return SimpleNamespace(), ArtifactDigest("c" * 64, 1)
 
-    for name in (
-        "require_live_claim",
-        "renew_lease",
-        "record_progress",
-        "revalidate_ephemeral_sources",
-    ):
+    for name in ("require_live_claim", "renew_lease", "record_progress"):
         monkeypatch.setattr(evaluation_pipeline, name, lambda *_args, **_kwargs: None)
     monkeypatch.setattr(evaluation_pipeline, "validate_claim_authority", lambda *_args: suite)
+    authority = GroundTruthAuthoritySnapshot({}, ())
     monkeypatch.setattr(
-        evaluation_pipeline, "_verify_suite_authority", lambda *_args, **_kwargs: None
+        evaluation_pipeline,
+        "_supervise_suite_load",
+        lambda *_args, **_kwargs: evaluation_pipeline._SuiteExecution(cases, authority),
+    )
+    monkeypatch.setattr(
+        evaluation_pipeline,
+        "_supervise_authority",
+        lambda *_args, **_kwargs: authority,
     )
 
-    def execute(*_args, seed, **_kwargs):
+    def execute_case(_factory, _settings, _scope, _question, seed, *_args):
         captured["seed"] = seed
-        return EphemeralRagOutcome(
+        return evaluation_pipeline._CaseExecution(
             "answered",
             "Synthetic answer.",
+            SafeRetrievalTrace(1, 1, (chunk_id,), ()),
             (),
-            1,
-            1,
-            (chunk_id,),
-            (),
+            True,
+            None,
         )
 
-    monkeypatch.setattr(evaluation_pipeline, "execute_rag_policy", execute)
+    monkeypatch.setattr(evaluation_pipeline, "_supervise_case", execute_case)
     monkeypatch.setattr(
         evaluation_pipeline,
         "finalize_success",
@@ -644,12 +1007,13 @@ def test_evaluator_one_case_fake_runtime_smoke_is_content_free(
     )
     settings = SimpleNamespace(
         lease_seconds=300,
+        heartbeat_seconds=1,
         operation_timeout_seconds=30,
         data_dir=Path("/unused"),
         rag=object(),
     )
     assert evaluation_pipeline.process_evaluation_run(
-        object(), settings, Store(), object(), object(), job, lambda: False
+        object(), settings, Store(), job, lambda: False
     )
     assert captured["finalized"] is True
     assert captured["seed"] == derive_case_seed(9, case_id)
@@ -701,6 +1065,187 @@ def test_evaluator_settings_reject_heartbeat_or_timeout_at_lease(
         monkeypatch.setenv(name, value)
     with pytest.raises(EvaluationConfigurationError):
         EvaluationSettings.from_environment()
+
+
+def _controlled_supervised_child(connection, delay: float, result: str | None) -> None:
+    os.setsid()
+    connection.send(("ready",))
+    if delay:
+        time.sleep(delay)
+    if result is not None:
+        connection.send(("result", result))
+    else:
+        while True:
+            time.sleep(1)
+
+
+def _controlled_group_grandchild() -> None:
+    while True:
+        time.sleep(1)
+
+
+def _controlled_group_child(connection, grandchild_pid) -> None:
+    os.setsid()
+    grandchild = multiprocessing.get_context("fork").Process(target=_controlled_group_grandchild)
+    grandchild.start()
+    grandchild_pid.value = grandchild.pid or 0
+
+    def terminate_group(_signal, _frame) -> None:
+        if grandchild.is_alive():
+            grandchild.terminate()
+        grandchild.join(timeout=1)
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, terminate_group)
+    connection.send(("ready",))
+    while True:
+        time.sleep(1)
+
+
+def _start_controlled_child(delay: float, result: str | None):
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_controlled_supervised_child,
+        args=(child, delay, result),
+    )
+    process.start()
+    child.close()
+    return parent, process
+
+
+def test_supervisor_heartbeats_multiple_times_during_long_case(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent, process = _start_controlled_child(0.22, "complete")
+    heartbeats: list[float] = []
+    monkeypatch.setattr(
+        evaluation_pipeline,
+        "renew_lease",
+        lambda *_args, **_kwargs: heartbeats.append(time.monotonic()),
+    )
+    settings = SimpleNamespace(
+        operation_timeout_seconds=1,
+        heartbeat_seconds=0.05,
+        lease_seconds=2,
+    )
+    result = evaluation_pipeline._wait_for_supervised_process(
+        object(),
+        settings,
+        object(),
+        lambda: False,
+        parent,
+        process,
+        str,
+    )
+    assert result == "complete"
+    assert len(heartbeats) >= 3
+    assert not process.is_alive()
+
+
+def test_supervisor_timeout_is_enforced_and_child_is_reaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent, process = _start_controlled_child(0, None)
+    monkeypatch.setattr(evaluation_pipeline, "renew_lease", lambda *_args, **_kwargs: None)
+    settings = SimpleNamespace(
+        operation_timeout_seconds=0.15,
+        heartbeat_seconds=0.05,
+        lease_seconds=2,
+    )
+    started = time.monotonic()
+    with pytest.raises(Exception) as caught:
+        evaluation_pipeline._wait_for_supervised_process(
+            object(),
+            settings,
+            object(),
+            lambda: False,
+            parent,
+            process,
+            str,
+        )
+    assert getattr(caught.value, "code", None) == "runtime_timeout"
+    assert time.monotonic() - started < 2
+    assert not process.is_alive()
+    assert process.exitcode is not None
+
+
+def test_supervisor_process_group_timeout_reaps_descendants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe(duplex=False)
+    grandchild_pid = context.Value("i", 0)
+    process = context.Process(
+        target=_controlled_group_child,
+        args=(child, grandchild_pid),
+    )
+    process.start()
+    child.close()
+    monkeypatch.setattr(evaluation_pipeline, "renew_lease", lambda *_args, **_kwargs: None)
+    settings = SimpleNamespace(
+        operation_timeout_seconds=0.15,
+        heartbeat_seconds=0.05,
+        lease_seconds=2,
+    )
+    with pytest.raises(Exception) as caught:
+        evaluation_pipeline._wait_for_supervised_process(
+            object(), settings, object(), lambda: False, parent, process, str
+        )
+    assert getattr(caught.value, "code", None) == "runtime_timeout"
+    assert grandchild_pid.value > 0
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild_pid.value, 0)
+    assert not process.is_alive()
+
+
+@pytest.mark.parametrize("stop_reason", ["claim_lost", "cancelled", "shutdown"])
+def test_supervisor_stops_and_reaps_on_ownership_or_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+    stop_reason: str,
+) -> None:
+    parent, process = _start_controlled_child(0, None)
+    calls = 0
+
+    def renew(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if stop_reason != "shutdown" and calls >= 2:
+            raise evaluation_pipeline.EvaluationQueueError(stop_reason)
+
+    monkeypatch.setattr(evaluation_pipeline, "renew_lease", renew)
+    started = time.monotonic()
+    settings = SimpleNamespace(
+        operation_timeout_seconds=2,
+        heartbeat_seconds=0.05,
+        lease_seconds=3,
+    )
+    with pytest.raises(Exception) as caught:
+        evaluation_pipeline._wait_for_supervised_process(
+            object(),
+            settings,
+            object(),
+            lambda: stop_reason == "shutdown" and time.monotonic() - started > 0.08,
+            parent,
+            process,
+            str,
+        )
+    expected = None if stop_reason == "shutdown" else stop_reason
+    assert getattr(caught.value, "code", None) == expected
+    assert not process.is_alive()
+
+
+def test_archive_suite_database_only_settings_require_only_database_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@localhost/test")
+    for name in (
+        "DEPTSLM_DATA_DIR",
+        "DEPTSLM_QDRANT_URL",
+        "DEPTSLM_RAG_RUNTIME_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert SuiteArchiveSettings.from_environment().database_url.endswith("/test")
 
 
 def stat_mode(path: Path) -> int:

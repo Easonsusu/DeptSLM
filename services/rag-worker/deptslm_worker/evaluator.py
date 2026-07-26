@@ -9,7 +9,6 @@ from threading import Event
 
 from app.database import create_database_engine, create_session_factory
 from app.evaluation_artifacts import EvaluationArtifactStore
-from app.rag_runtime_client import RagRuntimeClient
 from deptslm_worker.evaluation_pipeline import process_evaluation_run
 from deptslm_worker.evaluation_queue import (
     EvaluationQueueError,
@@ -48,14 +47,6 @@ def main() -> int:
             settings.rag.qdrant_timeout_seconds,
         )
         qdrant.verify_collection()
-        runtime = RagRuntimeClient(
-            settings.rag.runtime_url,
-            settings.rag.runtime_token,
-            min(
-                settings.rag.request_timeout_seconds,
-                settings.operation_timeout_seconds,
-            ),
-        )
     except (
         EvaluationConfigurationError,
         QdrantBoundaryError,
@@ -93,8 +84,6 @@ def main() -> int:
                     factory,
                     settings,
                     store,
-                    runtime,
-                    qdrant,
                     job,
                     STOP.is_set,
                 )

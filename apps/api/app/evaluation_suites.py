@@ -9,9 +9,11 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from deptslm_worker.artifact_reader import (
+    ArtifactAuthorityIdentity,
     ArtifactError,
     ArtifactExpectation,
     Phase5ArtifactReader,
+    verify_artifact_authority_identity,
 )
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
@@ -22,10 +24,9 @@ from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.database import create_database_engine, create_session_factory
 from app.evaluation_artifacts import (
     EvaluationArtifactStore,
+    SuiteSourceReader,
     canonical_json_bytes,
     iter_source_cases,
-    read_suite_definition,
-    validate_suite_source_directory,
 )
 from app.evaluation_domain import (
     ANSWER_NORMALIZATION_VERSION,
@@ -99,6 +100,18 @@ class GroundTruthArtifactValidation:
 
 
 @dataclass(frozen=True, slots=True)
+class VerifiedGroundTruthArtifact:
+    expectation: ArtifactExpectation
+    identity: ArtifactAuthorityIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class GroundTruthAuthoritySnapshot:
+    sources: dict[UUID, dict[str, object]]
+    artifacts: tuple[VerifiedGroundTruthArtifact, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class SuiteImportSettings:
     database_url: str
     data_dir: Path
@@ -132,6 +145,20 @@ class SuiteImportSettings:
         return cls(database_url, resolved, repository_root)
 
 
+@dataclass(frozen=True, slots=True)
+class SuiteArchiveSettings:
+    database_url: str
+
+    @classmethod
+    def from_environment(cls) -> SuiteArchiveSettings:
+        database_url = os.getenv("DATABASE_URL", "").strip()
+        if not database_url.startswith("postgresql+psycopg://"):
+            raise SuiteImportConfigurationError(
+                "DATABASE_URL must use the postgresql+psycopg driver."
+            )
+        return cls(database_url)
+
+
 def import_suite(
     settings: SuiteImportSettings,
     *,
@@ -148,9 +175,9 @@ def import_suite(
         or not actor_subject.strip()
     ):
         raise EvaluationContractError()
-    source = validate_suite_source_directory(source_directory, settings.repository_root)
-    gates = _suite_definition(read_suite_definition(source))
-    cases = tuple(_parse_cases(source))
+    with SuiteSourceReader(source_directory, settings.repository_root) as source:
+        gates = _suite_definition(source.read_definition())
+        cases = tuple(_parse_case_values(source.iter_cases()))
     answered = sum(case.expected_status == "answered" for case in cases)
     insufficient = len(cases) - answered
     if answered == 0:
@@ -176,7 +203,9 @@ def import_suite(
                 lock=True,
                 audit_action="evaluation.suite.import.authorization",
             )
-            snapshots = _ground_truth_snapshots(session, settings.data_dir, scope, cases)
+            snapshots, validations = _ground_truth_snapshot_metadata(session, scope, cases)
+        verified_artifacts = _verify_ground_truth_artifacts(settings.data_dir, scope, validations)
+        verified = GroundTruthAuthoritySnapshot(snapshots, verified_artifacts)
         canonical_lines = tuple(
             canonical_json_bytes(_canonical_case(case, snapshots)) + b"\n" for case in cases
         )
@@ -196,6 +225,14 @@ def import_suite(
             )
 
         try:
+            current = capture_ground_truth_authority(
+                factory,
+                settings.data_dir,
+                scope,
+                cases,
+            )
+            if current != verified:
+                raise EvaluationContractError("suite_source_stale")
             with factory.begin() as session:
                 authorization = authorize_transaction(
                     session,
@@ -205,9 +242,13 @@ def import_suite(
                     lock=True,
                     audit_action="evaluation.suite.import.authorization",
                 )
-                current = _ground_truth_snapshots(session, settings.data_dir, scope, cases)
-                if current != snapshots:
-                    raise EvaluationContractError("suite_source_stale")
+                revalidate_ground_truth_authority_in_transaction(
+                    session,
+                    settings.data_dir,
+                    scope,
+                    cases,
+                    current,
+                )
                 suite = EvaluationSuite(
                     id=suite_id,
                     department_id=department_id,
@@ -237,7 +278,12 @@ def import_suite(
                     resource_type="evaluation_suite",
                     resource_id=suite.id,
                 )
-                store.publish(staged, frozenset({"manifest.json", "cases.jsonl"}))
+                published_artifact = store.publish(
+                    staged, frozenset({"manifest.json", "cases.jsonl"})
+                )
+                suite.artifact_manifest_sha256 = published_artifact.manifest.sha256
+                suite.canonical_cases_sha256 = published_artifact.payload.sha256
+                suite.canonical_cases_byte_size = published_artifact.payload.byte_size
                 published = True
                 session.flush()
         except Exception:
@@ -262,7 +308,8 @@ def archive_suite(
     suite_id: UUID,
     actor_issuer: str,
     actor_subject: str,
-) -> None:
+    apply: bool = True,
+) -> bool:
     scope = DepartmentScope(department_id)
     request_scope = DepartmentRequestScope(scope)
     principal = AuthenticatedPrincipal(actor_subject, actor_issuer)
@@ -288,6 +335,8 @@ def archive_suite(
                 raise ServiceError(404, "Evaluation suite not found")
             if suite.status != "active":
                 raise ServiceError(409, "Evaluation suite is already archived")
+            if not apply:
+                return False
             suite.status = "archived"
             suite.archived_at = session.execute(select(_clock_timestamp())).scalar_one()
             suite.version += 1
@@ -300,34 +349,88 @@ def archive_suite(
                 resource_type="evaluation_suite",
                 resource_id=suite.id,
             )
+            return True
     except (ServiceError, EvaluationContractError):
         raise
     except SQLAlchemyError as error:
         raise ServiceError(503, "Database unavailable") from error
 
 
-def verify_canonical_suite_authority(
-    session: Session,
-    data_dir: Path,
-    scope: DepartmentScope,
-    cases: tuple[dict[str, object], ...],
-) -> None:
-    parsed = tuple(_canonical_case_to_parsed(case) for case in cases)
-    current = _ground_truth_snapshots(session, data_dir, scope, parsed)
-    _compare_canonical_snapshots(cases, current)
-
-
-def verify_canonical_suite_authority_without_open_transaction(
+def capture_canonical_suite_authority(
     factory: sessionmaker[Session],
     data_dir: Path,
     scope: DepartmentScope,
     cases: tuple[dict[str, object], ...],
+) -> GroundTruthAuthoritySnapshot:
+    parsed = tuple(_canonical_case_to_parsed(case) for case in cases)
+    snapshot = capture_ground_truth_authority(factory, data_dir, scope, parsed)
+    _compare_canonical_snapshots(cases, snapshot.sources)
+    return snapshot
+
+
+def capture_ground_truth_authority(
+    factory: sessionmaker[Session],
+    data_dir: Path,
+    scope: DepartmentScope,
+    cases: tuple[ParsedEvaluationCase, ...],
+) -> GroundTruthAuthoritySnapshot:
+    with factory() as session:
+        current, validations = _ground_truth_snapshot_metadata(session, scope, cases)
+    artifacts = _verify_ground_truth_artifacts(data_dir, scope, validations)
+    return GroundTruthAuthoritySnapshot(current, artifacts)
+
+
+def revalidate_ground_truth_authority_in_transaction(
+    session: Session,
+    data_dir: Path,
+    scope: DepartmentScope,
+    cases: tuple[ParsedEvaluationCase, ...],
+    verified: GroundTruthAuthoritySnapshot,
+) -> None:
+    current, _validations = _ground_truth_snapshot_metadata(
+        session,
+        scope,
+        cases,
+        lock=True,
+    )
+    if current != verified.sources:
+        raise EvaluationContractError("suite_source_stale")
+    recheck_ground_truth_artifact_identities(data_dir, scope, verified.artifacts)
+
+
+def revalidate_canonical_suite_authority_in_transaction(
+    session: Session,
+    data_dir: Path,
+    scope: DepartmentScope,
+    cases: tuple[dict[str, object], ...],
+    verified: GroundTruthAuthoritySnapshot,
 ) -> None:
     parsed = tuple(_canonical_case_to_parsed(case) for case in cases)
-    with factory() as session:
-        current, artifact_validations = _ground_truth_snapshot_metadata(session, scope, parsed)
-    _verify_ground_truth_artifacts(data_dir, scope, artifact_validations)
-    _compare_canonical_snapshots(cases, current)
+    revalidate_ground_truth_authority_in_transaction(
+        session,
+        data_dir,
+        scope,
+        parsed,
+        verified,
+    )
+    _compare_canonical_snapshots(cases, verified.sources)
+
+
+def recheck_ground_truth_artifact_identities(
+    data_dir: Path,
+    scope: DepartmentScope,
+    artifacts: tuple[VerifiedGroundTruthArtifact, ...],
+) -> None:
+    try:
+        for artifact in artifacts:
+            verify_artifact_authority_identity(
+                data_dir,
+                scope,
+                artifact.expectation,
+                artifact.identity,
+            )
+    except ArtifactError as error:
+        raise EvaluationContractError("suite_source_stale") from error
 
 
 def _compare_canonical_snapshots(
@@ -370,9 +473,13 @@ def _suite_definition(value: dict[str, object]) -> QualityGates:
 
 
 def _parse_cases(source: Path):
+    yield from _parse_case_values(iter_source_cases(source))
+
+
+def _parse_case_values(values):
     case_ids: set[UUID] = set()
     count = 0
-    for value in iter_source_cases(source):
+    for value in values:
         count += 1
         if count > MAX_SUITE_CASES or set(value) != {
             "case_id",
@@ -471,21 +578,12 @@ def _uuid(value: object) -> UUID:
     return parsed
 
 
-def _ground_truth_snapshots(
-    session: Session,
-    data_dir: Path,
-    scope: DepartmentScope,
-    cases: tuple[ParsedEvaluationCase, ...],
-) -> dict[UUID, dict[str, object]]:
-    snapshots, artifact_validations = _ground_truth_snapshot_metadata(session, scope, cases)
-    _verify_ground_truth_artifacts(data_dir, scope, artifact_validations)
-    return snapshots
-
-
 def _ground_truth_snapshot_metadata(
     session: Session,
     scope: DepartmentScope,
     cases: tuple[ParsedEvaluationCase, ...],
+    *,
+    lock: bool = False,
 ) -> tuple[
     dict[UUID, dict[str, object]],
     tuple[GroundTruthArtifactValidation, ...],
@@ -495,7 +593,7 @@ def _ground_truth_snapshot_metadata(
     )
     if not chunk_ids:
         return {}, ()
-    rows = session.execute(
+    statement = (
         select(Document, DocumentExtraction, DocumentVectorIndexing, DocumentChunk)
         .join(
             DocumentExtraction,
@@ -534,20 +632,43 @@ def _ground_truth_snapshot_metadata(
             DocumentVectorIndexing.vector_attempt_id.is_not(None),
             DocumentChunk.id.in_(chunk_ids),
         )
-        .order_by(DocumentChunk.id)
-    ).all()
+        .order_by(
+            Document.id,
+            DocumentExtraction.id,
+            DocumentVectorIndexing.id,
+            DocumentChunk.id,
+        )
+    )
+    if lock:
+        statement = statement.with_for_update(
+            of=(Document, DocumentExtraction, DocumentVectorIndexing, DocumentChunk)
+        )
+    rows = session.execute(statement).all()
     if len(rows) != len(chunk_ids):
         raise EvaluationContractError("suite_source_stale")
     snapshots: dict[UUID, dict[str, object]] = {}
     by_extraction: dict[UUID, list[tuple[DocumentExtraction, DocumentChunk]]] = {}
     for document, extraction, indexing, chunk in rows:
         snapshot = {
+            "department_id": str(document.department_id),
+            "document_status": document.status,
             "chunk_id": str(chunk.id),
             "document_id": str(document.id),
             "extraction_id": str(extraction.id),
             "indexing_id": str(indexing.id),
             "vector_attempt_id": str(indexing.vector_attempt_id),
+            "extraction_status": extraction.status,
+            "extraction_chunk_count": extraction.chunk_count,
+            "normalized_sha256": extraction.normalized_sha256,
+            "normalized_byte_size": extraction.normalized_byte_size,
+            "extraction_output_byte_size": extraction.output_byte_size,
+            "indexing_status": indexing.status,
+            "indexing_point_count": indexing.point_count,
+            "indexing_expected_chunk_count": indexing.expected_chunk_count,
             "ordinal": chunk.ordinal,
+            "char_start": chunk.char_start,
+            "char_end": chunk.char_end,
+            "byte_size": chunk.byte_size,
             "content_sha256": chunk.content_sha256,
             "provenance_kind": chunk.provenance_kind,
             "page_start": chunk.page_start,
@@ -603,8 +724,9 @@ def _verify_ground_truth_artifacts(
     data_dir: Path,
     scope: DepartmentScope,
     validations: tuple[GroundTruthArtifactValidation, ...],
-) -> None:
+) -> tuple[VerifiedGroundTruthArtifact, ...]:
     try:
+        verified: list[VerifiedGroundTruthArtifact] = []
         for validation in validations:
             found: set[int] = set()
             with Phase5ArtifactReader(data_dir, scope, validation.expectation) as reader:
@@ -626,8 +748,11 @@ def _verify_ground_truth_artifacts(
                         raise EvaluationContractError("suite_source_stale")
                     found.add(artifact_chunk.ordinal)
                 reader.verify_unchanged()
+                identity = reader.authority_identity()
             if found != set(validation.targets):
                 raise EvaluationContractError("suite_source_stale")
+            verified.append(VerifiedGroundTruthArtifact(validation.expectation, identity))
+        return tuple(verified)
     except ArtifactError as error:
         raise EvaluationContractError("suite_source_stale") from error
 

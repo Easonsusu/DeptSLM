@@ -8,7 +8,7 @@ WORKDIR /app
 RUN addgroup --system --gid 1001 deptslm \
     && adduser --system --uid 1001 --ingroup deptslm deptslm \
     && mkdir -p /runtime/deptslm/uploads /runtime/deptslm/extracted_text \
-        /runtime/deptslm/eval_results /app/deptslm_worker \
+        /app/deptslm_worker \
     && touch /app/deptslm_worker/__init__.py \
     && chown -R deptslm:deptslm /runtime/deptslm
 

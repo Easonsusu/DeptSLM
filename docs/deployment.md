@@ -1,8 +1,8 @@
 # Deployment and Local Development
 
-## Phase 8 status
+## Phase 9 status
 
-DeptSLM is not production ready. Phase 8 adds PostgreSQL-only structured feedback, review, retention, and explicit purge to the completed Phase 7 grounded-answer boundary. Public vector search, conversations, history, streaming, reranking, automated evaluation, scheduled purge, malware scanning, OCR, training, production identity/storage, secrets management, backups, clustering, and production operations remain deferred.
+DeptSLM is not production ready. Phase 9 adds an internal evaluation runner under review, with external immutable suites, content-free result artifacts, and PostgreSQL-backed leases. It reuses the completed Phase 7 grounded-answer boundary; it is not a public evaluation API. Public vector search, conversations, history, streaming, reranking, scheduled evaluation, scheduled purge, malware scanning, OCR, training, production identity/storage, secrets management, backups, clustering, and production operations remain deferred.
 
 ## Planned local services
 
@@ -224,4 +224,4 @@ No Phase 0 file should be interpreted as a production security or availability g
 - **Qdrant schema mismatch:** verify the fixed collection and payload indexes. Bootstrap never deletes/recreates a mismatch; repair requires a separately reviewed operational decision.
 - **The evaluator exits at startup:** provide a non-zero `DEPTSLM_EVALUATION_WORKER_ID`, an exact lowercase 40-character `DEPTSLM_EVALUATION_CODE_REVISION`, the existing Phase 7 Qdrant/runtime settings, and mounted `extracted_text` read-only plus `eval_results` read-write. Do not mount model cache or provide Hugging Face tokens.
 
-The evaluator image is non-root, read-only, capability-dropped, has no host port, and contains no Torch, Transformers, sentence-transformers, model weights, or automatic model preparation. Local Compose, deterministic fake-runtime tests, and fixed-seed runs are development evidence only; they do not establish production evaluation validity, determinism, privacy, availability, or performance.
+The evaluator image is non-root, read-only, capability-dropped, has no host port, and contains no Torch, Transformers, sentence-transformers, model weights, or automatic model preparation. It mounts only `extracted_text` read-only and `eval_results` read-write; the API, RAG runtime, extraction worker, and indexing worker do not mount `eval_results`. Local Compose, deterministic fake-runtime tests, and fixed-seed runs are development evidence only; they do not establish production evaluation validity, determinism, privacy, availability, or performance.

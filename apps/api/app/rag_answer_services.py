@@ -23,7 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.auth import AuthenticatedPrincipal
-from app.authorization import DepartmentRequestScope
+from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.extraction_domain import CHUNKING_VERSION, NORMALIZATION_VERSION, PIPELINE_VERSION
 from app.models import (
     Document,
@@ -82,6 +82,22 @@ class RagAnswerServiceError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class SafeRetrievalTrace:
+    """Content-free authorized retrieval state safe for transient evaluation scoring."""
+
+    candidate_count: int
+    authorized_count: int
+    authorized_candidate_ids: tuple[UUID, ...]
+    supplied_chunk_ids: tuple[UUID, ...]
+
+
+class RagPolicyEvaluationError(RagContractError):
+    def __init__(self, code: str, trace: SafeRetrievalTrace) -> None:
+        self.trace = trace
+        super().__init__(code)
+
+
+@dataclass(frozen=True, slots=True)
 class _StartedRun:
     id: UUID
     created_at: datetime
@@ -103,6 +119,15 @@ class EphemeralRagOutcome:
     def cited_chunk_ids(self) -> tuple[UUID, ...]:
         by_label = {item.source.label: item.hit.chunk_id for item in self.supplied}
         return tuple(by_label[label] for label in self.citation_labels)
+
+    @property
+    def retrieval_trace(self) -> SafeRetrievalTrace:
+        return SafeRetrievalTrace(
+            self.candidate_count,
+            self.authorized_count,
+            self.authorized_candidate_ids,
+            tuple(item.hit.chunk_id for item in self.supplied),
+        )
 
 
 def answer_question(
@@ -177,6 +202,9 @@ def answer_question(
         _fail_run(factory, started.id, request_scope.department, "department_unavailable")
         raise
     except RagContractError as error:
+        if isinstance(error, RagPolicyEvaluationError):
+            candidate_count = error.trace.candidate_count
+            authorized_count = error.trace.authorized_count
         _fail_run(
             factory,
             started.id,
@@ -237,7 +265,7 @@ def execute_rag_policy(
     factory: sessionmaker[Session],
     settings: RagSettings,
     data_dir: Path,
-    scope,
+    scope: DepartmentScope,
     question: str,
     runtime: RagRuntimeClient,
     qdrant: DepartmentQdrant,
@@ -284,15 +312,26 @@ def execute_rag_policy(
         max_evidence_chars=settings.max_evidence_chars,
     )
     _report_stage(stage_callback, "generation")
-    runtime_value = (
-        runtime.generate(question, tuple(item.source for item in loaded))
-        if seed is None
-        else runtime.generate(question, tuple(item.source for item in loaded), seed=seed)
+    trace = SafeRetrievalTrace(
+        search.candidate_count,
+        len(search.hits),
+        candidate_ids,
+        tuple(item.hit.chunk_id for item in loaded),
     )
-    generation = validate_generation_response(
-        runtime_value,
-        tuple(item.source.label for item in loaded),
-    )
+    try:
+        runtime_value = (
+            runtime.generate(question, tuple(item.source for item in loaded))
+            if seed is None
+            else runtime.generate(question, tuple(item.source for item in loaded), seed=seed)
+        )
+        generation = validate_generation_response(
+            runtime_value,
+            tuple(item.source.label for item in loaded),
+        )
+    except RagContractError as error:
+        if error.code in {"invalid_generation_response", "invalid_citation"}:
+            raise RagPolicyEvaluationError(error.code, trace) from error
+        raise
     _report_stage(stage_callback, "artifact_loading")
     reloaded = load_selected_chunks(
         data_dir,

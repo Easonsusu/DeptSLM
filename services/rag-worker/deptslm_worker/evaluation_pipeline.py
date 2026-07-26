@@ -3,14 +3,19 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
+import os
+import signal
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from uuid import UUID
 
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.authorization import DepartmentScope
+from app.database import create_database_engine, create_session_factory
 from app.evaluation_artifacts import EvaluationArtifactStore
 from app.evaluation_domain import (
     ANSWER_NORMALIZATION_VERSION,
@@ -29,9 +34,12 @@ from app.evaluation_domain import (
     score_case,
 )
 from app.evaluation_suites import (
-    verify_canonical_suite_authority_without_open_transaction,
+    GroundTruthAuthoritySnapshot,
+    capture_canonical_suite_authority,
 )
 from app.rag_answer_services import (
+    RagPolicyEvaluationError,
+    SafeRetrievalTrace,
     execute_rag_policy,
     revalidate_ephemeral_sources,
 )
@@ -58,12 +66,26 @@ class _WorkerStopped(RuntimeError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class _CaseExecution:
+    actual_status: str
+    generated_answer: str
+    trace: SafeRetrievalTrace
+    cited_chunk_ids: tuple[UUID, ...]
+    answer_contract_valid: bool
+    error_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _SuiteExecution:
+    cases: tuple[dict[str, object], ...]
+    authority: GroundTruthAuthoritySnapshot
+
+
 def process_evaluation_run(
     factory: sessionmaker[Session],
     settings: EvaluationSettings,
     store: EvaluationArtifactStore,
-    runtime: RagRuntimeClient,
-    qdrant: DepartmentQdrant,
     job: ClaimedEvaluationRun,
     should_stop: Callable[[], bool],
 ) -> bool:
@@ -75,18 +97,20 @@ def process_evaluation_run(
             store.cleanup_stage(scope, job.id, job.stale_claim_token, suite=False)
             require_live_claim(factory, job)
         suite = validate_claim_authority(factory, job)
-        cases = tuple(
-            store.iter_suite_cases(
-                scope,
-                suite.id,
-                manifest_sha256=suite.artifact_manifest_sha256,
-                cases_sha256=suite.canonical_cases_sha256,
-                cases_byte_size=suite.canonical_cases_byte_size,
-            )
+        suite_execution = _supervise_suite_load(
+            factory,
+            settings,
+            scope,
+            suite.id,
+            suite.artifact_manifest_sha256,
+            suite.canonical_cases_sha256,
+            suite.canonical_cases_byte_size,
+            job,
+            should_stop,
         )
+        cases = suite_execution.cases
         if len(cases) != job.case_count:
             raise EvaluationQueueError("suite_artifact_mismatch")
-        _verify_suite_authority(factory, settings, scope, cases)
         gates = _gates(suite)
         scores = []
         answered = 0
@@ -94,53 +118,28 @@ def process_evaluation_run(
         for case in cases:
             if should_stop():
                 raise _WorkerStopped()
-            renew_lease(factory, job, settings.lease_seconds)
             expected_status, relevant_ids, accepted_answers = _case_contract(case)
-            started = time.monotonic()
-            try:
-                outcome = execute_rag_policy(
-                    factory,
-                    settings.rag,
-                    settings.data_dir,
-                    scope,
-                    case["question"],
-                    runtime,
-                    qdrant,
-                    seed=derive_case_seed(job.base_seed, UUID(case["case_id"])),
-                )
-                if time.monotonic() - started > settings.operation_timeout_seconds:
-                    raise RagContractError("runtime_timeout")
-                renew_lease(factory, job, settings.lease_seconds)
-                revalidate_ephemeral_sources(factory, scope, outcome.supplied)
-                score = score_case(
-                    case_id=UUID(case["case_id"]),
-                    expected_status=expected_status,
-                    relevant_chunk_ids=relevant_ids,
-                    accepted_answers=accepted_answers,
-                    actual_status=outcome.status,
-                    generated_answer=outcome.answer,
-                    authorized_candidate_ids=outcome.authorized_candidate_ids,
-                    cited_chunk_ids=outcome.cited_chunk_ids,
-                    answer_contract_valid=True,
-                )
-            except RagContractError as error:
-                if error.code not in {
-                    "invalid_generation_response",
-                    "invalid_citation",
-                }:
-                    raise
-                score = score_case(
-                    case_id=UUID(case["case_id"]),
-                    expected_status=expected_status,
-                    relevant_chunk_ids=relevant_ids,
-                    accepted_answers=accepted_answers,
-                    actual_status="failed",
-                    generated_answer="",
-                    authorized_candidate_ids=(),
-                    cited_chunk_ids=(),
-                    answer_contract_valid=False,
-                    error_code=error.code,
-                )
+            execution = _supervise_case(
+                factory,
+                settings,
+                scope,
+                case["question"],
+                derive_case_seed(job.base_seed, UUID(case["case_id"])),
+                job,
+                should_stop,
+            )
+            score = score_case(
+                case_id=UUID(case["case_id"]),
+                expected_status=expected_status,
+                relevant_chunk_ids=relevant_ids,
+                accepted_answers=accepted_answers,
+                actual_status=execution.actual_status,
+                generated_answer=execution.generated_answer,
+                authorized_candidate_ids=execution.trace.authorized_candidate_ids,
+                cited_chunk_ids=execution.cited_chunk_ids,
+                answer_contract_valid=execution.answer_contract_valid,
+                error_code=execution.error_code,
+            )
             scores.append(score)
             answered += expected_status == "answered"
             insufficient += expected_status == "insufficient_information"
@@ -153,10 +152,19 @@ def process_evaluation_run(
             )
         metrics = aggregate_metrics(scores)
         gate = evaluate_gates(metrics, gates)
-        _verify_suite_authority(factory, settings, scope, cases)
+        final_authority = _supervise_authority(
+            factory,
+            settings,
+            scope,
+            cases,
+            job,
+            should_stop,
+        )
         require_live_claim(factory, job)
+        if should_stop():
+            raise _WorkerStopped()
         manifest, summary = _result_values(job, metrics, gates, gate)
-        staged, summary_digest = store.stage_run(
+        staged, _summary_digest = store.stage_run(
             scope,
             job.suite_id,
             job.id,
@@ -166,15 +174,18 @@ def process_evaluation_run(
             scores=tuple(scores),
         )
         require_live_claim(factory, job)
+        if should_stop():
+            raise _WorkerStopped()
         finalize_success(
             factory,
             store,
             job,
             staged,
-            summary_digest,
             tuple(scores),
             metrics,
             gate,
+            cases,
+            final_authority,
         )
         _event(job, "complete", "allowed", "evaluation_succeeded")
         return True
@@ -213,20 +224,373 @@ def process_evaluation_run(
     return False
 
 
-def _verify_suite_authority(
+def _suite_process_entry(
+    connection,
+    settings: EvaluationSettings,
+    scope: DepartmentScope,
+    suite_id: UUID,
+    manifest_sha256: str,
+    cases_sha256: str,
+    cases_byte_size: int,
+) -> None:
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    connection.send(("ready",))
+    engine = None
+    try:
+        store = EvaluationArtifactStore(settings.data_dir)
+        cases = tuple(
+            store.iter_suite_cases(
+                scope,
+                suite_id,
+                manifest_sha256=manifest_sha256,
+                cases_sha256=cases_sha256,
+                cases_byte_size=cases_byte_size,
+            )
+        )
+        engine = create_database_engine(settings.database_url)
+        authority = capture_canonical_suite_authority(
+            create_session_factory(engine),
+            settings.data_dir,
+            scope,
+            cases,
+        )
+        connection.send(("result", _SuiteExecution(cases, authority)))
+    except EvaluationContractError as error:
+        connection.send(("failure", error.code))
+    except SQLAlchemyError:
+        connection.send(("failure", "database_unavailable"))
+    except BaseException:
+        connection.send(("failure", "suite_source_stale"))
+    finally:
+        if engine is not None:
+            engine.dispose()
+        connection.close()
+
+
+def _supervise_suite_load(
     factory: sessionmaker[Session],
+    settings: EvaluationSettings,
+    scope: DepartmentScope,
+    suite_id: UUID,
+    manifest_sha256: str,
+    cases_sha256: str,
+    cases_byte_size: int,
+    job: ClaimedEvaluationRun,
+    should_stop: Callable[[], bool],
+) -> _SuiteExecution:
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_suite_process_entry,
+        args=(
+            child,
+            settings,
+            scope,
+            suite_id,
+            manifest_sha256,
+            cases_sha256,
+            cases_byte_size,
+        ),
+        daemon=False,
+    )
+    process.start()
+    child.close()
+    result = _wait_for_supervised_process(
+        factory,
+        settings,
+        job,
+        should_stop,
+        parent,
+        process,
+        _SuiteExecution,
+    )
+    if not isinstance(result, _SuiteExecution):
+        raise EvaluationQueueError("suite_source_stale")
+    return result
+
+
+def _case_process_entry(
+    connection,
+    settings: EvaluationSettings,
+    scope: DepartmentScope,
+    question: str,
+    seed: int,
+) -> None:
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    connection.send(("ready",))
+    engine = None
+    qdrant = None
+    try:
+        engine = create_database_engine(settings.database_url)
+        factory = create_session_factory(engine)
+        runtime = RagRuntimeClient(
+            settings.rag.runtime_url,
+            settings.rag.runtime_token,
+            min(
+                settings.rag.request_timeout_seconds,
+                settings.operation_timeout_seconds,
+            ),
+        )
+        qdrant = DepartmentQdrant(
+            settings.rag.qdrant_url,
+            settings.rag.qdrant_api_key,
+            settings.rag.qdrant_timeout_seconds,
+        )
+
+        def report_stage(stage: str) -> None:
+            connection.send(("stage", stage))
+
+        outcome = execute_rag_policy(
+            factory,
+            settings.rag,
+            settings.data_dir,
+            scope,
+            question,
+            runtime,
+            qdrant,
+            seed=seed,
+            stage_callback=report_stage,
+        )
+        report_stage("final_source_verification")
+        revalidate_ephemeral_sources(factory, scope, outcome.supplied)
+        connection.send(
+            (
+                "result",
+                _CaseExecution(
+                    outcome.status,
+                    outcome.answer,
+                    outcome.retrieval_trace,
+                    outcome.cited_chunk_ids,
+                    True,
+                    None,
+                ),
+            )
+        )
+    except RagPolicyEvaluationError as error:
+        connection.send(
+            (
+                "result",
+                _CaseExecution(
+                    "failed",
+                    "",
+                    error.trace,
+                    (),
+                    False,
+                    error.code,
+                ),
+            )
+        )
+    except RagContractError as error:
+        connection.send(("failure", _rag_error_code(error.code)))
+    except QdrantBoundaryError:
+        connection.send(("failure", "qdrant_unavailable"))
+    except RetrievalBoundaryError:
+        connection.send(("failure", "retrieval_authority_failed"))
+    except SQLAlchemyError:
+        connection.send(("failure", "database_unavailable"))
+    except BaseException:
+        connection.send(("failure", "generation_failed"))
+    finally:
+        if qdrant is not None:
+            try:
+                qdrant.close()
+            except Exception:
+                pass
+        if engine is not None:
+            engine.dispose()
+        connection.close()
+
+
+def _supervise_case(
+    factory: sessionmaker[Session],
+    settings: EvaluationSettings,
+    scope: DepartmentScope,
+    question: str,
+    seed: int,
+    job: ClaimedEvaluationRun,
+    should_stop: Callable[[], bool],
+) -> _CaseExecution:
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_case_process_entry,
+        args=(child, settings, scope, question, seed),
+        daemon=False,
+    )
+    process.start()
+    child.close()
+    result = _wait_for_supervised_process(
+        factory,
+        settings,
+        job,
+        should_stop,
+        parent,
+        process,
+        _CaseExecution,
+    )
+    if not isinstance(result, _CaseExecution):
+        raise EvaluationQueueError("generation_failed")
+    return result
+
+
+def _authority_process_entry(
+    connection,
     settings: EvaluationSettings,
     scope: DepartmentScope,
     cases: tuple[dict[str, object], ...],
 ) -> None:
     try:
-        verify_canonical_suite_authority_without_open_transaction(
-            factory, settings.data_dir, scope, cases
+        os.setsid()
+    except OSError:
+        pass
+    connection.send(("ready",))
+    engine = None
+    try:
+        engine = create_database_engine(settings.database_url)
+        factory = create_session_factory(engine)
+        authority = capture_canonical_suite_authority(
+            factory,
+            settings.data_dir,
+            scope,
+            cases,
         )
-    except EvaluationContractError:
-        raise
-    except SQLAlchemyError as error:
-        raise EvaluationQueueError("database_unavailable") from error
+        connection.send(("result", authority))
+    except EvaluationContractError as error:
+        connection.send(("failure", error.code))
+    except SQLAlchemyError:
+        connection.send(("failure", "database_unavailable"))
+    except BaseException:
+        connection.send(("failure", "suite_source_stale"))
+    finally:
+        if engine is not None:
+            engine.dispose()
+        connection.close()
+
+
+def _supervise_authority(
+    factory: sessionmaker[Session],
+    settings: EvaluationSettings,
+    scope: DepartmentScope,
+    cases: tuple[dict[str, object], ...],
+    job: ClaimedEvaluationRun,
+    should_stop: Callable[[], bool],
+) -> GroundTruthAuthoritySnapshot:
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_authority_process_entry,
+        args=(child, settings, scope, cases),
+        daemon=False,
+    )
+    process.start()
+    child.close()
+    result = _wait_for_supervised_process(
+        factory,
+        settings,
+        job,
+        should_stop,
+        parent,
+        process,
+        GroundTruthAuthoritySnapshot,
+    )
+    if not isinstance(result, GroundTruthAuthoritySnapshot):
+        raise EvaluationQueueError("suite_source_stale")
+    return result
+
+
+def _wait_for_supervised_process(
+    factory: sessionmaker[Session],
+    settings: EvaluationSettings,
+    job: ClaimedEvaluationRun,
+    should_stop: Callable[[], bool],
+    parent,
+    process: multiprocessing.Process,
+    result_type: type,
+):
+    deadline = time.monotonic() + settings.operation_timeout_seconds
+    next_heartbeat = time.monotonic()
+    group_ready = False
+    completed = False
+    try:
+        while True:
+            now = time.monotonic()
+            if should_stop():
+                raise _WorkerStopped()
+            if now >= deadline:
+                raise EvaluationQueueError("runtime_timeout")
+            if now >= next_heartbeat:
+                renew_lease(factory, job, settings.lease_seconds)
+                next_heartbeat = now + settings.heartbeat_seconds
+            wait_for = min(
+                deadline - now,
+                max(0.0, next_heartbeat - now),
+                0.1,
+            )
+            if parent.poll(wait_for):
+                try:
+                    message = parent.recv()
+                except EOFError as error:
+                    raise EvaluationQueueError("generation_failed") from error
+                if (
+                    not isinstance(message, tuple)
+                    or not message
+                    or message[0] not in {"ready", "stage", "result", "failure"}
+                ):
+                    raise EvaluationQueueError("generation_failed")
+                if message[0] == "ready" and len(message) == 1:
+                    group_ready = True
+                    continue
+                if message[0] == "stage" and len(message) == 2:
+                    continue
+                if message[0] == "failure" and len(message) == 2:
+                    raise EvaluationQueueError(str(message[1]))
+                if (
+                    message[0] == "result"
+                    and len(message) == 2
+                    and isinstance(message[1], result_type)
+                ):
+                    completed = True
+                    return message[1]
+                raise EvaluationQueueError("generation_failed")
+            if not process.is_alive():
+                raise EvaluationQueueError("generation_failed")
+    finally:
+        parent.close()
+        _terminate_and_reap(process, group_ready=group_ready, terminate=not completed)
+
+
+def _terminate_and_reap(
+    process: multiprocessing.Process,
+    *,
+    group_ready: bool,
+    terminate: bool,
+) -> None:
+    if terminate and process.is_alive():
+        try:
+            if group_ready and process.pid is not None:
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+        except (OSError, ProcessLookupError):
+            pass
+    process.join(timeout=1)
+    if process.is_alive():
+        try:
+            if group_ready and process.pid is not None:
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        process.join(timeout=1)
+    if process.is_alive():
+        raise EvaluationQueueError("generation_failed")
 
 
 def _case_contract(

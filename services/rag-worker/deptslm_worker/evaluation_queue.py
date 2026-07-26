@@ -13,7 +13,6 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.authorization import DepartmentScope
 from app.evaluation_artifacts import (
     RUN_FILES,
-    ArtifactDigest,
     EvaluationArtifactStore,
     StagedArtifact,
 )
@@ -22,8 +21,13 @@ from app.evaluation_domain import (
     SAFE_EVALUATION_ERROR_CODES,
     AggregateMetrics,
     EvaluationCaseScore,
+    EvaluationContractError,
     GateEvaluation,
     production_contract,
+)
+from app.evaluation_suites import (
+    GroundTruthAuthoritySnapshot,
+    revalidate_canonical_suite_authority_in_transaction,
 )
 from app.models import (
     Department,
@@ -139,31 +143,6 @@ def claim_next(
             )
     except SQLAlchemyError as error:
         raise EvaluationQueueError() from error
-
-
-def heartbeat(
-    factory: sessionmaker[Session],
-    job: ClaimedEvaluationRun,
-    lease_seconds: int,
-) -> bool:
-    try:
-        with factory.begin() as session:
-            result = session.execute(
-                update(EvaluationRun)
-                .where(
-                    *_owned_claim(job),
-                    _live_lease(),
-                    EvaluationRun.cancellation_requested_at.is_(None),
-                )
-                .values(
-                    lease_expires_at=func.clock_timestamp() + timedelta(seconds=lease_seconds),
-                    updated_at=func.clock_timestamp(),
-                    version=EvaluationRun.version + 1,
-                )
-            )
-            return result.rowcount == 1
-    except SQLAlchemyError:
-        return False
 
 
 def require_live_claim(
@@ -328,10 +307,11 @@ def finalize_success(
     store: EvaluationArtifactStore,
     job: ClaimedEvaluationRun,
     staged: StagedArtifact,
-    summary_digest: ArtifactDigest,
     scores: tuple[EvaluationCaseScore, ...],
     metrics: AggregateMetrics,
     gate: GateEvaluation,
+    cases: tuple[dict[str, object], ...],
+    authority: GroundTruthAuthoritySnapshot,
 ) -> None:
     scope = DepartmentScope(job.department_id)
     published = False
@@ -362,11 +342,31 @@ def finalize_success(
                 raise EvaluationQueueError("claim_lost")
             if run.cancellation_requested_at is not None:
                 raise EvaluationQueueError("cancelled")
-            if not _requester_authorized(session, job.department_id, job.requested_by_user_id, now):
+            if not _requester_authorized(
+                session,
+                job.department_id,
+                job.requested_by_user_id,
+                now,
+                lock=True,
+            ):
                 raise EvaluationQueueError("requester_unauthorized")
-            if len(scores) != job.case_count:
+            if (
+                len(scores) != job.case_count
+                or len(cases) != job.case_count
+                or tuple(str(score.case_id) for score in scores)
+                != tuple(case.get("case_id") for case in cases)
+                or tuple(score.expected_status for score in scores)
+                != tuple(case.get("expected_status") for case in cases)
+            ):
                 raise EvaluationQueueError("database_unavailable")
-            store.publish(staged, RUN_FILES)
+            revalidate_canonical_suite_authority_in_transaction(
+                session,
+                store.root.parent,
+                scope,
+                cases,
+                authority,
+            )
+            published_artifact = store.publish(staged, RUN_FILES)
             published = True
             for score in scores:
                 session.add(
@@ -393,10 +393,12 @@ def finalize_success(
                 item.expected_status == "insufficient_information" for item in scores
             )
             run.failed_gate_count = gate.failed_count
-            run.result_manifest_sha256 = staged.manifest.sha256
-            run.result_summary_sha256 = summary_digest.sha256
-            run.case_results_sha256 = staged.payload.sha256
-            run.case_results_byte_size = staged.payload.byte_size
+            if published_artifact.summary is None:
+                raise EvaluationQueueError("result_publication_failed")
+            run.result_manifest_sha256 = published_artifact.manifest.sha256
+            run.result_summary_sha256 = published_artifact.summary.sha256
+            run.case_results_sha256 = published_artifact.payload.sha256
+            run.case_results_byte_size = published_artifact.payload.byte_size
             run.worker_id = None
             run.claim_token = None
             run.lease_expires_at = None
@@ -417,6 +419,10 @@ def finalize_success(
             )
             session.flush()
     except EvaluationQueueError:
+        if published:
+            store.remove_final(scope, job.id, suite=False)
+        raise
+    except EvaluationContractError:
         if published:
             store.remove_final(scope, job.id, suite=False)
         raise
@@ -461,8 +467,15 @@ def validate_claim_authority(
         raise EvaluationQueueError("database_unavailable") from error
 
 
-def _requester_authorized(session: Session, department_id: UUID, user_id: UUID, now) -> bool:
-    row = session.execute(
+def _requester_authorized(
+    session: Session,
+    department_id: UUID,
+    user_id: UUID,
+    now,
+    *,
+    lock: bool = False,
+) -> bool:
+    statement = (
         select(Membership.id)
         .join(UserIdentity, UserIdentity.id == Membership.user_id)
         .where(
@@ -473,7 +486,10 @@ def _requester_authorized(session: Session, department_id: UUID, user_id: UUID, 
             or_(Membership.expires_at.is_(None), Membership.expires_at > now),
             UserIdentity.status == "active",
         )
-    ).scalar_one_or_none()
+    )
+    if lock:
+        statement = statement.with_for_update(of=(Membership, UserIdentity))
+    row = session.execute(statement).scalar_one_or_none()
     return row is not None
 
 

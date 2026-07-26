@@ -24,6 +24,7 @@ from app.evaluation_domain import (
 
 SUITE_FILES = frozenset({"manifest.json", "cases.jsonl"})
 RUN_FILES = frozenset({"manifest.json", "summary.json", "case_results.jsonl"})
+SOURCE_SUITE_FILES = frozenset({"suite.json", "cases.jsonl"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +39,15 @@ class StagedArtifact:
     final_path: Path
     manifest: ArtifactDigest
     payload: ArtifactDigest
+    files: tuple[tuple[str, ArtifactDigest], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedArtifact:
+    path: Path
+    manifest: ArtifactDigest
+    payload: ArtifactDigest
+    summary: ArtifactDigest | None
 
 
 class EvaluationArtifactStore:
@@ -77,8 +87,18 @@ class EvaluationArtifactStore:
             manifest_digest = _write_bytes(
                 stage, "manifest.json", canonical_json_bytes(manifest) + b"\n"
             )
-            _verify_directory(stage, SUITE_FILES)
-            return StagedArtifact(stage, final, manifest_digest, payload)
+            staged = StagedArtifact(
+                stage,
+                final,
+                manifest_digest,
+                payload,
+                (
+                    ("cases.jsonl", payload),
+                    ("manifest.json", manifest_digest),
+                ),
+            )
+            _verify_expected_files(stage, SUITE_FILES, dict(staged.files))
+            return staged
         except Exception:
             _safe_remove_tree(stage)
             raise
@@ -120,27 +140,53 @@ class EvaluationArtifactStore:
             manifest_digest = _write_bytes(
                 stage, "manifest.json", canonical_json_bytes(manifest) + b"\n"
             )
-            _verify_directory(stage, RUN_FILES)
+            staged = StagedArtifact(
+                stage,
+                final,
+                manifest_digest,
+                case_digest,
+                (
+                    ("case_results.jsonl", case_digest),
+                    ("manifest.json", manifest_digest),
+                    ("summary.json", summary_digest),
+                ),
+            )
+            _verify_expected_files(stage, RUN_FILES, dict(staged.files))
             return (
-                StagedArtifact(stage, final, manifest_digest, case_digest),
+                staged,
                 summary_digest,
             )
         except Exception:
             _safe_remove_tree(stage)
             raise
 
-    def publish(self, staged: StagedArtifact, allowlist: frozenset[str]) -> None:
-        _verify_directory(staged.path, allowlist)
+    def publish(self, staged: StagedArtifact, allowlist: frozenset[str]) -> PublishedArtifact:
+        expected = dict(staged.files)
+        if set(expected) != allowlist:
+            raise EvaluationContractError("result_publication_failed")
+        _verify_expected_files(staged.path, allowlist, expected)
         _ensure_parent(staged.final_path)
         if staged.final_path.exists():
             raise EvaluationContractError("result_publication_failed")
+        renamed = False
         try:
             os.rename(staged.path, staged.final_path)
+            renamed = True
             os.chmod(staged.final_path, 0o700)
-            _verify_directory(staged.final_path, allowlist)
+            verified = _verify_expected_files(staged.final_path, allowlist, expected)
+            return PublishedArtifact(
+                staged.final_path,
+                verified["manifest.json"],
+                verified["cases.jsonl" if "cases.jsonl" in verified else "case_results.jsonl"],
+                verified.get("summary.json"),
+            )
         except EvaluationContractError:
+            if renamed:
+                _safe_remove_tree(staged.final_path)
             raise
         except OSError as error:
+            if renamed:
+                _safe_remove_tree(staged.final_path)
             raise EvaluationContractError("result_publication_failed") from error
 
     def cleanup_stage(
@@ -167,16 +213,42 @@ class EvaluationArtifactStore:
         cases_byte_size: int,
     ) -> Iterator[dict[str, object]]:
         path = self._final_directory(self.suites, scope, suite_id)
-        _verify_directory(path, SUITE_FILES)
-        manifest = _digest_file(path / "manifest.json")
-        cases = _digest_file(path / "cases.jsonl")
-        if (
-            manifest.sha256 != manifest_sha256
-            or cases.sha256 != cases_sha256
-            or cases.byte_size != cases_byte_size
-        ):
-            raise EvaluationContractError("suite_artifact_mismatch")
-        yield from _iter_json_lines(path / "cases.jsonl")
+        directory = _open_directory(path)
+        try:
+            _verify_directory_descriptor(directory, SUITE_FILES)
+            manifest_descriptor, manifest_metadata = _open_regular_at(directory, "manifest.json")
+            try:
+                manifest_raw, manifest = _read_bounded_descriptor(
+                    manifest_descriptor,
+                    manifest_metadata,
+                    maximum=64 * 1024,
+                )
+                _verify_path_identity(directory, "manifest.json", manifest_metadata)
+            finally:
+                os.close(manifest_descriptor)
+            if manifest.sha256 != manifest_sha256:
+                raise EvaluationContractError("suite_artifact_mismatch")
+            manifest_value = _parse_json_object(manifest_raw)
+            _validate_canonical_suite_manifest(
+                manifest_value,
+                cases_sha256=cases_sha256,
+                cases_byte_size=cases_byte_size,
+            )
+            cases_descriptor, cases_metadata = _open_regular_at(directory, "cases.jsonl")
+            try:
+                yield from _iter_json_lines_descriptor(
+                    cases_descriptor,
+                    cases_metadata,
+                    expected=ArtifactDigest(cases_sha256, cases_byte_size),
+                    maximum=MAX_SUITE_INPUT_BYTES,
+                )
+                _verify_path_identity(directory, "cases.jsonl", cases_metadata)
+            finally:
+                os.close(cases_descriptor)
+            _verify_path_identity(directory, "manifest.json", manifest_metadata)
+            _verify_directory_descriptor(directory, SUITE_FILES)
+        finally:
+            os.close(directory)
 
     def _stage_directory(
         self,
@@ -203,38 +275,73 @@ class EvaluationArtifactStore:
         return path
 
 
+class SuiteSourceReader:
+    """Read an administrative suite through one no-follow descriptor lifetime."""
+
+    def __init__(self, source: Path, repository_root: Path) -> None:
+        self.path = _validate_external_source_path(source, repository_root)
+        self.directory = _open_directory(self.path)
+        self.files: dict[str, tuple[int, os.stat_result]] = {}
+        try:
+            _verify_directory_descriptor(
+                self.directory,
+                SOURCE_SUITE_FILES,
+                require_private=False,
+            )
+            for name in sorted(SOURCE_SUITE_FILES):
+                self.files[name] = _open_regular_at(self.directory, name)
+            total = sum(metadata.st_size for _descriptor, metadata in self.files.values())
+            if not 1 <= total <= MAX_SUITE_INPUT_BYTES:
+                raise EvaluationContractError()
+        except Exception:
+            self.close()
+            raise
+
+    def read_definition(self) -> dict[str, object]:
+        descriptor, metadata = self.files["suite.json"]
+        raw, _digest = _read_bounded_descriptor(
+            descriptor,
+            metadata,
+            maximum=64 * 1024,
+        )
+        _verify_path_identity(self.directory, "suite.json", metadata)
+        return _parse_json_object(raw)
+
+    def iter_cases(self) -> Iterator[dict[str, object]]:
+        descriptor, metadata = self.files["cases.jsonl"]
+        yield from _iter_json_lines_descriptor(
+            descriptor,
+            metadata,
+            expected=None,
+            maximum=MAX_SUITE_INPUT_BYTES,
+        )
+        _verify_path_identity(self.directory, "cases.jsonl", metadata)
+        _verify_path_identity(self.directory, "suite.json", self.files["suite.json"][1])
+
+    def close(self) -> None:
+        for descriptor, _metadata in self.files.values():
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        self.files.clear()
+        if getattr(self, "directory", -1) >= 0:
+            try:
+                os.close(self.directory)
+            except OSError:
+                pass
+            self.directory = -1
+
+    def __enter__(self) -> SuiteSourceReader:
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self.close()
+
+
 def validate_suite_source_directory(source: Path, repository_root: Path) -> Path:
-    if not source.is_absolute():
-        raise EvaluationContractError()
-    source = Path(os.path.abspath(source))
-    root = repository_root.resolve()
-    if source == root or source.is_relative_to(root) or root.is_relative_to(source):
-        raise EvaluationContractError()
-    directory = _real_directory(source, writable=False)
-    entries = {entry.name for entry in os.scandir(directory)}
-    if entries != {"suite.json", "cases.jsonl"}:
-        raise EvaluationContractError()
-    total = 0
-    for name in entries:
-        metadata = (directory / name).lstat()
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-            raise EvaluationContractError()
-        total += metadata.st_size
-    if not 1 <= total <= MAX_SUITE_INPUT_BYTES:
-        raise EvaluationContractError()
-    return directory
-
-
-def read_suite_definition(source: Path) -> dict[str, object]:
-    file_path = source / "suite.json"
-    raw = _read_bounded_file(file_path, maximum=64 * 1024)
-    try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise EvaluationContractError() from error
-    if not isinstance(value, dict):
-        raise EvaluationContractError()
-    return value
+    with SuiteSourceReader(source, repository_root) as reader:
+        return reader.path
 
 
 def iter_source_cases(source: Path) -> Iterator[dict[str, object]]:
@@ -301,21 +408,17 @@ def _score_value(score: EvaluationCaseScore) -> dict[str, object]:
 
 def _iter_json_lines(path: Path) -> Iterator[dict[str, object]]:
     try:
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-        )
-        with os.fdopen(descriptor, "rb", closefd=True) as handle:
-            for raw in handle:
-                if not raw.endswith(b"\n") or len(raw) > MAX_CASE_JSONL_LINE_BYTES:
-                    raise EvaluationContractError("suite_artifact_mismatch")
-                try:
-                    value = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    raise EvaluationContractError("suite_artifact_mismatch") from error
-                if not isinstance(value, dict):
-                    raise EvaluationContractError("suite_artifact_mismatch")
-                yield value
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        metadata = os.fstat(descriptor)
+        try:
+            yield from _iter_json_lines_descriptor(
+                descriptor,
+                metadata,
+                expected=None,
+                maximum=MAX_SUITE_INPUT_BYTES,
+            )
+        finally:
+            os.close(descriptor)
     except EvaluationContractError:
         raise
     except FileNotFoundError as error:
@@ -373,53 +476,314 @@ def _exclusive_file(path: Path) -> int:
         raise EvaluationContractError("result_publication_failed") from error
 
 
-def _digest_file(path: Path) -> ArtifactDigest:
-    digest = hashlib.sha256()
-    size = 0
+def _validate_external_source_path(source: Path, repository_root: Path) -> Path:
+    if not source.is_absolute():
+        raise EvaluationContractError()
+    source = Path(os.path.abspath(source))
+    root = repository_root.resolve()
+    if source == root or source.is_relative_to(root) or root.is_relative_to(source):
+        raise EvaluationContractError()
+    return _real_directory(source, writable=False)
+
+
+def _open_directory(path: Path) -> int:
     try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        if not stat.S_ISDIR(metadata.st_mode):
             raise EvaluationContractError("suite_artifact_mismatch")
-        with os.fdopen(descriptor, "rb", closefd=True) as handle:
-            while chunk := handle.read(1024 * 1024):
-                size += len(chunk)
-                digest.update(chunk)
+        return descriptor
     except EvaluationContractError:
+        try:
+            os.close(descriptor)
+        except (OSError, UnboundLocalError):
+            pass
         raise
     except FileNotFoundError as error:
         raise EvaluationContractError("suite_artifact_missing") from error
     except OSError as error:
         raise EvaluationContractError("suite_artifact_mismatch") from error
+
+
+def _open_regular_at(directory: int, name: str) -> tuple[int, os.stat_result]:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise EvaluationContractError("suite_artifact_mismatch")
+        return descriptor, metadata
+    except EvaluationContractError:
+        try:
+            os.close(descriptor)
+        except (OSError, UnboundLocalError):
+            pass
+        raise
+    except FileNotFoundError as error:
+        raise EvaluationContractError("suite_artifact_missing") from error
+    except OSError as error:
+        raise EvaluationContractError("suite_artifact_mismatch") from error
+
+
+def _same_file_identity(before: os.stat_result, after: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(after.st_mode)
+        and after.st_dev == before.st_dev
+        and after.st_ino == before.st_ino
+        and after.st_size == before.st_size
+        and after.st_nlink == before.st_nlink == 1
+        and after.st_mode == before.st_mode
+        and after.st_mtime_ns == before.st_mtime_ns
+        and after.st_ctime_ns == before.st_ctime_ns
+    )
+
+
+def _verify_path_identity(directory: int, name: str, expected: os.stat_result) -> None:
+    try:
+        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise EvaluationContractError("suite_artifact_missing") from error
+    except OSError as error:
+        raise EvaluationContractError("suite_artifact_mismatch") from error
+    if not _same_file_identity(expected, current):
+        raise EvaluationContractError("suite_artifact_mismatch")
+
+
+def _read_bounded_descriptor(
+    descriptor: int,
+    metadata: os.stat_result,
+    *,
+    maximum: int,
+) -> tuple[bytes, ArtifactDigest]:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or not 1 <= metadata.st_size <= maximum
+    ):
+        raise EvaluationContractError("suite_artifact_mismatch")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    result = bytearray()
+    while True:
+        chunk = os.read(descriptor, min(64 * 1024, maximum + 1 - len(result)))
+        if not chunk:
+            break
+        result.extend(chunk)
+        digest.update(chunk)
+        if len(result) > maximum:
+            raise EvaluationContractError("suite_artifact_mismatch")
+    after = os.fstat(descriptor)
+    if len(result) != metadata.st_size or not _same_file_identity(metadata, after):
+        raise EvaluationContractError("suite_artifact_mismatch")
+    return bytes(result), ArtifactDigest(digest.hexdigest(), len(result))
+
+
+def _iter_json_lines_descriptor(
+    descriptor: int,
+    metadata: os.stat_result,
+    *,
+    expected: ArtifactDigest | None,
+    maximum: int,
+) -> Iterator[dict[str, object]]:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or not 1 <= metadata.st_size <= maximum
+    ):
+        raise EvaluationContractError("suite_artifact_mismatch")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    duplicate = os.dup(descriptor)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with os.fdopen(duplicate, "rb", closefd=True) as handle:
+            duplicate = -1
+            while True:
+                raw = handle.readline(MAX_CASE_JSONL_LINE_BYTES + 1)
+                if not raw:
+                    break
+                if (
+                    len(raw) > MAX_CASE_JSONL_LINE_BYTES
+                    or not raw.endswith(b"\n")
+                    or total + len(raw) > maximum
+                ):
+                    raise EvaluationContractError("suite_artifact_mismatch")
+                total += len(raw)
+                digest.update(raw)
+                try:
+                    value = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise EvaluationContractError("suite_artifact_mismatch") from error
+                if not isinstance(value, dict):
+                    raise EvaluationContractError("suite_artifact_mismatch")
+                yield value
+        actual = ArtifactDigest(digest.hexdigest(), total)
+        after = os.fstat(descriptor)
+        if (
+            total != metadata.st_size
+            or not _same_file_identity(metadata, after)
+            or (expected is not None and actual != expected)
+        ):
+            raise EvaluationContractError("suite_artifact_mismatch")
+    finally:
+        if duplicate >= 0:
+            os.close(duplicate)
+
+
+def _digest_descriptor(
+    descriptor: int,
+    metadata: os.stat_result,
+    *,
+    maximum: int = MAX_SUITE_INPUT_BYTES,
+) -> ArtifactDigest:
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or not 1 <= metadata.st_size <= maximum
+    ):
+        raise EvaluationContractError("suite_artifact_mismatch")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        chunk = os.read(descriptor, min(1024 * 1024, maximum + 1 - size))
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > maximum:
+            raise EvaluationContractError("suite_artifact_mismatch")
+        digest.update(chunk)
+    after = os.fstat(descriptor)
+    if size != metadata.st_size or not _same_file_identity(metadata, after):
+        raise EvaluationContractError("suite_artifact_mismatch")
     return ArtifactDigest(digest.hexdigest(), size)
 
 
-def _read_bounded_file(path: Path, *, maximum: int) -> bytes:
-    digest = _digest_file(path)
-    if not 1 <= digest.byte_size <= maximum:
-        raise EvaluationContractError()
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    with os.fdopen(descriptor, "rb", closefd=True) as handle:
-        value = handle.read(maximum + 1)
-    if len(value) > maximum:
-        raise EvaluationContractError()
+def _verify_directory_descriptor(
+    directory: int,
+    allowlist: frozenset[str],
+    *,
+    require_private: bool = True,
+) -> None:
+    try:
+        entries = set(os.listdir(directory))
+        if entries != allowlist:
+            raise EvaluationContractError("suite_artifact_mismatch")
+        for name in sorted(entries):
+            descriptor, metadata = _open_regular_at(directory, name)
+            try:
+                if require_private and metadata.st_mode & 0o077:
+                    raise EvaluationContractError("suite_artifact_mismatch")
+                _verify_path_identity(directory, name, metadata)
+            finally:
+                os.close(descriptor)
+    except EvaluationContractError:
+        raise
+    except OSError as error:
+        raise EvaluationContractError("suite_artifact_mismatch") from error
+
+
+def _verify_expected_files(
+    path: Path,
+    allowlist: frozenset[str],
+    expected: dict[str, ArtifactDigest],
+) -> dict[str, ArtifactDigest]:
+    directory = _open_directory(path)
+    try:
+        _verify_directory_descriptor(directory, allowlist)
+        verified: dict[str, ArtifactDigest] = {}
+        manifest_raw = b""
+        opened = {name: _open_regular_at(directory, name) for name in sorted(allowlist)}
+        try:
+            for name in sorted(allowlist):
+                descriptor, metadata = opened[name]
+                if name == "manifest.json":
+                    manifest_raw, digest = _read_bounded_descriptor(
+                        descriptor,
+                        metadata,
+                        maximum=64 * 1024,
+                    )
+                else:
+                    digest = _digest_descriptor(descriptor, metadata)
+                if digest != expected.get(name):
+                    raise EvaluationContractError("result_publication_failed")
+                verified[name] = digest
+            for name, (_descriptor, metadata) in opened.items():
+                _verify_path_identity(directory, name, metadata)
+        finally:
+            for descriptor, _metadata in opened.values():
+                os.close(descriptor)
+        _verify_directory_descriptor(directory, allowlist)
+        _validate_published_manifest(manifest_raw, allowlist, verified)
+        return verified
+    finally:
+        os.close(directory)
+
+
+def _validate_published_manifest(
+    raw: bytes,
+    allowlist: frozenset[str],
+    verified: dict[str, ArtifactDigest],
+) -> None:
+    manifest = _parse_json_object(raw)
+    payload_names = allowlist - {"manifest.json"}
+    declared = manifest.get("files")
+    if not isinstance(declared, dict) or set(declared) != payload_names:
+        raise EvaluationContractError("result_publication_failed")
+    for name in payload_names:
+        value = declared.get(name)
+        expected = verified[name]
+        if value != {"sha256": expected.sha256, "byte_size": expected.byte_size}:
+            raise EvaluationContractError("result_publication_failed")
+
+
+def _parse_json_object(raw: bytes) -> dict[str, object]:
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise EvaluationContractError("suite_artifact_mismatch") from error
+    if not isinstance(value, dict):
+        raise EvaluationContractError("suite_artifact_mismatch")
     return value
 
 
-def _verify_directory(path: Path, allowlist: frozenset[str]) -> None:
-    directory = _real_directory(path, writable=False)
-    entries = {entry.name for entry in os.scandir(directory)}
-    if entries != allowlist:
+def _validate_canonical_suite_manifest(
+    value: dict[str, object],
+    *,
+    cases_sha256: str,
+    cases_byte_size: int,
+) -> None:
+    expected_keys = {
+        "suite_id",
+        "department_id",
+        "suite_contract_version",
+        "metric_contract_version",
+        "answer_normalization_version",
+        "gate_policy_version",
+        "case_count",
+        "answered_case_count",
+        "insufficient_case_count",
+        "gates",
+        "artifact_contract_version",
+        "files",
+    }
+    if set(value) != expected_keys or value.get("artifact_contract_version") != (
+        ARTIFACT_CONTRACT_VERSION
+    ):
         raise EvaluationContractError("suite_artifact_mismatch")
-    for name in entries:
-        metadata = (directory / name).lstat()
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or stat.S_ISLNK(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or metadata.st_mode & 0o077
-        ):
-            raise EvaluationContractError("suite_artifact_mismatch")
+    if value.get("files") != {
+        "cases.jsonl": {
+            "sha256": cases_sha256,
+            "byte_size": cases_byte_size,
+        }
+    }:
+        raise EvaluationContractError("suite_artifact_mismatch")
 
 
 def _real_directory(path: Path, *, writable: bool) -> Path:

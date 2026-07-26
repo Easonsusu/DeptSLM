@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import threading
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import jwt
 import pytest
@@ -24,6 +27,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from alembic import command
+from app import evaluation_suites
 from app.auth import AuthenticatedPrincipal
 from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.database import create_database_engine, create_session_factory
@@ -36,7 +40,9 @@ from app.evaluation_domain import (
     RUNNER_CONTRACT_VERSION,
     AggregateMetrics,
     EvaluationCaseScore,
+    EvaluationContractError,
     GateEvaluation,
+    QualityGates,
     production_contract,
 )
 from app.evaluation_services import (
@@ -45,10 +51,26 @@ from app.evaluation_services import (
     list_evaluation_runs,
     list_evaluation_suites,
 )
+from app.evaluation_suites import (
+    GroundTruthAuthoritySnapshot,
+    ParsedEvaluationCase,
+    SuiteImportSettings,
+    _canonical_case,
+    _ground_truth_snapshot_metadata,
+    _suite_manifest,
+    archive_suite,
+    capture_canonical_suite_authority,
+    import_suite,
+)
+from app.extraction_domain import CHUNKING_VERSION, NORMALIZATION_VERSION, PIPELINE_VERSION
 from app.main import app
 from app.models import (
     Base,
     Department,
+    Document,
+    DocumentChunk,
+    DocumentExtraction,
+    DocumentVectorIndexing,
     EvaluationCaseResult,
     EvaluationRun,
     EvaluationSuite,
@@ -57,6 +79,15 @@ from app.models import (
     UserIdentity,
 )
 from app.services import ServiceError
+from app.vector_index_domain import (
+    EMBEDDING_DIMENSION,
+    EMBEDDING_DISTANCE,
+    EMBEDDING_MODEL_ID,
+    EMBEDDING_MODEL_REVISION,
+    EMBEDDING_PIPELINE_VERSION,
+    QDRANT_COLLECTION,
+    VECTOR_SCHEMA_VERSION,
+)
 
 pytestmark = pytest.mark.postgres
 ISSUER = "https://phase9.issuer.invalid"
@@ -88,6 +119,10 @@ def db(engine) -> Session:
         session.execute(delete(EvaluationCaseResult))
         session.execute(delete(EvaluationRun))
         session.execute(delete(EvaluationSuite))
+        session.execute(delete(DocumentVectorIndexing))
+        session.execute(delete(DocumentChunk))
+        session.execute(delete(DocumentExtraction))
+        session.execute(delete(Document))
         session.execute(delete(PersistentAuditEvent))
         session.execute(delete(Membership))
         session.execute(delete(Department))
@@ -194,6 +229,188 @@ def _suite(db: Session, department: Department, identity: UserIdentity) -> Evalu
     db.add(suite)
     db.flush()
     return suite
+
+
+def _ground_truth_suite(
+    db: Session,
+    tmp_path: Path,
+    department: Department,
+    identity: UserIdentity,
+) -> tuple[
+    EvaluationSuite,
+    tuple[dict[str, object], ...],
+    Document,
+    DocumentExtraction,
+    DocumentVectorIndexing,
+    DocumentChunk,
+    EvaluationArtifactStore,
+]:
+    root = tmp_path / "runtime"
+    (root / "eval_results").mkdir(parents=True, exist_ok=True)
+    text_value = "alpha beta"
+    normalized = (text_value + "\n").encode()
+    document_id, extraction_id, chunk_id = uuid4(), uuid4(), uuid4()
+    chunk_value = {
+        "ordinal": 0,
+        "text": text_value,
+        "char_start": 0,
+        "char_end": len(text_value),
+        "byte_size": len(text_value.encode()),
+        "content_sha256": hashlib.sha256(text_value.encode()).hexdigest(),
+        "provenance_kind": "line",
+        "page_start": None,
+        "page_end": None,
+        "line_start": 1,
+        "line_end": 1,
+    }
+    chunks = (json.dumps(chunk_value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    manifest = {
+        "chunk_count": 1,
+        "chunking_version": CHUNKING_VERSION,
+        "chunks_sha256": hashlib.sha256(chunks).hexdigest(),
+        "department_id": str(department.id),
+        "document_id": str(document_id),
+        "extraction_id": str(extraction_id),
+        "normalization_version": NORMALIZATION_VERSION,
+        "normalized_byte_size": len(normalized),
+        "normalized_sha256": hashlib.sha256(normalized).hexdigest(),
+        "parser_name": "python-utf8",
+        "parser_version": "3.12",
+        "pipeline_version": PIPELINE_VERSION,
+        "source_byte_size": len(normalized),
+        "source_sha256": hashlib.sha256(normalized).hexdigest(),
+    }
+    final = root / "extracted_text" / str(department.id) / str(document_id) / str(extraction_id)
+    final.mkdir(parents=True)
+    (final / "normalized.txt").write_bytes(normalized)
+    (final / "chunks.jsonl").write_bytes(chunks)
+    (final / "manifest.json").write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    output_size = sum(path.stat().st_size for path in final.iterdir())
+    now = datetime.now(UTC)
+    document = Document(
+        id=document_id,
+        department_id=department.id,
+        uploaded_by_user_id=identity.id,
+        original_filename="synthetic.txt",
+        media_type="text/plain",
+        byte_size=len(normalized),
+        sha256=manifest["source_sha256"],
+    )
+    extraction = DocumentExtraction(
+        id=extraction_id,
+        department_id=department.id,
+        document_id=document.id,
+        requested_by_user_id=identity.id,
+        status="succeeded",
+        pipeline_version=PIPELINE_VERSION,
+        parser_name="python-utf8",
+        parser_version="3.12",
+        normalization_version=NORMALIZATION_VERSION,
+        chunking_version=CHUNKING_VERSION,
+        source_sha256=document.sha256,
+        source_byte_size=document.byte_size,
+        normalized_sha256=manifest["normalized_sha256"],
+        normalized_byte_size=len(normalized),
+        output_byte_size=output_size,
+        chunk_count=1,
+        worker_id=uuid4(),
+        claim_token=uuid4(),
+        claimed_at=now,
+        started_at=now,
+        finished_at=now,
+    )
+    chunk = DocumentChunk(
+        id=chunk_id,
+        department_id=department.id,
+        document_id=document.id,
+        extraction_id=extraction.id,
+        **{name: chunk_value[name] for name in chunk_value if name != "text"},
+    )
+    indexing = DocumentVectorIndexing(
+        department_id=department.id,
+        document_id=document.id,
+        extraction_id=extraction.id,
+        requested_by_user_id=identity.id,
+        status="succeeded",
+        embedding_pipeline_version=EMBEDDING_PIPELINE_VERSION,
+        embedding_model_id=EMBEDDING_MODEL_ID,
+        embedding_model_revision=EMBEDDING_MODEL_REVISION,
+        embedding_dimension=EMBEDDING_DIMENSION,
+        distance=EMBEDDING_DISTANCE,
+        vector_schema_version=VECTOR_SCHEMA_VERSION,
+        qdrant_collection=QDRANT_COLLECTION,
+        expected_chunk_count=1,
+        point_count=1,
+        worker_id=uuid4(),
+        claim_token=uuid4(),
+        vector_attempt_id=uuid4(),
+        claimed_at=now,
+        started_at=now,
+        finished_at=now,
+    )
+    # Flush each composite parent before creating rows that reference it.  The
+    # database intentionally does not rely on ORM insertion ordering across
+    # these independent relationship-free test fixtures.
+    db.add(document)
+    db.flush()
+    db.add(extraction)
+    db.flush()
+    db.add_all((chunk, indexing))
+    db.flush()
+    parsed = ParsedEvaluationCase(
+        uuid4(),
+        "answered",
+        "Synthetic question?",
+        (chunk.id,),
+        ("Synthetic answer.",),
+    )
+    snapshots, _validations = _ground_truth_snapshot_metadata(
+        db,
+        DepartmentScope(department.id),
+        (parsed,),
+    )
+    canonical = (_canonical_case(parsed, snapshots),)
+    gates = QualityGates(**{name: Decimal(0) for name in QualityGates.__dataclass_fields__})
+    suite_id = uuid4()
+    store = EvaluationArtifactStore(root)
+    staged = store.stage_suite(
+        DepartmentScope(department.id),
+        suite_id,
+        uuid4(),
+        _suite_manifest(
+            department_id=department.id,
+            suite_id=suite_id,
+            gates=gates,
+            case_count=1,
+            answered=1,
+            insufficient=0,
+        ),
+        (json.dumps(canonical[0], sort_keys=True, separators=(",", ":")).encode() + b"\n",),
+    )
+    published = store.publish(staged, frozenset({"manifest.json", "cases.jsonl"}))
+    suite = EvaluationSuite(
+        id=suite_id,
+        department_id=department.id,
+        imported_by_user_id=identity.id,
+        status="active",
+        suite_contract_version="phase9-evaluation-suite-v1",
+        artifact_contract_version=ARTIFACT_CONTRACT_VERSION,
+        metric_contract_version=METRIC_CONTRACT_VERSION,
+        answer_normalization_version=ANSWER_NORMALIZATION_VERSION,
+        gate_policy_version=GATE_POLICY_VERSION,
+        case_count=1,
+        answered_case_count=1,
+        insufficient_case_count=0,
+        artifact_manifest_sha256=published.manifest.sha256,
+        canonical_cases_sha256=published.payload.sha256,
+        canonical_cases_byte_size=published.payload.byte_size,
+        **gates.as_dict(),
+    )
+    db.add(suite)
+    db.flush()
+    return suite, canonical, document, extraction, indexing, chunk, store
 
 
 def _scope(department: Department) -> DepartmentRequestScope:
@@ -327,6 +544,172 @@ def test_system_admin_has_no_cross_department_bypass(db: Session) -> None:
             code_revision=CODE_REVISION,
         )
     assert caught.value.status_code == 403
+
+
+def test_archive_suite_dry_run_reauthorizes_without_mutation_or_audit(db: Session) -> None:
+    department = _department(db, "phase9-archive-dry-run")
+    actor = _identity(db, department, "department_admin", "archive-dry-run-admin")
+    viewer = _identity(db, department, "viewer", "archive-dry-run-viewer")
+    foreign = _department(db, "phase9-archive-foreign")
+    foreign_actor = _identity(db, foreign, "department_admin", "archive-foreign-admin")
+    suite = _suite(db, department, actor)
+    foreign_suite = _suite(db, foreign, foreign_actor)
+    db.commit()
+    factory = create_session_factory(db.get_bind())
+    assert not archive_suite(
+        factory,
+        department_id=department.id,
+        suite_id=suite.id,
+        actor_issuer=actor.issuer,
+        actor_subject=actor.subject,
+        apply=False,
+    )
+    with pytest.raises(ServiceError) as denied:
+        archive_suite(
+            factory,
+            department_id=department.id,
+            suite_id=suite.id,
+            actor_issuer=viewer.issuer,
+            actor_subject=viewer.subject,
+            apply=False,
+        )
+    assert denied.value.status_code == 403
+    with pytest.raises(ServiceError) as hidden:
+        archive_suite(
+            factory,
+            department_id=department.id,
+            suite_id=foreign_suite.id,
+            actor_issuer=actor.issuer,
+            actor_subject=actor.subject,
+            apply=False,
+        )
+    assert hidden.value.status_code == 404
+    with Session(db.get_bind()) as session:
+        assert session.get(EvaluationSuite, suite.id).status == "active"
+        assert (
+            session.scalar(
+                select(PersistentAuditEvent).where(
+                    PersistentAuditEvent.action == "evaluation.suite.archive"
+                )
+            )
+            is None
+        )
+
+
+def test_import_lock_releases_database_locks_during_artifact_scan_and_detects_change(
+    db: Session,
+    engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    department = _department(db, "phase9-import-boundary")
+    actor = _identity(db, department, "department_admin", "import-boundary-admin")
+    (
+        _suite_row,
+        _canonical,
+        _document,
+        _extraction,
+        indexing,
+        chunk,
+        store,
+    ) = _ground_truth_suite(db, tmp_path, department, actor)
+    db.commit()
+    source = tmp_path / "suite-source"
+    source.mkdir()
+    gates = {
+        "retrieval_recall_at_5_min": "0.00",
+        "retrieval_mrr_at_20_min": "0.00",
+        "answer_status_accuracy_min": "0.00",
+        "citation_precision_min": "0.00",
+        "citation_recall_min": "0.00",
+        "normalized_exact_match_min": "0.00",
+        "character_f1_min": "0.00",
+        "invalid_contract_rate_max": "0.00",
+    }
+    (source / "suite.json").write_text(
+        json.dumps(
+            {
+                "suite_contract_version": "phase9-evaluation-suite-v1",
+                "metric_contract_version": METRIC_CONTRACT_VERSION,
+                "answer_normalization_version": ANSWER_NORMALIZATION_VERSION,
+                "gate_policy_version": GATE_POLICY_VERSION,
+                "gates": gates,
+            }
+        )
+    )
+    (source / "cases.jsonl").write_text(
+        json.dumps(
+            {
+                "case_id": str(uuid4()),
+                "expected_status": "answered",
+                "question": "Synthetic question?",
+                "relevant_chunk_ids": [str(chunk.id)],
+                "accepted_answers": ["Synthetic answer."],
+            }
+        )
+        + "\n"
+    )
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    settings = SuiteImportSettings(
+        _database_url(),
+        store.root.parent,
+        repository,
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+    original = evaluation_suites._verify_ground_truth_artifacts
+    calls = 0
+
+    def blocked_verification(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        evaluation_suites,
+        "_verify_ground_truth_artifacts",
+        blocked_verification,
+    )
+
+    def run_import() -> None:
+        try:
+            import_suite(
+                settings,
+                department_id=department.id,
+                actor_issuer=actor.issuer,
+                actor_subject=actor.subject,
+                source_directory=source,
+                apply=True,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run_import)
+    thread.start()
+    assert entered.wait(5)
+    try:
+        with Session(engine) as session, session.begin():
+            session.execute(
+                select(Membership)
+                .where(
+                    Membership.department_id == department.id,
+                    Membership.user_id == actor.id,
+                )
+                .with_for_update(nowait=True)
+            ).scalar_one()
+            session.get(DocumentVectorIndexing, indexing.id).vector_attempt_id = uuid4()
+    finally:
+        release.set()
+        thread.join(10)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], EvaluationContractError)
+    assert errors[0].code == "suite_source_stale"
 
 
 def test_list_and_read_surfaces_are_content_free(db: Session) -> None:
@@ -467,7 +850,7 @@ def test_worker_claim_is_bound_to_exact_code_revision(db: Session, engine) -> No
     assert claim_next(factory, uuid4(), 300, CODE_REVISION).id == run.id
 
 
-def test_requester_revocation_blocks_publication_and_completion_audit(
+def test_final_authority_requester_revocation_blocks_publication_and_completion_audit(
     db: Session,
     engine,
     tmp_path: Path,
@@ -500,7 +883,7 @@ def test_requester_revocation_blocks_publication_and_completion_audit(
     score = _score_for_finalization()
     metrics = _metrics_for_finalization()
     gate = GateEvaluation(True, 0, {"retrieval_recall_at_5_min": True})
-    staged, summary = store.stage_run(
+    staged, _summary = store.stage_run(
         DepartmentScope(department.id),
         suite.id,
         run.id,
@@ -510,7 +893,17 @@ def test_requester_revocation_blocks_publication_and_completion_audit(
         scores=(score,),
     )
     with pytest.raises(EvaluationQueueError) as caught:
-        finalize_success(factory, store, job, staged, summary, (score,), metrics, gate)
+        finalize_success(
+            factory,
+            store,
+            job,
+            staged,
+            (score,),
+            metrics,
+            gate,
+            (_canonical_case_for_score(score),),
+            GroundTruthAuthoritySnapshot({}, ()),
+        )
     assert caught.value.code == "requester_unauthorized"
     assert not staged.final_path.exists()
     with Session(engine) as session:
@@ -525,9 +918,9 @@ def test_requester_revocation_blocks_publication_and_completion_audit(
         )
 
 
-def _score_for_finalization() -> EvaluationCaseScore:
+def _score_for_finalization(case_id=None) -> EvaluationCaseScore:
     return EvaluationCaseScore(
-        case_id=uuid4(),
+        case_id=case_id or uuid4(),
         expected_status="answered",
         actual_status="answered",
         relevant_chunk_count=1,
@@ -548,6 +941,190 @@ def _score_for_finalization() -> EvaluationCaseScore:
     )
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    ["document", "extraction", "indexing", "chunk", "artifact", "suite"],
+)
+def test_final_all_ground_truth_authority_blocks_races_without_success(
+    db: Session,
+    engine,
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    department = _department(db, f"phase9-final-{mutation}")
+    actor = _identity(db, department, "instructor", f"final-{mutation}-actor")
+    (
+        suite,
+        cases,
+        document,
+        extraction,
+        indexing,
+        chunk,
+        store,
+    ) = _ground_truth_suite(db, tmp_path, department, actor)
+    run = enqueue_evaluation_run(
+        db,
+        _principal(actor),
+        _scope(department),
+        suite.id,
+        code_revision=CODE_REVISION,
+    )
+    db.commit()
+    factory = create_session_factory(engine)
+    job = claim_next(factory, uuid4(), 300, CODE_REVISION)
+    assert job is not None
+    authority = capture_canonical_suite_authority(
+        factory,
+        store.root.parent,
+        DepartmentScope(department.id),
+        cases,
+    )
+    score = _score_for_finalization(UUID(cases[0]["case_id"]))
+    score = EvaluationCaseScore(
+        **{
+            **{name: getattr(score, name) for name in EvaluationCaseScore.__dataclass_fields__},
+            "retrieved_relevant_at_5": 0,
+            "retrieved_relevant_at_10": 0,
+            "retrieved_relevant_at_20": 0,
+            "reciprocal_rank_at_20": Decimal(0),
+        }
+    )
+    metrics = _metrics_for_finalization()
+    gate = GateEvaluation(True, 0, {"retrieval_recall_at_5_min": True})
+    staged, _summary = store.stage_run(
+        DepartmentScope(department.id),
+        suite.id,
+        run.id,
+        job.claim_token,
+        manifest_value={"case_count": 1},
+        summary_value={"failed_gate_count": 0},
+        scores=(score,),
+    )
+    if mutation == "artifact":
+        final = (
+            store.root.parent
+            / "extracted_text"
+            / str(department.id)
+            / str(document.id)
+            / str(extraction.id)
+        )
+        replacement = final / "manifest.replacement"
+        replacement.write_bytes((final / "manifest.json").read_bytes())
+        os.replace(replacement, final / "manifest.json")
+    else:
+        with factory.begin() as session:
+            if mutation == "document":
+                row = session.get(Document, document.id)
+                row.status = "deleted"
+                row.deleted_at = datetime.now(UTC)
+                row.deleted_by_user_id = actor.id
+            elif mutation == "extraction":
+                session.get(DocumentExtraction, extraction.id).chunk_count = 2
+            elif mutation == "indexing":
+                session.get(DocumentVectorIndexing, indexing.id).vector_attempt_id = uuid4()
+            elif mutation == "chunk":
+                session.get(DocumentChunk, chunk.id).char_end += 1
+            elif mutation == "suite":
+                row = session.get(EvaluationSuite, suite.id)
+                row.status = "archived"
+                row.archived_at = datetime.now(UTC)
+    with pytest.raises((EvaluationQueueError, EvaluationContractError)):
+        finalize_success(
+            factory,
+            store,
+            job,
+            staged,
+            (score,),
+            metrics,
+            gate,
+            cases,
+            authority,
+        )
+    assert not staged.final_path.exists()
+    with Session(engine) as session:
+        current = session.get(EvaluationRun, run.id)
+        assert current.status != "succeeded"
+        assert (
+            session.scalar(
+                select(EvaluationCaseResult).where(EvaluationCaseResult.run_id == run.id)
+            )
+            is None
+        )
+        assert (
+            session.scalar(
+                select(PersistentAuditEvent).where(
+                    PersistentAuditEvent.action == "evaluation.run.complete",
+                    PersistentAuditEvent.resource_id == str(run.id),
+                )
+            )
+            is None
+        )
+
+
+def test_unrelated_department_change_does_not_invalidate_finalization(
+    db: Session,
+    engine,
+    tmp_path: Path,
+) -> None:
+    department = _department(db, "phase9-final-owned")
+    actor = _identity(db, department, "department_admin", "final-owned-actor")
+    suite, cases, *_rows, store = _ground_truth_suite(db, tmp_path, department, actor)
+    unrelated = _department(db, "phase9-final-unrelated")
+    run = enqueue_evaluation_run(
+        db,
+        _principal(actor),
+        _scope(department),
+        suite.id,
+        code_revision=CODE_REVISION,
+    )
+    db.commit()
+    factory = create_session_factory(engine)
+    job = claim_next(factory, uuid4(), 300, CODE_REVISION)
+    authority = capture_canonical_suite_authority(
+        factory,
+        store.root.parent,
+        DepartmentScope(department.id),
+        cases,
+    )
+    with factory.begin() as session:
+        session.get(Department, unrelated.id).display_name = "Changed elsewhere"
+    score = _score_for_finalization(UUID(cases[0]["case_id"]))
+    metrics = _metrics_for_finalization()
+    gate = GateEvaluation(True, 0, {"retrieval_recall_at_5_min": True})
+    staged, _summary = store.stage_run(
+        DepartmentScope(department.id),
+        suite.id,
+        run.id,
+        job.claim_token,
+        manifest_value={"case_count": 1},
+        summary_value={"failed_gate_count": 0},
+        scores=(score,),
+    )
+    finalize_success(
+        factory,
+        store,
+        job,
+        staged,
+        (score,),
+        metrics,
+        gate,
+        cases,
+        authority,
+    )
+    with Session(engine) as session:
+        assert session.get(EvaluationRun, run.id).status == "succeeded"
+
+
+def _canonical_case_for_score(score: EvaluationCaseScore) -> dict[str, object]:
+    return {
+        "case_id": str(score.case_id),
+        "expected_status": score.expected_status,
+        "question": "Synthetic question?",
+        "relevant_sources": [],
+        "accepted_answers": [],
+    }
+
+
 def _metrics_for_finalization() -> AggregateMetrics:
     return AggregateMetrics(
         retrieval_recall_at_5=Decimal(1),
@@ -564,7 +1141,10 @@ def _metrics_for_finalization() -> AggregateMetrics:
 
 
 def test_quality_gate_failure_finishes_succeeded_and_audited(
-    db: Session, engine, tmp_path: Path
+    db: Session,
+    engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     department = _department(db, "phase9-gate")
     actor = _identity(db, department, "department_admin", "gate-admin")
@@ -616,7 +1196,7 @@ def test_quality_gate_failure_finishes_succeeded_and_audited(
         invalid_contract_rate=Decimal(0),
     )
     gate = GateEvaluation(False, 6, {"retrieval_recall_at_5_min": False})
-    staged, summary = store.stage_run(
+    staged, _summary = store.stage_run(
         DepartmentScope(department.id),
         suite.id,
         run.id,
@@ -625,7 +1205,21 @@ def test_quality_gate_failure_finishes_succeeded_and_audited(
         summary_value={"failed_gate_count": 6},
         scores=(score,),
     )
-    finalize_success(factory, store, job, staged, summary, (score,), metrics, gate)
+    monkeypatch.setattr(
+        "deptslm_worker.evaluation_queue.revalidate_canonical_suite_authority_in_transaction",
+        lambda *_args, **_kwargs: None,
+    )
+    finalize_success(
+        factory,
+        store,
+        job,
+        staged,
+        (score,),
+        metrics,
+        gate,
+        (_canonical_case_for_score(score),),
+        GroundTruthAuthoritySnapshot({}, ()),
+    )
     with Session(engine) as session:
         current = session.get(EvaluationRun, run.id)
         assert current.status == "succeeded"

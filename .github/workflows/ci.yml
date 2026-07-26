@@ -391,12 +391,21 @@ jobs:
           ! grep -E '@router\.(get|post).*evaluation.*(cases|artifact|download)' apps/api/app/routes.py
           ! grep -E '@router\.(get|post).*search|/search|query_vector' apps/api/app/routes.py apps/api/app/schemas.py
           grep -F 'execute_rag_policy' apps/api/app/rag_answer_services.py services/rag-worker/deptslm_worker/evaluation_pipeline.py >/dev/null
-          grep -F 'verify_canonical_suite_authority_without_open_transaction' services/rag-worker/deptslm_worker/evaluation_pipeline.py >/dev/null
+          grep -F '_supervise_suite_load' services/rag-worker/deptslm_worker/evaluation_pipeline.py >/dev/null
+          grep -F '_supervise_authority' services/rag-worker/deptslm_worker/evaluation_pipeline.py >/dev/null
+          grep -F 'revalidate_canonical_suite_authority_in_transaction' services/rag-worker/deptslm_worker/evaluation_queue.py >/dev/null
+          api_compose="$(sed -n '/^  api:/,/^  postgres:/p' docker-compose.yml)"
+          ! grep -F '/eval_results' <<<"$api_compose"
+          ! grep -F 'eval_results' apps/api/Dockerfile
           evaluator_compose="$(sed -n '/^  evaluator-worker:/,/^  model-admin:/p' docker-compose.yml)"
           ! grep -E 'uploads|model_cache|training_datasets|adapters|exports|HF_TOKEN|HUGGING_FACE_HUB_TOKEN' <<<"$evaluator_compose"
           grep -F '/extracted_text' <<<"$evaluator_compose" >/dev/null
           grep -F 'read_only: true' <<<"$evaluator_compose" >/dev/null
           grep -F '/eval_results' <<<"$evaluator_compose" >/dev/null
+          for service in rag-runtime rag-worker indexing-worker; do
+            block="$(sed -n "/^  ${service}:/,/^  [a-z][a-z-]*:/p" docker-compose.yml)"
+            ! grep -F '/eval_results' <<<"$block"
+          done
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then
