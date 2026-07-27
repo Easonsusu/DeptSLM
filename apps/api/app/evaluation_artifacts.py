@@ -218,8 +218,7 @@ class EvaluationArtifactStore:
             if expected is not None
             else _verify_run_files(path)
         )
-        manifest = _read_manifest(path)
-        _validate_run_manifest_shape(manifest)
+        manifest = _verified_run_manifest(path)
         required_manifest = dict(expected_manifest)
         required_manifest["artifact_contract_version"] = ARTIFACT_CONTRACT_VERSION
         required_manifest["files"] = {
@@ -245,19 +244,25 @@ class EvaluationArtifactStore:
         self,
         scope: DepartmentScope,
         run_id: UUID,
+        suite_id: UUID,
         publication_attempt_id: UUID,
+        attempt_number: int,
+        code_revision: str,
     ) -> bool:
         """Remove only a final directory whose closed manifest proves exact ownership."""
 
         path = self._final_directory(self.runs, scope, run_id)
         if not path.exists():
             return False
-        manifest = _read_manifest(path)
-        _validate_run_manifest_shape(manifest)
-        if (
-            manifest.get("department_id") != str(scope.value)
-            or manifest.get("run_id") != str(run_id)
-            or manifest.get("publication_attempt_id") != str(publication_attempt_id)
+        manifest = _verified_run_manifest(path)
+        if not _run_manifest_owned_by(
+            manifest,
+            scope,
+            run_id,
+            suite_id,
+            publication_attempt_id,
+            attempt_number,
+            code_revision,
         ):
             raise EvaluationContractError("result_publication_failed")
         _safe_remove_tree(path)
@@ -293,18 +298,74 @@ class EvaluationArtifactStore:
         )
 
     def run_final_owned_by(
-        self, scope: DepartmentScope, run_id: UUID, publication_attempt_id: UUID
+        self,
+        scope: DepartmentScope,
+        run_id: UUID,
+        suite_id: UUID,
+        publication_attempt_id: UUID,
+        attempt_number: int,
+        code_revision: str,
     ) -> bool:
         path = self._final_directory(self.runs, scope, run_id)
         if not path.exists():
             return False
-        manifest = _read_manifest(path)
-        _validate_run_manifest_shape(manifest)
-        return (
-            manifest.get("department_id") == str(scope.value)
-            and manifest.get("run_id") == str(run_id)
-            and manifest.get("publication_attempt_id") == str(publication_attempt_id)
+        manifest = _verified_run_manifest(path)
+        return _run_manifest_owned_by(
+            manifest,
+            scope,
+            run_id,
+            suite_id,
+            publication_attempt_id,
+            attempt_number,
+            code_revision,
         )
+
+    def run_stage_owned_by(
+        self,
+        scope: DepartmentScope,
+        run_id: UUID,
+        suite_id: UUID,
+        publication_attempt_id: UUID,
+        attempt_number: int,
+        code_revision: str,
+    ) -> bool:
+        path = self._existing_stage_path(self.staging_runs, scope, run_id, publication_attempt_id)
+        if not _path_exists(path):
+            return False
+        manifest = _verified_run_manifest(path)
+        return _run_manifest_owned_by(
+            manifest,
+            scope,
+            run_id,
+            suite_id,
+            publication_attempt_id,
+            attempt_number,
+            code_revision,
+        )
+
+    def remove_owned_run_stage(
+        self,
+        scope: DepartmentScope,
+        run_id: UUID,
+        suite_id: UUID,
+        publication_attempt_id: UUID,
+        attempt_number: int,
+        code_revision: str,
+    ) -> bool:
+        path = self._existing_stage_path(self.staging_runs, scope, run_id, publication_attempt_id)
+        if not _path_exists(path):
+            return False
+        if not self.run_stage_owned_by(
+            scope,
+            run_id,
+            suite_id,
+            publication_attempt_id,
+            attempt_number,
+            code_revision,
+        ):
+            raise EvaluationContractError("result_publication_failed")
+        _safe_remove_tree(path)
+        return True
 
     def remove_owned_suite_final(
         self,
@@ -315,8 +376,7 @@ class EvaluationArtifactStore:
         path = self._final_directory(self.suites, scope, suite_id)
         if not path.exists():
             return False
-        manifest = _read_suite_manifest(path)
-        _validate_suite_manifest_shape(manifest)
+        manifest = _verified_suite_manifest(path)
         if (
             manifest.get("department_id") != str(scope.value)
             or manifest.get("suite_id") != str(suite_id)
@@ -332,13 +392,63 @@ class EvaluationArtifactStore:
         path = self._final_directory(self.suites, scope, suite_id)
         if not path.exists():
             return False
-        manifest = _read_suite_manifest(path)
-        _validate_suite_manifest_shape(manifest)
+        manifest = _verified_suite_manifest(path)
         return (
             manifest.get("department_id") == str(scope.value)
             and manifest.get("suite_id") == str(suite_id)
             and manifest.get("import_attempt_id") == str(import_attempt_id)
         )
+
+    def suite_stage_owned_by(
+        self,
+        scope: DepartmentScope,
+        suite_id: UUID,
+        stage_id: UUID,
+        import_attempt_id: UUID,
+    ) -> bool:
+        path = self._existing_stage_path(self.staging_suites, scope, suite_id, stage_id)
+        if not _path_exists(path):
+            return False
+        manifest = _verified_suite_manifest(path)
+        return (
+            manifest.get("department_id") == str(scope.value)
+            and manifest.get("suite_id") == str(suite_id)
+            and manifest.get("stage_id") == str(stage_id)
+            and manifest.get("import_attempt_id") == str(import_attempt_id)
+        )
+
+    def remove_owned_suite_stage(
+        self,
+        scope: DepartmentScope,
+        suite_id: UUID,
+        stage_id: UUID,
+        import_attempt_id: UUID,
+    ) -> bool:
+        path = self._existing_stage_path(self.staging_suites, scope, suite_id, stage_id)
+        if not _path_exists(path):
+            return False
+        if not self.suite_stage_owned_by(scope, suite_id, stage_id, import_attempt_id):
+            raise EvaluationContractError("result_publication_failed")
+        _safe_remove_tree(path)
+        return True
+
+    def run_stage_present(
+        self, scope: DepartmentScope, run_id: UUID, publication_attempt_id: UUID
+    ) -> bool:
+        return _path_exists(
+            self._existing_stage_path(self.staging_runs, scope, run_id, publication_attempt_id)
+        )
+
+    def run_final_present(self, scope: DepartmentScope, run_id: UUID) -> bool:
+        return _path_exists(self._final_directory(self.runs, scope, run_id))
+
+    def suite_stage_present(self, scope: DepartmentScope, suite_id: UUID, stage_id: UUID) -> bool:
+        return _path_exists(
+            self._existing_stage_path(self.staging_suites, scope, suite_id, stage_id)
+        )
+
+    def suite_final_present(self, scope: DepartmentScope, suite_id: UUID) -> bool:
+        return _path_exists(self._final_directory(self.suites, scope, suite_id))
 
     def iter_suite_cases(
         self,
@@ -407,6 +517,18 @@ class EvaluationArtifactStore:
         except FileExistsError as error:
             raise EvaluationContractError("result_publication_failed") from error
         return _real_directory(stage, writable=True)
+
+    @staticmethod
+    def _existing_stage_path(
+        root: Path,
+        scope: DepartmentScope,
+        resource_id: UUID,
+        stage_id: UUID,
+    ) -> Path:
+        _require_identifiers(scope, resource_id, stage_id)
+        path = root / str(scope.value) / str(resource_id) / str(stage_id)
+        _require_beneath(root, path)
+        return path
 
     @staticmethod
     def _final_directory(root: Path, scope: DepartmentScope, resource_id: UUID) -> Path:
@@ -914,6 +1036,39 @@ def _read_suite_manifest(path: Path) -> dict[str, object]:
         os.close(directory)
 
 
+def _verified_run_manifest(path: Path) -> dict[str, object]:
+    manifest = _read_manifest(path)
+    _validate_run_manifest_shape(manifest)
+    _verify_run_files(path)
+    return manifest
+
+
+def _verified_suite_manifest(path: Path) -> dict[str, object]:
+    manifest = _read_suite_manifest(path)
+    _validate_suite_manifest_shape(manifest)
+    files = manifest["files"]
+    assert isinstance(files, dict)
+    payload = files["cases.jsonl"]
+    assert isinstance(payload, dict)
+    expected = {
+        "cases.jsonl": ArtifactDigest(payload["sha256"], payload["byte_size"]),
+    }
+    directory = _open_directory(path)
+    try:
+        descriptor, metadata = _open_regular_at(directory, "manifest.json")
+        try:
+            _raw, manifest_digest = _read_bounded_descriptor(
+                descriptor, metadata, maximum=64 * 1024
+            )
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory)
+    expected["manifest.json"] = manifest_digest
+    _verify_expected_files(path, SUITE_FILES, expected)
+    return manifest
+
+
 def _verify_run_files(path: Path) -> dict[str, ArtifactDigest]:
     manifest = _read_manifest(path)
     _validate_run_manifest_shape(manifest)
@@ -967,11 +1122,36 @@ def _valid_uuid(value: object) -> bool:
         return False
 
 
+def _valid_positive_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _run_manifest_owned_by(
+    manifest: dict[str, object],
+    scope: DepartmentScope,
+    run_id: UUID,
+    suite_id: UUID,
+    publication_attempt_id: UUID,
+    attempt_number: int,
+    code_revision: str,
+) -> bool:
+    return (
+        _valid_positive_integer(attempt_number)
+        and manifest.get("department_id") == str(scope.value)
+        and manifest.get("run_id") == str(run_id)
+        and manifest.get("suite_id") == str(suite_id)
+        and manifest.get("publication_attempt_id") == str(publication_attempt_id)
+        and manifest.get("attempt_number") == attempt_number
+        and manifest.get("code_revision") == code_revision
+    )
+
+
 def _validate_suite_manifest_shape(value: dict[str, object]) -> None:
     expected_keys = {
         "suite_id",
         "department_id",
         "import_attempt_id",
+        "stage_id",
         "suite_contract_version",
         "metric_contract_version",
         "answer_normalization_version",
@@ -989,7 +1169,8 @@ def _validate_suite_manifest_shape(value: dict[str, object]) -> None:
     ):
         raise EvaluationContractError("suite_artifact_mismatch")
     if not all(
-        _valid_uuid(value.get(name)) for name in ("suite_id", "department_id", "import_attempt_id")
+        _valid_uuid(value.get(name))
+        for name in ("suite_id", "department_id", "import_attempt_id", "stage_id")
     ):
         raise EvaluationContractError("suite_artifact_mismatch")
     if not all(
@@ -1015,6 +1196,7 @@ def _validate_run_manifest_shape(value: dict[str, object]) -> None:
         "suite_id",
         "department_id",
         "publication_attempt_id",
+        "attempt_number",
         "metric_contract_version",
         "runner_contract_version",
         "answer_normalization_version",
@@ -1050,6 +1232,7 @@ def _validate_run_manifest_shape(value: dict[str, object]) -> None:
     if (
         not isinstance(value.get("base_seed"), int)
         or isinstance(value.get("base_seed"), bool)
+        or not _valid_positive_integer(value.get("attempt_number"))
         or not isinstance(value.get("case_count"), int)
         or isinstance(value.get("case_count"), bool)
         or not isinstance(value.get("query_embedding_dimension"), int)
@@ -1191,3 +1374,11 @@ def _safe_remove_tree(path: Path) -> None:
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise EvaluationContractError("result_publication_failed")
     shutil.rmtree(path)
+
+
+def _path_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True

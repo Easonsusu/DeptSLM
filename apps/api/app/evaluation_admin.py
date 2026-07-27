@@ -104,8 +104,10 @@ def main(argv: list[str] | None = None) -> int:
                                 "resource_id": str(item.resource_id),
                                 "status": item.status,
                                 "created_at": item.created_at.isoformat(),
+                                "staging_present": item.staging_present,
+                                "staging_owned": item.staging_owned,
                                 "final_present": item.final_present,
-                                "owned": item.owned,
+                                "final_owned": item.final_owned,
                                 "applied": item.applied,
                             }
                             for item in items

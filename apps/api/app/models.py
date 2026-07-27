@@ -1107,6 +1107,45 @@ class EvaluationSuiteImportAttempt(Base):
             "canonical_cases_byte_size IS NULL OR canonical_cases_byte_size > 0",
             name="ck_evaluation_suite_import_attempt_cases_size",
         ),
+        CheckConstraint(
+            "(artifact_manifest_sha256 IS NULL AND canonical_cases_sha256 IS NULL "
+            "AND canonical_cases_byte_size IS NULL) OR "
+            "(artifact_manifest_sha256 IS NOT NULL AND canonical_cases_sha256 IS NOT NULL "
+            "AND canonical_cases_byte_size IS NOT NULL)",
+            name="ck_evaluation_suite_import_attempt_artifact_compatibility",
+        ),
+        CheckConstraint(
+            "(status = 'registered' AND artifact_manifest_sha256 IS NULL "
+            "AND staged_at IS NULL AND published_at IS NULL AND committed_at IS NULL "
+            "AND failed_at IS NULL AND abandoned_at IS NULL AND cleanup_confirmed_at IS NULL) OR "
+            "(status = 'staged' AND artifact_manifest_sha256 IS NOT NULL "
+            "AND staged_at IS NOT NULL AND published_at IS NULL AND committed_at IS NULL "
+            "AND failed_at IS NULL AND abandoned_at IS NULL AND cleanup_confirmed_at IS NULL) OR "
+            "(status = 'published' AND artifact_manifest_sha256 IS NOT NULL "
+            "AND staged_at IS NOT NULL AND published_at IS NOT NULL "
+            "AND published_at >= staged_at AND committed_at IS NULL "
+            "AND failed_at IS NULL AND abandoned_at IS NULL AND cleanup_confirmed_at IS NULL) OR "
+            "(status = 'committed' AND artifact_manifest_sha256 IS NOT NULL "
+            "AND staged_at IS NOT NULL AND published_at IS NOT NULL "
+            "AND committed_at IS NOT NULL AND published_at >= staged_at "
+            "AND committed_at >= published_at AND failed_at IS NULL AND abandoned_at IS NULL "
+            "AND cleanup_confirmed_at IS NULL) OR "
+            "(status = 'failed' AND committed_at IS NULL AND failed_at IS NOT NULL "
+            "AND abandoned_at IS NULL AND (published_at IS NULL OR staged_at IS NOT NULL) "
+            "AND ((staged_at IS NULL AND artifact_manifest_sha256 IS NULL) OR "
+            "(staged_at IS NOT NULL AND artifact_manifest_sha256 IS NOT NULL)) "
+            "AND (staged_at IS NULL OR failed_at >= staged_at) "
+            "AND (published_at IS NULL OR failed_at >= published_at) "
+            "AND cleanup_confirmed_at IS NOT NULL AND cleanup_confirmed_at >= failed_at) OR "
+            "(status = 'abandoned' AND committed_at IS NULL AND failed_at IS NULL "
+            "AND abandoned_at IS NOT NULL AND (published_at IS NULL OR staged_at IS NOT NULL) "
+            "AND ((staged_at IS NULL AND artifact_manifest_sha256 IS NULL) OR "
+            "(staged_at IS NOT NULL AND artifact_manifest_sha256 IS NOT NULL)) "
+            "AND (staged_at IS NULL OR abandoned_at >= staged_at) "
+            "AND (published_at IS NULL OR abandoned_at >= published_at) "
+            "AND cleanup_confirmed_at IS NOT NULL AND cleanup_confirmed_at >= abandoned_at)",
+            name="ck_evaluation_suite_import_attempt_lifecycle",
+        ),
         CheckConstraint("version > 0", name="ck_evaluation_suite_import_attempt_version"),
         Index(
             "ix_evaluation_suite_import_attempt_department_status_created",
@@ -1134,11 +1173,114 @@ class EvaluationSuiteImportAttempt(Base):
     committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     abandoned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleanup_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = utc_timestamp()
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class EvaluationArtifactReconciliationOperation(Base):
+    """Durable content-free batch authority for explicit artifact reconciliation."""
+
+    __tablename__ = "evaluation_artifact_reconciliation_operations"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('registered','completed')",
+            name="ck_evaluation_artifact_reconciliation_operation_status",
+        ),
+        CheckConstraint(
+            "(status = 'registered' AND completed_at IS NULL) OR "
+            "(status = 'completed' AND completed_at IS NOT NULL)",
+            name="ck_evaluation_artifact_reconciliation_operation_lifecycle",
+        ),
+        CheckConstraint(
+            "version > 0", name="ck_evaluation_artifact_reconciliation_operation_version"
+        ),
+        Index(
+            "ix_eval_artifact_reconcile_op_dept_status_created",
+            "department_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(
+        ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False
+    )
+    actor_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="registered")
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class EvaluationArtifactReconciliationOperationItem(Base):
+    """Exact content-free ownership tuples recoverable after a reconciliation crash."""
+
+    __tablename__ = "evaluation_artifact_reconciliation_operation_items"
+    __table_args__ = (
+        CheckConstraint(
+            "resource_type IN ('evaluation_run','evaluation_suite_import_attempt')",
+            name="ck_evaluation_artifact_reconciliation_item_resource_type",
+        ),
+        CheckConstraint(
+            "status IN ('registered','completed')",
+            name="ck_evaluation_artifact_reconciliation_item_status",
+        ),
+        CheckConstraint(
+            "(resource_type = 'evaluation_run' AND suite_id IS NOT NULL "
+            "AND ownership_attempt_id IS NOT NULL AND stage_id IS NOT NULL "
+            "AND stage_id = ownership_attempt_id AND attempt_number IS NOT NULL "
+            "AND attempt_number > 0 AND code_revision ~ '^[0-9a-f]{40}$') OR "
+            "(resource_type = 'evaluation_suite_import_attempt' AND suite_id IS NOT NULL "
+            "AND ownership_attempt_id = resource_id AND stage_id IS NOT NULL "
+            "AND attempt_number IS NULL AND code_revision IS NULL)",
+            name="ck_evaluation_artifact_reconciliation_item_ownership",
+        ),
+        CheckConstraint(
+            "(status = 'registered' AND completed_at IS NULL) OR "
+            "(status = 'completed' AND completed_at IS NOT NULL)",
+            name="ck_evaluation_artifact_reconciliation_item_lifecycle",
+        ),
+        UniqueConstraint(
+            "operation_id",
+            "resource_type",
+            "resource_id",
+            name="uq_evaluation_artifact_reconciliation_operation_item",
+        ),
+        Index(
+            "ix_evaluation_artifact_reconciliation_item_operation_status",
+            "operation_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    operation_id: Mapped[UUID] = mapped_column(
+        ForeignKey("evaluation_artifact_reconciliation_operations.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    department_id: Mapped[UUID] = mapped_column(
+        ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False
+    )
+    resource_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    resource_id: Mapped[UUID] = mapped_column(nullable=False)
+    suite_id: Mapped[UUID] = mapped_column(nullable=False)
+    ownership_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    stage_id: Mapped[UUID] = mapped_column(nullable=False)
+    attempt_number: Mapped[int | None] = mapped_column(Integer)
+    code_revision: Mapped[str | None] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="registered")
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = utc_timestamp()
 
 
 class EvaluationSuite(Base):

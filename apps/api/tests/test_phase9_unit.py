@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 from deptslm_worker import evaluation_pipeline
-from deptslm_worker.evaluation_queue import ClaimedEvaluationRun
+from deptslm_worker.evaluation_queue import ClaimedEvaluationRun, _expected_result_manifest
 from deptslm_worker.evaluation_settings import (
     EvaluationConfigurationError,
     EvaluationSettings,
@@ -30,6 +30,8 @@ from app.evaluation_artifacts import (
     ArtifactDigest,
     EvaluationArtifactStore,
     PublishedArtifact,
+    StagedArtifact,
+    _validate_run_manifest_shape,
     canonical_json_bytes,
     validate_suite_source_directory,
 )
@@ -59,6 +61,7 @@ from app.evaluation_suites import (
     SuiteArchiveSettings,
     _compare_canonical_snapshots,
     _parse_cases,
+    reconcile_artifacts,
 )
 from app.models import EvaluationCaseResult, EvaluationRun, EvaluationSuite
 from app.rag_answer_services import (
@@ -124,6 +127,19 @@ def test_fixed_evaluation_contract_identifiers() -> None:
     assert ANSWER_NORMALIZATION_VERSION == "phase9-answer-normalization-v1"
     assert GATE_POLICY_VERSION == "phase9-quality-gates-v1"
     assert RUNNER_CONTRACT_VERSION == "phase9-evaluation-runner-v1"
+
+
+@pytest.mark.parametrize("limit", (0, -1, 1001, True, "1", 1 << 62))
+def test_reconciliation_limit_rejects_invalid_values_before_side_effects(limit: object) -> None:
+    with pytest.raises(EvaluationContractError):
+        reconcile_artifacts(
+            None,  # type: ignore[arg-type]
+            data_dir=Path("/not-used"),
+            department_id=uuid4(),
+            actor_issuer="issuer",
+            actor_subject="subject",
+            limit=limit,  # type: ignore[arg-type]
+        )
 
 
 def test_quality_gates_are_exact_decimals() -> None:
@@ -535,6 +551,172 @@ def test_result_artifact_contains_only_numeric_content_free_case_fields(
         assert prohibited not in combined
 
 
+def test_result_manifest_binds_a_strict_positive_attempt_number() -> None:
+    job = ClaimedEvaluationRun(
+        id=uuid4(),
+        department_id=uuid4(),
+        suite_id=uuid4(),
+        requested_by_user_id=uuid4(),
+        worker_id=uuid4(),
+        claim_token=uuid4(),
+        stale_claim_token=None,
+        base_seed=1,
+        case_count=1,
+        code_revision="a" * 40,
+        attempt_number=1,
+        publication_attempt_id=uuid4(),
+    )
+    manifest = _expected_result_manifest(job)
+    assert manifest["attempt_number"] == 1
+    _validate_run_manifest_shape(
+        manifest
+        | {
+            "artifact_contract_version": ARTIFACT_CONTRACT_VERSION,
+            "files": {
+                "summary.json": {"sha256": "a" * 64, "byte_size": 1},
+                "case_results.jsonl": {"sha256": "b" * 64, "byte_size": 1},
+            },
+        }
+    )
+    for invalid in (True, 0, -1, "1"):
+        altered = dict(manifest)
+        altered["attempt_number"] = invalid
+        altered["artifact_contract_version"] = ARTIFACT_CONTRACT_VERSION
+        altered["files"] = {
+            "summary.json": {"sha256": "a" * 64, "byte_size": 1},
+            "case_results.jsonl": {"sha256": "b" * 64, "byte_size": 1},
+        }
+        with pytest.raises(EvaluationContractError):
+            _validate_run_manifest_shape(altered)
+    for malformed in (
+        {key: value for key, value in manifest.items() if key != "attempt_number"},
+        manifest | {"unexpected": True},
+    ):
+        malformed = dict(malformed)
+        malformed["artifact_contract_version"] = ARTIFACT_CONTRACT_VERSION
+        malformed["files"] = {
+            "summary.json": {"sha256": "a" * 64, "byte_size": 1},
+            "case_results.jsonl": {"sha256": "b" * 64, "byte_size": 1},
+        }
+        with pytest.raises(EvaluationContractError):
+            _validate_run_manifest_shape(malformed)
+
+
+def test_exact_run_artifact_ownership_rejects_mismatched_attempt_scope_or_revision(
+    tmp_path: Path,
+) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    job = ClaimedEvaluationRun(
+        id=uuid4(),
+        department_id=scope.value,
+        suite_id=uuid4(),
+        requested_by_user_id=uuid4(),
+        worker_id=uuid4(),
+        claim_token=uuid4(),
+        stale_claim_token=None,
+        base_seed=1,
+        case_count=1,
+        code_revision="b" * 40,
+        attempt_number=1,
+        publication_attempt_id=uuid4(),
+    )
+    staged, _summary = store.stage_run(
+        scope,
+        job.suite_id,
+        job.id,
+        job.publication_attempt_id,
+        manifest_value=_expected_result_manifest(job),
+        summary_value={"failed_gate_count": 0},
+        scores=(_score(),),
+    )
+    store.publish(staged, RUN_FILES)
+    for suite_id, attempt_number, revision in (
+        (uuid4(), 1, job.code_revision),
+        (job.suite_id, 2, job.code_revision),
+        (job.suite_id, 1, "c" * 40),
+    ):
+        with pytest.raises(EvaluationContractError):
+            store.remove_owned_run_final(
+                scope,
+                job.id,
+                suite_id,
+                job.publication_attempt_id,
+                attempt_number,
+                revision,
+            )
+        assert staged.final_path.exists()
+    assert store.remove_owned_run_final(
+        scope,
+        job.id,
+        job.suite_id,
+        job.publication_attempt_id,
+        job.attempt_number,
+        job.code_revision,
+    )
+
+
+def test_exact_run_cleanup_rejects_mutated_staging_and_final_payloads(tmp_path: Path) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    job = ClaimedEvaluationRun(
+        id=uuid4(),
+        department_id=scope.value,
+        suite_id=uuid4(),
+        requested_by_user_id=uuid4(),
+        worker_id=uuid4(),
+        claim_token=uuid4(),
+        stale_claim_token=None,
+        base_seed=1,
+        case_count=1,
+        code_revision="d" * 40,
+        attempt_number=1,
+        publication_attempt_id=uuid4(),
+    )
+
+    def stage() -> StagedArtifact:
+        staged, _summary = store.stage_run(
+            scope,
+            job.suite_id,
+            job.id,
+            job.publication_attempt_id,
+            manifest_value=_expected_result_manifest(job),
+            summary_value={"failed_gate_count": 0},
+            scores=(_score(),),
+        )
+        return staged
+
+    staged = stage()
+    staged.path.joinpath("summary.json").write_bytes(b'{"failed_gate_count":1}\n')
+    with pytest.raises(EvaluationContractError):
+        store.remove_owned_run_stage(
+            scope,
+            job.id,
+            job.suite_id,
+            job.publication_attempt_id,
+            job.attempt_number,
+            job.code_revision,
+        )
+    assert staged.path.exists()
+
+    store.cleanup_stage(scope, job.id, job.publication_attempt_id, suite=False)
+    staged = stage()
+    published = store.publish(staged, RUN_FILES)
+    published.path.joinpath("summary.json").write_bytes(b'{"failed_gate_count":1}\n')
+    with pytest.raises(EvaluationContractError):
+        store.remove_owned_run_final(
+            scope,
+            job.id,
+            job.suite_id,
+            job.publication_attempt_id,
+            job.attempt_number,
+            job.code_revision,
+        )
+    assert published.path.exists()
+
+
 @pytest.mark.parametrize("name", ["summary.json", "case_results.jsonl"])
 def test_result_publication_artifact_integrity_rejects_mutated_staged_files(
     tmp_path: Path,
@@ -625,10 +807,12 @@ def test_canonical_suite_descriptor_detects_mutation_during_same_descriptor_read
     store = EvaluationArtifactStore(root)
     scope = DepartmentScope(uuid4())
     suite_id = uuid4()
+    stage_id = uuid4()
     manifest = {
         "suite_id": suite_id,
         "department_id": scope.value,
         "import_attempt_id": uuid4(),
+        "stage_id": stage_id,
         "suite_contract_version": SUITE_CONTRACT_VERSION,
         "metric_contract_version": METRIC_CONTRACT_VERSION,
         "answer_normalization_version": ANSWER_NORMALIZATION_VERSION,
@@ -642,7 +826,7 @@ def test_canonical_suite_descriptor_detects_mutation_during_same_descriptor_read
         canonical_json_bytes({"case_id": str(uuid4())}) + b"\n",
         canonical_json_bytes({"case_id": str(uuid4())}) + b"\n",
     )
-    staged = store.stage_suite(scope, suite_id, uuid4(), manifest, lines)
+    staged = store.stage_suite(scope, suite_id, stage_id, manifest, lines)
     published = store.publish(staged, SUITE_FILES)
     iterator = store.iter_suite_cases(
         scope,
@@ -668,10 +852,12 @@ def test_canonical_suite_descriptor_rejects_manifest_path_replacement(
     store = EvaluationArtifactStore(root)
     scope = DepartmentScope(uuid4())
     suite_id = uuid4()
+    stage_id = uuid4()
     manifest = {
         "suite_id": suite_id,
         "department_id": scope.value,
         "import_attempt_id": uuid4(),
+        "stage_id": stage_id,
         "suite_contract_version": SUITE_CONTRACT_VERSION,
         "metric_contract_version": METRIC_CONTRACT_VERSION,
         "answer_normalization_version": ANSWER_NORMALIZATION_VERSION,
@@ -684,7 +870,7 @@ def test_canonical_suite_descriptor_rejects_manifest_path_replacement(
     staged = store.stage_suite(
         scope,
         suite_id,
-        uuid4(),
+        stage_id,
         manifest,
         (canonical_json_bytes({"case_id": str(uuid4())}) + b"\n",),
     )

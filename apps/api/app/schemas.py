@@ -376,7 +376,6 @@ class EvaluationRunResponse(ORMResponse):
     invalid_contract_rate: Decimal | None
     failed_gate_count: int | None
     error_code: str | None
-    attempt_number: int
     started_at: datetime | None
     finished_at: datetime | None
     version: int

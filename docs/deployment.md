@@ -225,3 +225,11 @@ No Phase 0 file should be interpreted as a production security or availability g
 - **The evaluator exits at startup:** provide a non-zero `DEPTSLM_EVALUATION_WORKER_ID`, an exact lowercase 40-character `DEPTSLM_EVALUATION_CODE_REVISION`, the existing Phase 7 Qdrant/runtime settings, and mounted `extracted_text` read-only plus `eval_results` read-write. Do not mount model cache or provide Hugging Face tokens.
 
 The evaluator image is non-root, read-only, capability-dropped, has no host port, and contains no Torch, Transformers, sentence-transformers, model weights, or automatic model preparation. It mounts only `extracted_text` read-only and `eval_results` read-write; the API, RAG runtime, extraction worker, and indexing worker do not mount `eval_results`. Local Compose, deterministic fake-runtime tests, and fixed-seed runs are development evidence only; they do not establish production evaluation validity, determinism, privacy, availability, or performance.
+
+Artifact recovery is an explicit administrator operation, not a scheduler:
+
+```text
+python -m app.evaluation_admin reconcile-artifacts --department-id <UUID> --actor-issuer <issuer> --actor-subject <subject> --limit <1-1000> [--apply]
+```
+
+It is dry-run by default and requires an active same-department system or department administrator. The command reports only IDs, statuses, timestamps, and staging/final presence; it never prints suite content, hashes, or paths. A durable batch lets a later authorized command resume after a crash, but it cannot delete backups or historical audit rows.

@@ -60,8 +60,10 @@ class ClaimedEvaluationRun:
     base_seed: int
     case_count: int
     code_revision: str
+    attempt_number: int = 1
     publication_attempt_id: UUID | None = None
     stale_publication_attempt_id: UUID | None = None
+    stale_attempt_number: int | None = None
 
 
 def claim_next(
@@ -116,6 +118,7 @@ def claim_next(
                 return None
             stale = row.claim_token if row.status == "running" else None
             stale_publication = row.publication_attempt_id
+            stale_attempt_number = row.attempt_number if stale_publication is not None else None
             if stale_publication is not None:
                 row.attempt_number += 1
             claim_token = uuid4()
@@ -145,8 +148,10 @@ def claim_next(
                 base_seed=row.base_seed,
                 case_count=row.case_count,
                 code_revision=row.code_revision,
+                attempt_number=row.attempt_number,
                 publication_attempt_id=publication_attempt_id,
                 stale_publication_attempt_id=stale_publication,
+                stale_attempt_number=stale_attempt_number,
             )
     except SQLAlchemyError as error:
         raise EvaluationQueueError() from error
@@ -466,7 +471,10 @@ def reconcile_stale_publication(
         store.remove_owned_run_final(
             DepartmentScope(job.department_id),
             job.id,
+            job.suite_id,
             job.stale_publication_attempt_id,
+            job.stale_attempt_number,
+            job.code_revision,
         )
     except EvaluationContractError as error:
         raise EvaluationQueueError("artifact_reconciliation_failed") from error
@@ -543,6 +551,7 @@ def _owned_claim(job: ClaimedEvaluationRun):
         EvaluationRun.status == "running",
         EvaluationRun.worker_id == job.worker_id,
         EvaluationRun.claim_token == job.claim_token,
+        EvaluationRun.attempt_number == job.attempt_number,
         EvaluationRun.publication_attempt_id == job.publication_attempt_id,
     )
 
@@ -573,13 +582,19 @@ def _fixed_contract(job: ClaimedEvaluationRun):
 
 
 def _expected_result_manifest(job: ClaimedEvaluationRun) -> dict[str, object]:
-    if job.publication_attempt_id is None:
+    if (
+        job.publication_attempt_id is None
+        or isinstance(job.attempt_number, bool)
+        or not isinstance(job.attempt_number, int)
+        or job.attempt_number <= 0
+    ):
         raise EvaluationQueueError("result_publication_failed")
     return {
         "run_id": str(job.id),
         "suite_id": str(job.suite_id),
         "department_id": str(job.department_id),
         "publication_attempt_id": str(job.publication_attempt_id),
+        "attempt_number": job.attempt_number,
         "metric_contract_version": METRIC_CONTRACT_VERSION,
         "runner_contract_version": RUNNER_CONTRACT_VERSION,
         "answer_normalization_version": ANSWER_NORMALIZATION_VERSION,

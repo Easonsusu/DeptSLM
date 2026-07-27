@@ -74,6 +74,8 @@ from app.models import (
     DocumentChunk,
     DocumentExtraction,
     DocumentVectorIndexing,
+    EvaluationArtifactReconciliationOperation,
+    EvaluationArtifactReconciliationOperationItem,
     EvaluationCaseResult,
     EvaluationRun,
     EvaluationSuite,
@@ -123,6 +125,8 @@ def db(engine) -> Session:
         session.execute(delete(EvaluationCaseResult))
         session.execute(delete(EvaluationRun))
         session.execute(delete(EvaluationSuite))
+        session.execute(delete(EvaluationArtifactReconciliationOperationItem))
+        session.execute(delete(EvaluationArtifactReconciliationOperation))
         session.execute(delete(EvaluationSuiteImportAttempt))
         session.execute(delete(DocumentVectorIndexing))
         session.execute(delete(DocumentChunk))
@@ -154,6 +158,8 @@ def test_00_phase9_migration_paths_and_orm_sync(engine) -> None:
     tables = {
         "evaluation_suites",
         "evaluation_suite_import_attempts",
+        "evaluation_artifact_reconciliation_operations",
+        "evaluation_artifact_reconciliation_operation_items",
         "evaluation_runs",
         "evaluation_case_results",
     }
@@ -384,15 +390,17 @@ def _ground_truth_suite(
     canonical = (_canonical_case(parsed, snapshots),)
     gates = QualityGates(**{name: Decimal(0) for name in QualityGates.__dataclass_fields__})
     suite_id = uuid4()
+    stage_id = uuid4()
     store = EvaluationArtifactStore(root)
     staged = store.stage_suite(
         DepartmentScope(department.id),
         suite_id,
-        uuid4(),
+        stage_id,
         _suite_manifest(
             department_id=department.id,
             suite_id=suite_id,
             import_attempt_id=uuid4(),
+            stage_id=stage_id,
             gates=gates,
             case_count=1,
             answered=1,
@@ -665,6 +673,327 @@ def test_reconcile_artifacts_is_dry_run_by_default_and_removes_only_owned_failur
     assert not staged.final_path.exists()
 
 
+def test_reconcile_run_staging_clears_terminal_ownership_without_reappearing(
+    db: Session, engine, tmp_path: Path
+) -> None:
+    department = _department(db, "phase9-reconcile-run-stage")
+    actor = _identity(db, department, "department_admin", "reconcile-run-stage-admin")
+    suite = _suite(db, department, actor)
+    run = enqueue_evaluation_run(
+        db,
+        _principal(actor),
+        _scope(department),
+        suite.id,
+        code_revision=CODE_REVISION,
+    )
+    db.commit()
+    factory = create_session_factory(engine)
+    job = claim_next(factory, uuid4(), 300, CODE_REVISION)
+    assert job is not None
+    root = tmp_path / "runtime"
+    (root / "eval_results").mkdir(parents=True)
+    store = EvaluationArtifactStore(root)
+    staged, _summary = store.stage_run(
+        DepartmentScope(department.id),
+        suite.id,
+        run.id,
+        job.publication_attempt_id,
+        manifest_value=_expected_result_manifest(job),
+        summary_value={"failed_gate_count": 0},
+        scores=(_score_for_finalization(),),
+    )
+    assert fail_owned(factory, job, "generation_failed")
+    with factory.begin() as session:
+        session.get(EvaluationRun, run.id).updated_at = datetime.now(UTC) - timedelta(minutes=2)
+
+    dry = reconcile_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department.id,
+        actor_issuer=ISSUER,
+        actor_subject=actor.subject,
+        limit=1,
+    )
+    assert len(dry) == 1
+    assert dry[0].staging_present and dry[0].staging_owned
+    assert not dry[0].final_present and not dry[0].applied
+    applied = reconcile_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department.id,
+        actor_issuer=ISSUER,
+        actor_subject=actor.subject,
+        limit=1,
+        apply=True,
+    )
+    assert len(applied) == 1 and applied[0].applied
+    assert not staged.path.exists()
+    with Session(engine) as session:
+        current = session.get(EvaluationRun, run.id)
+        assert current.status == "failed"
+        assert current.publication_attempt_id is None
+        assert (
+            session.scalar(
+                select(PersistentAuditEvent).where(
+                    PersistentAuditEvent.action == "evaluation.artifact.reconcile"
+                )
+            )
+            is not None
+        )
+        assert session.scalar(select(EvaluationArtifactReconciliationOperation)) is not None
+    assert not reconcile_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department.id,
+        actor_issuer=ISSUER,
+        actor_subject=actor.subject,
+        limit=1,
+    )
+
+
+def test_reconcile_suite_staging_is_sensitive_but_metadata_owned(
+    db: Session, engine, tmp_path: Path
+) -> None:
+    department = _department(db, "phase9-reconcile-suite-stage")
+    actor = _identity(db, department, "department_admin", "reconcile-suite-stage-admin")
+    root = tmp_path / "runtime"
+    (root / "eval_results").mkdir(parents=True)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(department.id)
+    suite_id = uuid4()
+    stage_id = uuid4()
+    attempt_id = uuid4()
+    db.add(
+        EvaluationSuiteImportAttempt(
+            id=attempt_id,
+            department_id=department.id,
+            imported_by_user_id=actor.id,
+            suite_id=suite_id,
+            stage_id=stage_id,
+            status="registered",
+        )
+    )
+    db.commit()
+    gates = QualityGates(**{name: Decimal(0) for name in QualityGates.__dataclass_fields__})
+    staged = store.stage_suite(
+        scope,
+        suite_id,
+        stage_id,
+        _suite_manifest(
+            department_id=department.id,
+            suite_id=suite_id,
+            import_attempt_id=attempt_id,
+            stage_id=stage_id,
+            gates=gates,
+            case_count=1,
+            answered=1,
+            insufficient=0,
+        ),
+        (
+            json.dumps(
+                {"question": "Sensitive question", "accepted_answers": ["Sensitive answer"]}
+            ).encode()
+            + b"\n",
+        ),
+    )
+    (staged.path / "unexpected.txt").write_text("synthetic malformed artifact")
+    factory = create_session_factory(engine)
+    with factory.begin() as session:
+        session.get(EvaluationSuiteImportAttempt, attempt_id).updated_at = datetime.now(
+            UTC
+        ) - timedelta(minutes=2)
+    dry = reconcile_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department.id,
+        actor_issuer=ISSUER,
+        actor_subject=actor.subject,
+        limit=1,
+    )
+    assert len(dry) == 1
+    assert dry[0].staging_present and not dry[0].staging_owned
+    with pytest.raises(EvaluationContractError):
+        reconcile_artifacts(
+            factory,
+            data_dir=root,
+            department_id=department.id,
+            actor_issuer=ISSUER,
+            actor_subject=actor.subject,
+            limit=1,
+            apply=True,
+        )
+    assert staged.path.exists()
+    (staged.path / "unexpected.txt").unlink()
+    dry = reconcile_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department.id,
+        actor_issuer=ISSUER,
+        actor_subject=actor.subject,
+        limit=1,
+    )
+    assert dry[0].staging_owned
+    applied = reconcile_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department.id,
+        actor_issuer=ISSUER,
+        actor_subject=actor.subject,
+        limit=1,
+        apply=True,
+    )
+    assert len(applied) == 1 and applied[0].applied
+    assert not staged.path.exists()
+    with Session(engine) as session:
+        current = session.get(EvaluationSuiteImportAttempt, attempt_id)
+        assert current.status == "abandoned" and current.abandoned_at is not None
+    assert not reconcile_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department.id,
+        actor_issuer=ISSUER,
+        actor_subject=actor.subject,
+        limit=1,
+    )
+
+
+def test_suite_import_attempt_terminal_lifecycle_requires_confirmed_cleanup(
+    db: Session,
+) -> None:
+    department = _department(db, "phase9-import-lifecycle")
+    actor = _identity(db, department, "department_admin", "import-lifecycle-admin")
+    db.commit()
+    now = datetime.now(UTC)
+
+    invalid = EvaluationSuiteImportAttempt(
+        department_id=department.id,
+        imported_by_user_id=actor.id,
+        suite_id=uuid4(),
+        stage_id=uuid4(),
+        status="failed",
+        failed_at=now,
+    )
+    db.add(invalid)
+    with pytest.raises(IntegrityError):
+        db.commit()
+    db.rollback()
+
+    failed = EvaluationSuiteImportAttempt(
+        department_id=department.id,
+        imported_by_user_id=actor.id,
+        suite_id=uuid4(),
+        stage_id=uuid4(),
+        status="failed",
+        failed_at=now,
+        cleanup_confirmed_at=now,
+    )
+    abandoned = EvaluationSuiteImportAttempt(
+        department_id=department.id,
+        imported_by_user_id=actor.id,
+        suite_id=uuid4(),
+        stage_id=uuid4(),
+        status="abandoned",
+        artifact_manifest_sha256="a" * 64,
+        canonical_cases_sha256="b" * 64,
+        canonical_cases_byte_size=1,
+        staged_at=now,
+        abandoned_at=now,
+        cleanup_confirmed_at=now,
+    )
+    db.add_all((failed, abandoned))
+    db.commit()
+    assert failed.cleanup_confirmed_at == failed.failed_at
+    assert abandoned.cleanup_confirmed_at == abandoned.abandoned_at
+
+
+def test_reconciliation_registration_recovers_after_delete_before_audit(
+    db: Session,
+    engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    department = _department(db, "phase9-reconcile-resume")
+    actor = _identity(db, department, "department_admin", "reconcile-resume-admin")
+    suite = _suite(db, department, actor)
+    run = enqueue_evaluation_run(
+        db,
+        _principal(actor),
+        _scope(department),
+        suite.id,
+        code_revision=CODE_REVISION,
+    )
+    db.commit()
+    factory = create_session_factory(engine)
+    job = claim_next(factory, uuid4(), 300, CODE_REVISION)
+    assert job is not None
+    root = tmp_path / "runtime"
+    (root / "eval_results").mkdir(parents=True)
+    store = EvaluationArtifactStore(root)
+    staged, _summary = store.stage_run(
+        DepartmentScope(department.id),
+        suite.id,
+        run.id,
+        job.publication_attempt_id,
+        manifest_value=_expected_result_manifest(job),
+        summary_value={"failed_gate_count": 0},
+        scores=(_score_for_finalization(),),
+    )
+    assert fail_owned(factory, job, "generation_failed")
+    with factory.begin() as session:
+        session.get(EvaluationRun, run.id).updated_at = datetime.now(UTC) - timedelta(minutes=2)
+    original = EvaluationArtifactStore.remove_owned_run_stage
+
+    def crash_after_delete(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        raise EvaluationContractError("artifact_reconciliation_failed")
+
+    monkeypatch.setattr(EvaluationArtifactStore, "remove_owned_run_stage", crash_after_delete)
+    with pytest.raises(EvaluationContractError):
+        reconcile_artifacts(
+            factory,
+            data_dir=root,
+            department_id=department.id,
+            actor_issuer=ISSUER,
+            actor_subject=actor.subject,
+            limit=1,
+            apply=True,
+        )
+    assert not staged.path.exists()
+    with Session(engine) as session:
+        operation = session.scalar(select(EvaluationArtifactReconciliationOperation))
+        assert operation.status == "registered"
+        assert (
+            session.scalar(
+                select(PersistentAuditEvent).where(
+                    PersistentAuditEvent.action == "evaluation.artifact.reconcile"
+                )
+            )
+            is None
+        )
+    monkeypatch.setattr(EvaluationArtifactStore, "remove_owned_run_stage", original)
+    applied = reconcile_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department.id,
+        actor_issuer=ISSUER,
+        actor_subject=actor.subject,
+        limit=1,
+        apply=True,
+    )
+    assert len(applied) == 1 and applied[0].applied
+    with Session(engine) as session:
+        operation = session.scalar(select(EvaluationArtifactReconciliationOperation))
+        assert operation.status == "completed"
+        assert (
+            session.scalar(
+                select(PersistentAuditEvent).where(
+                    PersistentAuditEvent.action == "evaluation.artifact.reconcile"
+                )
+            )
+            is not None
+        )
+
+
 def test_import_lock_releases_database_locks_during_artifact_scan_and_detects_change(
     db: Session,
     engine,
@@ -865,6 +1194,8 @@ def test_expired_claim_is_reclaimed_with_fresh_token_and_attempt(db: Session, en
     factory = create_session_factory(engine)
     first = claim_next(factory, uuid4(), 300, CODE_REVISION)
     assert first is not None
+    assert first.attempt_number == 1
+    assert _expected_result_manifest(first)["attempt_number"] == 1
     with factory.begin() as session:
         current = session.get(EvaluationRun, run.id)
         current.lease_expires_at = session.scalar(select(text("clock_timestamp()"))) - timedelta(
@@ -874,6 +1205,9 @@ def test_expired_claim_is_reclaimed_with_fresh_token_and_attempt(db: Session, en
     assert replacement is not None
     assert replacement.claim_token != first.claim_token
     assert replacement.stale_claim_token == first.claim_token
+    assert replacement.attempt_number == 2
+    assert replacement.stale_attempt_number == 1
+    assert _expected_result_manifest(replacement)["attempt_number"] == 2
     with pytest.raises(EvaluationQueueError):
         require_live_claim(factory, first)
     with Session(engine) as session:
@@ -1377,6 +1711,8 @@ def test_evaluation_api_authorization_bodies_cursors_and_public_safety(
             "evidence",
             "path",
             "result_manifest_sha256",
+            "attempt_number",
+            "publication_attempt_id",
         }
         assert set(value).isdisjoint(prohibited)
         assert (

@@ -163,9 +163,14 @@ def upgrade() -> None:
         sa.Column("committed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("failed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("abandoned_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("cleanup_confirmed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("version", sa.Integer(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
         sa.CheckConstraint(
             "status IN ('registered','staged','published','committed','failed','abandoned')",
             name="ck_evaluation_suite_import_attempt_status",
@@ -182,9 +187,50 @@ def upgrade() -> None:
             "canonical_cases_byte_size IS NULL OR canonical_cases_byte_size > 0",
             name="ck_evaluation_suite_import_attempt_cases_size",
         ),
+        sa.CheckConstraint(
+            "(artifact_manifest_sha256 IS NULL AND canonical_cases_sha256 IS NULL "
+            "AND canonical_cases_byte_size IS NULL) OR "
+            "(artifact_manifest_sha256 IS NOT NULL AND canonical_cases_sha256 IS NOT NULL "
+            "AND canonical_cases_byte_size IS NOT NULL)",
+            name="ck_evaluation_suite_import_attempt_artifact_compatibility",
+        ),
+        sa.CheckConstraint(
+            "(status = 'registered' AND artifact_manifest_sha256 IS NULL "
+            "AND staged_at IS NULL AND published_at IS NULL AND committed_at IS NULL "
+            "AND failed_at IS NULL AND abandoned_at IS NULL AND cleanup_confirmed_at IS NULL) OR "
+            "(status = 'staged' AND artifact_manifest_sha256 IS NOT NULL "
+            "AND staged_at IS NOT NULL AND published_at IS NULL AND committed_at IS NULL "
+            "AND failed_at IS NULL AND abandoned_at IS NULL AND cleanup_confirmed_at IS NULL) OR "
+            "(status = 'published' AND artifact_manifest_sha256 IS NOT NULL "
+            "AND staged_at IS NOT NULL AND published_at IS NOT NULL "
+            "AND published_at >= staged_at AND committed_at IS NULL "
+            "AND failed_at IS NULL AND abandoned_at IS NULL AND cleanup_confirmed_at IS NULL) OR "
+            "(status = 'committed' AND artifact_manifest_sha256 IS NOT NULL "
+            "AND staged_at IS NOT NULL AND published_at IS NOT NULL "
+            "AND committed_at IS NOT NULL AND published_at >= staged_at "
+            "AND committed_at >= published_at AND failed_at IS NULL AND abandoned_at IS NULL "
+            "AND cleanup_confirmed_at IS NULL) OR "
+            "(status = 'failed' AND committed_at IS NULL AND failed_at IS NOT NULL "
+            "AND abandoned_at IS NULL AND (published_at IS NULL OR staged_at IS NOT NULL) "
+            "AND ((staged_at IS NULL AND artifact_manifest_sha256 IS NULL) OR "
+            "(staged_at IS NOT NULL AND artifact_manifest_sha256 IS NOT NULL)) "
+            "AND (staged_at IS NULL OR failed_at >= staged_at) "
+            "AND (published_at IS NULL OR failed_at >= published_at) "
+            "AND cleanup_confirmed_at IS NOT NULL AND cleanup_confirmed_at >= failed_at) OR "
+            "(status = 'abandoned' AND committed_at IS NULL AND failed_at IS NULL "
+            "AND abandoned_at IS NOT NULL AND (published_at IS NULL OR staged_at IS NOT NULL) "
+            "AND ((staged_at IS NULL AND artifact_manifest_sha256 IS NULL) OR "
+            "(staged_at IS NOT NULL AND artifact_manifest_sha256 IS NOT NULL)) "
+            "AND (staged_at IS NULL OR abandoned_at >= staged_at) "
+            "AND (published_at IS NULL OR abandoned_at >= published_at) "
+            "AND cleanup_confirmed_at IS NOT NULL AND cleanup_confirmed_at >= abandoned_at)",
+            name="ck_evaluation_suite_import_attempt_lifecycle",
+        ),
         sa.CheckConstraint("version > 0", name="ck_evaluation_suite_import_attempt_version"),
         sa.ForeignKeyConstraint(["department_id"], ["departments.id"], ondelete="RESTRICT"),
-        sa.ForeignKeyConstraint(["imported_by_user_id"], ["user_identities.id"], ondelete="RESTRICT"),
+        sa.ForeignKeyConstraint(
+            ["imported_by_user_id"], ["user_identities.id"], ondelete="RESTRICT"
+        ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("suite_id"),
         sa.UniqueConstraint("stage_id"),
@@ -193,6 +239,101 @@ def upgrade() -> None:
         "ix_evaluation_suite_import_attempt_department_status_created",
         "evaluation_suite_import_attempts",
         ["department_id", "status", "created_at"],
+    )
+
+    op.create_table(
+        "evaluation_artifact_reconciliation_operations",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("department_id", sa.Uuid(), nullable=False),
+        sa.Column("actor_user_id", sa.Uuid(), nullable=False),
+        sa.Column("status", sa.String(16), nullable=False),
+        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("version", sa.Integer(), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
+        sa.CheckConstraint(
+            "status IN ('registered','completed')",
+            name="ck_evaluation_artifact_reconciliation_operation_status",
+        ),
+        sa.CheckConstraint(
+            "(status = 'registered' AND completed_at IS NULL) OR "
+            "(status = 'completed' AND completed_at IS NOT NULL)",
+            name="ck_evaluation_artifact_reconciliation_operation_lifecycle",
+        ),
+        sa.CheckConstraint(
+            "version > 0", name="ck_evaluation_artifact_reconciliation_operation_version"
+        ),
+        sa.ForeignKeyConstraint(["department_id"], ["departments.id"], ondelete="RESTRICT"),
+        sa.ForeignKeyConstraint(["actor_user_id"], ["user_identities.id"], ondelete="RESTRICT"),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index(
+        "ix_eval_artifact_reconcile_op_dept_status_created",
+        "evaluation_artifact_reconciliation_operations",
+        ["department_id", "status", "created_at"],
+    )
+    op.create_table(
+        "evaluation_artifact_reconciliation_operation_items",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("operation_id", sa.Uuid(), nullable=False),
+        sa.Column("department_id", sa.Uuid(), nullable=False),
+        sa.Column("resource_type", sa.String(48), nullable=False),
+        sa.Column("resource_id", sa.Uuid(), nullable=False),
+        sa.Column("suite_id", sa.Uuid(), nullable=False),
+        sa.Column("ownership_attempt_id", sa.Uuid(), nullable=False),
+        sa.Column("stage_id", sa.Uuid(), nullable=False),
+        sa.Column("attempt_number", sa.Integer(), nullable=True),
+        sa.Column("code_revision", sa.String(40), nullable=True),
+        sa.Column("status", sa.String(16), nullable=False),
+        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
+        sa.CheckConstraint(
+            "resource_type IN ('evaluation_run','evaluation_suite_import_attempt')",
+            name="ck_evaluation_artifact_reconciliation_item_resource_type",
+        ),
+        sa.CheckConstraint(
+            "status IN ('registered','completed')",
+            name="ck_evaluation_artifact_reconciliation_item_status",
+        ),
+        sa.CheckConstraint(
+            "(resource_type = 'evaluation_run' AND suite_id IS NOT NULL "
+            "AND ownership_attempt_id IS NOT NULL AND stage_id IS NOT NULL "
+            "AND stage_id = ownership_attempt_id AND attempt_number IS NOT NULL "
+            "AND attempt_number > 0 AND code_revision ~ '^[0-9a-f]{40}$') OR "
+            "(resource_type = 'evaluation_suite_import_attempt' AND suite_id IS NOT NULL "
+            "AND ownership_attempt_id = resource_id AND stage_id IS NOT NULL "
+            "AND attempt_number IS NULL AND code_revision IS NULL)",
+            name="ck_evaluation_artifact_reconciliation_item_ownership",
+        ),
+        sa.CheckConstraint(
+            "(status = 'registered' AND completed_at IS NULL) OR "
+            "(status = 'completed' AND completed_at IS NOT NULL)",
+            name="ck_evaluation_artifact_reconciliation_item_lifecycle",
+        ),
+        sa.ForeignKeyConstraint(
+            ["operation_id"],
+            ["evaluation_artifact_reconciliation_operations.id"],
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(["department_id"], ["departments.id"], ondelete="RESTRICT"),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "operation_id",
+            "resource_type",
+            "resource_id",
+            name="uq_evaluation_artifact_reconciliation_operation_item",
+        ),
+    )
+    op.create_index(
+        "ix_evaluation_artifact_reconciliation_item_operation_status",
+        "evaluation_artifact_reconciliation_operation_items",
+        ["operation_id", "status"],
     )
 
     op.create_table(
@@ -501,6 +642,16 @@ def downgrade() -> None:
     op.drop_index("ix_evaluation_run_suite_created", table_name="evaluation_runs")
     op.drop_index("ix_evaluation_run_department_status_created", table_name="evaluation_runs")
     op.drop_table("evaluation_runs")
+    op.drop_index(
+        "ix_evaluation_artifact_reconciliation_item_operation_status",
+        table_name="evaluation_artifact_reconciliation_operation_items",
+    )
+    op.drop_table("evaluation_artifact_reconciliation_operation_items")
+    op.drop_index(
+        "ix_eval_artifact_reconcile_op_dept_status_created",
+        table_name="evaluation_artifact_reconciliation_operations",
+    )
+    op.drop_table("evaluation_artifact_reconciliation_operations")
     op.drop_index(
         "ix_evaluation_suite_import_attempt_department_status_created",
         table_name="evaluation_suite_import_attempts",

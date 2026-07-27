@@ -96,7 +96,16 @@ def process_evaluation_run(
     try:
         require_live_claim(factory, job)
         if job.stale_publication_attempt_id is not None:
-            store.cleanup_stage(scope, job.id, job.stale_publication_attempt_id, suite=False)
+            if job.stale_attempt_number is None:
+                raise EvaluationQueueError("artifact_reconciliation_failed")
+            store.remove_owned_run_stage(
+                scope,
+                job.id,
+                job.suite_id,
+                job.stale_publication_attempt_id,
+                job.stale_attempt_number,
+                job.code_revision,
+            )
             require_live_claim(factory, job)
         reconcile_stale_publication(factory, store, job)
         suite = validate_claim_authority(factory, job)
@@ -201,14 +210,28 @@ def process_evaluation_run(
         if staged is not None:
             try:
                 require_live_claim(factory, job)
-                store.cleanup_stage(scope, job.id, job.publication_attempt_id, suite=False)
+                store.remove_owned_run_stage(
+                    scope,
+                    job.id,
+                    job.suite_id,
+                    job.publication_attempt_id,
+                    job.attempt_number,
+                    job.code_revision,
+                )
             except (EvaluationQueueError, EvaluationContractError):
                 pass
         _event(job, "processing", "denied", "worker_shutdown")
         if published is not None:
             try:
                 require_live_claim(factory, job, allow_cancellation=True)
-                store.remove_owned_run_final(scope, job.id, job.publication_attempt_id)
+                store.remove_owned_run_final(
+                    scope,
+                    job.id,
+                    job.suite_id,
+                    job.publication_attempt_id,
+                    job.attempt_number,
+                    job.code_revision,
+                )
             except (EvaluationQueueError, EvaluationContractError):
                 pass
         return False
@@ -230,13 +253,27 @@ def process_evaluation_run(
     if staged is not None:
         try:
             require_live_claim(factory, job, allow_cancellation=True)
-            store.cleanup_stage(scope, job.id, job.publication_attempt_id, suite=False)
+            store.remove_owned_run_stage(
+                scope,
+                job.id,
+                job.suite_id,
+                job.publication_attempt_id,
+                job.attempt_number,
+                job.code_revision,
+            )
         except (EvaluationQueueError, EvaluationContractError):
             pass
     if published is not None:
         try:
             require_live_claim(factory, job, allow_cancellation=True)
-            store.remove_owned_run_final(scope, job.id, job.publication_attempt_id)
+            store.remove_owned_run_final(
+                scope,
+                job.id,
+                job.suite_id,
+                job.publication_attempt_id,
+                job.attempt_number,
+                job.code_revision,
+            )
         except (EvaluationQueueError, EvaluationContractError):
             pass
     fail_owned(factory, job, code)
@@ -781,6 +818,7 @@ def _result_values(job, metrics, gates, gate):
         "suite_id": str(job.suite_id),
         "department_id": str(job.department_id),
         "publication_attempt_id": str(job.publication_attempt_id),
+        "attempt_number": job.attempt_number,
         "metric_contract_version": METRIC_CONTRACT_VERSION,
         "runner_contract_version": RUNNER_CONTRACT_VERSION,
         "answer_normalization_version": ANSWER_NORMALIZATION_VERSION,
