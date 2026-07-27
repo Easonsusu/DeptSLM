@@ -2,7 +2,7 @@
 
 ## Status and boundaries
 
-Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 completed the internal department-scoped evaluation runner: it reuses the exact Phase 7 policy, stores only metadata and numeric metrics, and keeps suites/results in external runtime storage. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or the private runtime. Public vector search, conversations, streaming, reranking, training, and adapter flows remain unimplemented.
+Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 completed the internal department-scoped evaluation runner: it reuses the exact Phase 7 policy, stores only metadata and numeric metrics, and keeps suites/results in external runtime storage. Phase 10 is under review with a metadata-only builder for human-authored supervised fine-tuning dataset artifacts. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or the private runtime. Public vector search, conversations, streaming, reranking, training, and adapter flows remain unimplemented.
 
 Phase 9 publication is deliberately non-atomic across PostgreSQL and external storage. A server-generated publication UUID and exact positive run attempt number bind each staged and final result manifest to the department, suite, run, and code revision. Result staging and publication run in killable leased children; PostgreSQL writes the succeeded state only after descriptor-relative no-follow final-artifact verification. Reclaim and the administrator-only `reconcile-artifacts` command delete only an exact manifest-proven, non-succeeded attempt. Reconciliation records a durable content-free batch before filesystem mutation and terminalizes the owned run or suite metadata with one batch audit, so a later authorized invocation can resume a crash window. They never delete unknown, mismatched, succeeded, or committed artifacts. A crash after an external rename can therefore leave an untrusted orphan, but never an authoritative result.
 
@@ -68,6 +68,12 @@ The arrows describe intended responsibilities and do not imply that a production
 ### Next.js frontend
 
 `apps/web` is the browser-facing interface. In future phases it is expected to provide department-scoped document management, ingestion status, chat, training and evaluation views, and administrative controls. It must not be treated as an authorization boundary; the API must independently authenticate and authorize every operation.
+
+## Phase 10 SFT dataset boundary
+
+The dataset builder accepts only reviewed, human-authored external source bundles. It revalidates every same-department source chunk against stored document, succeeded extraction, and succeeded indexing authority before generating a deterministic group-isolated train/validation split. `training_datasets` contains private contentful artifacts; PostgreSQL records only ownership, counts, statuses, reviewed contracts, lifecycle timestamps, and file digests. It does not persist instructions, responses, provenance source identifiers, or artifact paths.
+
+The builder has only PostgreSQL and `training_datasets` access. It has no Qdrant, RAG runtime, model, Hugging Face, upload, extraction, evaluation-result, adapter, export, or application-auth-secret access. Filesystem publication and PostgreSQL success cannot be atomic: final artifacts are descriptor-verified before database success, and incomplete exact-owned stages may be reconciled. An orphaned artifact is never Phase 11 authority.
 
 ### FastAPI backend
 

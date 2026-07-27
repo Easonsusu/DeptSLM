@@ -2,7 +2,7 @@
 
 ## Phase 9 status
 
-DeptSLM is not production ready. Phase 9 completed the internal evaluation runner with external immutable suites, content-free result artifacts, and PostgreSQL-backed leases. It reuses the completed Phase 7 grounded-answer boundary; it is not a public evaluation API. Phase 10 is the current planning scope and its implementation has not started. Public vector search, conversations, history, streaming, reranking, scheduled evaluation, scheduled purge, malware scanning, OCR, training, production identity/storage, secrets management, backups, clustering, and production operations remain deferred.
+DeptSLM is not production ready. Phase 9 completed the internal evaluation runner with external immutable suites, content-free result artifacts, and PostgreSQL-backed leases. It reuses the completed Phase 7 grounded-answer boundary; it is not a public evaluation API. Phase 10 is under review with an isolated dataset-builder worker that writes only private external SFT dataset artifacts. It does not train models or create adapters. Public vector search, conversations, history, streaming, reranking, scheduled evaluation, scheduled purge, malware scanning, OCR, training, production identity/storage, secrets management, backups, clustering, and production operations remain deferred.
 
 ## Planned local services
 
@@ -17,7 +17,7 @@ DeptSLM is not production ready. Phase 9 completed the internal evaluation runne
 | `model-admin` | Explicit model preparation | Writes only the external model cache when invoked; receives no database or Qdrant credentials. |
 | `vector-admin` | Explicit Qdrant bootstrap | Verifies the fixed collection contract; receives no database, model-cache, or document access. |
 | `rag-runtime` | Private Phase 7 inference | HTTP supervisor plus one killable persistent model child; offline query embedding and non-thinking generation; no database/Qdrant/API-auth credentials or host port. |
-| `training-worker` | Future LLaMA-Factory jobs | Structural placeholder; no fine-tuning is implemented. |
+| `training-worker` | Phase 10 SFT dataset builder | PostgreSQL plus `training_datasets` only; no model, Qdrant, RAG, or adapter stack. |
 
 Phase 6 pins `Qwen/Qwen3-Embedding-0.6B` at immutable revision `d23109d65ca9fdf61eef614209744716f337f50f`; Phase 7 pins `Qwen/Qwen3-0.6B` at revision `c1899de289a04d12100db370d81485cdf75e47ca`. Explicit administration downloads them outside Git while normal processes stay offline. LlamaIndex and LLaMA-Factory remain future components. pypdf remains extraction-only; model inference dependencies remain outside API/extraction/indexing images.
 

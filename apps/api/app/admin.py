@@ -6,6 +6,7 @@ import argparse
 import os
 import re
 import sys
+from pathlib import Path
 from uuid import UUID
 
 from sqlalchemy import select
@@ -20,6 +21,18 @@ from app.feedback_purge import (
 from app.models import Department, Membership, PersistentAuditEvent, UserIdentity
 from app.services import ServiceError
 from app.settings import ALLOWED_HS256_ENVIRONMENTS, ConfigurationError, Settings
+from app.sft_maintenance import (
+    SftMaintenanceConfigurationError,
+    SftMaintenanceSettings,
+    archive_sft_source,
+    purge_sft_artifacts,
+    reconcile_sft_artifacts,
+)
+from app.sft_services import (
+    SftImportConfigurationError,
+    SftImportSettings,
+    import_sft_source,
+)
 
 SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -108,6 +121,30 @@ def _parser() -> argparse.ArgumentParser:
     purge.add_argument("--actor-subject", required=True)
     purge.add_argument("--limit", type=_purge_limit, default=500)
     purge.add_argument("--apply", action="store_true")
+    sft_import = commands.add_parser("import-sft-source")
+    sft_import.add_argument("--department-id", required=True, type=_nonzero_uuid)
+    sft_import.add_argument("--actor-issuer", required=True)
+    sft_import.add_argument("--actor-subject", required=True)
+    sft_import.add_argument("--source-dir", required=True)
+    sft_import.add_argument("--apply", action="store_true")
+    sft_archive = commands.add_parser("archive-sft-source")
+    sft_archive.add_argument("--department-id", required=True, type=_nonzero_uuid)
+    sft_archive.add_argument("--source-bundle-id", required=True, type=_nonzero_uuid)
+    sft_archive.add_argument("--actor-issuer", required=True)
+    sft_archive.add_argument("--actor-subject", required=True)
+    sft_archive.add_argument("--apply", action="store_true")
+    sft_reconcile = commands.add_parser("reconcile-sft-artifacts")
+    sft_reconcile.add_argument("--department-id", required=True, type=_nonzero_uuid)
+    sft_reconcile.add_argument("--actor-issuer", required=True)
+    sft_reconcile.add_argument("--actor-subject", required=True)
+    sft_reconcile.add_argument("--limit", type=_purge_limit, default=500)
+    sft_reconcile.add_argument("--apply", action="store_true")
+    sft_purge = commands.add_parser("purge-sft-artifacts")
+    sft_purge.add_argument("--department-id", required=True, type=_nonzero_uuid)
+    sft_purge.add_argument("--actor-issuer", required=True)
+    sft_purge.add_argument("--actor-subject", required=True)
+    sft_purge.add_argument("--limit", type=_purge_limit, default=500)
+    sft_purge.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -151,6 +188,66 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"Bootstrapped department {department.slug} ({department.id}).")
             return 0
+        if args.command == "import-sft-source":
+            result = import_sft_source(
+                SftImportSettings.from_environment(),
+                department_id=args.department_id,
+                actor_issuer=args.actor_issuer,
+                actor_subject=args.actor_subject,
+                source_directory=Path(args.source_dir),
+                apply=args.apply,
+            )
+            verb = "Imported" if result.applied else "Validated"
+            print(
+                f"{verb} SFT source {result.source_bundle_id}: "
+                f"{result.example_count} examples in {result.group_count} groups."
+            )
+            return 0
+        if args.command in {"archive-sft-source", "reconcile-sft-artifacts", "purge-sft-artifacts"}:
+            settings = SftMaintenanceSettings.from_environment()
+            engine = create_database_engine(settings.database_url)
+            factory = create_session_factory(engine)
+            try:
+                if args.command == "archive-sft-source":
+                    applied = archive_sft_source(
+                        factory,
+                        department_id=args.department_id,
+                        source_bundle_id=args.source_bundle_id,
+                        actor_issuer=args.actor_issuer,
+                        actor_subject=args.actor_subject,
+                        apply=args.apply,
+                    )
+                    print("Archived SFT source." if applied else "Validated SFT source archive.")
+                    return 0
+                if args.command == "reconcile-sft-artifacts":
+                    result = reconcile_sft_artifacts(
+                        factory,
+                        data_dir=settings.data_dir,
+                        department_id=args.department_id,
+                        actor_issuer=args.actor_issuer,
+                        actor_subject=args.actor_subject,
+                        limit=args.limit,
+                        apply=args.apply,
+                    )
+                else:
+                    result = purge_sft_artifacts(
+                        factory,
+                        data_dir=settings.data_dir,
+                        department_id=args.department_id,
+                        actor_issuer=args.actor_issuer,
+                        actor_subject=args.actor_subject,
+                        retention_days=settings.retention_days,
+                        limit=args.limit,
+                        apply=args.apply,
+                    )
+            finally:
+                engine.dispose()
+            print(
+                "Eligible: "
+                f"{result.eligible_count}; applied: {result.applied_count}; "
+                f"blocked: {result.blocked_count}."
+            )
+            return 0
         settings = FeedbackPurgeSettings.from_environment()
         result = purge_rag_feedback(
             settings,
@@ -164,6 +261,8 @@ def main(argv: list[str] | None = None) -> int:
         BootstrapError,
         ConfigurationError,
         FeedbackPurgeConfigurationError,
+        SftImportConfigurationError,
+        SftMaintenanceConfigurationError,
         ServiceError,
     ) as error:
         print(str(error), file=sys.stderr)

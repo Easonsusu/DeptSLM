@@ -59,8 +59,9 @@ case "$source_root" in
     ;;
 esac
 
-if [ ! -w "$resolved_data_dir" ] || [ ! -x "$resolved_data_dir" ]; then
-  echo "training-worker error: DEPTSLM_DATA_DIR is not writable and searchable: $resolved_data_dir" >&2
+training_root="$resolved_data_dir/training_datasets"
+if [ ! -d "$training_root" ] || [ ! -w "$training_root" ] || [ ! -x "$training_root" ]; then
+  echo "training-worker error: DEPTSLM_DATA_DIR/training_datasets must be writable and searchable." >&2
   exit 1
 fi
 
@@ -69,8 +70,12 @@ if command -v python3 >/dev/null 2>&1; then
 elif command -v python >/dev/null 2>&1; then
   python_bin=python
 else
-  echo "training-worker error: Python is required to start the worker placeholder." >&2
+  echo "training-worker error: Python is required to start the dataset builder." >&2
   exit 1
 fi
 
-exec "$python_bin" "$script_dir/worker.py"
+if [ "$#" -eq 0 ]; then
+  set -- "$python_bin" -m app.sft_worker --poll
+fi
+
+exec "$@"

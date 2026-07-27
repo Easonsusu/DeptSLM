@@ -92,6 +92,12 @@ from app.schemas import (
     RagFeedbackResponse,
     RagFeedbackReviewRequest,
     RagFeedbackSubmitRequest,
+    SftDatasetBuildCancelRequest,
+    SftDatasetBuildListResponse,
+    SftDatasetBuildResponse,
+    SftDatasetBuildReviewRequest,
+    SftSourceListResponse,
+    SftSourceResponse,
     VectorIndexingListResponse,
     VectorIndexingResponse,
 )
@@ -107,6 +113,21 @@ from app.services import (
     revoke_membership,
     update_department,
     update_membership,
+)
+from app.sft_request_body import (
+    SFT_CANCEL_BODY_MAX_BYTES,
+    SFT_REVIEW_BODY_MAX_BYTES,
+    SftBodyError,
+    read_bounded_sft_object,
+)
+from app.sft_services import (
+    cancel_sft_build,
+    enqueue_sft_build,
+    list_sft_builds,
+    list_sft_sources,
+    read_sft_build,
+    read_sft_source,
+    review_sft_build,
 )
 from app.vector_index_services import (
     enqueue_indexing,
@@ -146,6 +167,28 @@ async def _validated_evaluation_body(request: Request, model, *, maximum_bytes: 
         return model.model_validate(payload)
     except ValidationError:
         raise HTTPException(422, "Invalid evaluation request") from None
+
+
+async def _validated_sft_body(request: Request, model, *, maximum_bytes: int):
+    try:
+        payload = await read_bounded_sft_object(request, maximum_bytes=maximum_bytes)
+    except SftBodyError as error:
+        raise HTTPException(error.status_code, error.detail) from None
+    try:
+        return model.model_validate(payload)
+    except ValidationError:
+        raise HTTPException(422, "Invalid SFT request") from None
+
+
+async def _require_empty_sft_body(request: Request) -> None:
+    content_length = request.headers.get("content-length")
+    if content_length is not None and (
+        not content_length.isascii() or not content_length.isdecimal() or int(content_length) != 0
+    ):
+        raise HTTPException(400, "Invalid SFT request")
+    async for chunk in request.stream():
+        if chunk:
+            raise HTTPException(400, "Invalid SFT request")
 
 
 @router.get("/departments", response_model=DepartmentListResponse, tags=["departments"])
@@ -981,6 +1024,173 @@ async def post_evaluation_run_cancel(
                 principal,
                 request_scope,
                 run_id,
+                expected_version=body.expected_version,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/sft/sources",
+    response_model=SftSourceListResponse,
+    tags=["sft-datasets"],
+)
+def get_sft_sources(
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> SftSourceListResponse:
+    try:
+        rows = list_sft_sources(session, principal, request_scope, limit=limit, offset=offset)
+        return SftSourceListResponse(
+            items=[SftSourceResponse.model_validate(row) for row in rows],
+            limit=limit,
+            offset=offset,
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/sft/sources/{source_bundle_id}",
+    response_model=SftSourceResponse,
+    tags=["sft-datasets"],
+)
+def get_sft_source(
+    source_bundle_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> SftSourceResponse:
+    try:
+        return SftSourceResponse.model_validate(
+            read_sft_source(session, principal, request_scope, source_bundle_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/sft/sources/{source_bundle_id}/builds",
+    response_model=SftDatasetBuildResponse,
+    status_code=202,
+    tags=["sft-datasets"],
+)
+async def post_sft_build(
+    source_bundle_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> SftDatasetBuildResponse:
+    await _require_empty_sft_body(request)
+    try:
+        return SftDatasetBuildResponse.model_validate(
+            enqueue_sft_build(
+                session,
+                principal,
+                request_scope,
+                source_bundle_id,
+                code_revision=request.app.state.settings.sft_code_revision,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/sft/builds",
+    response_model=SftDatasetBuildListResponse,
+    tags=["sft-datasets"],
+)
+def get_sft_builds(
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> SftDatasetBuildListResponse:
+    try:
+        rows = list_sft_builds(session, principal, request_scope, limit=limit, offset=offset)
+        return SftDatasetBuildListResponse(
+            items=[SftDatasetBuildResponse.model_validate(row) for row in rows],
+            limit=limit,
+            offset=offset,
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/sft/builds/{build_id}",
+    response_model=SftDatasetBuildResponse,
+    tags=["sft-datasets"],
+)
+def get_sft_build(
+    build_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> SftDatasetBuildResponse:
+    try:
+        return SftDatasetBuildResponse.model_validate(
+            read_sft_build(session, principal, request_scope, build_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/sft/builds/{build_id}/cancel",
+    response_model=SftDatasetBuildResponse,
+    tags=["sft-datasets"],
+)
+async def post_sft_build_cancel(
+    build_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> SftDatasetBuildResponse:
+    body = await _validated_sft_body(
+        request, SftDatasetBuildCancelRequest, maximum_bytes=SFT_CANCEL_BODY_MAX_BYTES
+    )
+    try:
+        return SftDatasetBuildResponse.model_validate(
+            cancel_sft_build(
+                session, principal, request_scope, build_id, expected_version=body.expected_version
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.patch(
+    "/departments/{department_id}/sft/builds/{build_id}/review",
+    response_model=SftDatasetBuildResponse,
+    tags=["sft-datasets"],
+)
+async def patch_sft_build_review(
+    build_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> SftDatasetBuildResponse:
+    body = await _validated_sft_body(
+        request, SftDatasetBuildReviewRequest, maximum_bytes=SFT_REVIEW_BODY_MAX_BYTES
+    )
+    try:
+        return SftDatasetBuildResponse.model_validate(
+            review_sft_build(
+                session,
+                principal,
+                request_scope,
+                build_id,
+                action=body.action,
                 expected_version=body.expected_version,
             )
         )
