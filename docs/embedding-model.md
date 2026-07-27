@@ -19,6 +19,8 @@ Normal workers never download models. An administrator prepares only the fixed r
 
 For gated access only, add `-e HF_TOKEN` after `run --rm` to forward an already-exported, untracked token to this service. The public model needs no token. The command never prints or persists the token and never passes it to ordinary workers, PostgreSQL, Qdrant, the API, or parser subprocesses. Download staging, the Hugging Face cache, real files, and the final integrity manifest remain beneath `DEPTSLM_DATA_DIR/model_cache`. The resolved upstream SHA must equal the reviewed revision before publication.
 
+The Phase 9 evaluator does not load, download, mount, or receive model weights or Hugging Face credentials. It delegates generation only to the existing isolated runtime.
+
 Preparation writes `deptslm-model-manifest.json` with the model ID, immutable revision, dimension, pooling/library contract, remote-code prohibition, and SHA-256 plus size for every asset. Runtime revalidates the real non-symlink directory, exact file allowlist, sizes, and digests before loading. It never falls back to a home cache, repository path, network, another revision, or another model.
 
 ## Process and test boundary

@@ -56,6 +56,25 @@ class ExternalChunk:
     line_end: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class ArtifactFileIdentity:
+    name: str
+    device: int
+    inode: int
+    byte_size: int
+    link_count: int
+    mode: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactAuthorityIdentity:
+    directory_device: int
+    directory_inode: int
+    files: tuple[ArtifactFileIdentity, ...]
+
+
 class Phase5ArtifactReader:
     def __init__(
         self,
@@ -216,6 +235,26 @@ class Phase5ArtifactReader:
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
             raise ArtifactError() from error
 
+    def authority_identity(self) -> ArtifactAuthorityIdentity:
+        directory = os.fstat(self.descriptors[-1])
+        return ArtifactAuthorityIdentity(
+            directory_device=directory.st_dev,
+            directory_inode=directory.st_ino,
+            files=tuple(
+                ArtifactFileIdentity(
+                    name=name,
+                    device=metadata.st_dev,
+                    inode=metadata.st_ino,
+                    byte_size=metadata.st_size,
+                    link_count=metadata.st_nlink,
+                    mode=metadata.st_mode,
+                    modified_ns=metadata.st_mtime_ns,
+                    changed_ns=metadata.st_ctime_ns,
+                )
+                for name, (_descriptor, metadata) in sorted(self.files.items())
+            ),
+        )
+
     def close(self) -> None:
         for descriptor, _metadata in self.files.values():
             try:
@@ -333,6 +372,61 @@ def _open_regular(parent: int, name: str) -> tuple[int, os.stat_result]:
         os.close(descriptor)
         raise ArtifactError()
     return descriptor, metadata
+
+
+def verify_artifact_authority_identity(
+    data_dir: Path,
+    scope: DepartmentScope,
+    expectation: ArtifactExpectation,
+    expected: ArtifactAuthorityIdentity,
+) -> None:
+    """Reopen only descriptors and prove the previously scanned files are still exact."""
+
+    descriptors: list[int] = []
+    files: list[int] = []
+    try:
+        descriptors.append(_open_root(data_dir / "extracted_text"))
+        for value in (scope.value, expectation.document_id, expectation.extraction_id):
+            descriptors.append(_open_uuid_directory(descriptors[-1], value))
+        directory = os.fstat(descriptors[-1])
+        if (
+            directory.st_dev != expected.directory_device
+            or directory.st_ino != expected.directory_inode
+            or set(os.listdir(descriptors[-1])) != FINAL_FILES
+        ):
+            raise ArtifactError()
+        expected_files = {item.name: item for item in expected.files}
+        if set(expected_files) != FINAL_FILES:
+            raise ArtifactError()
+        for name in sorted(FINAL_FILES):
+            descriptor, metadata = _open_regular(descriptors[-1], name)
+            files.append(descriptor)
+            identity = expected_files[name]
+            if (
+                metadata.st_dev != identity.device
+                or metadata.st_ino != identity.inode
+                or metadata.st_size != identity.byte_size
+                or metadata.st_nlink != identity.link_count
+                or metadata.st_mode != identity.mode
+                or metadata.st_mtime_ns != identity.modified_ns
+                or metadata.st_ctime_ns != identity.changed_ns
+            ):
+                raise ArtifactError()
+    except ArtifactError:
+        raise
+    except (FileNotFoundError, OSError) as error:
+        raise ArtifactError() from error
+    finally:
+        for descriptor in files:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _read_exact(descriptor: int, size: int) -> bytes:

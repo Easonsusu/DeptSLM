@@ -19,7 +19,7 @@ Sentiments are `helpful`, `unhelpful`, and `report`. Helpful feedback accepts ze
 - Submission and review body limits are enforced while streaming, including when `Content-Length` is absent; bodies are never logged or written to disk.
 - Browser controls are not an authorization boundary and persist no feedback in browser storage.
 
-Feedback is a user-provided review signal, not an evaluation result or training dataset. Phase 9 evaluation remains separate.
+Feedback is a user-provided review signal, not an evaluation result, ground truth, quality gate, or training dataset. Phase 9 modules do not import feedback models or services, create cases from feedback, weight cases, tune gates, trigger runs, or resolve feedback.
 
 ## Retention
 

@@ -36,10 +36,19 @@ class RagRuntimeClient:
             raise RagContractError("invalid_query_embedding")
         return value["vector"]
 
-    def generate(self, question: str, evidence) -> Any:
+    def generate(self, question: str, evidence, *, seed: int | None = None) -> Any:
+        payload = runtime_generation_request(question, evidence)
+        if seed is not None:
+            if (
+                isinstance(seed, bool)
+                or not isinstance(seed, int)
+                or not 0 <= seed <= (1 << 63) - 1
+            ):
+                raise RagContractError("invalid_generation_response")
+            payload["seed"] = seed
         return self._post(
             "/internal/v1/generate",
-            runtime_generation_request(question, evidence),
+            payload,
             timeout_code="generation_timeout",
         )
 

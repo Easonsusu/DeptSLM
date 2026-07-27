@@ -147,6 +147,12 @@ All five active roles may submit structured feedback only when their exact ident
 
 Feedback rows, reasons, and source targets carry exact non-null department/run scope. Targets must reference a persisted citation from that same scope. Public contracts expose no submitter or reviewer identity, content, filename, document/chunk/indexing metadata, or infrastructure detail. Feedback is immutable; review uses constrained forward-only transitions and optimistic versions. Expiry, visibility, and purge use PostgreSQL server time. Purge is explicit and bounded, deletes children before parents, preserves runs/citations, and appends transactional content-free audits. Feedback code has no Qdrant, artifact, extracted-text, RAG runtime, or model access and cannot alter retrieval, prompts, generation, evaluation, or training.
 
+## Phase 9 evaluation boundary
+
+Suite import, suite/run metadata, enqueue, cancellation, and execution require active same-department `system_admin`, `department_admin`, or `instructor` membership. `system_admin` has no cross-department bypass. Admission and mutation reauthorize in PostgreSQL; claim and finalization also revalidate the active department, suite, requester role, exact contracts, and source snapshots. Foreign suite/run identifiers return a safe not-found response.
+
+All suite, run, case-result rows and suite/run artifact paths contain exact non-null department scope. Public APIs expose no questions, accepted/generated answers, source identifiers, prompts, evidence, vectors, identities, claims, workers, paths, or secrets. Phase 8 feedback is not imported, weighted, or resolved by evaluation. Gate outcomes cannot change production automatically.
+
 ## Acceptance criteria for Phase 2
 
 - Authentication produces a server-validated user identity.

@@ -2,7 +2,9 @@
 
 ## Status and boundaries
 
-Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or the private runtime. Public vector search, conversations, streaming, reranking, evaluation, training, and adapter flows remain unimplemented.
+Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 adds an internal department-scoped evaluation runner under review: it reuses the exact Phase 7 policy, stores only metadata and numeric metrics, and keeps suites/results in external runtime storage. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or the private runtime. Public vector search, conversations, streaming, reranking, training, and adapter flows remain unimplemented.
+
+Phase 9 publication is deliberately non-atomic across PostgreSQL and external storage. A server-generated publication UUID and exact positive run attempt number bind each staged and final result manifest to the department, suite, run, and code revision. Result staging and publication run in killable leased children; PostgreSQL writes the succeeded state only after descriptor-relative no-follow final-artifact verification. Reclaim and the administrator-only `reconcile-artifacts` command delete only an exact manifest-proven, non-succeeded attempt. Reconciliation records a durable content-free batch before filesystem mutation and terminalizes the owned run or suite metadata with one batch audit, so a later authorized invocation can resume a crash window. They never delete unknown, mismatched, succeeded, or committed artifacts. A crash after an external rename can therefore leave an untrusted orphan, but never an authoritative result.
 
 ## System context
 
@@ -143,6 +145,12 @@ The browser, uploaded files, extracted text, document metadata, retrieved passag
 The repository is for source code only. All file-based runtime artifacts derive from the required `DEPTSLM_DATA_DIR`; in the user's local environment it points to Google Drive. No component may silently create runtime directories inside the checkout. Tests and CI substitute isolated temporary directories. See [storage-policy.md](storage-policy.md).
 
 PostgreSQL and Qdrant are service state. The Compose stack is for local development only; before either stores real data, its persistence, backup, and recovery design must be reviewed to ensure no runtime files are written into the repository and that department deletion and retention requirements can be met.
+
+## Phase 9 evaluation boundary
+
+The internal evaluator is a metadata control plane plus a dedicated non-model worker. Immutable suites and content-free result artifacts live beneath external `eval_results`; PostgreSQL stores suite/run/case-result metadata and numeric metrics only. The evaluator reuses the exact Phase 7 production pipeline and delegates embedding and generation to the existing internal runtime. It mounts `extracted_text` read-only and `eval_results` read-write, with no uploads, model cache, training data, adapters, exports, model stack, or Hugging Face token.
+
+PostgreSQL claims, Qdrant retrieval, Phase 5 artifacts, result publication, and the runtime do not share a transaction. The evaluator runs blocking suite reads, production-policy cases, and final authority checks in killable child groups while the parent retains PostgreSQL-server-time lease ownership. It captures complete case-source snapshots outside locks, then rechecks identities and deterministic source locks immediately before publication. Those controls fail closed but do not establish distributed atomicity, remote-request fencing, or production availability. Phase 8 feedback is not read.
 
 ## Deferred decisions
 

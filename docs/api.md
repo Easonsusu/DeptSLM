@@ -222,6 +222,19 @@ An adapter may be selected only for the department that owns it. Cross-departmen
 
 Generated evaluation outputs and exports belong under `DEPTSLM_DATA_DIR`.
 
+### Phase 9 internal evaluation metadata
+
+Implemented evaluator-only metadata endpoints are:
+
+- `GET /departments/{department_id}/evaluation-suites`
+- `GET /departments/{department_id}/evaluation-suites/{suite_id}`
+- `POST /departments/{department_id}/evaluation-suites/{suite_id}/runs`
+- `GET /departments/{department_id}/evaluation-runs`
+- `GET /departments/{department_id}/evaluation-runs/{run_id}`
+- `POST /departments/{department_id}/evaluation-runs/{run_id}/cancel`
+
+Active same-department `system_admin`, `department_admin`, and `instructor` roles may use them; student, viewer, and cross-department access are denied. Lists use bounded opaque department/resource-bound cursors. Run creation accepts exactly `{}` and returns 202; cancellation requires `expected_version`. Responses contain content-free metadata and aggregate numbers only. There is no public suite upload, case/result content, artifact download, raw search, or generated-answer replay endpoint.
+
 ## Security considerations for future endpoints
 
 - Authenticate before resolving department context and authorize every object operation.

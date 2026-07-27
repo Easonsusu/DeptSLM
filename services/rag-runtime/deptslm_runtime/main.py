@@ -70,12 +70,17 @@ async def query_embedding(request: Request) -> dict[str, list[float]]:
 async def generate(request: Request) -> dict:
     _authorize(request)
     value = await _json_body(request)
-    if not isinstance(value, dict) or set(value) != {
+    required = {
         "question",
         "evidence",
         "prompt_version",
         "answer_contract_version",
-    }:
+    }
+    if (
+        not isinstance(value, dict)
+        or not required <= set(value)
+        or set(value) - required not in (set(), {"seed"})
+    ):
         raise HTTPException(400, "Invalid request")
     try:
         question = normalize_question(value["question"])
@@ -113,7 +118,15 @@ async def generate(request: Request) -> dict:
             raise HTTPException(400, "Invalid request") from None
     if labels != [f"S{index}" for index in range(1, len(labels) + 1)] or total > 6000:
         raise HTTPException(400, "Invalid request")
-    return await _run_model(request, "generate", {"question": question, "evidence": evidence})
+    seed = value.get("seed")
+    if seed is not None and (
+        isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= (1 << 63) - 1
+    ):
+        raise HTTPException(400, "Invalid request")
+    payload = {"question": question, "evidence": evidence}
+    if seed is not None:
+        payload["seed"] = seed
+    return await _run_model(request, "generate", payload)
 
 
 def _authorize(request: Request) -> None:

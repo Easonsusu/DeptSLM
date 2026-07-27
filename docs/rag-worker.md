@@ -64,4 +64,6 @@ The persistent embedding child receives only bounded text batches/sequence IDs a
 
 Grounded answering is not added to either queue worker. The API owns authentication, retrieval authority, exact selected-artifact reads, citation validation, and final revalidation. `services/rag-runtime` owns only offline question embedding and generation behind token-authenticated internal endpoints. It has no database/Qdrant/API-auth credentials, host port, tools, or writable model cache.
 
+Evaluation result staging and final rename are supervised child operations. The parent retains PostgreSQL-server-time ownership, renews its lease, and terminates/reaps the process group on timeout, cancellation, shutdown, heartbeat failure, or claim loss. The final transaction never performs a rename or unbounded external write; it only locks/revalidates authority and verifies the already-published descriptor-bound result before recording success.
+
 The runtime uses `Qwen/Qwen3-0.6B` revision `c1899de289a04d12100db370d81485cdf75e47ca` in non-thinking mode and the Phase 6 embedding model for query vectors. Questions and selected evidence are bounded, handled in memory, and never persisted. This synchronous local boundary is not a production inference scheduler.

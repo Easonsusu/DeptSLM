@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 from pathlib import Path
 from typing import Any
 
@@ -86,7 +87,13 @@ class RuntimeModels:
         )
         return values[0].tolist()
 
-    def generate(self, question: str, evidence: list[dict[str, str]]) -> dict:
+    def generate(
+        self,
+        question: str,
+        evidence: list[dict[str, str]],
+        *,
+        seed: int | None = None,
+    ) -> dict:
         labels = tuple(item["source_id"] for item in evidence)
         messages = build_generation_messages(question, evidence)
         if self._provider == "fake":
@@ -101,6 +108,15 @@ class RuntimeModels:
             )
             validate_generation_response(value, labels)
             return value
+        if seed is not None:
+            random.seed(seed)
+            import numpy
+            import torch
+
+            numpy.random.seed(seed % (1 << 32))
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
         inputs = tokenize_generation_input(self._tokenizer, messages)
         inputs = inputs.to(self._generation.device)
         outputs = self._generation.generate(

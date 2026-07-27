@@ -31,6 +31,8 @@ A deterministic fake provider is permitted only with exact `ENVIRONMENT=test` an
 
 The real two-model smoke test is opt-in only. It requires both exact model directories already prepared under an external temporary/test data root, an explicit switch, and offline environment. Missing assets cause a skip, never a download.
 
+Phase 9 evaluation uses the same runtime endpoints, prompt contract, non-thinking generation parameters, token limits, validation, and child isolation. The optional server-owned per-case seed is transmitted only on the private generation call; the model child applies reviewed Python and model RNG seeds before generation. Public RAG calls preserve the existing unseeded contract. Fixed seeds improve repeatability but cannot guarantee bit-identical output across hardware, libraries, or kernels. The evaluator receives the runtime URL/token but no model mount, model dependency, or Hugging Face credential.
+
 ## Limitations
 
 The local container and process boundaries are defense in depth, not a production model-serving platform. PostgreSQL, Qdrant, artifacts, runtime child IPC, runtime HTTP, and API HTTP are not transactionally atomic. Production TLS/mTLS, network policy, credential rotation, GPU scheduling, queueing, autoscaling, timeout calibration under hardware load, observability without content leakage, model distribution, license review, and denial-of-service controls remain deferred.
