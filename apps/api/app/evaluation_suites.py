@@ -688,12 +688,16 @@ def _reconciliation_candidates(
     cutoff = session.scalar(
         select(func.clock_timestamp() - timedelta(seconds=RECONCILIATION_MINIMUM_AGE_SECONDS))
     )
-    blocked_run = ~select(EvaluationArtifactReconciliationOperationItem.id).where(
-        EvaluationArtifactReconciliationOperationItem.department_id == department_id,
-        EvaluationArtifactReconciliationOperationItem.resource_type == "evaluation_run",
-        EvaluationArtifactReconciliationOperationItem.resource_id == EvaluationRun.id,
-        EvaluationArtifactReconciliationOperationItem.status == "blocked",
-    ).exists()
+    blocked_run = (
+        ~select(EvaluationArtifactReconciliationOperationItem.id)
+        .where(
+            EvaluationArtifactReconciliationOperationItem.department_id == department_id,
+            EvaluationArtifactReconciliationOperationItem.resource_type == "evaluation_run",
+            EvaluationArtifactReconciliationOperationItem.resource_id == EvaluationRun.id,
+            EvaluationArtifactReconciliationOperationItem.status == "blocked",
+        )
+        .exists()
+    )
     runs = tuple(
         session.execute(
             select(
@@ -742,14 +746,18 @@ def _reconciliation_candidates(
     remaining = limit - len(candidates)
     if remaining <= 0:
         return tuple(candidates)
-    blocked_suite = ~select(EvaluationArtifactReconciliationOperationItem.id).where(
-        EvaluationArtifactReconciliationOperationItem.department_id == department_id,
-        EvaluationArtifactReconciliationOperationItem.resource_type
-        == "evaluation_suite_import_attempt",
-        EvaluationArtifactReconciliationOperationItem.resource_id
-        == EvaluationSuiteImportAttempt.id,
-        EvaluationArtifactReconciliationOperationItem.status == "blocked",
-    ).exists()
+    blocked_suite = (
+        ~select(EvaluationArtifactReconciliationOperationItem.id)
+        .where(
+            EvaluationArtifactReconciliationOperationItem.department_id == department_id,
+            EvaluationArtifactReconciliationOperationItem.resource_type
+            == "evaluation_suite_import_attempt",
+            EvaluationArtifactReconciliationOperationItem.resource_id
+            == EvaluationSuiteImportAttempt.id,
+            EvaluationArtifactReconciliationOperationItem.status == "blocked",
+        )
+        .exists()
+    )
     attempts = tuple(
         session.execute(
             select(
@@ -952,14 +960,17 @@ def _apply_reconciliation_operation(
             item.completed_at = now
             applied.add((item.resource_type, item.resource_id))
             outcomes[(item.resource_type, item.resource_id)] = ("completed", None)
-        has_blocks = session.scalar(
-            select(EvaluationArtifactReconciliationOperationItem.id)
-            .where(
-                EvaluationArtifactReconciliationOperationItem.operation_id == operation.id,
-                EvaluationArtifactReconciliationOperationItem.status == "blocked",
+        has_blocks = (
+            session.scalar(
+                select(EvaluationArtifactReconciliationOperationItem.id)
+                .where(
+                    EvaluationArtifactReconciliationOperationItem.operation_id == operation.id,
+                    EvaluationArtifactReconciliationOperationItem.status == "blocked",
+                )
+                .limit(1)
             )
-            .limit(1)
-        ) is not None
+            is not None
+        )
         operation.status = "completed_with_blocks" if has_blocks else "completed"
         operation.completed_at = now
         operation.version += 1

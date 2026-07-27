@@ -470,9 +470,7 @@ class EvaluationArtifactStore:
             if not self.suite_stage_present(scope, suite_id, stage_id):
                 return False
             raise EvaluationContractError("result_publication_failed")
-        return _remove_owned_stage_directory(
-            self.staging_suites, scope, suite_id, stage_id
-        )
+        return _remove_owned_stage_directory(self.staging_suites, scope, suite_id, stage_id)
 
     def run_stage_present(
         self, scope: DepartmentScope, run_id: UUID, publication_attempt_id: UUID
