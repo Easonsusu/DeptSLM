@@ -49,14 +49,14 @@ This roadmap separates foundational safety work from product implementation. A l
 - Add immutable department-scoped structured feedback, constrained review transitions, PostgreSQL-server-time retention, explicit purge, and transactional audit metadata.
 - Phase 8 merged its reviewed feedback isolation, retention, purge, and review boundaries.
 
-## Phase 9 — Evaluation runner (current; not completed)
+## Phase 9 — Evaluation runner (completed)
 
-- Add department-scoped immutable external suites, exact production-policy reuse, deterministic retrieval and answer metrics, content-free result artifacts, and explicit Decimal quality gates.
-- Phase 9 remains current until this implementation is reviewed and merged. It adds no LLM judge, feedback-derived data, production changes, training data, or Phase 10 behavior.
+- Phase 9 merged its reviewed immutable external evaluation-suite boundary, exact production-policy reuse, deterministic retrieval and answer metrics, explicit Decimal quality gates, and content-free result publication.
+- It also merged complete ground-truth final authority, supervised worker and publication lifecycle controls, descriptor-bound artifact integrity, crash recovery, and bounded reconciliation. It adds no LLM judge, feedback-derived data, production changes, training data, or Phase 10 behavior.
 
-## Phase 10 — SFT dataset builder
+## Phase 10 — SFT dataset builder (current; not completed)
 
-- Add reviewed, traceable, department-scoped supervised fine-tuning dataset generation.
+- Planning scope only: add reviewed, traceable, department-scoped supervised fine-tuning dataset generation. Phase 10 implementation has not started.
 
 ## Phase 11 — LLaMA-Factory training job generation
 
