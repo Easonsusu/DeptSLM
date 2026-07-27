@@ -769,6 +769,215 @@ def test_exact_owned_stage_cleanup_handles_crash_before_ownership_marker(
     assert not stage.exists()
 
 
+@pytest.mark.parametrize("marker_value", (b"", b"deptslm-stage", b"deptslm-stage-v1\n"))
+def test_exact_owned_stage_cleanup_recovers_interrupted_marker_contents(
+    tmp_path: Path, marker_value: bytes
+) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    run_id = uuid4()
+    attempt_id = uuid4()
+    stage = store._stage_directory(store.staging_runs, scope, run_id, attempt_id)
+    (stage / evaluation_artifacts.STAGE_OWNERSHIP_MARKER).write_bytes(marker_value)
+
+    assert store.remove_owned_run_stage(
+        scope,
+        run_id,
+        uuid4(),
+        attempt_id,
+        1,
+        "a" * 40,
+    )
+    assert not stage.exists()
+
+
+def test_partial_stage_cleanup_does_not_parse_marker_or_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    run_id = uuid4()
+    attempt_id = uuid4()
+    stage = store._stage_directory(store.staging_runs, scope, run_id, attempt_id)
+    (stage / evaluation_artifacts.STAGE_OWNERSHIP_MARKER).write_bytes(b"partial")
+    (stage / "manifest.json").write_bytes(b"not-json")
+
+    monkeypatch.setattr(
+        evaluation_artifacts,
+        "_verified_run_manifest",
+        lambda *_args, **_kwargs: pytest.fail("partial-stage cleanup must not parse a manifest"),
+    )
+    assert store.remove_owned_run_stage(
+        scope,
+        run_id,
+        uuid4(),
+        attempt_id,
+        1,
+        "a" * 40,
+    )
+    assert not stage.exists()
+
+
+@pytest.mark.parametrize("marker_value", (b"", b"partial-marker", b"deptslm-stage-v1\n"))
+def test_exact_owned_stage_cleanup_recovers_marker_writer_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, marker_value: bytes
+) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    run_id = uuid4()
+    attempt_id = uuid4()
+
+    def interrupted_marker(directory: Path) -> None:
+        descriptor = evaluation_artifacts._exclusive_file(
+            directory / evaluation_artifacts.STAGE_OWNERSHIP_MARKER
+        )
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(marker_value)
+            handle.flush()
+        raise RuntimeError("simulated marker interruption")
+
+    monkeypatch.setattr(evaluation_artifacts, "_write_stage_ownership_marker", interrupted_marker)
+    with pytest.raises(RuntimeError):
+        store._stage_directory(store.staging_runs, scope, run_id, attempt_id)
+    stage = store.staging_runs / str(scope.value) / str(run_id) / str(attempt_id)
+    assert stage.is_dir()
+    assert store.remove_owned_run_stage(
+        scope,
+        run_id,
+        uuid4(),
+        attempt_id,
+        1,
+        "a" * 40,
+    )
+    assert not stage.exists()
+
+
+def test_exact_owned_suite_stage_cleanup_removes_sensitive_partial_payload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    suite_id = uuid4()
+    stage_id = uuid4()
+    import_attempt_id = uuid4()
+    stage = store._stage_directory(store.staging_suites, scope, suite_id, stage_id)
+    (stage / evaluation_artifacts.STAGE_OWNERSHIP_MARKER).write_bytes(b"partial-marker")
+    (stage / "cases.jsonl").write_text("sensitive partial suite", encoding="utf-8")
+
+    monkeypatch.setattr(
+        evaluation_artifacts,
+        "_stage_directory_owned",
+        lambda *_args, **_kwargs: pytest.fail("suite deletion must not use a separate probe"),
+    )
+    assert store.remove_owned_suite_stage(scope, suite_id, stage_id, import_attempt_id)
+    assert not stage.exists()
+
+
+def test_stage_deletion_does_not_call_a_separate_ownership_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    run_id = uuid4()
+    attempt_id = uuid4()
+    stage = store._stage_directory(store.staging_runs, scope, run_id, attempt_id)
+
+    def unexpected_probe(*_args, **_kwargs) -> bool:
+        pytest.fail("stage deletion must not use a separately opened ownership probe")
+
+    monkeypatch.setattr(evaluation_artifacts, "_stage_directory_owned", unexpected_probe)
+    assert store.remove_owned_run_stage(
+        scope,
+        run_id,
+        uuid4(),
+        attempt_id,
+        1,
+        "a" * 40,
+    )
+    assert not stage.exists()
+
+
+def test_stage_deletion_rejects_replacement_without_touching_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    run_id = uuid4()
+    attempt_id = uuid4()
+    stage = store._stage_directory(store.staging_runs, scope, run_id, attempt_id)
+    replacement = tmp_path / "replacement-stage"
+    replacement.mkdir()
+    protected = replacement / "protected.txt"
+    protected.write_text("replacement", encoding="utf-8")
+    original_location = tmp_path / "original-stage"
+    remove_contents = evaluation_artifacts._remove_directory_contents
+
+    def replace_after_open(descriptor: int) -> None:
+        os.rename(stage, original_location)
+        os.rename(replacement, stage)
+        remove_contents(descriptor)
+
+    monkeypatch.setattr(evaluation_artifacts, "_remove_directory_contents", replace_after_open)
+    with pytest.raises(EvaluationContractError):
+        store.remove_owned_run_stage(
+            scope,
+            run_id,
+            uuid4(),
+            attempt_id,
+            1,
+            "a" * 40,
+        )
+    assert (stage / "protected.txt").read_text(encoding="utf-8") == "replacement"
+    assert stage.is_dir() and original_location.is_dir()
+
+
+def test_foreign_stage_is_not_deleted_by_another_exact_scope(tmp_path: Path) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    foreign_scope = DepartmentScope(uuid4())
+    foreign_run_id = uuid4()
+    foreign_attempt_id = uuid4()
+    foreign_stage = store._stage_directory(
+        store.staging_runs,
+        foreign_scope,
+        foreign_run_id,
+        foreign_attempt_id,
+    )
+
+    assert not store.remove_owned_run_stage(
+        DepartmentScope(uuid4()),
+        uuid4(),
+        uuid4(),
+        uuid4(),
+        1,
+        "a" * 40,
+    )
+    assert foreign_stage.exists()
+    assert not store.remove_owned_run_stage(
+        foreign_scope,
+        uuid4(),
+        uuid4(),
+        foreign_attempt_id,
+        1,
+        "a" * 40,
+    )
+    assert not store.remove_owned_run_stage(
+        foreign_scope,
+        foreign_run_id,
+        uuid4(),
+        uuid4(),
+        1,
+        "a" * 40,
+    )
+    assert foreign_stage.exists()
+
+
 def test_staging_boundary_symlink_fails_closed_without_touching_target(tmp_path: Path) -> None:
     root = _data_root(tmp_path)
     store = EvaluationArtifactStore(root)

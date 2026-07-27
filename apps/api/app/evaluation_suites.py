@@ -1059,15 +1059,14 @@ def _delete_owned_run_artifacts(
 ) -> None:
     if candidate.attempt_number is None or candidate.code_revision is None:
         raise EvaluationContractError("artifact_reconciliation_failed")
-    if store.run_stage_present(scope, candidate.resource_id, candidate.stage_id):
-        store.remove_owned_run_stage(
-            scope,
-            candidate.resource_id,
-            candidate.suite_id,
-            candidate.ownership_attempt_id,
-            candidate.attempt_number,
-            candidate.code_revision,
-        )
+    store.remove_owned_run_stage(
+        scope,
+        candidate.resource_id,
+        candidate.suite_id,
+        candidate.ownership_attempt_id,
+        candidate.attempt_number,
+        candidate.code_revision,
+    )
     if store.run_final_present(scope, candidate.resource_id):
         if not store.run_final_owned_by(
             scope,
@@ -1091,13 +1090,12 @@ def _delete_owned_run_artifacts(
 def _delete_owned_suite_artifacts(
     store: EvaluationArtifactStore, scope: DepartmentScope, candidate: _ArtifactReconcileCandidate
 ) -> None:
-    if store.suite_stage_present(scope, candidate.suite_id, candidate.stage_id):
-        store.remove_owned_suite_stage(
-            scope,
-            candidate.suite_id,
-            candidate.stage_id,
-            candidate.ownership_attempt_id,
-        )
+    store.remove_owned_suite_stage(
+        scope,
+        candidate.suite_id,
+        candidate.stage_id,
+        candidate.ownership_attempt_id,
+    )
     if store.suite_final_present(scope, candidate.suite_id):
         if not store.suite_final_owned_by(
             scope, candidate.suite_id, candidate.ownership_attempt_id

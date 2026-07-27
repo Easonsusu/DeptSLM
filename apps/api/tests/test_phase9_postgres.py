@@ -806,6 +806,7 @@ def test_reconcile_suite_partial_staging_is_sensitive_but_metadata_owned(
         ),
     )
     (staged.path / "unexpected.txt").write_text("synthetic malformed artifact")
+    (staged.path / ".deptslm-stage-owner").write_bytes(b"")
     factory = create_session_factory(engine)
     with factory.begin() as session:
         session.get(EvaluationSuiteImportAttempt, attempt_id).updated_at = datetime.now(
