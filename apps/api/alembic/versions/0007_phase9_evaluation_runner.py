@@ -246,7 +246,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("department_id", sa.Uuid(), nullable=False),
         sa.Column("actor_user_id", sa.Uuid(), nullable=False),
-        sa.Column("status", sa.String(16), nullable=False),
+        sa.Column("status", sa.String(32), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("version", sa.Integer(), nullable=False),
         sa.Column(
@@ -256,12 +256,12 @@ def upgrade() -> None:
             "updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
         ),
         sa.CheckConstraint(
-            "status IN ('registered','completed')",
+            "status IN ('registered','completed','completed_with_blocks')",
             name="ck_evaluation_artifact_reconciliation_operation_status",
         ),
         sa.CheckConstraint(
             "(status = 'registered' AND completed_at IS NULL) OR "
-            "(status = 'completed' AND completed_at IS NOT NULL)",
+            "(status IN ('completed','completed_with_blocks') AND completed_at IS NOT NULL)",
             name="ck_evaluation_artifact_reconciliation_operation_lifecycle",
         ),
         sa.CheckConstraint(
@@ -270,6 +270,11 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["department_id"], ["departments.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["actor_user_id"], ["user_identities.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "id",
+            "department_id",
+            name="uq_evaluation_artifact_reconciliation_operation_department",
+        ),
     )
     op.create_index(
         "ix_eval_artifact_reconcile_op_dept_status_created",
@@ -290,6 +295,8 @@ def upgrade() -> None:
         sa.Column("code_revision", sa.String(40), nullable=True),
         sa.Column("status", sa.String(16), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("blocked_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("blocked_reason_code", sa.String(48), nullable=True),
         sa.Column(
             "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
         ),
@@ -298,7 +305,7 @@ def upgrade() -> None:
             name="ck_evaluation_artifact_reconciliation_item_resource_type",
         ),
         sa.CheckConstraint(
-            "status IN ('registered','completed')",
+            "status IN ('registered','completed','blocked')",
             name="ck_evaluation_artifact_reconciliation_item_status",
         ),
         sa.CheckConstraint(
@@ -312,13 +319,22 @@ def upgrade() -> None:
             name="ck_evaluation_artifact_reconciliation_item_ownership",
         ),
         sa.CheckConstraint(
-            "(status = 'registered' AND completed_at IS NULL) OR "
-            "(status = 'completed' AND completed_at IS NOT NULL)",
+            "(status = 'registered' AND completed_at IS NULL AND blocked_at IS NULL "
+            "AND blocked_reason_code IS NULL) OR "
+            "(status = 'completed' AND completed_at IS NOT NULL AND blocked_at IS NULL "
+            "AND blocked_reason_code IS NULL) OR "
+            "(status = 'blocked' AND completed_at IS NULL AND blocked_at IS NOT NULL "
+            "AND blocked_reason_code IN ('staging_path_unsafe','artifact_ownership_mismatch',"
+            "'artifact_manifest_invalid','artifact_permissions_invalid'))",
             name="ck_evaluation_artifact_reconciliation_item_lifecycle",
         ),
         sa.ForeignKeyConstraint(
-            ["operation_id"],
-            ["evaluation_artifact_reconciliation_operations.id"],
+            ["operation_id", "department_id"],
+            [
+                "evaluation_artifact_reconciliation_operations.id",
+                "evaluation_artifact_reconciliation_operations.department_id",
+            ],
+            name="fk_evaluation_artifact_reconciliation_item_operation_scope",
             ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(["department_id"], ["departments.id"], ondelete="RESTRICT"),
@@ -483,7 +499,8 @@ def upgrade() -> None:
             "(status = 'running' AND gate_status = 'pending' "
             "AND worker_id IS NOT NULL AND claim_token IS NOT NULL "
             "AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL "
-            "AND started_at IS NOT NULL AND finished_at IS NULL AND publication_attempt_id IS NOT NULL "
+            "AND started_at IS NOT NULL AND finished_at IS NULL "
+            "AND publication_attempt_id IS NOT NULL "
             "AND failed_gate_count IS NULL AND result_manifest_sha256 IS NULL "
             "AND result_summary_sha256 IS NULL AND case_results_sha256 IS NULL "
             "AND case_results_byte_size IS NULL AND error_code IS NULL) "
@@ -504,7 +521,8 @@ def upgrade() -> None:
             "AND failed_gate_count IS NOT NULL AND failed_gate_count BETWEEN 0 AND 8 "
             "AND result_manifest_sha256 IS NOT NULL AND result_summary_sha256 IS NOT NULL "
             "AND case_results_sha256 IS NOT NULL AND case_results_byte_size IS NOT NULL "
-            "AND publication_attempt_id IS NOT NULL AND error_code IS NULL) OR status <> 'succeeded'",
+            "AND publication_attempt_id IS NOT NULL AND error_code IS NULL) "
+            "OR status <> 'succeeded'",
             name="ck_evaluation_run_succeeded_lifecycle",
         ),
         sa.CheckConstraint(

@@ -109,6 +109,8 @@ def main(argv: list[str] | None = None) -> int:
                                 "final_present": item.final_present,
                                 "final_owned": item.final_owned,
                                 "applied": item.applied,
+                                "reconciliation_status": item.reconciliation_status,
+                                "blocked_reason_code": item.blocked_reason_code,
                             }
                             for item in items
                         ],

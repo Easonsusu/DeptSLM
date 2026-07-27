@@ -1187,12 +1187,12 @@ class EvaluationArtifactReconciliationOperation(Base):
     __tablename__ = "evaluation_artifact_reconciliation_operations"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('registered','completed')",
+            "status IN ('registered','completed','completed_with_blocks')",
             name="ck_evaluation_artifact_reconciliation_operation_status",
         ),
         CheckConstraint(
             "(status = 'registered' AND completed_at IS NULL) OR "
-            "(status = 'completed' AND completed_at IS NOT NULL)",
+            "(status IN ('completed','completed_with_blocks') AND completed_at IS NOT NULL)",
             name="ck_evaluation_artifact_reconciliation_operation_lifecycle",
         ),
         CheckConstraint(
@@ -1204,6 +1204,11 @@ class EvaluationArtifactReconciliationOperation(Base):
             "status",
             "created_at",
         ),
+        UniqueConstraint(
+            "id",
+            "department_id",
+            name="uq_evaluation_artifact_reconciliation_operation_department",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -1213,7 +1218,7 @@ class EvaluationArtifactReconciliationOperation(Base):
     actor_user_id: Mapped[UUID] = mapped_column(
         ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
     )
-    status: Mapped[str] = mapped_column(String(16), nullable=False, default="registered")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="registered")
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = utc_timestamp()
@@ -1232,7 +1237,7 @@ class EvaluationArtifactReconciliationOperationItem(Base):
             name="ck_evaluation_artifact_reconciliation_item_resource_type",
         ),
         CheckConstraint(
-            "status IN ('registered','completed')",
+            "status IN ('registered','completed','blocked')",
             name="ck_evaluation_artifact_reconciliation_item_status",
         ),
         CheckConstraint(
@@ -1246,8 +1251,13 @@ class EvaluationArtifactReconciliationOperationItem(Base):
             name="ck_evaluation_artifact_reconciliation_item_ownership",
         ),
         CheckConstraint(
-            "(status = 'registered' AND completed_at IS NULL) OR "
-            "(status = 'completed' AND completed_at IS NOT NULL)",
+            "(status = 'registered' AND completed_at IS NULL AND blocked_at IS NULL "
+            "AND blocked_reason_code IS NULL) OR "
+            "(status = 'completed' AND completed_at IS NOT NULL AND blocked_at IS NULL "
+            "AND blocked_reason_code IS NULL) OR "
+            "(status = 'blocked' AND completed_at IS NULL AND blocked_at IS NOT NULL "
+            "AND blocked_reason_code IN ('staging_path_unsafe','artifact_ownership_mismatch',"
+            "'artifact_manifest_invalid','artifact_permissions_invalid'))",
             name="ck_evaluation_artifact_reconciliation_item_lifecycle",
         ),
         UniqueConstraint(
@@ -1261,13 +1271,19 @@ class EvaluationArtifactReconciliationOperationItem(Base):
             "operation_id",
             "status",
         ),
+        ForeignKeyConstraint(
+            ["operation_id", "department_id"],
+            [
+                "evaluation_artifact_reconciliation_operations.id",
+                "evaluation_artifact_reconciliation_operations.department_id",
+            ],
+            name="fk_evaluation_artifact_reconciliation_item_operation_scope",
+            ondelete="RESTRICT",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
-    operation_id: Mapped[UUID] = mapped_column(
-        ForeignKey("evaluation_artifact_reconciliation_operations.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
+    operation_id: Mapped[UUID] = mapped_column(nullable=False)
     department_id: Mapped[UUID] = mapped_column(
         ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False
     )
@@ -1280,6 +1296,8 @@ class EvaluationArtifactReconciliationOperationItem(Base):
     code_revision: Mapped[str | None] = mapped_column(String(40))
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="registered")
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    blocked_reason_code: Mapped[str | None] = mapped_column(String(48))
     created_at: Mapped[datetime] = utc_timestamp()
 
 

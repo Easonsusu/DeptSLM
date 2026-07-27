@@ -207,7 +207,7 @@ def process_evaluation_run(
         _event(job, "complete", "allowed", "evaluation_succeeded")
         return True
     except _WorkerStopped:
-        if staged is not None:
+        if job.publication_attempt_id is not None:
             try:
                 require_live_claim(factory, job)
                 store.remove_owned_run_stage(
@@ -250,7 +250,9 @@ def process_evaluation_run(
     except Exception:
         code = "generation_failed"
 
-    if staged is not None:
+    # A supervised staging child may die after mkdir but before returning StagedArtifact.
+    # The exact live attempt path is still safe to inspect and remove under metadata ownership.
+    if job.publication_attempt_id is not None:
         try:
             require_live_claim(factory, job, allow_cancellation=True)
             store.remove_owned_run_stage(

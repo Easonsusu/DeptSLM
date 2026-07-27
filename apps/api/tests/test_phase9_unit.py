@@ -23,6 +23,7 @@ from deptslm_worker.evaluation_settings import (
     EvaluationSettings,
 )
 
+from app import evaluation_artifacts
 from app.authorization import DepartmentScope
 from app.evaluation_artifacts import (
     RUN_FILES,
@@ -657,7 +658,9 @@ def test_exact_run_artifact_ownership_rejects_mismatched_attempt_scope_or_revisi
     )
 
 
-def test_exact_run_cleanup_rejects_mutated_staging_and_final_payloads(tmp_path: Path) -> None:
+def test_exact_run_stage_cleanup_accepts_partial_payload_but_final_remains_strict(
+    tmp_path: Path,
+) -> None:
     root = _data_root(tmp_path)
     store = EvaluationArtifactStore(root)
     scope = DepartmentScope(uuid4())
@@ -690,18 +693,16 @@ def test_exact_run_cleanup_rejects_mutated_staging_and_final_payloads(tmp_path: 
 
     staged = stage()
     staged.path.joinpath("summary.json").write_bytes(b'{"failed_gate_count":1}\n')
-    with pytest.raises(EvaluationContractError):
-        store.remove_owned_run_stage(
-            scope,
-            job.id,
-            job.suite_id,
-            job.publication_attempt_id,
-            job.attempt_number,
-            job.code_revision,
-        )
-    assert staged.path.exists()
+    assert store.remove_owned_run_stage(
+        scope,
+        job.id,
+        job.suite_id,
+        job.publication_attempt_id,
+        job.attempt_number,
+        job.code_revision,
+    )
+    assert not staged.path.exists()
 
-    store.cleanup_stage(scope, job.id, job.publication_attempt_id, suite=False)
     staged = stage()
     published = store.publish(staged, RUN_FILES)
     published.path.joinpath("summary.json").write_bytes(b'{"failed_gate_count":1}\n')
@@ -715,6 +716,203 @@ def test_exact_run_cleanup_rejects_mutated_staging_and_final_payloads(tmp_path: 
             job.code_revision,
         )
     assert published.path.exists()
+
+
+@pytest.mark.parametrize("partial_name", ("manifest.json", "summary.json", "case_results.jsonl"))
+def test_exact_owned_run_stage_cleanup_removes_partial_child_output(
+    tmp_path: Path, partial_name: str
+) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    run_id = uuid4()
+    attempt_id = uuid4()
+    stage = store._stage_directory(store.staging_runs, scope, run_id, attempt_id)
+    (stage / partial_name).write_text("sensitive partial stage", encoding="utf-8")
+
+    assert store.remove_owned_run_stage(
+        scope,
+        run_id,
+        uuid4(),
+        attempt_id,
+        1,
+        "a" * 40,
+    )
+    assert not stage.exists()
+
+
+def test_exact_owned_stage_cleanup_handles_crash_before_ownership_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    run_id = uuid4()
+    attempt_id = uuid4()
+
+    def fail_marker(_directory: Path) -> None:
+        raise RuntimeError("simulated crash")
+
+    monkeypatch.setattr(evaluation_artifacts, "_write_stage_ownership_marker", fail_marker)
+    with pytest.raises(RuntimeError):
+        store._stage_directory(store.staging_runs, scope, run_id, attempt_id)
+    stage = store.staging_runs / str(scope.value) / str(run_id) / str(attempt_id)
+    assert stage.is_dir() and not tuple(stage.iterdir())
+    assert store.remove_owned_run_stage(
+        scope,
+        run_id,
+        uuid4(),
+        attempt_id,
+        1,
+        "a" * 40,
+    )
+    assert not stage.exists()
+
+
+def test_staging_boundary_symlink_fails_closed_without_touching_target(tmp_path: Path) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    run_id = uuid4()
+    attempt_id = uuid4()
+    stage = store._stage_directory(store.staging_runs, scope, run_id, attempt_id)
+    store.cleanup_stage(scope, run_id, attempt_id, suite=False)
+    target = tmp_path / "unrelated"
+    target.mkdir()
+    protected = target / "protected.txt"
+    protected.write_text("unrelated", encoding="utf-8")
+    stage.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(EvaluationContractError):
+        store.remove_owned_run_stage(
+            scope,
+            run_id,
+            uuid4(),
+            attempt_id,
+            1,
+            "a" * 40,
+        )
+    assert protected.read_text(encoding="utf-8") == "unrelated"
+
+
+def test_staging_boundary_requires_the_current_service_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    run_id = uuid4()
+    attempt_id = uuid4()
+    stage = store._stage_directory(store.staging_runs, scope, run_id, attempt_id)
+
+    service_uid = os.geteuid()
+    monkeypatch.setattr(evaluation_artifacts.os, "geteuid", lambda: service_uid + 1)
+    with pytest.raises(EvaluationContractError):
+        store.remove_owned_run_stage(
+            scope,
+            run_id,
+            uuid4(),
+            attempt_id,
+            1,
+            "a" * 40,
+        )
+    assert stage.exists()
+
+
+def test_parent_cleans_exact_partial_stage_when_supervision_returns_no_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _data_root(tmp_path)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(uuid4())
+    job = ClaimedEvaluationRun(
+        id=uuid4(),
+        department_id=scope.value,
+        suite_id=uuid4(),
+        requested_by_user_id=uuid4(),
+        worker_id=uuid4(),
+        claim_token=uuid4(),
+        stale_claim_token=None,
+        base_seed=1,
+        case_count=1,
+        code_revision="a" * 40,
+        attempt_number=1,
+        publication_attempt_id=uuid4(),
+    )
+    stage = store._stage_directory(store.staging_runs, scope, job.id, job.publication_attempt_id)
+    (stage / "summary.json").write_text("partial", encoding="utf-8")
+    failures: list[str] = []
+    case_id = uuid4()
+    chunk_id = uuid4()
+    suite = SimpleNamespace(
+        id=job.suite_id,
+        suite_contract_version=SUITE_CONTRACT_VERSION,
+        artifact_contract_version=ARTIFACT_CONTRACT_VERSION,
+        metric_contract_version=METRIC_CONTRACT_VERSION,
+        answer_normalization_version=ANSWER_NORMALIZATION_VERSION,
+        gate_policy_version=GATE_POLICY_VERSION,
+        artifact_manifest_sha256="a" * 64,
+        canonical_cases_sha256="b" * 64,
+        canonical_cases_byte_size=1,
+        **{name: Decimal(0) for name in _gates()},
+    )
+    cases = (
+        {
+            "case_id": str(case_id),
+            "expected_status": "answered",
+            "question": "Synthetic question?",
+            "relevant_sources": [{"chunk_id": str(chunk_id)}],
+            "accepted_answers": ["Synthetic answer."],
+        },
+    )
+    authority = GroundTruthAuthoritySnapshot({}, ())
+
+    monkeypatch.setattr(evaluation_pipeline, "require_live_claim", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(evaluation_pipeline, "reconcile_stale_publication", lambda *_args: None)
+    monkeypatch.setattr(evaluation_pipeline, "record_progress", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(evaluation_pipeline, "validate_claim_authority", lambda *_args: suite)
+    monkeypatch.setattr(
+        evaluation_pipeline,
+        "_supervise_suite_load",
+        lambda *_args, **_kwargs: evaluation_pipeline._SuiteExecution(cases, authority),
+    )
+    monkeypatch.setattr(
+        evaluation_pipeline,
+        "_supervise_authority",
+        lambda *_args, **_kwargs: authority,
+    )
+    monkeypatch.setattr(
+        evaluation_pipeline,
+        "_supervise_case",
+        lambda *_args, **_kwargs: evaluation_pipeline._CaseExecution(
+            "answered",
+            "Synthetic answer.",
+            SafeRetrievalTrace(1, 1, (chunk_id,), ()),
+            (),
+            True,
+            None,
+        ),
+    )
+
+    def stage_timeout(*_args, **_kwargs):
+        raise evaluation_pipeline.EvaluationQueueError("runtime_timeout")
+
+    monkeypatch.setattr(evaluation_pipeline, "_supervise_result_stage", stage_timeout)
+    monkeypatch.setattr(
+        evaluation_pipeline,
+        "fail_owned",
+        lambda _factory, _job, code: failures.append(code) or True,
+    )
+
+    assert not evaluation_pipeline.process_evaluation_run(
+        object(),
+        SimpleNamespace(),
+        store,
+        job,
+        lambda: False,
+    )
+    assert failures == ["runtime_timeout"]
+    assert not stage.exists()
 
 
 @pytest.mark.parametrize("name", ["summary.json", "case_results.jsonl"])

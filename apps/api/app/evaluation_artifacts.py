@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import stat
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -26,6 +25,8 @@ from app.evaluation_domain import (
 SUITE_FILES = frozenset({"manifest.json", "cases.jsonl"})
 RUN_FILES = frozenset({"manifest.json", "summary.json", "case_results.jsonl"})
 SOURCE_SUITE_FILES = frozenset({"suite.json", "cases.jsonl"})
+STAGE_OWNERSHIP_MARKER = ".deptslm-stage-owner"
+STAGE_OWNERSHIP_MARKER_BYTES = b"deptslm-stage-v1\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +99,12 @@ class EvaluationArtifactStore:
                     ("manifest.json", manifest_digest),
                 ),
             )
-            _verify_expected_files(stage, SUITE_FILES, dict(staged.files))
+            _verify_expected_files(
+                stage,
+                SUITE_FILES,
+                dict(staged.files),
+                internal_files=frozenset({STAGE_OWNERSHIP_MARKER}),
+            )
             return staged
         except Exception:
             _safe_remove_tree(stage)
@@ -152,7 +158,12 @@ class EvaluationArtifactStore:
                     ("summary.json", summary_digest),
                 ),
             )
-            _verify_expected_files(stage, RUN_FILES, dict(staged.files))
+            _verify_expected_files(
+                stage,
+                RUN_FILES,
+                dict(staged.files),
+                internal_files=frozenset({STAGE_OWNERSHIP_MARKER}),
+            )
             return (
                 staged,
                 summary_digest,
@@ -165,6 +176,13 @@ class EvaluationArtifactStore:
         expected = dict(staged.files)
         if set(expected) != allowlist:
             raise EvaluationContractError("result_publication_failed")
+        _verify_expected_files(
+            staged.path,
+            allowlist,
+            expected,
+            internal_files=frozenset({STAGE_OWNERSHIP_MARKER}),
+        )
+        _remove_stage_ownership_marker(staged.path)
         _verify_expected_files(staged.path, allowlist, expected)
         _ensure_parent(staged.final_path)
         if staged.final_path.exists():
@@ -329,12 +347,7 @@ class EvaluationArtifactStore:
         attempt_number: int,
         code_revision: str,
     ) -> bool:
-        path = self._existing_stage_path(self.staging_runs, scope, run_id, publication_attempt_id)
-        if not _path_exists(path):
-            return False
-        manifest = _verified_run_manifest(path)
-        return _run_manifest_owned_by(
-            manifest,
+        _require_run_stage_ownership(
             scope,
             run_id,
             suite_id,
@@ -342,6 +355,23 @@ class EvaluationArtifactStore:
             attempt_number,
             code_revision,
         )
+        if not _stage_directory_owned(self.staging_runs, scope, run_id, publication_attempt_id):
+            path = self._existing_stage_path(
+                self.staging_runs, scope, run_id, publication_attempt_id
+            )
+            if not _path_exists(path):
+                return False
+            manifest = _verified_run_manifest(path)
+            return _run_manifest_owned_by(
+                manifest,
+                scope,
+                run_id,
+                suite_id,
+                publication_attempt_id,
+                attempt_number,
+                code_revision,
+            )
+        return True
 
     def remove_owned_run_stage(
         self,
@@ -352,9 +382,14 @@ class EvaluationArtifactStore:
         attempt_number: int,
         code_revision: str,
     ) -> bool:
-        path = self._existing_stage_path(self.staging_runs, scope, run_id, publication_attempt_id)
-        if not _path_exists(path):
-            return False
+        _require_run_stage_ownership(
+            scope,
+            run_id,
+            suite_id,
+            publication_attempt_id,
+            attempt_number,
+            code_revision,
+        )
         if not self.run_stage_owned_by(
             scope,
             run_id,
@@ -363,9 +398,12 @@ class EvaluationArtifactStore:
             attempt_number,
             code_revision,
         ):
+            if not self.run_stage_present(scope, run_id, publication_attempt_id):
+                return False
             raise EvaluationContractError("result_publication_failed")
-        _safe_remove_tree(path)
-        return True
+        return _remove_owned_stage_directory(
+            self.staging_runs, scope, run_id, publication_attempt_id
+        )
 
     def remove_owned_suite_final(
         self,
@@ -406,16 +444,19 @@ class EvaluationArtifactStore:
         stage_id: UUID,
         import_attempt_id: UUID,
     ) -> bool:
-        path = self._existing_stage_path(self.staging_suites, scope, suite_id, stage_id)
-        if not _path_exists(path):
-            return False
-        manifest = _verified_suite_manifest(path)
-        return (
-            manifest.get("department_id") == str(scope.value)
-            and manifest.get("suite_id") == str(suite_id)
-            and manifest.get("stage_id") == str(stage_id)
-            and manifest.get("import_attempt_id") == str(import_attempt_id)
-        )
+        _require_suite_stage_ownership(scope, suite_id, stage_id, import_attempt_id)
+        if not _stage_directory_owned(self.staging_suites, scope, suite_id, stage_id):
+            path = self._existing_stage_path(self.staging_suites, scope, suite_id, stage_id)
+            if not _path_exists(path):
+                return False
+            manifest = _verified_suite_manifest(path)
+            return (
+                manifest.get("department_id") == str(scope.value)
+                and manifest.get("suite_id") == str(suite_id)
+                and manifest.get("stage_id") == str(stage_id)
+                and manifest.get("import_attempt_id") == str(import_attempt_id)
+            )
+        return True
 
     def remove_owned_suite_stage(
         self,
@@ -424,13 +465,14 @@ class EvaluationArtifactStore:
         stage_id: UUID,
         import_attempt_id: UUID,
     ) -> bool:
-        path = self._existing_stage_path(self.staging_suites, scope, suite_id, stage_id)
-        if not _path_exists(path):
-            return False
+        _require_suite_stage_ownership(scope, suite_id, stage_id, import_attempt_id)
         if not self.suite_stage_owned_by(scope, suite_id, stage_id, import_attempt_id):
+            if not self.suite_stage_present(scope, suite_id, stage_id):
+                return False
             raise EvaluationContractError("result_publication_failed")
-        _safe_remove_tree(path)
-        return True
+        return _remove_owned_stage_directory(
+            self.staging_suites, scope, suite_id, stage_id
+        )
 
     def run_stage_present(
         self, scope: DepartmentScope, run_id: UUID, publication_attempt_id: UUID
@@ -516,7 +558,9 @@ class EvaluationArtifactStore:
             os.mkdir(stage, 0o700)
         except FileExistsError as error:
             raise EvaluationContractError("result_publication_failed") from error
-        return _real_directory(stage, writable=True)
+        stage = _real_directory(stage, writable=True)
+        _write_stage_ownership_marker(stage)
+        return stage
 
     @staticmethod
     def _existing_stage_path(
@@ -739,6 +783,28 @@ def _exclusive_file(path: Path) -> int:
         raise EvaluationContractError("result_publication_failed") from error
 
 
+def _write_stage_ownership_marker(directory: Path) -> None:
+    descriptor = _exclusive_file(directory / STAGE_OWNERSHIP_MARKER)
+    with os.fdopen(descriptor, "wb", closefd=True) as handle:
+        handle.write(STAGE_OWNERSHIP_MARKER_BYTES)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _remove_stage_ownership_marker(directory: Path) -> None:
+    descriptor = _open_directory(directory)
+    try:
+        if not _stage_marker_is_valid(descriptor):
+            raise EvaluationContractError("result_publication_failed")
+        os.unlink(STAGE_OWNERSHIP_MARKER, dir_fd=descriptor)
+    except EvaluationContractError:
+        raise
+    except OSError as error:
+        raise EvaluationContractError("result_publication_failed") from error
+    finally:
+        os.close(descriptor)
+
+
 def _validate_external_source_path(source: Path, repository_root: Path) -> Path:
     if not source.is_absolute():
         raise EvaluationContractError()
@@ -956,10 +1022,12 @@ def _verify_expected_files(
     path: Path,
     allowlist: frozenset[str],
     expected: dict[str, ArtifactDigest],
+    *,
+    internal_files: frozenset[str] = frozenset(),
 ) -> dict[str, ArtifactDigest]:
     directory = _open_directory(path)
     try:
-        _verify_directory_descriptor(directory, allowlist)
+        _verify_directory_descriptor(directory, allowlist | internal_files)
         verified: dict[str, ArtifactDigest] = {}
         manifest_raw = b""
         opened = {name: _open_regular_at(directory, name) for name in sorted(allowlist)}
@@ -982,7 +1050,7 @@ def _verify_expected_files(
         finally:
             for descriptor, _metadata in opened.values():
                 os.close(descriptor)
-        _verify_directory_descriptor(directory, allowlist)
+        _verify_directory_descriptor(directory, allowlist | internal_files)
         _validate_published_manifest(manifest_raw, allowlist, verified)
         return verified
     finally:
@@ -1367,13 +1435,229 @@ def _require_beneath(root: Path, path: Path) -> None:
 
 
 def _safe_remove_tree(path: Path) -> None:
+    """Remove one known directory without following any descendant symlink."""
+
     try:
-        metadata = path.lstat()
+        parent = _open_directory(path.parent)
     except FileNotFoundError:
         return
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+    try:
+        try:
+            before = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+            raise EvaluationContractError("result_publication_failed")
+        directory = _open_directory_at(parent, path.name)
+        try:
+            if not _same_directory_identity(before, os.fstat(directory)):
+                raise EvaluationContractError("result_publication_failed")
+            _remove_directory_contents(directory)
+            current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            if not _same_directory_identity(before, current):
+                raise EvaluationContractError("result_publication_failed")
+        finally:
+            os.close(directory)
+        os.rmdir(path.name, dir_fd=parent)
+    except EvaluationContractError:
+        raise
+    except OSError as error:
+        raise EvaluationContractError("result_publication_failed") from error
+    finally:
+        os.close(parent)
+
+
+def _require_run_stage_ownership(
+    scope: DepartmentScope,
+    run_id: UUID,
+    suite_id: UUID,
+    publication_attempt_id: UUID,
+    attempt_number: int,
+    code_revision: str,
+) -> None:
+    _require_identifiers(scope, run_id, publication_attempt_id)
+    if (
+        not isinstance(suite_id, UUID)
+        or suite_id.int == 0
+        or isinstance(attempt_number, bool)
+        or not isinstance(attempt_number, int)
+        or attempt_number < 1
+        or not isinstance(code_revision, str)
+        or len(code_revision) != 40
+        or any(character not in "0123456789abcdef" for character in code_revision)
+    ):
         raise EvaluationContractError("result_publication_failed")
-    shutil.rmtree(path)
+
+
+def _require_suite_stage_ownership(
+    scope: DepartmentScope,
+    suite_id: UUID,
+    stage_id: UUID,
+    import_attempt_id: UUID,
+) -> None:
+    _require_identifiers(scope, suite_id, stage_id)
+    if not isinstance(import_attempt_id, UUID) or import_attempt_id.int == 0:
+        raise EvaluationContractError("result_publication_failed")
+
+
+def _stage_directory_owned(
+    root: Path, scope: DepartmentScope, resource_id: UUID, stage_id: UUID
+) -> bool:
+    handles = _open_owned_stage_directory(root, scope, resource_id, stage_id)
+    if handles is None:
+        return False
+    root_fd, department_fd, resource_fd, stage_fd, _metadata = handles
+    try:
+        return _stage_marker_is_valid(stage_fd) or not os.listdir(stage_fd)
+    finally:
+        for descriptor in (stage_fd, resource_fd, department_fd, root_fd):
+            os.close(descriptor)
+
+
+def _remove_owned_stage_directory(
+    root: Path, scope: DepartmentScope, resource_id: UUID, stage_id: UUID
+) -> bool:
+    """Delete an exact metadata-owned staging directory, even when its payload is partial.
+
+    The fixed UUID path and private no-follow directory chain establish ownership. Payload
+    files are deliberately not parsed: a killed writer can leave any subset of them.
+    """
+
+    handles = _open_owned_stage_directory(root, scope, resource_id, stage_id)
+    if handles is None:
+        return False
+    root_fd, department_fd, resource_fd, stage_fd, before = handles
+    try:
+        _remove_directory_contents(stage_fd)
+        current = os.stat(str(stage_id), dir_fd=resource_fd, follow_symlinks=False)
+        if not _same_directory_identity(before, current):
+            raise EvaluationContractError("result_publication_failed")
+        os.rmdir(str(stage_id), dir_fd=resource_fd)
+    except EvaluationContractError:
+        raise
+    except OSError as error:
+        raise EvaluationContractError("result_publication_failed") from error
+    finally:
+        for descriptor in (stage_fd, resource_fd, department_fd, root_fd):
+            os.close(descriptor)
+    return True
+
+
+def _open_owned_stage_directory(
+    root: Path, scope: DepartmentScope, resource_id: UUID, stage_id: UUID
+) -> tuple[int, int, int, int, os.stat_result] | None:
+    """Open exact staging ownership components without following substitutions."""
+
+    _require_identifiers(scope, resource_id, stage_id)
+    descriptors: list[int] = []
+    try:
+        root_fd = _open_directory(root)
+        descriptors.append(root_fd)
+        department_fd = _open_directory_at(root_fd, str(scope.value))
+        descriptors.append(department_fd)
+        resource_fd = _open_directory_at(department_fd, str(resource_id))
+        descriptors.append(resource_fd)
+        before = os.stat(str(stage_id), dir_fd=resource_fd, follow_symlinks=False)
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+            raise EvaluationContractError("result_publication_failed")
+        if before.st_mode & 0o077:
+            raise EvaluationContractError("result_publication_failed")
+        expected_uid = os.geteuid() if hasattr(os, "geteuid") else None
+        if expected_uid is not None and before.st_uid != expected_uid:
+            raise EvaluationContractError("result_publication_failed")
+        if before.st_uid != os.fstat(resource_fd).st_uid:
+            raise EvaluationContractError("result_publication_failed")
+        stage_fd = _open_directory_at(resource_fd, str(stage_id))
+        descriptors.append(stage_fd)
+        if not _same_directory_identity(before, os.fstat(stage_fd)):
+            raise EvaluationContractError("result_publication_failed")
+        return root_fd, department_fd, resource_fd, stage_fd, before
+    except FileNotFoundError:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        return None
+    except EvaluationContractError:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+    except OSError as error:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise EvaluationContractError("result_publication_failed") from error
+
+
+def _open_directory_at(parent: int, name: str) -> int:
+    return os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent,
+    )
+
+
+def _same_directory_identity(before: os.stat_result, after: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(after.st_mode)
+        and before.st_dev == after.st_dev
+        and before.st_ino == after.st_ino
+        and before.st_mode == after.st_mode
+    )
+
+
+def _remove_directory_contents(directory: int) -> None:
+    """Unlink all entries under an already-open private directory without traversal escapes."""
+
+    try:
+        for name in os.listdir(directory):
+            if not name or name in {".", ".."} or "/" in name or "\\" in name:
+                raise EvaluationContractError("result_publication_failed")
+            metadata = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                child = _open_directory_at(directory, name)
+                try:
+                    if not _same_directory_identity(metadata, os.fstat(child)):
+                        raise EvaluationContractError("result_publication_failed")
+                    _remove_directory_contents(child)
+                    current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    if not _same_directory_identity(metadata, current):
+                        raise EvaluationContractError("result_publication_failed")
+                finally:
+                    os.close(child)
+                os.rmdir(name, dir_fd=directory)
+            else:
+                os.unlink(name, dir_fd=directory)
+    except EvaluationContractError:
+        raise
+    except OSError as error:
+        raise EvaluationContractError("result_publication_failed") from error
+
+
+def _stage_marker_is_valid(directory: int) -> bool:
+    try:
+        descriptor = os.open(
+            STAGE_OWNERSHIP_MARKER,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory,
+        )
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise EvaluationContractError("result_publication_failed") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o077
+            or metadata.st_size != len(STAGE_OWNERSHIP_MARKER_BYTES)
+        ):
+            raise EvaluationContractError("result_publication_failed")
+        value = os.read(descriptor, len(STAGE_OWNERSHIP_MARKER_BYTES) + 1)
+        if value != STAGE_OWNERSHIP_MARKER_BYTES:
+            raise EvaluationContractError("result_publication_failed")
+        _verify_path_identity(directory, STAGE_OWNERSHIP_MARKER, metadata)
+        return True
+    finally:
+        os.close(descriptor)
 
 
 def _path_exists(path: Path) -> bool:

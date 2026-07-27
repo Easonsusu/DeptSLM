@@ -24,7 +24,7 @@ from deptslm_worker.evaluation_queue import (
     require_live_claim,
 )
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, inspect, select, text
+from sqlalchemy import delete, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -172,6 +172,15 @@ def test_00_phase9_migration_paths_and_orm_sync(engine) -> None:
             key["options"].get("ondelete") == "RESTRICT"
             for key in inspector.get_foreign_keys(table)
         )
+    item_foreign_keys = inspector.get_foreign_keys(
+        "evaluation_artifact_reconciliation_operation_items"
+    )
+    assert any(
+        key["constrained_columns"] == ["operation_id", "department_id"]
+        and key["referred_table"] == "evaluation_artifact_reconciliation_operations"
+        and key["referred_columns"] == ["id", "department_id"]
+        for key in item_foreign_keys
+    )
     columns = {column["name"] for table in tables for column in inspector.get_columns(table)}
     assert columns.isdisjoint(
         {
@@ -751,7 +760,7 @@ def test_reconcile_run_staging_clears_terminal_ownership_without_reappearing(
     )
 
 
-def test_reconcile_suite_staging_is_sensitive_but_metadata_owned(
+def test_reconcile_suite_partial_staging_is_sensitive_but_metadata_owned(
     db: Session, engine, tmp_path: Path
 ) -> None:
     department = _department(db, "phase9-reconcile-suite-stage")
@@ -811,28 +820,7 @@ def test_reconcile_suite_staging_is_sensitive_but_metadata_owned(
         limit=1,
     )
     assert len(dry) == 1
-    assert dry[0].staging_present and not dry[0].staging_owned
-    with pytest.raises(EvaluationContractError):
-        reconcile_artifacts(
-            factory,
-            data_dir=root,
-            department_id=department.id,
-            actor_issuer=ISSUER,
-            actor_subject=actor.subject,
-            limit=1,
-            apply=True,
-        )
-    assert staged.path.exists()
-    (staged.path / "unexpected.txt").unlink()
-    dry = reconcile_artifacts(
-        factory,
-        data_dir=root,
-        department_id=department.id,
-        actor_issuer=ISSUER,
-        actor_subject=actor.subject,
-        limit=1,
-    )
-    assert dry[0].staging_owned
+    assert dry[0].staging_present and dry[0].staging_owned
     applied = reconcile_artifacts(
         factory,
         data_dir=root,
@@ -854,6 +842,109 @@ def test_reconcile_suite_staging_is_sensitive_but_metadata_owned(
         actor_issuer=ISSUER,
         actor_subject=actor.subject,
         limit=1,
+    )
+
+
+def test_reconcile_blocked_stage_does_not_starve_later_owned_stage(
+    db: Session, engine, tmp_path: Path
+) -> None:
+    department = _department(db, "phase9-reconcile-blocked")
+    actor = _identity(db, department, "department_admin", "reconcile-blocked-admin")
+    root = tmp_path / "runtime"
+    (root / "eval_results").mkdir(parents=True)
+    store = EvaluationArtifactStore(root)
+    scope = DepartmentScope(department.id)
+    unsafe_suite_id, unsafe_stage_id, unsafe_attempt_id = uuid4(), uuid4(), uuid4()
+    valid_suite_id, valid_stage_id, valid_attempt_id = uuid4(), uuid4(), uuid4()
+    unsafe = EvaluationSuiteImportAttempt(
+        id=unsafe_attempt_id,
+        department_id=department.id,
+        imported_by_user_id=actor.id,
+        suite_id=unsafe_suite_id,
+        stage_id=unsafe_stage_id,
+        status="registered",
+    )
+    valid = EvaluationSuiteImportAttempt(
+        id=valid_attempt_id,
+        department_id=department.id,
+        imported_by_user_id=actor.id,
+        suite_id=valid_suite_id,
+        stage_id=valid_stage_id,
+        status="registered",
+    )
+    db.add_all((unsafe, valid))
+    db.commit()
+
+    unsafe_stage = store._stage_directory(
+        store.staging_suites, scope, unsafe_suite_id, unsafe_stage_id
+    )
+    store.cleanup_stage(scope, unsafe_suite_id, unsafe_stage_id, suite=True)
+    foreign = tmp_path / "foreign-stage"
+    foreign.mkdir()
+    protected = foreign / "protected.txt"
+    protected.write_text("foreign", encoding="utf-8")
+    unsafe_stage.symlink_to(foreign, target_is_directory=True)
+
+    valid_stage = store._stage_directory(
+        store.staging_suites,
+        scope,
+        valid_suite_id,
+        valid_stage_id,
+    )
+    (valid_stage / "cases.jsonl").write_text("sensitive partial suite", encoding="utf-8")
+    factory = create_session_factory(engine)
+    with factory.begin() as session:
+        now = datetime.now(UTC) - timedelta(minutes=2)
+        session.get(EvaluationSuiteImportAttempt, unsafe_attempt_id).created_at = now
+        session.get(EvaluationSuiteImportAttempt, unsafe_attempt_id).updated_at = now
+        session.get(EvaluationSuiteImportAttempt, valid_attempt_id).created_at = now + timedelta(
+            seconds=1
+        )
+        session.get(EvaluationSuiteImportAttempt, valid_attempt_id).updated_at = now
+
+    applied = reconcile_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department.id,
+        actor_issuer=ISSUER,
+        actor_subject=actor.subject,
+        limit=2,
+        apply=True,
+    )
+    assert len(applied) == 2
+    blocked = next(item for item in applied if item.resource_id == unsafe_attempt_id)
+    completed = next(item for item in applied if item.resource_id == valid_attempt_id)
+    assert blocked.reconciliation_status == "blocked"
+    assert blocked.blocked_reason_code == "staging_path_unsafe"
+    assert not blocked.applied
+    assert completed.reconciliation_status == "completed" and completed.applied
+    assert protected.read_text(encoding="utf-8") == "foreign"
+    assert not valid_stage.exists()
+    with Session(engine) as session:
+        operation = session.scalar(select(EvaluationArtifactReconciliationOperation))
+        assert operation.status == "completed_with_blocks"
+        item = session.scalar(
+            select(EvaluationArtifactReconciliationOperationItem).where(
+                EvaluationArtifactReconciliationOperationItem.resource_id == unsafe_attempt_id
+            )
+        )
+        assert item.status == "blocked" and item.blocked_reason_code == "staging_path_unsafe"
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.action == "evaluation.artifact.reconcile"
+                )
+            )
+            == 1
+        )
+    assert not reconcile_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department.id,
+        actor_issuer=ISSUER,
+        actor_subject=actor.subject,
+        limit=2,
+        apply=True,
     )
 
 

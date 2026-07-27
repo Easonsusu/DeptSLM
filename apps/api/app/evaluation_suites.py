@@ -200,6 +200,8 @@ class ArtifactReconcileItem:
     final_present: bool
     final_owned: bool
     applied: bool
+    reconciliation_status: str
+    blocked_reason_code: str | None
 
     @property
     def owned(self) -> bool:
@@ -587,7 +589,14 @@ def reconcile_artifacts(
                 )
                 candidates = _reconciliation_candidates(session, department_id, limit)
             return tuple(
-                _reconciliation_item(store, scope, candidate, applied=False)
+                _reconciliation_item(
+                    store,
+                    scope,
+                    candidate,
+                    applied=False,
+                    reconciliation_status="dry_run",
+                    blocked_reason_code=None,
+                )
                 for candidate in candidates
             )
 
@@ -643,7 +652,7 @@ def reconcile_artifacts(
             candidates = _operation_candidates(session, operation.id, department_id)
             operation_id = operation.id
 
-        applied = _apply_reconciliation_operation(
+        outcomes = _apply_reconciliation_operation(
             factory,
             store,
             scope,
@@ -651,15 +660,22 @@ def reconcile_artifacts(
             request_scope,
             operation_id,
         )
-        return tuple(
-            _reconciliation_item(
-                store,
-                scope,
-                candidate,
-                applied=(candidate.resource_type, candidate.resource_id) in applied,
+        result: list[ArtifactReconcileItem] = []
+        for candidate in candidates:
+            outcome, reason = outcomes.get(
+                (candidate.resource_type, candidate.resource_id), ("registered", None)
             )
-            for candidate in candidates
-        )
+            result.append(
+                _reconciliation_item(
+                    store,
+                    scope,
+                    candidate,
+                    applied=outcome == "completed",
+                    reconciliation_status=outcome,
+                    blocked_reason_code=reason,
+                )
+            )
+        return tuple(result)
     except (ServiceError, EvaluationContractError):
         raise
     except SQLAlchemyError as error:
@@ -672,6 +688,12 @@ def _reconciliation_candidates(
     cutoff = session.scalar(
         select(func.clock_timestamp() - timedelta(seconds=RECONCILIATION_MINIMUM_AGE_SECONDS))
     )
+    blocked_run = ~select(EvaluationArtifactReconciliationOperationItem.id).where(
+        EvaluationArtifactReconciliationOperationItem.department_id == department_id,
+        EvaluationArtifactReconciliationOperationItem.resource_type == "evaluation_run",
+        EvaluationArtifactReconciliationOperationItem.resource_id == EvaluationRun.id,
+        EvaluationArtifactReconciliationOperationItem.status == "blocked",
+    ).exists()
     runs = tuple(
         session.execute(
             select(
@@ -688,6 +710,7 @@ def _reconciliation_candidates(
                 EvaluationRun.status.in_(("failed", "cancelled")),
                 EvaluationRun.publication_attempt_id.is_not(None),
                 EvaluationRun.updated_at <= cutoff,
+                blocked_run,
             )
             .order_by(EvaluationRun.created_at, EvaluationRun.id)
             .limit(limit)
@@ -719,6 +742,14 @@ def _reconciliation_candidates(
     remaining = limit - len(candidates)
     if remaining <= 0:
         return tuple(candidates)
+    blocked_suite = ~select(EvaluationArtifactReconciliationOperationItem.id).where(
+        EvaluationArtifactReconciliationOperationItem.department_id == department_id,
+        EvaluationArtifactReconciliationOperationItem.resource_type
+        == "evaluation_suite_import_attempt",
+        EvaluationArtifactReconciliationOperationItem.resource_id
+        == EvaluationSuiteImportAttempt.id,
+        EvaluationArtifactReconciliationOperationItem.status == "blocked",
+    ).exists()
     attempts = tuple(
         session.execute(
             select(
@@ -732,6 +763,7 @@ def _reconciliation_candidates(
                 EvaluationSuiteImportAttempt.department_id == department_id,
                 EvaluationSuiteImportAttempt.status.in_(("registered", "staged", "published")),
                 EvaluationSuiteImportAttempt.updated_at <= cutoff,
+                blocked_suite,
             )
             .order_by(EvaluationSuiteImportAttempt.created_at, EvaluationSuiteImportAttempt.id)
             .limit(remaining)
@@ -790,7 +822,7 @@ def _operation_candidates(
                 )
             ).one_or_none()
         if row is None:
-            raise EvaluationContractError("artifact_reconciliation_failed")
+            row = ("unavailable", item.created_at)
         candidates.append(
             _ArtifactReconcileCandidate(
                 item.resource_type,
@@ -814,9 +846,10 @@ def _apply_reconciliation_operation(
     principal: AuthenticatedPrincipal,
     request_scope: DepartmentRequestScope,
     operation_id: UUID,
-) -> set[tuple[str, UUID]]:
+) -> dict[tuple[str, UUID], tuple[str, str | None]]:
     """Delete under locked metadata, then atomically terminalize and audit the batch."""
 
+    outcomes: dict[tuple[str, UUID], tuple[str, str | None]] = {}
     applied: set[tuple[str, UUID]] = set()
     with factory.begin() as session:
         authorization = authorize_transaction(
@@ -837,7 +870,7 @@ def _apply_reconciliation_operation(
             .with_for_update()
         ).scalar_one_or_none()
         if operation is None:
-            return applied
+            return outcomes
         items = tuple(
             session.scalars(
                 select(EvaluationArtifactReconciliationOperationItem)
@@ -854,61 +887,80 @@ def _apply_reconciliation_operation(
         )
         now = session.scalar(select(_clock_timestamp()))
         for item in items:
-            candidate = _operation_candidates(session, operation_id, scope.value)
-            current = next(
-                (
-                    value
-                    for value in candidate
-                    if value.resource_type == item.resource_type
-                    and value.resource_id == item.resource_id
-                ),
-                None,
+            current = _ArtifactReconcileCandidate(
+                item.resource_type,
+                item.resource_id,
+                item.suite_id,
+                item.ownership_attempt_id,
+                item.stage_id,
+                item.attempt_number,
+                item.code_revision,
+                "registered",
+                item.created_at,
             )
-            if current is None:
-                raise EvaluationContractError("artifact_reconciliation_failed")
-            if item.resource_type == "evaluation_run":
-                row = session.execute(
-                    select(EvaluationRun)
-                    .where(
-                        EvaluationRun.id == item.resource_id,
-                        EvaluationRun.department_id == scope.value,
-                        EvaluationRun.suite_id == item.suite_id,
-                        EvaluationRun.status.in_(("failed", "cancelled")),
-                        EvaluationRun.publication_attempt_id == item.ownership_attempt_id,
-                        EvaluationRun.attempt_number == item.attempt_number,
-                        EvaluationRun.code_revision == item.code_revision,
-                    )
-                    .with_for_update()
-                ).scalar_one_or_none()
-                if row is not None:
+            try:
+                if item.resource_type == "evaluation_run":
+                    row = session.execute(
+                        select(EvaluationRun)
+                        .where(
+                            EvaluationRun.id == item.resource_id,
+                            EvaluationRun.department_id == scope.value,
+                            EvaluationRun.suite_id == item.suite_id,
+                            EvaluationRun.status.in_(("failed", "cancelled")),
+                            EvaluationRun.publication_attempt_id == item.ownership_attempt_id,
+                            EvaluationRun.attempt_number == item.attempt_number,
+                            EvaluationRun.code_revision == item.code_revision,
+                        )
+                        .with_for_update()
+                    ).scalar_one_or_none()
+                    if row is None:
+                        raise EvaluationContractError("result_publication_failed")
                     _delete_owned_run_artifacts(store, scope, current)
                     row.publication_attempt_id = None
                     row.version += 1
-                    applied.add((item.resource_type, item.resource_id))
-            else:
-                row = session.execute(
-                    select(EvaluationSuiteImportAttempt)
-                    .where(
-                        EvaluationSuiteImportAttempt.id == item.resource_id,
-                        EvaluationSuiteImportAttempt.department_id == scope.value,
-                        EvaluationSuiteImportAttempt.suite_id == item.suite_id,
-                        EvaluationSuiteImportAttempt.stage_id == item.stage_id,
-                        EvaluationSuiteImportAttempt.status.in_(
-                            ("registered", "staged", "published")
-                        ),
-                    )
-                    .with_for_update()
-                ).scalar_one_or_none()
-                if row is not None:
+                else:
+                    row = session.execute(
+                        select(EvaluationSuiteImportAttempt)
+                        .where(
+                            EvaluationSuiteImportAttempt.id == item.resource_id,
+                            EvaluationSuiteImportAttempt.department_id == scope.value,
+                            EvaluationSuiteImportAttempt.suite_id == item.suite_id,
+                            EvaluationSuiteImportAttempt.stage_id == item.stage_id,
+                            EvaluationSuiteImportAttempt.status.in_(
+                                ("registered", "staged", "published")
+                            ),
+                        )
+                        .with_for_update()
+                    ).scalar_one_or_none()
+                    if row is None:
+                        raise EvaluationContractError("result_publication_failed")
                     _delete_owned_suite_artifacts(store, scope, current)
                     row.status = "abandoned"
                     row.abandoned_at = now
                     row.cleanup_confirmed_at = now
                     row.version += 1
-                    applied.add((item.resource_type, item.resource_id))
+            except EvaluationContractError as error:
+                if error.code != "result_publication_failed":
+                    raise
+                reason = _blocked_reconciliation_reason(store, scope, current, error)
+                item.status = "blocked"
+                item.blocked_at = now
+                item.blocked_reason_code = reason
+                outcomes[(item.resource_type, item.resource_id)] = ("blocked", reason)
+                continue
             item.status = "completed"
             item.completed_at = now
-        operation.status = "completed"
+            applied.add((item.resource_type, item.resource_id))
+            outcomes[(item.resource_type, item.resource_id)] = ("completed", None)
+        has_blocks = session.scalar(
+            select(EvaluationArtifactReconciliationOperationItem.id)
+            .where(
+                EvaluationArtifactReconciliationOperationItem.operation_id == operation.id,
+                EvaluationArtifactReconciliationOperationItem.status == "blocked",
+            )
+            .limit(1)
+        ) is not None
+        operation.status = "completed_with_blocks" if has_blocks else "completed"
         operation.completed_at = now
         operation.version += 1
         if applied:
@@ -921,7 +973,7 @@ def _apply_reconciliation_operation(
                 resource_type="evaluation_artifact_reconciliation_operation",
                 resource_id=operation.id,
             )
-    return applied
+    return outcomes
 
 
 def _reconciliation_item(
@@ -930,6 +982,8 @@ def _reconciliation_item(
     candidate: _ArtifactReconcileCandidate,
     *,
     applied: bool,
+    reconciliation_status: str,
+    blocked_reason_code: str | None,
 ) -> ArtifactReconcileItem:
     try:
         if candidate.resource_type == "evaluation_run":
@@ -984,6 +1038,8 @@ def _reconciliation_item(
         final_present,
         final_owned,
         applied,
+        reconciliation_status,
+        blocked_reason_code,
     )
 
 
@@ -993,15 +1049,6 @@ def _delete_owned_run_artifacts(
     if candidate.attempt_number is None or candidate.code_revision is None:
         raise EvaluationContractError("artifact_reconciliation_failed")
     if store.run_stage_present(scope, candidate.resource_id, candidate.stage_id):
-        if not store.run_stage_owned_by(
-            scope,
-            candidate.resource_id,
-            candidate.suite_id,
-            candidate.ownership_attempt_id,
-            candidate.attempt_number,
-            candidate.code_revision,
-        ):
-            raise EvaluationContractError("artifact_reconciliation_failed")
         store.remove_owned_run_stage(
             scope,
             candidate.resource_id,
@@ -1034,13 +1081,6 @@ def _delete_owned_suite_artifacts(
     store: EvaluationArtifactStore, scope: DepartmentScope, candidate: _ArtifactReconcileCandidate
 ) -> None:
     if store.suite_stage_present(scope, candidate.suite_id, candidate.stage_id):
-        if not store.suite_stage_owned_by(
-            scope,
-            candidate.suite_id,
-            candidate.stage_id,
-            candidate.ownership_attempt_id,
-        ):
-            raise EvaluationContractError("artifact_reconciliation_failed")
         store.remove_owned_suite_stage(
             scope,
             candidate.suite_id,
@@ -1053,6 +1093,27 @@ def _delete_owned_suite_artifacts(
         ):
             raise EvaluationContractError("artifact_reconciliation_failed")
         store.remove_owned_suite_final(scope, candidate.suite_id, candidate.ownership_attempt_id)
+
+
+def _blocked_reconciliation_reason(
+    store: EvaluationArtifactStore,
+    scope: DepartmentScope,
+    candidate: _ArtifactReconcileCandidate,
+    _error: EvaluationContractError,
+) -> str:
+    """Classify only reviewed, content-free terminal outcomes for manual follow-up."""
+
+    if candidate.resource_type == "evaluation_run":
+        if store.run_stage_present(scope, candidate.resource_id, candidate.stage_id):
+            return "staging_path_unsafe"
+        if store.run_final_present(scope, candidate.resource_id):
+            return "artifact_manifest_invalid"
+    else:
+        if store.suite_stage_present(scope, candidate.suite_id, candidate.stage_id):
+            return "staging_path_unsafe"
+        if store.suite_final_present(scope, candidate.suite_id):
+            return "artifact_manifest_invalid"
+    return "artifact_ownership_mismatch"
 
 
 def capture_canonical_suite_authority(
