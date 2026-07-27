@@ -2,7 +2,7 @@
 
 ## Phase 9 status
 
-DeptSLM is not production ready. Phase 9 adds an internal evaluation runner under review, with external immutable suites, content-free result artifacts, and PostgreSQL-backed leases. It reuses the completed Phase 7 grounded-answer boundary; it is not a public evaluation API. Public vector search, conversations, history, streaming, reranking, scheduled evaluation, scheduled purge, malware scanning, OCR, training, production identity/storage, secrets management, backups, clustering, and production operations remain deferred.
+DeptSLM is not production ready. Phase 9 completed the internal evaluation runner with external immutable suites, content-free result artifacts, and PostgreSQL-backed leases. It reuses the completed Phase 7 grounded-answer boundary; it is not a public evaluation API. Phase 10 is the current planning scope and its implementation has not started. Public vector search, conversations, history, streaming, reranking, scheduled evaluation, scheduled purge, malware scanning, OCR, training, production identity/storage, secrets management, backups, clustering, and production operations remain deferred.
 
 ## Planned local services
 
