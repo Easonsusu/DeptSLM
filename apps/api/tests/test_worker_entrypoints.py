@@ -17,6 +17,14 @@ WORKER_ENTRYPOINTS = (
 )
 
 
+def prepare_worker_storage(entrypoint: Path, data_dir: Path) -> None:
+    """Create the worker-specific external storage root used by entrypoint tests."""
+
+    data_dir.mkdir(exist_ok=True)
+    if entrypoint.parent.name == "training-worker":
+        (data_dir / "training_datasets").mkdir(mode=0o700, exist_ok=True)
+
+
 def run_entrypoint(entrypoint: Path, data_dir: str | None) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     if data_dir is None:
@@ -24,9 +32,7 @@ def run_entrypoint(entrypoint: Path, data_dir: str | None) -> subprocess.Complet
     else:
         environment["DEPTSLM_DATA_DIR"] = data_dir
 
-    arguments = [str(entrypoint)]
-    if entrypoint.parent.name == "rag-worker" or not entrypoint.with_name("worker.py").exists():
-        arguments.extend([sys.executable, "-c", "print('worker-forwarded')"])
+    arguments = [str(entrypoint), sys.executable, "-c", "print('worker-forwarded')"]
     return subprocess.run(
         arguments,
         check=False,
@@ -50,11 +56,11 @@ def copy_worker_source(entrypoint: Path, destination: Path) -> Path:
 
 @pytest.mark.parametrize("entrypoint", WORKER_ENTRYPOINTS)
 def test_worker_accepts_temporary_storage(entrypoint: Path, tmp_path: Path) -> None:
+    prepare_worker_storage(entrypoint, tmp_path)
     result = run_entrypoint(entrypoint, str(tmp_path))
 
     assert result.returncode == 0
-    expected = "worker-forwarded" if entrypoint.parent.name == "rag-worker" else "placeholder"
-    assert expected in result.stdout
+    assert "worker-forwarded" in result.stdout
 
 
 @pytest.mark.parametrize("entrypoint", WORKER_ENTRYPOINTS)
@@ -108,7 +114,10 @@ def test_worker_rejects_repository_ancestor(entrypoint: Path) -> None:
 @pytest.mark.parametrize("entrypoint", WORKER_ENTRYPOINTS)
 def test_worker_rejects_unwritable_storage(entrypoint: Path, tmp_path: Path) -> None:
     data_dir = tmp_path / "read-only"
-    data_dir.mkdir()
+    prepare_worker_storage(entrypoint, data_dir)
+    training_root = data_dir / "training_datasets"
+    if training_root.is_dir():
+        training_root.chmod(0o500)
     data_dir.chmod(0o500)
 
     if os.access(data_dir, os.W_OK):
@@ -118,27 +127,24 @@ def test_worker_rejects_unwritable_storage(entrypoint: Path, tmp_path: Path) -> 
     try:
         result = run_entrypoint(entrypoint, str(data_dir))
     finally:
+        if training_root.is_dir():
+            training_root.chmod(0o700)
         data_dir.chmod(0o700)
 
     assert result.returncode != 0
-    assert "is not writable and searchable" in result.stderr
+    assert "writable and searchable" in result.stderr
 
 
 @pytest.mark.parametrize("entrypoint", WORKER_ENTRYPOINTS)
 def test_copied_worker_accepts_external_sibling_storage(entrypoint: Path, tmp_path: Path) -> None:
     copied_entrypoint = copy_worker_source(entrypoint, tmp_path / "container-app")
     data_dir = tmp_path / "runtime-data"
-    data_dir.mkdir()
+    prepare_worker_storage(entrypoint, data_dir)
 
     result = run_entrypoint(copied_entrypoint, str(data_dir))
 
     assert result.returncode == 0
-    expected = (
-        "worker-forwarded"
-        if not copied_entrypoint.with_name("worker.py").exists()
-        else "placeholder"
-    )
-    assert expected in result.stdout
+    assert "worker-forwarded" in result.stdout
 
 
 @pytest.mark.parametrize("entrypoint", WORKER_ENTRYPOINTS)
