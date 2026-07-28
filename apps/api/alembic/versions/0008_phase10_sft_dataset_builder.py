@@ -279,6 +279,7 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("id", "department_id", "source_bundle_id", name="uq_sft_build_scope"),
+        sa.UniqueConstraint("id", "department_id", name="uq_sft_build_department"),
     )
     op.create_index(
         "ix_sft_build_department_status_created",
@@ -287,6 +288,71 @@ def upgrade() -> None:
     )
     op.create_index(
         "ix_sft_build_claim", "sft_dataset_builds", ["status", "lease_expires_at", "created_at"]
+    )
+
+    op.create_table(
+        "sft_dataset_build_attempts",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("department_id", sa.Uuid(), nullable=False),
+        sa.Column("build_id", sa.Uuid(), nullable=False),
+        sa.Column("attempt_number", sa.Integer(), nullable=False),
+        sa.Column("publication_attempt_id", sa.Uuid(), nullable=False),
+        sa.Column("code_revision", sa.String(40), nullable=False),
+        sa.Column("status", sa.String(16), nullable=False),
+        sa.Column("ownership_manifest", sa.JSON()),
+        sa.Column(
+            "registered_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.Column("claimed_at", sa.DateTime(timezone=True)),
+        sa.Column("published_at", sa.DateTime(timezone=True)),
+        sa.Column("finished_at", sa.DateTime(timezone=True)),
+        sa.Column("cleanup_confirmed_at", sa.DateTime(timezone=True)),
+        sa.Column("version", sa.Integer(), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
+        sa.CheckConstraint(
+            "status IN ('running','reclaimed','succeeded','failed','cancelled')",
+            name="ck_sft_build_attempt_status",
+        ),
+        sa.CheckConstraint(
+            "attempt_number > 0 AND version > 0", name="ck_sft_build_attempt_versions"
+        ),
+        sa.CheckConstraint(
+            "(status = 'running' AND claimed_at IS NOT NULL AND finished_at IS NULL) OR "
+            "(status = 'reclaimed' AND finished_at IS NOT NULL) OR "
+            "(status = 'succeeded' AND published_at IS NOT NULL AND finished_at IS NOT NULL) OR "
+            "(status IN ('failed','cancelled') AND finished_at IS NOT NULL)",
+            name="ck_sft_build_attempt_lifecycle",
+        ),
+        sa.ForeignKeyConstraint(
+            ["build_id", "department_id"],
+            ["sft_dataset_builds.id", "sft_dataset_builds.department_id"],
+            name="fk_sft_build_attempt_scope",
+            ondelete="RESTRICT",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("id", "department_id", "build_id", name="uq_sft_build_attempt_scope"),
+        sa.UniqueConstraint("build_id", "attempt_number", name="uq_sft_build_attempt_number"),
+        sa.UniqueConstraint("publication_attempt_id", name="uq_sft_build_attempt_publication"),
+    )
+    op.create_index(
+        "ix_sft_build_attempt_department_status",
+        "sft_dataset_build_attempts",
+        ["department_id", "status", "created_at"],
+    )
+    op.create_index(
+        "uq_sft_build_attempt_active",
+        "sft_dataset_build_attempts",
+        ["build_id"],
+        unique=True,
+        postgresql_where=sa.text("status = 'running'"),
     )
 
     op.create_table(
@@ -379,7 +445,11 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint(
-            "operation_id", "resource_type", "resource_id", name="uq_sft_reconciliation_item"
+            "operation_id",
+            "resource_type",
+            "resource_id",
+            "attempt_id",
+            name="uq_sft_reconciliation_item",
         ),
     )
 
@@ -393,6 +463,9 @@ def downgrade() -> None:
     op.drop_table("sft_artifact_reconciliation_operations")
     op.drop_index("ix_sft_build_claim", table_name="sft_dataset_builds")
     op.drop_index("ix_sft_build_department_status_created", table_name="sft_dataset_builds")
+    op.drop_index("uq_sft_build_attempt_active", table_name="sft_dataset_build_attempts")
+    op.drop_index("ix_sft_build_attempt_department_status", table_name="sft_dataset_build_attempts")
+    op.drop_table("sft_dataset_build_attempts")
     op.drop_table("sft_dataset_builds")
     op.drop_index("ix_sft_source_import_department_status", table_name="sft_source_import_attempts")
     op.drop_table("sft_source_import_attempts")

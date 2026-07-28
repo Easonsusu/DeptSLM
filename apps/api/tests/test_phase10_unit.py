@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+from dataclasses import replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -11,12 +13,14 @@ import pytest
 
 from app.authorization import DepartmentScope
 from app.sft_artifacts import DATASET_FILES, STAGE_MARKER, SftArtifactError, SftArtifactStore
+from app.sft_authority import SftAuthorityReference, _fingerprint
 from app.sft_domain import (
     SftContractError,
     canonical_json_bytes,
     parse_source_bundle,
     split_examples,
 )
+from app.sft_queue import SftQueueError, _LeaseCheckpoint
 from app.sft_services import _same_stable_file
 from app.sft_supervision import SftChildOperation, _frame, run_claimed_operation
 
@@ -274,8 +278,8 @@ def test_stage_substitution_is_detected_without_deleting_replacement(tmp_path, m
 
     original = sft_artifacts._remove_contents
 
-    def replace_after_empty(descriptor: int) -> None:
-        original(descriptor)
+    def replace_after_empty(descriptor: int, *, checkpoint) -> None:
+        original(descriptor, checkpoint=checkpoint)
         os.rmdir(directory)
         directory.mkdir(mode=0o700)
 
@@ -412,6 +416,34 @@ def _child_request(tmp_path):
                 "vector_attempt_id": str(uuid4()),
             }
         )
+    selector_result = run_claimed_operation(
+        timeout_seconds=5,
+        heartbeat_seconds=1,
+        should_stop=lambda: False,
+        heartbeat=lambda: None,
+        error=_OperationError,
+        operation=SftChildOperation.SELECT_SOURCE,
+        request={
+            "source_fd": source_fd,
+            "stage_fd": stage.stage_fd,
+            "department_id": str(parsed.department_id),
+            "source_bundle_id": str(parsed.source_bundle_id),
+        },
+        pass_fds=(source_fd, stage.stage_fd),
+    )
+    assert selector_result["selector"]["count"] == len(authority)
+    descriptor = os.open(
+        ".deptslm-authority.jsonl",
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=stage.stage_fd,
+    )
+    try:
+        for item in authority:
+            os.write(descriptor, canonical_json_bytes(item) + b"\n")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     request = {
         "source_fd": source_fd,
         "stage_fd": stage.stage_fd,
@@ -422,7 +454,7 @@ def _child_request(tmp_path):
         "attempt_number": 1,
         "code_revision": "a" * 40,
         "authority_fingerprint": "b" * 64,
-        "authority": authority,
+        "authority_count": len(authority),
     }
     return store, source_fd, stage, request
 
@@ -451,10 +483,235 @@ def test_supervision_exec_child_heartbeats_and_returns_content_free_result(tmp_p
         }
         assert b"First" not in repr(result).encode("utf-8")
         assert heartbeats
+        assert set(os.listdir(stage.stage_fd)) == set(DATASET_FILES) | {STAGE_MARKER}
     finally:
         stage.close()
         os.close(source_fd)
         store.close()
+
+
+def test_descriptor_backed_authority_never_expands_the_ipc_frame() -> None:
+    request = {
+        "source_fd": 3,
+        "stage_fd": 4,
+        "department_id": str(uuid4()),
+        "source_bundle_id": str(uuid4()),
+        "build_id": str(uuid4()),
+        "publication_attempt_id": str(uuid4()),
+        "attempt_number": 1,
+        "code_revision": "a" * 40,
+        "authority_fingerprint": "b" * 64,
+        "authority_count": 800_000,
+    }
+    assert len(_frame({"operation": "build_dataset", "request": request}, 64 * 1024 * 1024)) < 2048
+    assert "authority" not in request
+
+
+def test_private_authority_fingerprint_covers_mutable_contract_fields() -> None:
+    reference = SftAuthorityReference(
+        department_id=uuid4(),
+        document_id=uuid4(),
+        document_version=1,
+        document_status="stored",
+        document_byte_size=9,
+        document_sha256="a" * 64,
+        extraction_id=uuid4(),
+        extraction_version=2,
+        extraction_status="succeeded",
+        extraction_attempt_number=3,
+        extraction_pipeline_version="phase5-v1",
+        extraction_parser_name="parser",
+        extraction_parser_version="1",
+        extraction_normalization_version="normalization-v1",
+        extraction_chunking_version="chunking-v1",
+        extraction_source_sha256="b" * 64,
+        extraction_normalized_sha256="c" * 64,
+        extraction_normalized_byte_size=10,
+        extraction_chunk_count=1,
+        extraction_finished_at=datetime.now(UTC),
+        indexing_id=uuid4(),
+        indexing_version=4,
+        indexing_status="succeeded",
+        indexing_attempt_number=5,
+        vector_attempt_id=uuid4(),
+        embedding_pipeline_version="embedding-v1",
+        embedding_model_id="model",
+        embedding_model_revision="revision",
+        embedding_dimension=1024,
+        embedding_distance="cosine",
+        vector_schema_version="schema-v1",
+        collection_identity="collection-v1",
+        indexing_expected_chunk_count=1,
+        indexing_point_count=1,
+        indexing_finished_at=datetime.now(UTC),
+        chunk_id=uuid4(),
+        chunk_created_at=datetime.now(UTC),
+        chunk_ordinal=0,
+        chunk_content_sha256="d" * 64,
+        chunk_byte_size=9,
+        chunk_char_start=0,
+        chunk_char_end=9,
+        provenance_kind="line",
+        provenance_start=1,
+        provenance_end=1,
+    )
+    private = reference.private_value()
+    assert {"document_sha256", "chunk_content_sha256", "indexing_point_count"}.issubset(private)
+    assert set(reference.provenance_value()) == {
+        "document_id",
+        "extraction_id",
+        "indexing_id",
+        "chunk_id",
+        "vector_attempt_id",
+    }
+    assert _fingerprint((reference,)) != _fingerprint(
+        (replace(reference, chunk_content_sha256="e" * 64),)
+    )
+    for changed in (
+        replace(reference, document_sha256="f" * 64),
+        replace(reference, extraction_normalized_sha256="g" * 64),
+        replace(reference, extraction_attempt_number=4),
+        replace(reference, indexing_point_count=2),
+        replace(reference, chunk_created_at=datetime.now(UTC)),
+    ):
+        assert _fingerprint((reference,)) != _fingerprint((changed,))
+
+
+def test_parent_artifact_hashing_invokes_live_checkpoint(tmp_path) -> None:
+    (tmp_path / "training_datasets").mkdir(mode=0o700)
+    manifest, examples = _source()
+    parsed = parse_source_bundle(manifest, examples)
+    store = SftArtifactStore(tmp_path)
+    scope = DepartmentScope(parsed.department_id)
+    staged = store.stage_source(
+        scope,
+        parsed.source_bundle_id,
+        parsed.import_attempt_id,
+        manifest=manifest,
+        examples=examples,
+    )
+    checkpoints: list[None] = []
+    try:
+        store.publish(
+            staged,
+            allowlist=frozenset({"manifest.json", "examples.jsonl"}),
+            expected=parsed.manifest,
+            checkpoint=lambda: checkpoints.append(None),
+        )
+    finally:
+        store.close()
+    assert len(checkpoints) >= 4
+
+
+def test_parent_final_hashing_and_cleanup_invoke_live_checkpoint(tmp_path) -> None:
+    (tmp_path / "training_datasets").mkdir(mode=0o700)
+    manifest, examples = _source()
+    parsed = parse_source_bundle(manifest, examples)
+    store = SftArtifactStore(tmp_path)
+    scope = DepartmentScope(parsed.department_id)
+    staged = store.stage_source(
+        scope,
+        parsed.source_bundle_id,
+        parsed.import_attempt_id,
+        manifest=manifest,
+        examples=examples,
+    )
+    checkpoints: list[None] = []
+    try:
+        published = store.publish(
+            staged,
+            allowlist=frozenset({"manifest.json", "examples.jsonl"}),
+            expected=parsed.manifest,
+            retain=True,
+            checkpoint=lambda: checkpoints.append(None),
+        )
+        verification = store.verify_retained_final(
+            published,
+            allowlist=frozenset({"manifest.json", "examples.jsonl"}),
+            expected=parsed.manifest,
+            checkpoint=lambda: checkpoints.append(None),
+        )
+        verification.close()
+        assert store.remove_owned_source_final(
+            scope,
+            parsed.source_bundle_id,
+            parsed.import_attempt_id,
+            expected=parsed.manifest,
+            checkpoint=lambda: checkpoints.append(None),
+        )
+    finally:
+        store.close()
+    assert len(checkpoints) >= 10
+
+
+def test_parent_checkpoint_failure_aborts_before_publication(tmp_path) -> None:
+    (tmp_path / "training_datasets").mkdir(mode=0o700)
+    manifest, examples = _source()
+    parsed = parse_source_bundle(manifest, examples)
+    store = SftArtifactStore(tmp_path)
+    scope = DepartmentScope(parsed.department_id)
+    staged = store.stage_source(
+        scope,
+        parsed.source_bundle_id,
+        parsed.import_attempt_id,
+        manifest=manifest,
+        examples=examples,
+    )
+    try:
+        with pytest.raises(_OperationError, match="claim_lost"):
+            store.publish(
+                staged,
+                allowlist=frozenset({"manifest.json", "examples.jsonl"}),
+                expected=parsed.manifest,
+                checkpoint=lambda: (_ for _ in ()).throw(_OperationError("claim_lost")),
+            )
+        assert (
+            tmp_path / "training_datasets/sources" / str(scope.value) / str(parsed.source_bundle_id)
+        ).exists() is False
+    finally:
+        staged.close()
+        store.close()
+
+
+def test_parent_lease_checkpoint_renews_and_fails_closed(monkeypatch) -> None:
+    from app import sft_queue
+
+    renewals: list[object] = []
+    checkpoint = _LeaseCheckpoint(
+        factory=SimpleNamespace(),
+        job=SimpleNamespace(),
+        lease_seconds=3,
+        operation_seconds=10,
+        should_stop=lambda: False,
+    )
+    monkeypatch.setattr(
+        sft_queue,
+        "renew_lease",
+        lambda factory, job, lease_seconds: renewals.append((factory, job, lease_seconds)),
+    )
+    checkpoint()
+    checkpoint._next_heartbeat = 0
+    checkpoint()
+    assert len(renewals) == 2
+
+    monkeypatch.setattr(
+        sft_queue,
+        "renew_lease",
+        lambda factory, job, lease_seconds: (_ for _ in ()).throw(SftQueueError("claim_lost")),
+    )
+    checkpoint._next_heartbeat = 0
+    with pytest.raises(SftQueueError, match="claim_lost"):
+        checkpoint()
+
+    stopped = _LeaseCheckpoint(
+        factory=SimpleNamespace(),
+        job=SimpleNamespace(),
+        lease_seconds=3,
+        operation_seconds=10,
+        should_stop=lambda: True,
+    )
+    with pytest.raises(SftQueueError, match="worker_shutdown"):
+        stopped()
 
 
 def test_supervision_timeout_terminates_before_unbounded_child_io() -> None:

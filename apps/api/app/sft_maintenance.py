@@ -18,6 +18,7 @@ from app.models import (
     SftArtifactReconciliationOperation,
     SftArtifactReconciliationOperationItem,
     SftDatasetBuild,
+    SftDatasetBuildAttempt,
     SftSourceBundle,
     SftSourceImportAttempt,
 )
@@ -242,20 +243,22 @@ def _register_or_resume_reconciliation(
                 .with_for_update(skip_locked=True)
                 .limit(limit)
             ).all()
-            builds = session.scalars(
-                select(SftDatasetBuild)
+            build_attempts = session.scalars(
+                select(SftDatasetBuildAttempt)
                 .where(
-                    SftDatasetBuild.department_id == department_id,
-                    SftDatasetBuild.status.in_(("failed", "cancelled")),
-                    SftDatasetBuild.publication_attempt_id.is_not(None),
-                    SftDatasetBuild.artifact_cleanup_confirmed_at.is_(None),
+                    SftDatasetBuildAttempt.department_id == department_id,
+                    SftDatasetBuildAttempt.status.in_(("reclaimed", "failed", "cancelled")),
+                    SftDatasetBuildAttempt.cleanup_confirmed_at.is_(None),
                 )
-                .order_by(SftDatasetBuild.created_at, SftDatasetBuild.id)
+                .order_by(
+                    SftDatasetBuildAttempt.created_at,
+                    SftDatasetBuildAttempt.id,
+                )
                 .with_for_update(skip_locked=True)
                 .limit(max(0, limit - len(attempts)))
             ).all()
             if not apply:
-                return None, _reconciliation_candidates(attempts, builds)
+                return None, _reconciliation_candidates(attempts, build_attempts)
             operation = SftArtifactReconciliationOperation(
                 department_id=department_id,
                 requested_by_user_id=authorization.identity.id,
@@ -265,7 +268,7 @@ def _register_or_resume_reconciliation(
             )
             session.add(operation)
             session.flush()
-            for candidate in _reconciliation_candidates(attempts, builds):
+            for candidate in _reconciliation_candidates(attempts, build_attempts):
                 session.add(
                     SftArtifactReconciliationOperationItem(
                         operation_id=operation.id,
@@ -388,7 +391,7 @@ def _register_or_resume_purge(
 
 def _reconciliation_candidates(
     attempts: list[SftSourceImportAttempt],
-    builds: list[SftDatasetBuild],
+    build_attempts: list[SftDatasetBuildAttempt],
 ) -> tuple[_ArtifactOperationItem, ...]:
     candidates: list[_ArtifactOperationItem] = []
     for attempt in attempts:
@@ -411,26 +414,24 @@ def _reconciliation_candidates(
                     ownership_manifest=dict(attempt.artifact_manifest),
                 )
             )
-    for build in builds:
-        if build.publication_attempt_id is None:
-            continue
+    for attempt in build_attempts:
         candidates.append(
             _ArtifactOperationItem(
                 id=uuid4(),
                 resource_type="dataset_stage",
-                resource_id=build.id,
-                attempt_id=build.publication_attempt_id,
+                resource_id=attempt.build_id,
+                attempt_id=attempt.publication_attempt_id,
                 ownership_manifest={},
             )
         )
-        if isinstance(build.publication_manifest, dict):
+        if isinstance(attempt.ownership_manifest, dict):
             candidates.append(
                 _ArtifactOperationItem(
                     id=uuid4(),
                     resource_type="dataset_final",
-                    resource_id=build.id,
-                    attempt_id=build.publication_attempt_id,
-                    ownership_manifest=dict(build.publication_manifest),
+                    resource_id=attempt.build_id,
+                    attempt_id=attempt.publication_attempt_id,
+                    ownership_manifest=dict(attempt.ownership_manifest),
                 )
             )
     return tuple(candidates)
@@ -787,6 +788,19 @@ def _finalize_reconciliation_resource(
             attempt.version += 1
         return
     if item.resource_type in {"dataset_stage", "dataset_final"}:
+        attempt = session.execute(
+            select(SftDatasetBuildAttempt)
+            .where(
+                SftDatasetBuildAttempt.build_id == item.resource_id,
+                SftDatasetBuildAttempt.department_id == department_id,
+                SftDatasetBuildAttempt.publication_attempt_id == item.attempt_id,
+                SftDatasetBuildAttempt.status.in_(("reclaimed", "failed", "cancelled")),
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if attempt is not None:
+            attempt.cleanup_confirmed_at = now
+            attempt.version += 1
         build = session.execute(
             select(SftDatasetBuild)
             .where(
@@ -797,7 +811,7 @@ def _finalize_reconciliation_resource(
             )
             .with_for_update()
         ).scalar_one_or_none()
-        if build is not None:
+        if build is not None and attempt is not None:
             build.artifact_cleanup_confirmed_at = now
             build.version += 1
 

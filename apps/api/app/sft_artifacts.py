@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -21,6 +22,7 @@ SOURCE_FILES = frozenset({"manifest.json", "examples.jsonl"})
 DATASET_FILES = frozenset({"manifest.json", "train.jsonl", "validation.jsonl", "provenance.jsonl"})
 STAGE_MARKER = ".deptslm-stage-owner"
 _MARKER_BYTES = b"deptslm-sft-stage-v1\n"
+_Checkpoint = Callable[[], None]
 
 
 class SftArtifactError(RuntimeError):
@@ -231,6 +233,7 @@ class SftArtifactStore:
         allowlist: frozenset[str],
         expected: dict[str, object] | None = None,
         retain: bool = False,
+        checkpoint: _Checkpoint | None = None,
     ) -> SftStagedArtifact:
         if (
             staged.stage_parent_fd is None
@@ -241,21 +244,39 @@ class SftArtifactStore:
         if allowlist not in {SOURCE_FILES, DATASET_FILES}:
             raise SftArtifactError()
         try:
+            check = checkpoint or _noop
+            check()
             _entry_matches(staged.stage_parent_fd, str(staged.attempt_id), staged.stage_fd)
             verified = _verify_files(
-                staged.stage_fd, allowlist, dict(staged.files), marker_allowed=True
+                staged.stage_fd,
+                allowlist,
+                dict(staged.files),
+                marker_allowed=True,
+                checkpoint=check,
             )
             if expected is not None:
                 _require_exact_manifest(
                     _parse_manifest(
-                        _read_file_at(staged.stage_fd, "manifest.json", maximum=256 * 1024)
+                        _read_file_at(
+                            staged.stage_fd,
+                            "manifest.json",
+                            maximum=256 * 1024,
+                            checkpoint=check,
+                        )
                     ),
                     allowlist,
                     verified,
                     expected,
                 )
+            check()
             _unlink_exact(staged.stage_fd, STAGE_MARKER)
-            _verify_files(staged.stage_fd, allowlist, dict(staged.files), marker_allowed=False)
+            _verify_files(
+                staged.stage_fd,
+                allowlist,
+                dict(staged.files),
+                marker_allowed=False,
+                checkpoint=check,
+            )
             try:
                 os.stat(
                     str(staged.resource_id), dir_fd=staged.final_parent_fd, follow_symlinks=False
@@ -264,6 +285,7 @@ class SftArtifactStore:
                 pass
             else:
                 raise SftArtifactError("artifact_ownership_mismatch")
+            check()
             os.rename(
                 str(staged.attempt_id),
                 str(staged.resource_id),
@@ -271,10 +293,15 @@ class SftArtifactStore:
                 dst_dir_fd=staged.final_parent_fd,
             )
             _fsync(staged.stage_parent_fd)
+            check()
             _fsync(staged.final_parent_fd)
             _entry_matches(staged.final_parent_fd, str(staged.resource_id), staged.stage_fd)
             verified = _verify_files(
-                staged.stage_fd, allowlist, dict(staged.files), marker_allowed=False
+                staged.stage_fd,
+                allowlist,
+                dict(staged.files),
+                marker_allowed=False,
+                checkpoint=check,
             )
             # Keep the exact final directory and its parent descriptor open so
             # final verification can be bound to the later metadata commit.
@@ -344,6 +371,7 @@ class SftArtifactStore:
         *,
         allowlist: frozenset[str],
         expected: dict[str, object],
+        checkpoint: _Checkpoint | None = None,
     ) -> SftFinalArtifactVerification:
         """Hash once outside locks and retain descriptors for commit-time proof."""
 
@@ -351,6 +379,8 @@ class SftArtifactStore:
             raise SftArtifactError("artifact_ownership_mismatch")
         if allowlist not in {SOURCE_FILES, DATASET_FILES}:
             raise SftArtifactError()
+        check = checkpoint or _noop
+        check()
         _require_private_directory(artifact.stage_fd, writable=True)
         _entry_matches(artifact.final_parent_fd, str(artifact.resource_id), artifact.stage_fd)
         names = set(os.listdir(artifact.stage_fd))
@@ -361,13 +391,16 @@ class SftArtifactStore:
             files: dict[str, ArtifactDigest] = {}
             manifest_raw: bytes | None = None
             for name in sorted(allowlist):
+                check()
                 descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=artifact.stage_fd)
                 try:
                     metadata = _require_private_file(descriptor, maximum=512 * 1024 * 1024)
                     current = os.stat(name, dir_fd=artifact.stage_fd, follow_symlinks=False)
                     if not _same_file(metadata, current):
                         raise SftArtifactError("artifact_ownership_mismatch")
-                    digest, raw = _digest_open_file(descriptor, maximum=512 * 1024 * 1024)
+                    digest, raw = _digest_open_file(
+                        descriptor, maximum=512 * 1024 * 1024, checkpoint=check
+                    )
                     if not _same_file(metadata, os.fstat(descriptor)):
                         raise SftArtifactError("artifact_ownership_mismatch")
                     descriptors.append((name, descriptor, metadata))
@@ -402,15 +435,20 @@ class SftArtifactStore:
         *,
         allowlist: frozenset[str],
         expected: dict[str, object],
+        checkpoint: _Checkpoint | None = None,
     ) -> dict[str, ArtifactDigest]:
         """Verify a child-written stage before it can be renamed into final storage."""
 
         if artifact.stage_fd is None or artifact.stage_parent_fd is None:
             raise SftArtifactError("artifact_ownership_mismatch")
+        check = checkpoint or _noop
+        check()
         _entry_matches(artifact.stage_parent_fd, str(artifact.attempt_id), artifact.stage_fd)
-        verified = _verify_files(artifact.stage_fd, allowlist, {}, marker_allowed=True)
+        verified = _verify_files(
+            artifact.stage_fd, allowlist, {}, marker_allowed=True, checkpoint=check
+        )
         manifest = _parse_manifest(
-            _read_file_at(artifact.stage_fd, "manifest.json", maximum=256 * 1024)
+            _read_file_at(artifact.stage_fd, "manifest.json", maximum=256 * 1024, checkpoint=check)
         )
         _require_exact_manifest(manifest, allowlist, verified, expected)
         artifact.files = tuple(sorted(verified.items()))
@@ -453,11 +491,60 @@ class SftArtifactStore:
             if parent is not None:
                 os.close(parent)
 
+    def open_stage_scratch(
+        self,
+        artifact: SftStagedArtifact,
+        name: str,
+        *,
+        expected: ArtifactDigest,
+        checkpoint: _Checkpoint | None = None,
+    ) -> int:
+        """Retain an exact scratch descriptor while its parent is later renamed.
+
+        The descriptor survives unlinking the scratch entry before final
+        allowlist verification, enabling exact final authority revalidation
+        without reopening a path or retaining source content in memory.
+        """
+
+        if artifact.stage_fd is None or artifact.stage_parent_fd is None:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        check = checkpoint or _noop
+        check()
+        _entry_matches(artifact.stage_parent_fd, str(artifact.attempt_id), artifact.stage_fd)
+        try:
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=artifact.stage_fd)
+            metadata = _require_private_file(descriptor, maximum=512 * 1024 * 1024)
+            digest, _ = _digest_open_file(descriptor, maximum=512 * 1024 * 1024, checkpoint=check)
+            current = os.stat(name, dir_fd=artifact.stage_fd, follow_symlinks=False)
+            if (
+                digest != expected
+                or not _same_file(metadata, os.fstat(descriptor))
+                or not _same_file(metadata, current)
+            ):
+                raise SftArtifactError("artifact_ownership_mismatch")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            return descriptor
+        except Exception:
+            try:
+                os.close(descriptor)
+            except (OSError, UnboundLocalError):
+                pass
+            raise
+
     def remove_owned_source_stage(
-        self, scope: DepartmentScope, source_bundle_id: UUID, import_attempt_id: UUID
+        self,
+        scope: DepartmentScope,
+        source_bundle_id: UUID,
+        import_attempt_id: UUID,
+        *,
+        checkpoint: _Checkpoint | None = None,
     ) -> bool:
         return self._remove_stage(
-            self._staging_sources_fd, scope, source_bundle_id, import_attempt_id
+            self._staging_sources_fd,
+            scope,
+            source_bundle_id,
+            import_attempt_id,
+            checkpoint=checkpoint,
         )
 
     def open_source_stage(
@@ -474,10 +561,19 @@ class SftArtifactStore:
         )
 
     def remove_owned_dataset_stage(
-        self, scope: DepartmentScope, build_id: UUID, publication_attempt_id: UUID
+        self,
+        scope: DepartmentScope,
+        build_id: UUID,
+        publication_attempt_id: UUID,
+        *,
+        checkpoint: _Checkpoint | None = None,
     ) -> bool:
         return self._remove_stage(
-            self._staging_datasets_fd, scope, build_id, publication_attempt_id
+            self._staging_datasets_fd,
+            scope,
+            build_id,
+            publication_attempt_id,
+            checkpoint=checkpoint,
         )
 
     def open_dataset_stage(
@@ -500,8 +596,16 @@ class SftArtifactStore:
         import_attempt_id: UUID,
         *,
         expected: dict[str, object],
+        checkpoint: _Checkpoint | None = None,
     ) -> bool:
-        return self._remove_final(self._sources_fd, scope, source_bundle_id, SOURCE_FILES, expected)
+        return self._remove_final(
+            self._sources_fd,
+            scope,
+            source_bundle_id,
+            SOURCE_FILES,
+            expected,
+            checkpoint=checkpoint,
+        )
 
     def remove_owned_dataset_final(
         self,
@@ -510,8 +614,16 @@ class SftArtifactStore:
         publication_attempt_id: UUID,
         *,
         expected: dict[str, object],
+        checkpoint: _Checkpoint | None = None,
     ) -> bool:
-        return self._remove_final(self._datasets_fd, scope, build_id, DATASET_FILES, expected)
+        return self._remove_final(
+            self._datasets_fd,
+            scope,
+            build_id,
+            DATASET_FILES,
+            expected,
+            checkpoint=checkpoint,
+        )
 
     def _stage(
         self,
@@ -663,7 +775,13 @@ class SftArtifactStore:
             os.close(directory)
 
     def _remove_stage(
-        self, root_fd: int, scope: DepartmentScope, resource_id: UUID, attempt_id: UUID
+        self,
+        root_fd: int,
+        scope: DepartmentScope,
+        resource_id: UUID,
+        attempt_id: UUID,
+        *,
+        checkpoint: _Checkpoint | None = None,
     ) -> bool:
         if resource_id.int == 0 or attempt_id.int == 0:
             raise SftArtifactError()
@@ -674,7 +792,7 @@ class SftArtifactStore:
                 try:
                     stage = _open_private_child(resource, str(attempt_id))
                     try:
-                        _remove_contents(stage)
+                        _remove_contents(stage, checkpoint=checkpoint or _noop)
                         _rmdir_exact(resource, str(attempt_id), stage)
                         _fsync(resource)
                         return True
@@ -696,18 +814,24 @@ class SftArtifactStore:
         resource_id: UUID,
         allowlist: frozenset[str],
         expected: dict[str, object],
+        *,
+        checkpoint: _Checkpoint | None = None,
     ) -> bool:
         try:
             department = _open_private_child(root_fd, str(scope.value))
             try:
                 target = _open_private_child(department, str(resource_id))
                 try:
-                    verified = _verify_files(target, allowlist, {}, marker_allowed=False)
+                    check = checkpoint or _noop
+                    check()
+                    verified = _verify_files(
+                        target, allowlist, {}, marker_allowed=False, checkpoint=check
+                    )
                     manifest = _parse_manifest(
-                        _read_file_at(target, "manifest.json", maximum=256 * 1024)
+                        _read_file_at(target, "manifest.json", maximum=256 * 1024, checkpoint=check)
                     )
                     _require_exact_manifest(manifest, allowlist, verified, expected)
-                    _remove_contents(target)
+                    _remove_contents(target, checkpoint=check)
                     _rmdir_exact(department, str(resource_id), target)
                     _fsync(department)
                     return True
@@ -842,7 +966,13 @@ def _write_file(directory_fd: int, name: str, value: bytes) -> ArtifactDigest:
         os.close(descriptor)
 
 
-def _read_file_at(directory_fd: int, name: str, *, maximum: int) -> bytes:
+def _read_file_at(
+    directory_fd: int,
+    name: str,
+    *,
+    maximum: int,
+    checkpoint: _Checkpoint | None = None,
+) -> bytes:
     descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
     try:
         before = os.fstat(descriptor)
@@ -853,7 +983,9 @@ def _read_file_at(directory_fd: int, name: str, *, maximum: int) -> bytes:
         ):
             raise SftArtifactError("source_artifact_mismatch")
         output = bytearray()
+        check = checkpoint or _noop
         while True:
+            check()
             part = os.read(descriptor, min(64 * 1024, maximum + 1 - len(output)))
             if not part:
                 break
@@ -877,25 +1009,45 @@ def _verify_files(
     expected: dict[str, ArtifactDigest],
     *,
     marker_allowed: bool,
+    checkpoint: _Checkpoint | None = None,
 ) -> dict[str, ArtifactDigest]:
+    check = checkpoint or _noop
+    check()
     names = set(os.listdir(directory_fd))
     permitted = set(allowlist) | ({STAGE_MARKER} if marker_allowed else set())
     if names != permitted:
         raise SftArtifactError("artifact_ownership_mismatch")
-    verified = {name: _digest_file(directory_fd, name) for name in sorted(allowlist)}
+    verified = {
+        name: _digest_file(directory_fd, name, checkpoint=check) for name in sorted(allowlist)
+    }
     if expected and verified != expected:
         raise SftArtifactError("artifact_ownership_mismatch")
-    manifest = _parse_manifest(_read_file_at(directory_fd, "manifest.json", maximum=256 * 1024))
+    manifest = _parse_manifest(
+        _read_file_at(directory_fd, "manifest.json", maximum=256 * 1024, checkpoint=check)
+    )
     _require_manifest_files(manifest, allowlist, verified)
     return verified
 
 
-def _digest_file(directory_fd: int, name: str) -> ArtifactDigest:
-    raw = _read_file_at(directory_fd, name, maximum=512 * 1024 * 1024)
-    return ArtifactDigest(hashlib.sha256(raw).hexdigest(), len(raw))
+def _digest_file(
+    directory_fd: int, name: str, *, checkpoint: _Checkpoint | None = None
+) -> ArtifactDigest:
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        digest, _ = _digest_open_file(
+            descriptor, maximum=512 * 1024 * 1024, checkpoint=checkpoint or _noop
+        )
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not _same_file(os.fstat(descriptor), current):
+            raise SftArtifactError("artifact_ownership_mismatch")
+        return digest
+    finally:
+        os.close(descriptor)
 
 
-def _digest_open_file(descriptor: int, *, maximum: int) -> tuple[ArtifactDigest, bytes | None]:
+def _digest_open_file(
+    descriptor: int, *, maximum: int, checkpoint: _Checkpoint | None = None
+) -> tuple[ArtifactDigest, bytes | None]:
     """Hash one retained descriptor without holding a second pathname handle."""
 
     before = _require_private_file(descriptor, maximum=maximum)
@@ -903,7 +1055,9 @@ def _digest_open_file(descriptor: int, *, maximum: int) -> tuple[ArtifactDigest,
     digest = hashlib.sha256()
     total = 0
     retained = bytearray() if before.st_size <= 256 * 1024 else None
+    check = checkpoint or _noop
     while True:
+        check()
         part = os.read(descriptor, min(64 * 1024, maximum + 1 - total))
         if not part:
             break
@@ -1001,15 +1155,16 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object
     return result
 
 
-def _remove_contents(directory_fd: int) -> None:
+def _remove_contents(directory_fd: int, *, checkpoint: _Checkpoint) -> None:
     for name in os.listdir(directory_fd):
+        checkpoint()
         metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if stat.S_ISDIR(metadata.st_mode):
             child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory_fd)
             try:
                 _require_private_directory(child, writable=True)
                 _entry_matches(directory_fd, name, child)
-                _remove_contents(child)
+                _remove_contents(child, checkpoint=checkpoint)
                 _rmdir_exact(directory_fd, name, child)
             finally:
                 os.close(child)
@@ -1039,3 +1194,7 @@ def _fsync(descriptor: int) -> None:
         os.fsync(descriptor)
     except OSError as error:
         raise SftArtifactError("dataset_publication_failed") from error
+
+
+def _noop() -> None:
+    return None

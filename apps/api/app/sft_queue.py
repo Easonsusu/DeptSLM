@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from uuid import UUID, uuid4
@@ -18,15 +19,21 @@ from app.models import (
     Membership,
     PersistentAuditEvent,
     SftDatasetBuild,
+    SftDatasetBuildAttempt,
     SftSourceBundle,
 )
 from app.sft_artifacts import (
     DATASET_FILES,
+    ArtifactDigest,
     SftArtifactError,
     SftArtifactStore,
     SftFinalArtifactVerification,
 )
-from app.sft_authority import SftSourceAuthorityError, validate_source_authority
+from app.sft_authority import (
+    SftSourceAuthorityError,
+    validate_authority_selector,
+    write_authority_mapping,
+)
 from app.sft_domain import (
     DATASET_ARTIFACT_CONTRACT_VERSION,
     EXAMPLE_CONTRACT_VERSION,
@@ -34,9 +41,10 @@ from app.sft_domain import (
     SPLIT_VERSION,
     VALIDATION_RATIO,
     SftContractError,
-    parse_source_bundle,
 )
 from app.sft_supervision import SftChildOperation, run_claimed_operation
+
+_SELECTOR_FILE = ".deptslm-selector.jsonl"
 
 
 class SftQueueError(RuntimeError):
@@ -78,9 +86,50 @@ class ClaimedSftBuild:
     stale_publication_manifest: dict[str, object] | None
 
 
+class _LeaseCheckpoint:
+    """Monotonic, cancellation-aware parent-operation lease coverage."""
+
+    def __init__(
+        self,
+        factory: sessionmaker[Session],
+        job: ClaimedSftBuild,
+        *,
+        lease_seconds: int,
+        operation_seconds: int,
+        should_stop: Callable[[], bool],
+    ) -> None:
+        self.factory = factory
+        self.job = job
+        self.lease_seconds = lease_seconds
+        self.should_stop = should_stop
+        self.deadline = time.monotonic() + operation_seconds
+        self._next_heartbeat = 0.0
+        self._interval = max(0.1, min(15.0, lease_seconds / 3))
+
+    def __call__(self) -> None:
+        now = time.monotonic()
+        if self.should_stop():
+            raise SftQueueError("worker_shutdown")
+        if now >= self.deadline:
+            raise SftQueueError("worker_timeout")
+        if now >= self._next_heartbeat:
+            renew_lease(self.factory, self.job, self.lease_seconds)
+            self._next_heartbeat = now + self._interval
+
+    def final_check(self) -> None:
+        """Check cancellation and deadline while a final transaction owns locks."""
+
+        if self.should_stop():
+            raise SftQueueError("worker_shutdown")
+        if time.monotonic() >= self.deadline:
+            raise SftQueueError("worker_timeout")
+
+
 def claim_next(
     factory: sessionmaker[Session], worker_id: UUID, lease_seconds: int, code_revision: str
 ) -> ClaimedSftBuild | None:
+    """Claim one build and durably register its external ownership first."""
+
     try:
         with factory() as session, session.begin():
             row = session.execute(
@@ -102,25 +151,58 @@ def claim_next(
             department = session.execute(
                 select(Department).where(Department.id == row.department_id).with_for_update()
             ).scalar_one_or_none()
-            if department is None or department.status != "active":
-                _terminal_failure(
-                    row, session.scalar(select(func.clock_timestamp())), "department_unavailable"
-                )
-                return None
-            stale_attempt = row.publication_attempt_id if row.status == "running" else None
-            stale_manifest = (
-                dict(row.publication_manifest)
-                if stale_attempt is not None and isinstance(row.publication_manifest, dict)
-                else None
-            )
             now = session.scalar(select(func.clock_timestamp()))
-            if stale_attempt is not None:
+            if department is None or department.status != "active":
+                _terminal_failure(row, now, "department_unavailable")
+                return None
+
+            stale_id: UUID | None = None
+            stale_manifest: dict[str, object] | None = None
+            if row.status == "running":
+                if row.publication_attempt_id is None:
+                    raise SftQueueError("database_unavailable")
+                stale = session.execute(
+                    select(SftDatasetBuildAttempt)
+                    .where(
+                        SftDatasetBuildAttempt.department_id == row.department_id,
+                        SftDatasetBuildAttempt.build_id == row.id,
+                        SftDatasetBuildAttempt.publication_attempt_id == row.publication_attempt_id,
+                        SftDatasetBuildAttempt.status == "running",
+                    )
+                    .with_for_update()
+                ).scalar_one_or_none()
+                if stale is None:
+                    raise SftQueueError("database_unavailable")
+                stale.status = "reclaimed"
+                stale.finished_at = now
+                stale.version += 1
+                stale_id = stale.publication_attempt_id
+                stale_manifest = (
+                    dict(stale.ownership_manifest)
+                    if isinstance(stale.ownership_manifest, dict)
+                    else None
+                )
                 row.attempt_number += 1
+
+            attempt_id = uuid4()
+            token = uuid4()
+            session.add(
+                SftDatasetBuildAttempt(
+                    department_id=row.department_id,
+                    build_id=row.id,
+                    attempt_number=row.attempt_number,
+                    publication_attempt_id=attempt_id,
+                    code_revision=row.code_revision,
+                    status="running",
+                    claimed_at=now,
+                    version=1,
+                )
+            )
             row.status = "running"
             row.review_status = "not_ready"
             row.worker_id = worker_id
-            row.claim_token = uuid4()
-            row.publication_attempt_id = uuid4()
+            row.claim_token = token
+            row.publication_attempt_id = attempt_id
             row.publication_manifest = None
             row.claimed_at = now
             row.lease_expires_at = now + timedelta(seconds=lease_seconds)
@@ -135,13 +217,15 @@ def claim_next(
                 source_bundle_id=row.source_bundle_id,
                 requested_by_user_id=row.requested_by_user_id,
                 worker_id=worker_id,
-                claim_token=row.claim_token,
-                publication_attempt_id=row.publication_attempt_id,
+                claim_token=token,
+                publication_attempt_id=attempt_id,
                 code_revision=row.code_revision,
                 attempt_number=row.attempt_number,
-                stale_publication_attempt_id=stale_attempt,
+                stale_publication_attempt_id=stale_id,
                 stale_publication_manifest=stale_manifest,
             )
+    except SftQueueError:
+        raise
     except SQLAlchemyError as error:
         raise SftQueueError() from error
 
@@ -167,14 +251,18 @@ def require_live_claim(factory: sessionmaker[Session], job: ClaimedSftBuild) -> 
 def renew_lease(factory: sessionmaker[Session], job: ClaimedSftBuild, lease_seconds: int) -> None:
     try:
         with factory.begin() as session:
+            row = session.execute(
+                select(SftDatasetBuild.cancellation_requested_at).where(
+                    *_owned(job), *_contract(job), _live()
+                )
+            ).one_or_none()
+            if row is None:
+                raise SftQueueError("claim_lost")
+            if row.cancellation_requested_at is not None:
+                raise SftQueueError("cancelled")
             result = session.execute(
                 update(SftDatasetBuild)
-                .where(
-                    *_owned(job),
-                    *_contract(job),
-                    _live(),
-                    SftDatasetBuild.cancellation_requested_at.is_(None),
-                )
+                .where(*_owned(job), *_contract(job), _live())
                 .values(
                     lease_expires_at=func.clock_timestamp() + timedelta(seconds=lease_seconds),
                     version=SftDatasetBuild.version + 1,
@@ -195,27 +283,70 @@ def process_build(
     *,
     lease_seconds: int,
     operation_seconds: int = 120,
-    should_stop=lambda: False,
+    should_stop: Callable[[], bool] = lambda: False,
 ) -> None:
-    """Build exact JSONL artifacts with rechecks before external mutation and final success."""
+    """Build only under one live claim, without parent-side source parsing."""
 
     scope = DepartmentScope(job.department_id)
+    guard = _LeaseCheckpoint(
+        factory,
+        job,
+        lease_seconds=lease_seconds,
+        operation_seconds=operation_seconds,
+        should_stop=should_stop,
+    )
     verification: SftFinalArtifactVerification | None = None
     staged = None
+    selector_fd: int | None = None
     try:
+        guard()
         if job.stale_publication_attempt_id is not None:
-            require_live_claim(factory, job)
-            _cleanup_stale_attempt(data_dir, scope, job)
-            renew_lease(factory, job, lease_seconds)
-        source, authority, source_chunk_ids = _read_and_validate_source(
-            factory, data_dir, scope, job
-        )
+            _cleanup_stale_attempt(factory, data_dir, scope, job, checkpoint=guard)
+            guard()
+        source = _load_source_metadata(factory, job, checkpoint=guard)
         with SftArtifactStore(data_dir) as store:
+            guard()
             source_fd = store.open_source_directory(scope, job.source_bundle_id)
             try:
                 staged = store.prepare_dataset_stage(scope, job.id, job.publication_attempt_id)
                 if staged.stage_fd is None:
                     raise SftQueueError("dataset_publication_failed")
+                selector_result = _supervise(
+                    factory,
+                    job,
+                    lease_seconds,
+                    operation_seconds,
+                    should_stop,
+                    operation=SftChildOperation.SELECT_SOURCE,
+                    request={
+                        "source_fd": source_fd,
+                        "stage_fd": staged.stage_fd,
+                        "department_id": str(job.department_id),
+                        "source_bundle_id": str(job.source_bundle_id),
+                    },
+                    pass_fds=(source_fd, staged.stage_fd),
+                )
+                selector = _validate_selector_result(selector_result, source)
+                selector_fd = store.open_stage_scratch(
+                    staged,
+                    _SELECTOR_FILE,
+                    expected=ArtifactDigest(selector["sha256"], selector["byte_size"]),
+                    checkpoint=guard,
+                )
+                with factory() as session:
+                    authority = write_authority_mapping(
+                        session,
+                        job.department_id,
+                        selector_fd,
+                        staged.stage_fd,
+                        checkpoint=guard,
+                    )
+                if (
+                    authority.fingerprint != source.authority_snapshot_sha256
+                    or authority.selector_count != selector["count"]
+                ):
+                    raise SftQueueError("source_authority_changed")
+                guard()
                 result = _supervise(
                     factory,
                     job,
@@ -223,7 +354,13 @@ def process_build(
                     operation_seconds,
                     should_stop,
                     operation=SftChildOperation.BUILD_DATASET,
-                    request=_child_request(source_fd, staged.stage_fd, job, authority),
+                    request=_build_request(
+                        source_fd,
+                        staged.stage_fd,
+                        job,
+                        authority.fingerprint,
+                        authority.selector_count,
+                    ),
                     pass_fds=(source_fd, staged.stage_fd),
                 )
             finally:
@@ -231,29 +368,41 @@ def process_build(
                     os.close(source_fd)
                 except OSError:
                     pass
-            manifest, train_count, validation_count = _validate_child_result(
-                result, source, authority, job
-            )
+            manifest, train_count, validation_count = _validate_child_result(result, source, job)
             _record_publication_manifest(factory, job, manifest)
-            require_live_claim(factory, job)
-            store.verify_staged(staged, allowlist=DATASET_FILES, expected=manifest)
+            guard()
+            store.verify_staged(
+                staged, allowlist=DATASET_FILES, expected=manifest, checkpoint=guard
+            )
+            guard()
             published = store.publish(
-                staged, allowlist=DATASET_FILES, expected=manifest, retain=True
+                staged,
+                allowlist=DATASET_FILES,
+                expected=manifest,
+                retain=True,
+                checkpoint=guard,
             )
             staged = published
+            _mark_attempt_published(factory, job)
+            guard()
             verification = store.verify_retained_final(
-                published, allowlist=DATASET_FILES, expected=manifest
+                published, allowlist=DATASET_FILES, expected=manifest, checkpoint=guard
             )
             staged = None
+            # Extend server-time ownership immediately before the short commit.
+            renew_lease(factory, job, lease_seconds)
             _complete(
                 factory,
                 job,
                 verification,
-                source_chunk_ids=source_chunk_ids,
+                selector_fd=selector_fd,
+                selector_count=selector["count"],
                 authority_fingerprint=authority.fingerprint,
                 publication_manifest=manifest,
                 train_count=train_count,
                 validation_count=validation_count,
+                guard=guard,
+                lease_seconds=lease_seconds,
             )
     except SftQueueError as error:
         _fail_or_cancel(factory, job, error.code)
@@ -261,21 +410,26 @@ def process_build(
         _fail_or_cancel(factory, job, error.code)
     except SftArtifactError as error:
         _fail_or_cancel(factory, job, error.code)
+    except SftSourceAuthorityError:
+        _fail_or_cancel(factory, job, "source_authority_changed")
     except Exception:
         _fail_or_cancel(factory, job, "dataset_publication_failed")
     finally:
+        if selector_fd is not None:
+            try:
+                os.close(selector_fd)
+            except OSError:
+                pass
         if verification is not None:
             verification.close()
         elif staged is not None:
             staged.close()
 
 
-def _read_and_validate_source(
-    factory: sessionmaker[Session],
-    data_dir,
-    scope: DepartmentScope,
-    job: ClaimedSftBuild,
-):
+def _load_source_metadata(
+    factory: sessionmaker[Session], job: ClaimedSftBuild, *, checkpoint: _LeaseCheckpoint
+) -> SftSourceBundle:
+    checkpoint()
     try:
         with factory() as session:
             source = session.execute(
@@ -300,43 +454,9 @@ def _read_and_validate_source(
                 "instructor",
             }:
                 raise SftQueueError("requester_unauthorized")
-            source_fingerprint = source.authority_snapshot_sha256
-        # The source body is never returned through IPC and is never persisted
-        # in PostgreSQL.  This parent-side preflight derives transient selectors
-        # solely to capture current database authority for the isolated child.
-        with SftArtifactStore(data_dir) as store:
-            manifest_raw, examples_raw = store.read_source(scope, job.source_bundle_id)
-        parsed = parse_source_bundle(manifest_raw, examples_raw)
-        source_chunk_ids = {
-            chunk_id for example in parsed.examples for chunk_id in example.source_chunk_ids
-        }
-        with factory() as session:
-            if (
-                parsed.department_id != job.department_id
-                or parsed.source_bundle_id != job.source_bundle_id
-                or hashlib.sha256(manifest_raw).hexdigest() != source.manifest_sha256
-                or parsed.examples_sha256 != source.examples_sha256
-                or parsed.examples_byte_size != source.examples_byte_size
-                or len(parsed.examples) != source.example_count
-                or parsed.group_count != source.group_count
-                or parsed.source_reference_count != source.source_reference_count
-            ):
-                raise SftQueueError("source_artifact_mismatch")
-            authority = validate_source_authority(
-                session,
-                job.department_id,
-                source_chunk_ids,
-                expected_fingerprint=source_fingerprint,
-            )
-            return source, authority, source_chunk_ids
+            return source
     except SftQueueError:
         raise
-    except SftArtifactError as error:
-        raise SftQueueError("source_artifact_missing") from error
-    except SftContractError as error:
-        raise SftQueueError("source_contract_invalid") from error
-    except SftSourceAuthorityError as error:
-        raise SftQueueError("source_authority_changed") from error
     except SQLAlchemyError as error:
         raise SftQueueError() from error
 
@@ -364,20 +484,61 @@ def _supervise(
     )
 
 
-def _cleanup_stale_attempt(data_dir, scope: DepartmentScope, job: ClaimedSftBuild) -> bool:
+def _cleanup_stale_attempt(
+    factory: sessionmaker[Session],
+    data_dir,
+    scope: DepartmentScope,
+    job: ClaimedSftBuild,
+    *,
+    checkpoint: _LeaseCheckpoint,
+) -> bool:
+    if job.stale_publication_attempt_id is None:
+        return False
     with SftArtifactStore(data_dir) as store:
-        removed = store.remove_owned_dataset_stage(scope, job.id, job.stale_publication_attempt_id)
+        checkpoint()
+        removed = store.remove_owned_dataset_stage(
+            scope, job.id, job.stale_publication_attempt_id, checkpoint=checkpoint
+        )
         if job.stale_publication_manifest is not None:
+            checkpoint()
             removed = (
                 store.remove_owned_dataset_final(
                     scope,
                     job.id,
                     job.stale_publication_attempt_id,
                     expected=job.stale_publication_manifest,
+                    checkpoint=checkpoint,
                 )
                 or removed
             )
-        return removed
+    checkpoint()
+    _confirm_attempt_cleanup(factory, job, job.stale_publication_attempt_id)
+    return removed
+
+
+def _confirm_attempt_cleanup(
+    factory: sessionmaker[Session], job: ClaimedSftBuild, attempt_id: UUID
+) -> None:
+    try:
+        with factory.begin() as session:
+            row = session.execute(
+                select(SftDatasetBuildAttempt)
+                .where(
+                    SftDatasetBuildAttempt.department_id == job.department_id,
+                    SftDatasetBuildAttempt.build_id == job.id,
+                    SftDatasetBuildAttempt.publication_attempt_id == attempt_id,
+                    SftDatasetBuildAttempt.status.in_(("reclaimed", "failed", "cancelled")),
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                raise SftQueueError("claim_lost")
+            row.cleanup_confirmed_at = session.scalar(select(func.clock_timestamp()))
+            row.version += 1
+    except SftQueueError:
+        raise
+    except SQLAlchemyError as error:
+        raise SftQueueError() from error
 
 
 def _record_publication_manifest(
@@ -390,22 +551,66 @@ def _record_publication_manifest(
                 .where(*_owned(job), *_contract(job), _live())
                 .with_for_update()
             ).scalar_one_or_none()
-            if row is None or row.cancellation_requested_at is not None:
+            attempt = session.execute(
+                select(SftDatasetBuildAttempt)
+                .where(
+                    SftDatasetBuildAttempt.department_id == job.department_id,
+                    SftDatasetBuildAttempt.build_id == job.id,
+                    SftDatasetBuildAttempt.publication_attempt_id == job.publication_attempt_id,
+                    SftDatasetBuildAttempt.status == "running",
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None or attempt is None or row.cancellation_requested_at is not None:
                 raise SftQueueError("claim_lost")
             if row.publication_manifest is not None and row.publication_manifest != manifest:
                 raise SftQueueError("dataset_publication_failed")
             row.publication_manifest = manifest
             row.version += 1
+            attempt.ownership_manifest = manifest
+            attempt.version += 1
     except SftQueueError:
         raise
     except SQLAlchemyError as error:
         raise SftQueueError() from error
 
 
-def _child_request(
-    source_fd: int, stage_fd: int, job: ClaimedSftBuild, authority
+def _mark_attempt_published(factory: sessionmaker[Session], job: ClaimedSftBuild) -> None:
+    try:
+        with factory.begin() as session:
+            row = session.execute(
+                select(SftDatasetBuild)
+                .where(*_owned(job), *_contract(job), _live())
+                .with_for_update()
+            ).scalar_one_or_none()
+            attempt = session.execute(
+                select(SftDatasetBuildAttempt)
+                .where(
+                    SftDatasetBuildAttempt.department_id == job.department_id,
+                    SftDatasetBuildAttempt.build_id == job.id,
+                    SftDatasetBuildAttempt.publication_attempt_id == job.publication_attempt_id,
+                    SftDatasetBuildAttempt.status == "running",
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None or attempt is None or row.cancellation_requested_at is not None:
+                raise SftQueueError("claim_lost")
+            attempt.published_at = session.scalar(select(func.clock_timestamp()))
+            attempt.version += 1
+    except SftQueueError:
+        raise
+    except SQLAlchemyError as error:
+        raise SftQueueError() from error
+
+
+def _build_request(
+    source_fd: int,
+    stage_fd: int,
+    job: ClaimedSftBuild,
+    authority_fingerprint: str,
+    authority_count: int,
 ) -> dict[str, object]:
-    """Build the closed, content-free child request from current DB authority."""
+    """Closed, content-free IPC request; authority data stays descriptor-backed."""
 
     return {
         "source_fd": source_fd,
@@ -416,12 +621,33 @@ def _child_request(
         "publication_attempt_id": str(job.publication_attempt_id),
         "attempt_number": job.attempt_number,
         "code_revision": job.code_revision,
-        "authority_fingerprint": authority.fingerprint,
-        "authority": [reference.provenance_value() for reference in authority.references],
+        "authority_fingerprint": authority_fingerprint,
+        "authority_count": authority_count,
     }
 
 
-def _validate_child_result(result, source: SftSourceBundle, authority, job: ClaimedSftBuild):
+def _validate_selector_result(result: object, source: SftSourceBundle) -> dict[str, int | str]:
+    if not isinstance(result, dict) or set(result) != {"source", "selector"}:
+        raise SftQueueError("dataset_publication_failed")
+    _validate_source_result(result["source"], source)
+    selector = result["selector"]
+    if (
+        not isinstance(selector, dict)
+        or set(selector) != {"sha256", "byte_size", "count"}
+        or not isinstance(selector["sha256"], str)
+        or len(selector["sha256"]) != 64
+        or type(selector["byte_size"]) is not int
+        or type(selector["count"]) is not int
+        or selector["byte_size"] < selector["count"]
+        or not 1 <= selector["count"] <= source.source_reference_count
+    ):
+        raise SftQueueError("source_artifact_mismatch")
+    return selector
+
+
+def _validate_child_result(
+    result: object, source: SftSourceBundle, job: ClaimedSftBuild
+) -> tuple[dict[str, object], int, int]:
     if not isinstance(result, dict) or set(result) != {
         "source",
         "publication_manifest",
@@ -431,26 +657,9 @@ def _validate_child_result(result, source: SftSourceBundle, authority, job: Clai
         "authority_fingerprint",
     }:
         raise SftQueueError("dataset_publication_failed")
-    child_source = result["source"]
-    if not isinstance(child_source, dict) or set(child_source) != {
-        "manifest_sha256",
-        "examples_sha256",
-        "examples_byte_size",
-        "example_count",
-        "group_count",
-        "source_reference_count",
-    }:
-        raise SftQueueError("source_artifact_mismatch")
-    if (
-        child_source.get("manifest_sha256") != source.manifest_sha256
-        or child_source.get("examples_sha256") != source.examples_sha256
-        or child_source.get("examples_byte_size") != source.examples_byte_size
-        or child_source.get("example_count") != source.example_count
-        or child_source.get("group_count") != source.group_count
-        or child_source.get("source_reference_count") != source.source_reference_count
-        or result.get("authority_fingerprint") != authority.fingerprint
-    ):
-        raise SftQueueError("source_artifact_mismatch")
+    _validate_source_result(result["source"], source)
+    if result["authority_fingerprint"] != source.authority_snapshot_sha256:
+        raise SftQueueError("source_authority_changed")
     manifest = result["publication_manifest"]
     train_count = result["train_count"]
     validation_count = result["validation_count"]
@@ -461,9 +670,31 @@ def _validate_child_result(result, source: SftSourceBundle, authority, job: Clai
         or train_count < 1
         or validation_count < 1
         or train_count + validation_count != source.example_count
+        or manifest.get("publication_attempt_id") != str(job.publication_attempt_id)
     ):
         raise SftQueueError("dataset_publication_failed")
     return manifest, train_count, validation_count
+
+
+def _validate_source_result(value: object, source: SftSourceBundle) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "manifest_sha256",
+        "examples_sha256",
+        "examples_byte_size",
+        "example_count",
+        "group_count",
+        "source_reference_count",
+    }:
+        raise SftQueueError("source_artifact_mismatch")
+    if (
+        value.get("manifest_sha256") != source.manifest_sha256
+        or value.get("examples_sha256") != source.examples_sha256
+        or value.get("examples_byte_size") != source.examples_byte_size
+        or value.get("example_count") != source.example_count
+        or value.get("group_count") != source.group_count
+        or value.get("source_reference_count") != source.source_reference_count
+    ):
+        raise SftQueueError("source_artifact_mismatch")
 
 
 def _complete(
@@ -471,12 +702,17 @@ def _complete(
     job: ClaimedSftBuild,
     verification: SftFinalArtifactVerification,
     *,
-    source_chunk_ids: set[UUID],
+    selector_fd: int | None,
+    selector_count: int,
     authority_fingerprint: str,
     publication_manifest: dict[str, object],
     train_count: int,
     validation_count: int,
+    guard: _LeaseCheckpoint,
+    lease_seconds: int,
 ) -> None:
+    if selector_fd is None:
+        raise SftQueueError("source_authority_changed")
     try:
         files = dict(verification.files)
         with factory.begin() as session:
@@ -485,7 +721,17 @@ def _complete(
                 .where(*_owned(job), *_contract(job), _live())
                 .with_for_update()
             ).scalar_one_or_none()
-            if row is None or row.cancellation_requested_at is not None:
+            attempt = session.execute(
+                select(SftDatasetBuildAttempt)
+                .where(
+                    SftDatasetBuildAttempt.department_id == job.department_id,
+                    SftDatasetBuildAttempt.build_id == job.id,
+                    SftDatasetBuildAttempt.publication_attempt_id == job.publication_attempt_id,
+                    SftDatasetBuildAttempt.status == "running",
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None or attempt is None or row.cancellation_requested_at is not None:
                 raise SftQueueError("claim_lost")
             department = session.execute(
                 select(Department)
@@ -502,10 +748,6 @@ def _complete(
                 )
                 .with_for_update()
             ).scalar_one_or_none()
-            if department is None:
-                raise SftQueueError("department_unavailable")
-            if requester is None:
-                raise SftQueueError("requester_unauthorized")
             source = session.execute(
                 select(SftSourceBundle)
                 .where(
@@ -515,24 +757,47 @@ def _complete(
                 )
                 .with_for_update()
             ).scalar_one_or_none()
-            if source is None:
-                raise SftQueueError("source_authority_changed")
-            if source.authority_snapshot_sha256 != authority_fingerprint:
+            if department is None:
+                raise SftQueueError("department_unavailable")
+            if requester is None:
+                raise SftQueueError("requester_unauthorized")
+            if source is None or source.authority_snapshot_sha256 != authority_fingerprint:
                 raise SftQueueError("source_authority_changed")
             if row.publication_manifest != publication_manifest:
                 raise SftQueueError("dataset_publication_failed")
-            validate_source_authority(
+
+            last_renewal = 0.0
+
+            def final_checkpoint() -> None:
+                nonlocal last_renewal
+                guard.final_check()
+                now_monotonic = time.monotonic()
+                if now_monotonic < last_renewal + max(0.1, lease_seconds / 3):
+                    return
+                now = session.scalar(select(func.clock_timestamp()))
+                if row.lease_expires_at is None or row.lease_expires_at <= now:
+                    raise SftQueueError("claim_lost")
+                row.lease_expires_at = now + timedelta(seconds=lease_seconds)
+                row.version += 1
+                session.flush()
+                last_renewal = now_monotonic
+
+            validate_authority_selector(
                 session,
                 job.department_id,
-                source_chunk_ids,
+                selector_fd,
                 expected_fingerprint=authority_fingerprint,
+                expected_count=selector_count,
                 lock=True,
+                checkpoint=final_checkpoint,
             )
-            # Descriptors were hashed before this short transaction.  This
-            # identity-only recheck catches path substitution without holding
-            # database locks over another complete artifact read.
+            final_checkpoint()
+            # Complete hashes were calculated before this transaction.  The
+            # retained descriptor proof binds those bytes to this exact commit.
             verification.recheck_identity()
             now = session.scalar(select(func.clock_timestamp()))
+            if row.lease_expires_at is None or row.lease_expires_at <= now:
+                raise SftQueueError("claim_lost")
             row.status = "succeeded"
             row.review_status = "pending"
             row.finished_at = now
@@ -549,6 +814,10 @@ def _complete(
             row.provenance_sha256 = files["provenance.jsonl"].sha256
             row.provenance_byte_size = files["provenance.jsonl"].byte_size
             row.version += 1
+            attempt.status = "succeeded"
+            attempt.finished_at = now
+            attempt.published_at = attempt.published_at or now
+            attempt.version += 1
             session.add(
                 PersistentAuditEvent(
                     actor_subject="service:sft-dataset-builder",
@@ -578,18 +847,32 @@ def _fail_or_cancel(factory: sessionmaker[Session], job: ClaimedSftBuild, code: 
             ).scalar_one_or_none()
             if row is None:
                 return False
+            attempt = session.execute(
+                select(SftDatasetBuildAttempt)
+                .where(
+                    SftDatasetBuildAttempt.department_id == job.department_id,
+                    SftDatasetBuildAttempt.build_id == job.id,
+                    SftDatasetBuildAttempt.publication_attempt_id == job.publication_attempt_id,
+                    SftDatasetBuildAttempt.status == "running",
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if attempt is None:
+                return False
             now = session.scalar(select(func.clock_timestamp()))
-            row.status = (
-                "cancelled"
-                if code == "cancelled" or row.cancellation_requested_at is not None
-                else "failed"
+            terminal = (
+                "cancelled" if code == "cancelled" or row.cancellation_requested_at else "failed"
             )
-            row.error_code = "cancelled" if row.status == "cancelled" else code
+            row.status = terminal
+            row.error_code = "cancelled" if terminal == "cancelled" else code
             row.finished_at = now
             row.lease_expires_at = None
             row.worker_id = None
             row.claim_token = None
             row.version += 1
+            attempt.status = terminal
+            attempt.finished_at = now
+            attempt.version += 1
             return True
     except SQLAlchemyError:
         return False

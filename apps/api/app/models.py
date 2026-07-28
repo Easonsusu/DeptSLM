@@ -1889,6 +1889,7 @@ class SftDatasetBuild(Base):
             ondelete="RESTRICT",
         ),
         UniqueConstraint("id", "department_id", "source_bundle_id", name="uq_sft_build_scope"),
+        UniqueConstraint("id", "department_id", name="uq_sft_build_department"),
         CheckConstraint(
             "status IN ('queued','running','succeeded','failed','cancelled')",
             name="ck_sft_build_status",
@@ -2010,6 +2011,66 @@ class SftDatasetBuild(Base):
     )
 
 
+class SftDatasetBuildAttempt(Base):
+    """Durable, content-free ownership for every external build publication attempt."""
+
+    __tablename__ = "sft_dataset_build_attempts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["build_id", "department_id"],
+            ["sft_dataset_builds.id", "sft_dataset_builds.department_id"],
+            name="fk_sft_build_attempt_scope",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("id", "department_id", "build_id", name="uq_sft_build_attempt_scope"),
+        UniqueConstraint("build_id", "attempt_number", name="uq_sft_build_attempt_number"),
+        UniqueConstraint("publication_attempt_id", name="uq_sft_build_attempt_publication"),
+        CheckConstraint(
+            "status IN ('running','reclaimed','succeeded','failed','cancelled')",
+            name="ck_sft_build_attempt_status",
+        ),
+        CheckConstraint("attempt_number > 0 AND version > 0", name="ck_sft_build_attempt_versions"),
+        CheckConstraint(
+            "(status = 'running' AND claimed_at IS NOT NULL AND finished_at IS NULL) OR "
+            "(status = 'reclaimed' AND finished_at IS NOT NULL) OR "
+            "(status = 'succeeded' AND published_at IS NOT NULL AND finished_at IS NOT NULL) OR "
+            "(status IN ('failed','cancelled') AND finished_at IS NOT NULL)",
+            name="ck_sft_build_attempt_lifecycle",
+        ),
+        Index(
+            "ix_sft_build_attempt_department_status",
+            "department_id",
+            "status",
+            "created_at",
+        ),
+        Index(
+            "uq_sft_build_attempt_active",
+            "build_id",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    build_id: Mapped[UUID] = mapped_column(nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    ownership_manifest: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    registered_at: Mapped[datetime] = utc_timestamp()
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleanup_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class SftArtifactReconciliationOperation(Base):
     """Content-free durable Phase 10 artifact reconciliation batch."""
 
@@ -2085,7 +2146,11 @@ class SftArtifactReconciliationOperationItem(Base):
             name="ck_sft_reconciliation_item_resource_type",
         ),
         UniqueConstraint(
-            "operation_id", "resource_type", "resource_id", name="uq_sft_reconciliation_item"
+            "operation_id",
+            "resource_type",
+            "resource_id",
+            "attempt_id",
+            name="uq_sft_reconciliation_item",
         ),
     )
 

@@ -25,6 +25,7 @@ _POLL_SECONDS = 0.2
 
 
 class SftChildOperation(StrEnum):
+    SELECT_SOURCE = "select_source"
     BUILD_DATASET = "build_dataset"
     BOUNDARY_PROBE = "boundary_probe"
 
