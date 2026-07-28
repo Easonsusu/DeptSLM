@@ -429,9 +429,15 @@ def import_sft_source(
     if parsed.department_id != department_id:
         raise SftImportConfigurationError("SFT source department does not match --department-id.")
     manifest_sha256 = hashlib.sha256(manifest_raw).hexdigest()
-    source_chunk_ids = {
-        chunk_id for example in parsed.examples for chunk_id in example.source_chunk_ids
-    }
+    # This is the only complete selector retained by the importer.  Sorting
+    # and deduplication happen before any PostgreSQL transaction; authority
+    # rows themselves are consumed and discarded one bounded batch at a time.
+    source_chunk_ids = tuple(
+        sorted(
+            {chunk_id for example in parsed.examples for chunk_id in example.source_chunk_ids},
+            key=lambda item: item.bytes,
+        )
+    )
     engine = None
     try:
         from app.database import create_database_engine, create_session_factory
@@ -440,12 +446,54 @@ def import_sft_source(
         factory = create_session_factory(engine)
         principal = AuthenticatedPrincipal(subject=actor_subject, issuer=actor_issuer)
         scope = DepartmentRequestScope(DepartmentScope(department_id))
+        # Keep the lock-taking authorization check short.  A complete source
+        # authority scan can be very large, and must never retain membership,
+        # department, or source-bundle locks while it runs.
+        with factory.begin() as session:
+            authorize_transaction(
+                session,
+                principal,
+                scope,
+                SFT_AUTHOR_ROLES,
+                lock=True,
+                audit_action="sft.source.import.authorization",
+            )
+            existing = _scoped_source(session, scope.department, parsed.source_bundle_id, lock=True)
+            if existing is not None:
+                if (
+                    existing.manifest_sha256 == manifest_sha256
+                    and existing.examples_sha256 == parsed.examples_sha256
+                ):
+                    return SftSourceImportResult(
+                        existing.id,
+                        department_id,
+                        existing.example_count,
+                        existing.group_count,
+                        False,
+                    )
+                raise SftImportConfigurationError("SFT source bundle identifier already exists.")
+
+        # Capture one immutable, lock-free authority view before creating any
+        # import state.  The selector is already sorted and each lookup is
+        # bounded by SELECTOR_BATCH_SIZE in sft_authority.
         with factory.begin() as session:
             if session.get_bind().dialect.name == "postgresql":
-                # Source authority may span many bounded queries.  Establish
-                # one immutable PostgreSQL view before any authorization or
-                # source lookup in this transaction.
-                session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+                session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
+            authority = validate_source_authority(
+                session, department_id, source_chunk_ids, lock=False
+            )
+            if not apply:
+                return SftSourceImportResult(
+                    parsed.source_bundle_id,
+                    department_id,
+                    len(parsed.examples),
+                    parsed.group_count,
+                    False,
+                )
+
+        # Reauthorize and register only after the read-only capture commits.
+        # Never repeat the full authority scan in this lock-taking transaction.
+        with factory.begin() as session:
             authorization = authorize_transaction(
                 session,
                 principal,
@@ -468,17 +516,6 @@ def import_sft_source(
                         False,
                     )
                 raise SftImportConfigurationError("SFT source bundle identifier already exists.")
-            authority = validate_source_authority(
-                session, department_id, source_chunk_ids, lock=True
-            )
-            if not apply:
-                return SftSourceImportResult(
-                    parsed.source_bundle_id,
-                    department_id,
-                    len(parsed.examples),
-                    parsed.group_count,
-                    False,
-                )
             attempt = session.execute(
                 select(SftSourceImportAttempt)
                 .where(

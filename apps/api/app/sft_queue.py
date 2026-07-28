@@ -28,6 +28,7 @@ from app.sft_artifacts import (
     SftArtifactError,
     SftArtifactStore,
     SftFinalArtifactVerification,
+    SftStagedArtifactVerification,
 )
 from app.sft_authority import (
     SftAuthorityMapping,
@@ -292,6 +293,7 @@ def process_build(
     scope = DepartmentScope(job.department_id)
     verification: SftFinalArtifactVerification | None = None
     staged = None
+    prepublication: SftStagedArtifactVerification | None = None
     selector_fd: int | None = None
     authority_mapping: SftAuthorityMapping | None = None
 
@@ -310,7 +312,7 @@ def process_build(
 
     try:
         if job.stale_publication_attempt_id is not None:
-            _cleanup_stale_attempt(factory, data_dir, scope, job, checkpoint=checkpoint())
+            _cleanup_stale_attempt(factory, data_dir, scope, job, checkpoint_factory=checkpoint)
         source = _load_source_metadata(factory, job, checkpoint=checkpoint())
         with SftArtifactStore(data_dir) as store:
             open_source = checkpoint()
@@ -390,30 +392,28 @@ def process_build(
             record_manifest = checkpoint()
             _record_publication_manifest(factory, job, manifest)
             record_manifest()
-            verify_staged = checkpoint()
-            store.verify_staged(
-                staged, allowlist=DATASET_FILES, expected=manifest, checkpoint=verify_staged
-            )
-            verify_staged()
-            publish = checkpoint()
-            published = store.publish(
+            prepublication_guard = checkpoint()
+            prepublication = store.preverify_staged(
                 staged,
                 allowlist=DATASET_FILES,
                 expected=manifest,
-                retain=True,
-                checkpoint=publish,
+                checkpoint=prepublication_guard,
             )
-            staged = published
-            publish()
+            staged = None
+            prepublication_guard()
+            marker_transition = checkpoint()
+            store.transition_stage_marker(prepublication, checkpoint=marker_transition)
+            marker_transition()
+            rename_and_durability = checkpoint()
+            store.rename_preverified_stage(prepublication, checkpoint=rename_and_durability)
+            rename_and_durability()
+            post_rename = checkpoint()
+            verification = store.verify_preverified_final(prepublication, checkpoint=post_rename)
+            prepublication = None
+            post_rename()
             mark_published = checkpoint()
             _mark_attempt_published(factory, job)
             mark_published()
-            verify_final = checkpoint()
-            verification = store.verify_retained_final(
-                published, allowlist=DATASET_FILES, expected=manifest, checkpoint=verify_final
-            )
-            staged = None
-            verify_final()
             # Extend server-time ownership immediately before the short commit.
             renew_lease(factory, job, lease_seconds)
             finalize = checkpoint()
@@ -450,6 +450,8 @@ def process_build(
             authority_mapping.close()
         if verification is not None:
             verification.close()
+        elif prepublication is not None:
+            prepublication.close()
         elif staged is not None:
             staged.close()
 
@@ -518,28 +520,29 @@ def _cleanup_stale_attempt(
     scope: DepartmentScope,
     job: ClaimedSftBuild,
     *,
-    checkpoint: _LeaseCheckpoint,
+    checkpoint_factory: Callable[[], _LeaseCheckpoint],
 ) -> bool:
     if job.stale_publication_attempt_id is None:
         return False
     with SftArtifactStore(data_dir) as store:
-        checkpoint()
+        stage_cleanup = checkpoint_factory()
         removed = store.remove_owned_dataset_stage(
-            scope, job.id, job.stale_publication_attempt_id, checkpoint=checkpoint
+            scope, job.id, job.stale_publication_attempt_id, checkpoint=stage_cleanup
         )
         if job.stale_publication_manifest is not None:
-            checkpoint()
+            final_cleanup = checkpoint_factory()
             removed = (
                 store.remove_owned_dataset_final(
                     scope,
                     job.id,
                     job.stale_publication_attempt_id,
                     expected=job.stale_publication_manifest,
-                    checkpoint=checkpoint,
+                    checkpoint=final_cleanup,
                 )
                 or removed
             )
-    checkpoint()
+    cleanup_confirmation = checkpoint_factory()
+    cleanup_confirmation()
     _confirm_attempt_cleanup(factory, job, job.stale_publication_attempt_id)
     return removed
 

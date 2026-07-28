@@ -10,7 +10,13 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > expose metadata only. PostgreSQL intentionally stores closed, content-free
 > ownership manifests for exact attempt-scoped cleanup, never source content,
 > source references, artifact paths, or dataset bytes. It does not train
-> models, create adapters, or begin Phase 11 or Phase 12 work.
+> models, create adapters, or begin Phase 11 or Phase 12 work. Import first
+> completes a short lock-taking authorization transaction, then captures
+> authority in a repeatable-read, read-only, lock-free batch scan; final
+> publication reauthorizes and repeats the exact selector scan under locks.
+> Leased dataset publication gives independent deadlines to staged verification,
+> marker transition, rename/durability, post-rename verification, and final
+> metadata commit.
 
 Each evaluation publication has a server-generated attempt UUID and a positive run attempt number. Final suite/result manifests are closed schemas and removal requires descriptor-verified exact department, resource, ownership UUID, run attempt, code revision, payload digests, and sizes. Staging has a separate private UUID-path ownership contract so a supervised child killed during directory or payload creation can be removed without parsing partial content. The exact descriptor chain is opened once through deletion; a staging marker is housekeeping only, so missing, zero-byte, truncated, or partial marker states remain recoverable. Reconciliation registers a resumable content-free batch before deletion. Unsafe entries terminalize as fixed-code blocked items and cannot starve later valid items; completed batches write one audit only when deletion succeeded. It is dry-run by default, department-scoped, restricted to system or department administrators, and accepts a strict limit of 1 through 1000. PostgreSQL and external storage are not transactionally atomic: an orphaned external result after a crash is never retrieval or evaluation authority. Reconciliation does not delete backups or persistent audit history.
 

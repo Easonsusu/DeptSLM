@@ -128,6 +128,33 @@ class SftFinalArtifactVerification:
             raise SftArtifactError("artifact_ownership_mismatch")
 
 
+@dataclass(slots=True)
+class SftStagedArtifactVerification:
+    """One complete prepublication verification retained through rename.
+
+    The stage directory and every allowlisted file stay open from the first
+    complete hash through marker removal and descriptor-relative rename.  This
+    lets each publication phase receive a separate deadline without reopening
+    an already-authorized path or rehashing large payloads before rename.
+    """
+
+    artifact: SftStagedArtifact
+    allowlist: frozenset[str]
+    expected: dict[str, object]
+    files: tuple[tuple[str, ArtifactDigest], ...]
+    file_descriptors: tuple[tuple[str, int, os.stat_result], ...]
+    renamed: bool = False
+
+    def close(self) -> None:
+        for _name, descriptor, _metadata in self.file_descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        self.file_descriptors = ()
+        self.artifact.close()
+
+
 class SftArtifactStore:
     """External storage rooted once at a private, service-owned descriptor."""
 
@@ -235,97 +262,259 @@ class SftArtifactStore:
         retain: bool = False,
         checkpoint: _Checkpoint | None = None,
     ) -> SftStagedArtifact:
-        if (
-            staged.stage_parent_fd is None
-            or staged.stage_fd is None
-            or staged.final_parent_fd is None
-        ):
-            raise SftArtifactError("artifact_ownership_mismatch")
-        if allowlist not in {SOURCE_FILES, DATASET_FILES}:
-            raise SftArtifactError()
+        """Compatibility helper for callers without leased phase deadlines.
+
+        Lease-owning workers must call the explicit prepublication, marker,
+        rename, and post-rename methods so every phase gets a fresh deadline.
+        """
+        verification: SftStagedArtifactVerification | None = None
+        final: SftFinalArtifactVerification | None = None
         try:
             check = checkpoint or _noop
-            check()
-            _entry_matches(staged.stage_parent_fd, str(staged.attempt_id), staged.stage_fd)
-            verified = _verify_files(
-                staged.stage_fd,
-                allowlist,
-                dict(staged.files),
-                marker_allowed=True,
+            verification = self.preverify_staged(
+                staged,
+                allowlist=allowlist,
+                expected=expected,
                 checkpoint=check,
             )
-            if expected is not None:
-                _require_exact_manifest(
-                    _parse_manifest(
-                        _read_file_at(
-                            staged.stage_fd,
-                            "manifest.json",
-                            maximum=256 * 1024,
-                            checkpoint=check,
-                        )
-                    ),
-                    allowlist,
-                    verified,
-                    expected,
-                )
-            check()
-            _unlink_exact(staged.stage_fd, STAGE_MARKER)
-            _verify_files(
-                staged.stage_fd,
-                allowlist,
-                dict(staged.files),
-                marker_allowed=False,
-                checkpoint=check,
-            )
-            try:
-                os.stat(
-                    str(staged.resource_id), dir_fd=staged.final_parent_fd, follow_symlinks=False
-                )
-            except FileNotFoundError:
-                pass
-            else:
-                raise SftArtifactError("artifact_ownership_mismatch")
-            check()
-            os.rename(
-                str(staged.attempt_id),
-                str(staged.resource_id),
-                src_dir_fd=staged.stage_parent_fd,
-                dst_dir_fd=staged.final_parent_fd,
-            )
-            _fsync(staged.stage_parent_fd)
-            check()
-            _fsync(staged.final_parent_fd)
-            _entry_matches(staged.final_parent_fd, str(staged.resource_id), staged.stage_fd)
-            verified = _verify_files(
-                staged.stage_fd,
-                allowlist,
-                dict(staged.files),
-                marker_allowed=False,
-                checkpoint=check,
-            )
-            # Keep the exact final directory and its parent descriptor open so
-            # final verification can be bound to the later metadata commit.
-            if staged.stage_parent_fd is not None:
-                os.close(staged.stage_parent_fd)
-                staged.stage_parent_fd = None
-            staged.files = tuple(sorted(verified.items()))
+            self.transition_stage_marker(verification, checkpoint=check)
+            self.rename_preverified_stage(verification, checkpoint=check)
+            final = self.verify_preverified_final(verification, checkpoint=check)
+            verification = None
             if retain:
-                return staged
+                # The caller retains the directory descriptors and will run a
+                # separate final verification before committing metadata.
+                for _name, descriptor, _metadata in final.file_descriptors:
+                    os.close(descriptor)
+                final.file_descriptors = ()
+                result = final.artifact
+                final = None
+                return result
             result = SftStagedArtifact(
-                staged.category,
-                staged.scope,
-                staged.resource_id,
-                staged.attempt_id,
-                staged.files,
+                final.artifact.category,
+                final.artifact.scope,
+                final.artifact.resource_id,
+                final.artifact.attempt_id,
+                final.files,
                 None,
                 None,
                 None,
             )
-            staged.close()
+            final.close()
+            final = None
             return result
         except OSError as error:
             staged.close()
             raise SftArtifactError("dataset_publication_failed") from error
+        except SftArtifactError:
+            staged.close()
+            raise
+        finally:
+            if final is not None:
+                final.close()
+            elif verification is not None:
+                verification.close()
+
+    def preverify_staged(
+        self,
+        artifact: SftStagedArtifact,
+        *,
+        allowlist: frozenset[str],
+        expected: dict[str, object] | None,
+        checkpoint: _Checkpoint | None = None,
+    ) -> SftStagedArtifactVerification:
+        """Hash and retain the exact private staged artifact once."""
+
+        if (
+            artifact.stage_parent_fd is None
+            or artifact.stage_fd is None
+            or artifact.final_parent_fd is None
+            or allowlist not in {SOURCE_FILES, DATASET_FILES}
+        ):
+            raise SftArtifactError("artifact_ownership_mismatch")
+        check = checkpoint or _noop
+        check()
+        _entry_matches(artifact.stage_parent_fd, str(artifact.attempt_id), artifact.stage_fd)
+        _require_private_directory(artifact.stage_fd, writable=True)
+        names = set(os.listdir(artifact.stage_fd))
+        if names != set(allowlist) | {STAGE_MARKER}:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        descriptors: list[tuple[str, int, os.stat_result]] = []
+        try:
+            files: dict[str, ArtifactDigest] = {}
+            manifest_raw: bytes | None = None
+            for name in sorted(allowlist):
+                check()
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=artifact.stage_fd)
+                try:
+                    metadata = _require_private_file(descriptor, maximum=512 * 1024 * 1024)
+                    current = os.stat(name, dir_fd=artifact.stage_fd, follow_symlinks=False)
+                    if not _same_file(metadata, current):
+                        raise SftArtifactError("artifact_ownership_mismatch")
+                    digest, raw = _digest_open_file(
+                        descriptor, maximum=512 * 1024 * 1024, checkpoint=check
+                    )
+                    if not _same_file(metadata, os.fstat(descriptor)):
+                        raise SftArtifactError("artifact_ownership_mismatch")
+                    files[name] = digest
+                    descriptors.append((name, descriptor, metadata))
+                    descriptor = -1
+                    if name == "manifest.json":
+                        if raw is None or len(raw) > 256 * 1024:
+                            raise SftArtifactError("artifact_ownership_mismatch")
+                        manifest_raw = raw
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+            if manifest_raw is None:
+                raise SftArtifactError("artifact_ownership_mismatch")
+            manifest = _parse_manifest(manifest_raw)
+            _require_manifest_files(manifest, allowlist, files)
+            if expected is not None:
+                _require_exact_manifest(manifest, allowlist, files, expected)
+            artifact.files = tuple(sorted(files.items()))
+            return SftStagedArtifactVerification(
+                artifact,
+                allowlist,
+                {} if expected is None else dict(expected),
+                artifact.files,
+                tuple(descriptors),
+            )
+        except Exception:
+            for _name, descriptor, _metadata in descriptors:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise
+
+    def transition_stage_marker(
+        self, verification: SftStagedArtifactVerification, *, checkpoint: _Checkpoint | None = None
+    ) -> None:
+        """Close the staged allowlist by removing only its exact marker."""
+
+        artifact = verification.artifact
+        if verification.renamed or artifact.stage_fd is None or artifact.stage_parent_fd is None:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        check = checkpoint or _noop
+        check()
+        _entry_matches(artifact.stage_parent_fd, str(artifact.attempt_id), artifact.stage_fd)
+        self._recheck_retained_files(verification, marker_allowed=True)
+        _unlink_exact(artifact.stage_fd, STAGE_MARKER)
+        _fsync(artifact.stage_fd)
+        check()
+        if set(os.listdir(artifact.stage_fd)) != set(verification.allowlist):
+            raise SftArtifactError("artifact_ownership_mismatch")
+        self._recheck_retained_files(verification, marker_allowed=False)
+
+    def rename_preverified_stage(
+        self, verification: SftStagedArtifactVerification, *, checkpoint: _Checkpoint | None = None
+    ) -> None:
+        """Rename a closed, retained stage without hashing payloads again."""
+
+        artifact = verification.artifact
+        if (
+            verification.renamed
+            or artifact.stage_fd is None
+            or artifact.stage_parent_fd is None
+            or artifact.final_parent_fd is None
+        ):
+            raise SftArtifactError("artifact_ownership_mismatch")
+        check = checkpoint or _noop
+        check()
+        _entry_matches(artifact.stage_parent_fd, str(artifact.attempt_id), artifact.stage_fd)
+        self._recheck_retained_files(verification, marker_allowed=False)
+        try:
+            os.stat(
+                str(artifact.resource_id),
+                dir_fd=artifact.final_parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        check()
+        os.rename(
+            str(artifact.attempt_id),
+            str(artifact.resource_id),
+            src_dir_fd=artifact.stage_parent_fd,
+            dst_dir_fd=artifact.final_parent_fd,
+        )
+        _fsync(artifact.stage_parent_fd)
+        check()
+        _fsync(artifact.final_parent_fd)
+        _entry_matches(artifact.final_parent_fd, str(artifact.resource_id), artifact.stage_fd)
+        os.close(artifact.stage_parent_fd)
+        artifact.stage_parent_fd = None
+        verification.renamed = True
+
+    def verify_preverified_final(
+        self,
+        verification: SftStagedArtifactVerification,
+        *,
+        checkpoint: _Checkpoint | None = None,
+    ) -> SftFinalArtifactVerification:
+        """Rehash the retained final artifact once after the durable rename."""
+
+        artifact = verification.artifact
+        if (
+            not verification.renamed
+            or artifact.stage_fd is None
+            or artifact.final_parent_fd is None
+        ):
+            raise SftArtifactError("artifact_ownership_mismatch")
+        check = checkpoint or _noop
+        check()
+        self._recheck_retained_files(verification, marker_allowed=False)
+        files: dict[str, ArtifactDigest] = {}
+        manifest_raw: bytes | None = None
+        for name, descriptor, metadata in verification.file_descriptors:
+            check()
+            digest, raw = _digest_open_file(descriptor, maximum=512 * 1024 * 1024, checkpoint=check)
+            current = os.stat(name, dir_fd=artifact.stage_fd, follow_symlinks=False)
+            if not _same_file(metadata, os.fstat(descriptor)) or not _same_file(metadata, current):
+                raise SftArtifactError("artifact_ownership_mismatch")
+            if digest != dict(verification.files)[name]:
+                raise SftArtifactError("artifact_ownership_mismatch")
+            files[name] = digest
+            if name == "manifest.json":
+                if raw is None or len(raw) > 256 * 1024:
+                    raise SftArtifactError("artifact_ownership_mismatch")
+                manifest_raw = raw
+        if manifest_raw is None:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        manifest = _parse_manifest(manifest_raw)
+        _require_manifest_files(manifest, verification.allowlist, files)
+        if verification.expected:
+            _require_exact_manifest(manifest, verification.allowlist, files, verification.expected)
+        artifact.files = tuple(sorted(files.items()))
+        descriptors = verification.file_descriptors
+        verification.file_descriptors = ()
+        return SftFinalArtifactVerification(
+            artifact, verification.allowlist, artifact.files, descriptors
+        )
+
+    def _recheck_retained_files(
+        self, verification: SftStagedArtifactVerification, *, marker_allowed: bool
+    ) -> None:
+        artifact = verification.artifact
+        if artifact.stage_fd is None or artifact.final_parent_fd is None:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        _require_private_directory(artifact.stage_fd, writable=True)
+        parent_fd = artifact.final_parent_fd if verification.renamed else artifact.stage_parent_fd
+        name = str(artifact.resource_id) if verification.renamed else str(artifact.attempt_id)
+        if parent_fd is None:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        _entry_matches(parent_fd, name, artifact.stage_fd)
+        expected_names = set(verification.allowlist) | ({STAGE_MARKER} if marker_allowed else set())
+        if set(os.listdir(artifact.stage_fd)) != expected_names:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        for name, descriptor, before in verification.file_descriptors:
+            after = os.fstat(descriptor)
+            current = os.stat(name, dir_fd=artifact.stage_fd, follow_symlinks=False)
+            if not _same_file(before, after) or not _same_file(before, current):
+                raise SftArtifactError("artifact_ownership_mismatch")
 
     def read_source(self, scope: DepartmentScope, source_bundle_id: UUID) -> tuple[bytes, bytes]:
         directory = self._open_final(self._sources_fd, scope, source_bundle_id)

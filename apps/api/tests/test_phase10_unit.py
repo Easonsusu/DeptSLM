@@ -818,6 +818,113 @@ def test_parent_checkpoint_failure_aborts_before_publication(tmp_path) -> None:
         store.close()
 
 
+def test_publication_uses_retained_descriptors_with_independent_phase_guards(
+    tmp_path, monkeypatch
+) -> None:
+    """Each publication boundary can receive a fresh lease deadline."""
+
+    (tmp_path / "training_datasets").mkdir(mode=0o700)
+    manifest, examples = _source()
+    parsed = parse_source_bundle(manifest, examples)
+    scope = DepartmentScope(parsed.department_id)
+    store = SftArtifactStore(tmp_path)
+    staged = store.stage_source(
+        scope,
+        parsed.source_bundle_id,
+        parsed.import_attempt_id,
+        manifest=manifest,
+        examples=examples,
+    )
+    from app import sft_artifacts
+
+    original_digest = sft_artifacts._digest_open_file
+    digests: list[str] = []
+    checkpoints: dict[str, int] = {
+        "prepublication": 0,
+        "marker": 0,
+        "rename": 0,
+        "post_rename": 0,
+    }
+
+    def digest(*args, **kwargs):
+        digests.append("digest")
+        return original_digest(*args, **kwargs)
+
+    def guard(name: str):
+        def check() -> None:
+            checkpoints[name] += 1
+
+        return check
+
+    monkeypatch.setattr(sft_artifacts, "_digest_open_file", digest)
+    verification = store.preverify_staged(
+        staged,
+        allowlist=frozenset({"manifest.json", "examples.jsonl"}),
+        expected=parsed.manifest,
+        checkpoint=guard("prepublication"),
+    )
+    try:
+        assert set(os.listdir(staged.stage_fd)) == {"manifest.json", "examples.jsonl", STAGE_MARKER}
+        store.transition_stage_marker(verification, checkpoint=guard("marker"))
+        assert set(os.listdir(staged.stage_fd)) == {"manifest.json", "examples.jsonl"}
+        store.rename_preverified_stage(verification, checkpoint=guard("rename"))
+        final = store.verify_preverified_final(verification, checkpoint=guard("post_rename"))
+        verification = None
+        try:
+            final.recheck_identity()
+            assert final.files == staged.files
+        finally:
+            final.close()
+        # Two allowlisted files are hashed exactly once before and once after
+        # rename; marker and rename boundaries do not rehash payloads.
+        assert len(digests) == 4
+        assert all(value > 0 for value in checkpoints.values())
+    finally:
+        if verification is not None:
+            verification.close()
+        store.close()
+
+
+def test_marker_phase_failure_does_not_consume_a_fresh_rename_budget(tmp_path) -> None:
+    """A failed phase leaves later deadlines independent rather than shared."""
+
+    (tmp_path / "training_datasets").mkdir(mode=0o700)
+    manifest, examples = _source()
+    parsed = parse_source_bundle(manifest, examples)
+    scope = DepartmentScope(parsed.department_id)
+    store = SftArtifactStore(tmp_path)
+    staged = store.stage_source(
+        scope,
+        parsed.source_bundle_id,
+        parsed.import_attempt_id,
+        manifest=manifest,
+        examples=examples,
+    )
+    verification = store.preverify_staged(
+        staged,
+        allowlist=frozenset({"manifest.json", "examples.jsonl"}),
+        expected=parsed.manifest,
+    )
+    try:
+        with pytest.raises(_OperationError, match="claim_lost"):
+            store.transition_stage_marker(
+                verification,
+                checkpoint=lambda: (_ for _ in ()).throw(_OperationError("claim_lost")),
+            )
+        assert STAGE_MARKER in os.listdir(staged.stage_fd)
+        # A new claim can use a new marker and rename deadline; no failed
+        # checkpoint state is retained by the descriptor verification object.
+        store.transition_stage_marker(verification, checkpoint=lambda: None)
+        store.rename_preverified_stage(verification, checkpoint=lambda: None)
+        final = store.verify_preverified_final(verification, checkpoint=lambda: None)
+        verification = None
+        final.close()
+    finally:
+        if verification is not None:
+            verification.close()
+        store.close()
+
+
 def test_parent_lease_checkpoint_renews_and_fails_closed(monkeypatch) -> None:
     from app import sft_queue
 
