@@ -73,7 +73,9 @@ The arrows describe intended responsibilities and do not imply that a production
 
 The dataset builder accepts only reviewed, human-authored external source bundles. It revalidates every same-department source chunk against stored document, succeeded extraction, and succeeded indexing authority before generating a deterministic group-isolated train/validation split. `training_datasets` contains private contentful artifacts; PostgreSQL records only ownership, counts, statuses, reviewed contracts, lifecycle timestamps, and file digests. It does not persist instructions, responses, provenance source identifiers, or artifact paths.
 
-The builder has only PostgreSQL and `training_datasets` access. It has no Qdrant, RAG runtime, model, Hugging Face, upload, extraction, evaluation-result, adapter, export, or application-auth-secret access. Filesystem publication and PostgreSQL success cannot be atomic: final artifacts are descriptor-verified before database success, and incomplete exact-owned stages may be reconciled. An orphaned artifact is never Phase 11 authority.
+The builder has only PostgreSQL and `training_datasets` access. Its contentful construction step is a fixed exec child with a closed schema, exact secret-free environment, `close_fds`, and only explicit private source/stage descriptors. It has no Qdrant, RAG runtime, model, Hugging Face, upload, extraction, evaluation-result, adapter, export, database socket, or application-auth-secret access. Requests and responses use bounded framed IPC while the parent retains PostgreSQL-server-time lease ownership; dataset bytes never traverse the IPC channel.
+
+Filesystem publication and PostgreSQL success cannot be atomic: final artifacts are fully hashed before locks, then their exact directory and file descriptors stay open through the success transaction for identity-only rechecks. Every incomplete lifecycle registers its stage plus any manifest-proven final surface for reconciliation; a blocked final artifact keeps resource cleanup unconfirmed. An orphaned artifact is never Phase 11 authority.
 
 ### FastAPI backend
 

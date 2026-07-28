@@ -132,7 +132,7 @@ def upgrade() -> None:
             "(status = 'published' AND staged_at IS NOT NULL AND published_at IS NOT NULL "
             "AND committed_at IS NULL AND failed_at IS NULL AND abandoned_at IS NULL) OR "
             "(status = 'committed' AND committed_at IS NOT NULL) OR "
-            "(status = 'failed' AND failed_at IS NOT NULL AND cleanup_confirmed_at IS NOT NULL) OR "
+            "(status = 'failed' AND failed_at IS NOT NULL) OR "
             "(status = 'abandoned' AND abandoned_at IS NOT NULL)",
             name="ck_sft_source_import_lifecycle",
         ),

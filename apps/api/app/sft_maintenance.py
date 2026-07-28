@@ -392,20 +392,25 @@ def _reconciliation_candidates(
 ) -> tuple[_ArtifactOperationItem, ...]:
     candidates: list[_ArtifactOperationItem] = []
     for attempt in attempts:
-        target = "source_final" if attempt.status == "published" else "source_stage"
         candidates.append(
             _ArtifactOperationItem(
                 id=uuid4(),
-                resource_type=target,
+                resource_type="source_stage",
                 resource_id=attempt.source_bundle_id,
                 attempt_id=attempt.import_attempt_id,
-                ownership_manifest=(
-                    dict(attempt.artifact_manifest)
-                    if isinstance(attempt.artifact_manifest, dict)
-                    else {}
-                ),
+                ownership_manifest={},
             )
         )
+        if isinstance(attempt.artifact_manifest, dict):
+            candidates.append(
+                _ArtifactOperationItem(
+                    id=uuid4(),
+                    resource_type="source_final",
+                    resource_id=attempt.source_bundle_id,
+                    attempt_id=attempt.import_attempt_id,
+                    ownership_manifest=dict(attempt.artifact_manifest),
+                )
+            )
     for build in builds:
         if build.publication_attempt_id is None:
             continue
@@ -418,19 +423,16 @@ def _reconciliation_candidates(
                 ownership_manifest={},
             )
         )
-        candidates.append(
-            _ArtifactOperationItem(
-                id=uuid4(),
-                resource_type="dataset_final",
-                resource_id=build.id,
-                attempt_id=build.publication_attempt_id,
-                ownership_manifest=(
-                    dict(build.publication_manifest)
-                    if isinstance(build.publication_manifest, dict)
-                    else {}
-                ),
+        if isinstance(build.publication_manifest, dict):
+            candidates.append(
+                _ArtifactOperationItem(
+                    id=uuid4(),
+                    resource_type="dataset_final",
+                    resource_id=build.id,
+                    attempt_id=build.publication_attempt_id,
+                    ownership_manifest=dict(build.publication_manifest),
+                )
             )
-        )
     return tuple(candidates)
 
 
@@ -622,11 +624,18 @@ def _terminalize_artifact_item(
             if not _finalize_purge_resource(session, item, department_id, now):
                 completed = False
                 reason = "artifact_state_changed"
-        if completed and operation.operation_type == "reconcile":
-            _finalize_reconciliation_resource(session, item, department_id, now)
         if completed:
             item.status = "completed"
             item.completed_at = now
+            session.flush()
+            if operation.operation_type == "reconcile":
+                _finalize_reconciliation_resource(
+                    session,
+                    operation_id=operation.id,
+                    item=item,
+                    department_id=department_id,
+                    now=now,
+                )
         else:
             item.status = "blocked"
             item.blocked_at = now
@@ -675,7 +684,9 @@ def _complete_artifact_operation(
             else "completed"
         )
         operation.completed_at = session.scalar(select(func.clock_timestamp()))
-        if any(item.status == "completed" for item in items):
+        if not any(item.status == "blocked" for item in items) and any(
+            item.status == "completed" for item in items
+        ):
             append_mutation_audit(
                 session,
                 actor=authorization.identity,
@@ -732,10 +743,32 @@ def _finalize_purge_resource(
 
 def _finalize_reconciliation_resource(
     session: Session,
+    *,
+    operation_id: UUID,
     item: SftArtifactReconciliationOperationItem,
     department_id: UUID,
     now,
 ) -> None:
+    family = "source" if item.resource_type.startswith("source_") else "dataset"
+    siblings = session.scalars(
+        select(SftArtifactReconciliationOperationItem).where(
+            SftArtifactReconciliationOperationItem.operation_id == operation_id,
+            SftArtifactReconciliationOperationItem.department_id == department_id,
+            SftArtifactReconciliationOperationItem.resource_id == item.resource_id,
+            SftArtifactReconciliationOperationItem.attempt_id == item.attempt_id,
+            SftArtifactReconciliationOperationItem.resource_type.in_(
+                ("source_stage", "source_final")
+                if family == "source"
+                else ("dataset_stage", "dataset_final")
+            ),
+        )
+    ).all()
+    # A later reconciliation deliberately creates a new operation item rather
+    # than mutating a blocked historical item.  Only a complete current surface
+    # set can finalize the exact resource; a stage completion never masks a
+    # blocked final artifact.
+    if not siblings or any(sibling.status != "completed" for sibling in siblings):
+        return
     if item.resource_type in {"source_stage", "source_final"}:
         attempt = session.execute(
             select(SftSourceImportAttempt)

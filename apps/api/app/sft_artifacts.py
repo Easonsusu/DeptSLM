@@ -75,6 +75,57 @@ class SftStagedArtifact:
                 setattr(self, attribute, None)
 
 
+@dataclass(slots=True)
+class SftFinalArtifactVerification:
+    """A verified final artifact whose directory and files remain open.
+
+    The caller must keep this object alive through its short PostgreSQL commit.
+    It deliberately retains only descriptors and content-free digests; file
+    contents are never copied into process metadata.
+    """
+
+    artifact: SftStagedArtifact
+    allowlist: frozenset[str]
+    files: tuple[tuple[str, ArtifactDigest], ...]
+    file_descriptors: tuple[tuple[str, int, os.stat_result], ...]
+
+    def close(self) -> None:
+        for _name, descriptor, _metadata in self.file_descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        self.file_descriptors = ()
+        self.artifact.close()
+
+    def recheck_identity(self) -> None:
+        """Bind an earlier complete hash to the still-open final artifact.
+
+        This intentionally does not rehash large artifacts while database locks
+        are held.  Stable descriptor, entry, and directory identities prove that
+        the earlier digest applies to the object being committed.
+        """
+
+        artifact = self.artifact
+        if artifact.stage_fd is None or artifact.final_parent_fd is None:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        _require_private_directory(artifact.stage_fd, writable=True)
+        _entry_matches(artifact.final_parent_fd, str(artifact.resource_id), artifact.stage_fd)
+        if set(os.listdir(artifact.stage_fd)) != set(self.allowlist):
+            raise SftArtifactError("artifact_ownership_mismatch")
+        expected = dict(self.files)
+        for name, descriptor, before in self.file_descriptors:
+            after = os.fstat(descriptor)
+            current = os.stat(name, dir_fd=artifact.stage_fd, follow_symlinks=False)
+            if not _same_file(before, after) or not _same_file(before, current):
+                raise SftArtifactError("artifact_ownership_mismatch")
+        # The retained manifest descriptor is part of the same identity set;
+        # checking its digest record prevents a caller from substituting an
+        # incomplete or unrelated result between preverification and commit.
+        if set(expected) != set(self.allowlist):
+            raise SftArtifactError("artifact_ownership_mismatch")
+
+
 class SftArtifactStore:
     """External storage rooted once at a private, service-owned descriptor."""
 
@@ -156,12 +207,30 @@ class SftArtifactStore:
             DATASET_FILES,
         )
 
+    def prepare_dataset_stage(
+        self,
+        scope: DepartmentScope,
+        build_id: UUID,
+        publication_attempt_id: UUID,
+    ) -> SftStagedArtifact:
+        """Create only the exact private stage directory for a child writer."""
+
+        return self._prepare_stage(
+            self._staging_datasets_fd,
+            self._datasets_fd,
+            "dataset",
+            scope,
+            build_id,
+            publication_attempt_id,
+        )
+
     def publish(
         self,
         staged: SftStagedArtifact,
         *,
         allowlist: frozenset[str],
         expected: dict[str, object] | None = None,
+        retain: bool = False,
     ) -> SftStagedArtifact:
         if (
             staged.stage_parent_fd is None
@@ -207,12 +276,20 @@ class SftArtifactStore:
             verified = _verify_files(
                 staged.stage_fd, allowlist, dict(staged.files), marker_allowed=False
             )
+            # Keep the exact final directory and its parent descriptor open so
+            # final verification can be bound to the later metadata commit.
+            if staged.stage_parent_fd is not None:
+                os.close(staged.stage_parent_fd)
+                staged.stage_parent_fd = None
+            staged.files = tuple(sorted(verified.items()))
+            if retain:
+                return staged
             result = SftStagedArtifact(
                 staged.category,
                 staged.scope,
                 staged.resource_id,
                 staged.attempt_id,
-                tuple(sorted(verified.items())),
+                staged.files,
                 None,
                 None,
                 None,
@@ -234,6 +311,15 @@ class SftArtifactStore:
         finally:
             os.close(directory)
 
+    def open_source_directory(self, scope: DepartmentScope, source_bundle_id: UUID) -> int:
+        """Return one verified, descriptor-relative source directory handle.
+
+        The caller owns the returned descriptor and may pass only that handle to
+        the isolated child.  No path is passed across the execution boundary.
+        """
+
+        return self._open_final(self._sources_fd, scope, source_bundle_id)
+
     def verify_source_final(
         self,
         scope: DepartmentScope,
@@ -251,6 +337,121 @@ class SftArtifactStore:
         expected: dict[str, object],
     ) -> dict[str, ArtifactDigest]:
         return self._verify_final(self._datasets_fd, scope, build_id, DATASET_FILES, expected)
+
+    def verify_retained_final(
+        self,
+        artifact: SftStagedArtifact,
+        *,
+        allowlist: frozenset[str],
+        expected: dict[str, object],
+    ) -> SftFinalArtifactVerification:
+        """Hash once outside locks and retain descriptors for commit-time proof."""
+
+        if artifact.stage_fd is None or artifact.final_parent_fd is None:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        if allowlist not in {SOURCE_FILES, DATASET_FILES}:
+            raise SftArtifactError()
+        _require_private_directory(artifact.stage_fd, writable=True)
+        _entry_matches(artifact.final_parent_fd, str(artifact.resource_id), artifact.stage_fd)
+        names = set(os.listdir(artifact.stage_fd))
+        if names != set(allowlist):
+            raise SftArtifactError("artifact_ownership_mismatch")
+        descriptors: list[tuple[str, int, os.stat_result]] = []
+        try:
+            files: dict[str, ArtifactDigest] = {}
+            manifest_raw: bytes | None = None
+            for name in sorted(allowlist):
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=artifact.stage_fd)
+                try:
+                    metadata = _require_private_file(descriptor, maximum=512 * 1024 * 1024)
+                    current = os.stat(name, dir_fd=artifact.stage_fd, follow_symlinks=False)
+                    if not _same_file(metadata, current):
+                        raise SftArtifactError("artifact_ownership_mismatch")
+                    digest, raw = _digest_open_file(descriptor, maximum=512 * 1024 * 1024)
+                    if not _same_file(metadata, os.fstat(descriptor)):
+                        raise SftArtifactError("artifact_ownership_mismatch")
+                    descriptors.append((name, descriptor, metadata))
+                    descriptor = -1
+                    files[name] = digest
+                    if name == "manifest.json":
+                        if raw is None or len(raw) > 256 * 1024:
+                            raise SftArtifactError("artifact_ownership_mismatch")
+                        manifest_raw = raw
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+            if manifest_raw is None:
+                raise SftArtifactError("artifact_ownership_mismatch")
+            manifest = _parse_manifest(manifest_raw)
+            _require_exact_manifest(manifest, allowlist, files, expected)
+            artifact.files = tuple(sorted(files.items()))
+            return SftFinalArtifactVerification(
+                artifact, allowlist, artifact.files, tuple(descriptors)
+            )
+        except Exception:
+            for _name, descriptor, _metadata in descriptors:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise
+
+    def verify_staged(
+        self,
+        artifact: SftStagedArtifact,
+        *,
+        allowlist: frozenset[str],
+        expected: dict[str, object],
+    ) -> dict[str, ArtifactDigest]:
+        """Verify a child-written stage before it can be renamed into final storage."""
+
+        if artifact.stage_fd is None or artifact.stage_parent_fd is None:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        _entry_matches(artifact.stage_parent_fd, str(artifact.attempt_id), artifact.stage_fd)
+        verified = _verify_files(artifact.stage_fd, allowlist, {}, marker_allowed=True)
+        manifest = _parse_manifest(
+            _read_file_at(artifact.stage_fd, "manifest.json", maximum=256 * 1024)
+        )
+        _require_exact_manifest(manifest, allowlist, verified, expected)
+        artifact.files = tuple(sorted(verified.items()))
+        return verified
+
+    def open_retained_final(
+        self,
+        scope: DepartmentScope,
+        resource_id: UUID,
+        *,
+        category: str,
+        attempt_id: UUID,
+        allowlist: frozenset[str],
+        expected: dict[str, object],
+    ) -> SftFinalArtifactVerification:
+        """Open an already-published final artifact without reopening at commit."""
+
+        if category not in {"source", "dataset"}:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        root = self._sources_fd if category == "source" else self._datasets_fd
+        parent = _open_private_child(root, str(scope.value))
+        directory: int | None = None
+        try:
+            directory = _open_private_child(parent, str(resource_id))
+            artifact = SftStagedArtifact(
+                category,
+                scope,
+                resource_id,
+                attempt_id,
+                (),
+                None,
+                directory,
+                parent,
+            )
+            directory = parent = None
+            return self.verify_retained_final(artifact, allowlist=allowlist, expected=expected)
+        finally:
+            if directory is not None:
+                os.close(directory)
+            if parent is not None:
+                os.close(parent)
 
     def remove_owned_source_stage(
         self, scope: DepartmentScope, source_bundle_id: UUID, import_attempt_id: UUID
@@ -323,6 +524,36 @@ class SftArtifactStore:
         values: tuple[tuple[str, bytes], ...],
         allowlist: frozenset[str],
     ) -> SftStagedArtifact:
+        result = self._prepare_stage(
+            staging_root_fd,
+            final_root_fd,
+            category,
+            scope,
+            resource_id,
+            attempt_id,
+        )
+        try:
+            if result.stage_fd is None:
+                raise SftArtifactError("artifact_ownership_mismatch")
+            files = tuple(
+                (name, _write_file(result.stage_fd, name, value)) for name, value in values
+            )
+            _verify_files(result.stage_fd, allowlist, dict(files), marker_allowed=True)
+            result.files = files
+            return result
+        except Exception:
+            result.close()
+            raise
+
+    def _prepare_stage(
+        self,
+        staging_root_fd: int,
+        final_root_fd: int,
+        category: str,
+        scope: DepartmentScope,
+        resource_id: UUID,
+        attempt_id: UUID,
+    ) -> SftStagedArtifact:
         if not isinstance(scope, DepartmentScope) or resource_id.int == 0 or attempt_id.int == 0:
             raise SftArtifactError()
         descriptors: list[int] = []
@@ -331,19 +562,26 @@ class SftArtifactStore:
             descriptors.append(department)
             resource = _ensure_private_child(department, str(resource_id))
             descriptors.append(resource)
-            stage = _create_private_child(resource, str(attempt_id))
+            try:
+                stage = _create_private_child(resource, str(attempt_id))
+                _write_file(stage, STAGE_MARKER, _MARKER_BYTES)
+            except FileExistsError:
+                # A crash after mkdir or marker construction leaves an owned
+                # directory.  Its UUID chain, not marker bytes, is the recovery
+                # authority; a child will only receive a fresh empty stage.
+                stage = _open_private_child(resource, str(attempt_id))
+                if set(os.listdir(stage)) != {STAGE_MARKER}:
+                    os.close(stage)
+                    raise SftArtifactError("artifact_ownership_mismatch")
             descriptors.append(stage)
             final_department = _ensure_private_child(final_root_fd, str(scope.value))
             descriptors.append(final_department)
-            _write_file(stage, STAGE_MARKER, _MARKER_BYTES)
-            files = tuple((name, _write_file(stage, name, value)) for name, value in values)
-            _verify_files(stage, allowlist, dict(files), marker_allowed=True)
             result = SftStagedArtifact(
                 category,
                 scope,
                 resource_id,
                 attempt_id,
-                files,
+                (),
                 resource,
                 stage,
                 final_department,
@@ -504,6 +742,19 @@ def _require_private_directory(descriptor: int, *, writable: bool) -> os.stat_re
     return metadata
 
 
+def _require_private_file(descriptor: int, *, maximum: int) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+        or metadata.st_nlink != 1
+        or not 1 <= metadata.st_size <= maximum
+    ):
+        raise SftArtifactError("artifact_ownership_mismatch")
+    return metadata
+
+
 def _ensure_private_child(parent_fd: int, name: str) -> int:
     _safe_name(name)
     try:
@@ -644,6 +895,32 @@ def _digest_file(directory_fd: int, name: str) -> ArtifactDigest:
     return ArtifactDigest(hashlib.sha256(raw).hexdigest(), len(raw))
 
 
+def _digest_open_file(descriptor: int, *, maximum: int) -> tuple[ArtifactDigest, bytes | None]:
+    """Hash one retained descriptor without holding a second pathname handle."""
+
+    before = _require_private_file(descriptor, maximum=maximum)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    total = 0
+    retained = bytearray() if before.st_size <= 256 * 1024 else None
+    while True:
+        part = os.read(descriptor, min(64 * 1024, maximum + 1 - total))
+        if not part:
+            break
+        total += len(part)
+        if total > maximum:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        digest.update(part)
+        if retained is not None:
+            retained.extend(part)
+    after = os.fstat(descriptor)
+    if total != before.st_size or not _same_file(before, after):
+        raise SftArtifactError("artifact_ownership_mismatch")
+    return ArtifactDigest(digest.hexdigest(), total), (
+        bytes(retained) if retained is not None else None
+    )
+
+
 def _require_manifest_files(
     manifest: dict[str, object], allowlist: frozenset[str], verified: dict[str, ArtifactDigest]
 ) -> None:
@@ -748,6 +1025,8 @@ def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
         stat.S_ISREG(second.st_mode)
         and first.st_dev == second.st_dev
         and first.st_ino == second.st_ino
+        and first.st_uid == second.st_uid
+        and stat.S_IMODE(first.st_mode) == stat.S_IMODE(second.st_mode)
         and first.st_size == second.st_size
         and first.st_nlink == second.st_nlink == 1
         and first.st_mtime_ns == second.st_mtime_ns

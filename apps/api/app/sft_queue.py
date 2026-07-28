@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from datetime import timedelta
 from uuid import UUID, uuid4
@@ -19,7 +20,12 @@ from app.models import (
     SftDatasetBuild,
     SftSourceBundle,
 )
-from app.sft_artifacts import DATASET_FILES, SftArtifactError, SftArtifactStore
+from app.sft_artifacts import (
+    DATASET_FILES,
+    SftArtifactError,
+    SftArtifactStore,
+    SftFinalArtifactVerification,
+)
 from app.sft_authority import SftSourceAuthorityError, validate_source_authority
 from app.sft_domain import (
     DATASET_ARTIFACT_CONTRACT_VERSION,
@@ -28,13 +34,9 @@ from app.sft_domain import (
     SPLIT_VERSION,
     VALIDATION_RATIO,
     SftContractError,
-    canonical_json_bytes,
-    dataset_record,
     parse_source_bundle,
-    provenance_record,
-    split_examples,
 )
-from app.sft_supervision import run_claimed_operation
+from app.sft_supervision import SftChildOperation, run_claimed_operation
 
 
 class SftQueueError(RuntimeError):
@@ -198,73 +200,61 @@ def process_build(
     """Build exact JSONL artifacts with rechecks before external mutation and final success."""
 
     scope = DepartmentScope(job.department_id)
+    verification: SftFinalArtifactVerification | None = None
+    staged = None
     try:
         if job.stale_publication_attempt_id is not None:
-            _supervise(
-                factory,
-                job,
-                lease_seconds,
-                operation_seconds,
-                should_stop,
-                lambda: _cleanup_stale_attempt(data_dir, scope, job),
-            )
+            require_live_claim(factory, job)
+            _cleanup_stale_attempt(data_dir, scope, job)
+            renew_lease(factory, job, lease_seconds)
         source, authority, source_chunk_ids = _read_and_validate_source(
-            factory, data_dir, scope, job, lease_seconds, operation_seconds, should_stop
+            factory, data_dir, scope, job
         )
-        train_bytes, validation_bytes, provenance_bytes, manifest, train_count, validation_count = (
-            _supervise(
+        with SftArtifactStore(data_dir) as store:
+            source_fd = store.open_source_directory(scope, job.source_bundle_id)
+            try:
+                staged = store.prepare_dataset_stage(scope, job.id, job.publication_attempt_id)
+                if staged.stage_fd is None:
+                    raise SftQueueError("dataset_publication_failed")
+                result = _supervise(
+                    factory,
+                    job,
+                    lease_seconds,
+                    operation_seconds,
+                    should_stop,
+                    operation=SftChildOperation.BUILD_DATASET,
+                    request=_child_request(source_fd, staged.stage_fd, job, authority),
+                    pass_fds=(source_fd, staged.stage_fd),
+                )
+            finally:
+                try:
+                    os.close(source_fd)
+                except OSError:
+                    pass
+            manifest, train_count, validation_count = _validate_child_result(
+                result, source, authority, job
+            )
+            _record_publication_manifest(factory, job, manifest)
+            require_live_claim(factory, job)
+            store.verify_staged(staged, allowlist=DATASET_FILES, expected=manifest)
+            published = store.publish(
+                staged, allowlist=DATASET_FILES, expected=manifest, retain=True
+            )
+            staged = published
+            verification = store.verify_retained_final(
+                published, allowlist=DATASET_FILES, expected=manifest
+            )
+            staged = None
+            _complete(
                 factory,
                 job,
-                lease_seconds,
-                operation_seconds,
-                should_stop,
-                lambda: _serialize_dataset(source, authority, job),
+                verification,
+                source_chunk_ids=source_chunk_ids,
+                authority_fingerprint=authority.fingerprint,
+                publication_manifest=manifest,
+                train_count=train_count,
+                validation_count=validation_count,
             )
-        )
-        _record_publication_manifest(factory, job, manifest)
-        expected = manifest
-        _supervise(
-            factory,
-            job,
-            lease_seconds,
-            operation_seconds,
-            should_stop,
-            lambda: _stage_dataset(
-                data_dir,
-                scope,
-                job,
-                canonical_json_bytes(manifest) + b"\n",
-                train_bytes,
-                validation_bytes,
-                provenance_bytes,
-            ),
-        )
-        published_files = _supervise(
-            factory,
-            job,
-            lease_seconds,
-            operation_seconds,
-            should_stop,
-            lambda: _publish_dataset(data_dir, scope, job, expected),
-        )
-        _supervise(
-            factory,
-            job,
-            lease_seconds,
-            operation_seconds,
-            should_stop,
-            lambda: _verify_dataset_final(data_dir, scope, job, expected),
-        )
-        _complete(
-            factory,
-            job,
-            published_files,
-            source_chunk_ids=source_chunk_ids,
-            authority_fingerprint=authority.fingerprint,
-            publication_manifest=manifest,
-            train_count=train_count,
-            validation_count=validation_count,
-        )
     except SftQueueError as error:
         _fail_or_cancel(factory, job, error.code)
     except SftContractError as error:
@@ -273,6 +263,11 @@ def process_build(
         _fail_or_cancel(factory, job, error.code)
     except Exception:
         _fail_or_cancel(factory, job, "dataset_publication_failed")
+    finally:
+        if verification is not None:
+            verification.close()
+        elif staged is not None:
+            staged.close()
 
 
 def _read_and_validate_source(
@@ -280,9 +275,6 @@ def _read_and_validate_source(
     data_dir,
     scope: DepartmentScope,
     job: ClaimedSftBuild,
-    lease_seconds: int,
-    operation_seconds: int,
-    should_stop,
 ):
     try:
         with factory() as session:
@@ -309,19 +301,20 @@ def _read_and_validate_source(
             }:
                 raise SftQueueError("requester_unauthorized")
             source_fingerprint = source.authority_snapshot_sha256
-        parsed, manifest_sha256, source_chunk_ids = _supervise(
-            factory,
-            job,
-            lease_seconds,
-            operation_seconds,
-            should_stop,
-            lambda: _load_source(data_dir, scope, job.source_bundle_id),
-        )
+        # The source body is never returned through IPC and is never persisted
+        # in PostgreSQL.  This parent-side preflight derives transient selectors
+        # solely to capture current database authority for the isolated child.
+        with SftArtifactStore(data_dir) as store:
+            manifest_raw, examples_raw = store.read_source(scope, job.source_bundle_id)
+        parsed = parse_source_bundle(manifest_raw, examples_raw)
+        source_chunk_ids = {
+            chunk_id for example in parsed.examples for chunk_id in example.source_chunk_ids
+        }
         with factory() as session:
             if (
                 parsed.department_id != job.department_id
                 or parsed.source_bundle_id != job.source_bundle_id
-                or manifest_sha256 != source.manifest_sha256
+                or hashlib.sha256(manifest_raw).hexdigest() != source.manifest_sha256
                 or parsed.examples_sha256 != source.examples_sha256
                 or parsed.examples_byte_size != source.examples_byte_size
                 or len(parsed.examples) != source.example_count
@@ -335,7 +328,7 @@ def _read_and_validate_source(
                 source_chunk_ids,
                 expected_fingerprint=source_fingerprint,
             )
-            return parsed, authority, source_chunk_ids
+            return source, authority, source_chunk_ids
     except SftQueueError:
         raise
     except SftArtifactError as error:
@@ -348,7 +341,17 @@ def _read_and_validate_source(
         raise SftQueueError() from error
 
 
-def _supervise(factory, job, lease_seconds, operation_seconds, should_stop, operation):
+def _supervise(
+    factory,
+    job,
+    lease_seconds,
+    operation_seconds,
+    should_stop,
+    *,
+    operation: SftChildOperation,
+    request: dict[str, object],
+    pass_fds: tuple[int, ...],
+):
     return run_claimed_operation(
         timeout_seconds=operation_seconds,
         heartbeat_seconds=lease_seconds,
@@ -356,6 +359,8 @@ def _supervise(factory, job, lease_seconds, operation_seconds, should_stop, oper
         heartbeat=lambda: renew_lease(factory, job, lease_seconds),
         error=SftQueueError,
         operation=operation,
+        request=request,
+        pass_fds=pass_fds,
     )
 
 
@@ -373,71 +378,6 @@ def _cleanup_stale_attempt(data_dir, scope: DepartmentScope, job: ClaimedSftBuil
                 or removed
             )
         return removed
-
-
-def _load_source(data_dir, scope: DepartmentScope, source_bundle_id: UUID):
-    with SftArtifactStore(data_dir) as store:
-        manifest_raw, examples_raw = store.read_source(scope, source_bundle_id)
-    source = parse_source_bundle(manifest_raw, examples_raw)
-    return (
-        source,
-        hashlib.sha256(manifest_raw).hexdigest(),
-        {chunk_id for example in source.examples for chunk_id in example.source_chunk_ids},
-    )
-
-
-def _serialize_dataset(source, authority, job: ClaimedSftBuild):
-    train, validation = split_examples(source, build_id=job.id)
-    references = {reference.chunk_id: reference for reference in authority.references}
-    train_bytes = _lines(dataset_record(item) for item in train)
-    validation_bytes = _lines(dataset_record(item) for item in validation)
-    provenance_bytes = _lines(
-        [
-            *(provenance_record(item, split="train", authorities=references) for item in train),
-            *(
-                provenance_record(item, split="validation", authorities=references)
-                for item in validation
-            ),
-        ]
-    )
-    manifest = _manifest(
-        job, train_bytes, validation_bytes, provenance_bytes, len(train), len(validation)
-    )
-    return train_bytes, validation_bytes, provenance_bytes, manifest, len(train), len(validation)
-
-
-def _stage_dataset(
-    data_dir, scope: DepartmentScope, job: ClaimedSftBuild, manifest, train, validation, provenance
-):
-    with SftArtifactStore(data_dir) as store:
-        staged = store.stage_dataset(
-            scope,
-            job.id,
-            job.publication_attempt_id,
-            manifest=manifest,
-            train=train,
-            validation=validation,
-            provenance=provenance,
-        )
-        staged.close()
-
-
-def _publish_dataset(
-    data_dir, scope: DepartmentScope, job: ClaimedSftBuild, expected: dict[str, object]
-):
-    with SftArtifactStore(data_dir) as store:
-        staged = store.open_dataset_stage(scope, job.id, job.publication_attempt_id)
-        try:
-            return store.publish(staged, allowlist=DATASET_FILES, expected=expected).files
-        finally:
-            staged.close()
-
-
-def _verify_dataset_final(
-    data_dir, scope: DepartmentScope, job: ClaimedSftBuild, expected: dict[str, object]
-):
-    with SftArtifactStore(data_dir) as store:
-        return tuple(sorted(store.verify_dataset_final(scope, job.id, expected=expected).items()))
 
 
 def _record_publication_manifest(
@@ -462,10 +402,74 @@ def _record_publication_manifest(
         raise SftQueueError() from error
 
 
+def _child_request(
+    source_fd: int, stage_fd: int, job: ClaimedSftBuild, authority
+) -> dict[str, object]:
+    """Build the closed, content-free child request from current DB authority."""
+
+    return {
+        "source_fd": source_fd,
+        "stage_fd": stage_fd,
+        "department_id": str(job.department_id),
+        "source_bundle_id": str(job.source_bundle_id),
+        "build_id": str(job.id),
+        "publication_attempt_id": str(job.publication_attempt_id),
+        "attempt_number": job.attempt_number,
+        "code_revision": job.code_revision,
+        "authority_fingerprint": authority.fingerprint,
+        "authority": [reference.provenance_value() for reference in authority.references],
+    }
+
+
+def _validate_child_result(result, source: SftSourceBundle, authority, job: ClaimedSftBuild):
+    if not isinstance(result, dict) or set(result) != {
+        "source",
+        "publication_manifest",
+        "files",
+        "train_count",
+        "validation_count",
+        "authority_fingerprint",
+    }:
+        raise SftQueueError("dataset_publication_failed")
+    child_source = result["source"]
+    if not isinstance(child_source, dict) or set(child_source) != {
+        "manifest_sha256",
+        "examples_sha256",
+        "examples_byte_size",
+        "example_count",
+        "group_count",
+        "source_reference_count",
+    }:
+        raise SftQueueError("source_artifact_mismatch")
+    if (
+        child_source.get("manifest_sha256") != source.manifest_sha256
+        or child_source.get("examples_sha256") != source.examples_sha256
+        or child_source.get("examples_byte_size") != source.examples_byte_size
+        or child_source.get("example_count") != source.example_count
+        or child_source.get("group_count") != source.group_count
+        or child_source.get("source_reference_count") != source.source_reference_count
+        or result.get("authority_fingerprint") != authority.fingerprint
+    ):
+        raise SftQueueError("source_artifact_mismatch")
+    manifest = result["publication_manifest"]
+    train_count = result["train_count"]
+    validation_count = result["validation_count"]
+    if (
+        not isinstance(manifest, dict)
+        or type(train_count) is not int
+        or type(validation_count) is not int
+        or train_count < 1
+        or validation_count < 1
+        or train_count + validation_count != source.example_count
+    ):
+        raise SftQueueError("dataset_publication_failed")
+    return manifest, train_count, validation_count
+
+
 def _complete(
     factory: sessionmaker[Session],
     job: ClaimedSftBuild,
-    published,
+    verification: SftFinalArtifactVerification,
     *,
     source_chunk_ids: set[UUID],
     authority_fingerprint: str,
@@ -474,7 +478,7 @@ def _complete(
     validation_count: int,
 ) -> None:
     try:
-        files = dict(published)
+        files = dict(verification.files)
         with factory.begin() as session:
             row = session.execute(
                 select(SftDatasetBuild)
@@ -524,6 +528,10 @@ def _complete(
                 expected_fingerprint=authority_fingerprint,
                 lock=True,
             )
+            # Descriptors were hashed before this short transaction.  This
+            # identity-only recheck catches path substitution without holding
+            # database locks over another complete artifact read.
+            verification.recheck_identity()
             now = session.scalar(select(func.clock_timestamp()))
             row.status = "succeeded"
             row.review_status = "pending"
@@ -622,38 +630,3 @@ def _terminal_failure(row: SftDatasetBuild, now, code: str) -> None:
     row.worker_id = None
     row.claim_token = None
     row.version += 1
-
-
-def _lines(values) -> bytes:
-    return b"".join(canonical_json_bytes(value) + b"\n" for value in values)
-
-
-def _manifest(
-    job, train: bytes, validation: bytes, provenance: bytes, train_count: int, validation_count: int
-):
-    def digest(value: bytes):
-        return {"sha256": hashlib.sha256(value).hexdigest(), "byte_size": len(value)}
-
-    return {
-        "artifact_contract_version": DATASET_ARTIFACT_CONTRACT_VERSION,
-        "department_id": str(job.department_id),
-        "source_bundle_id": str(job.source_bundle_id),
-        "build_id": str(job.id),
-        "publication_attempt_id": str(job.publication_attempt_id),
-        "attempt_number": job.attempt_number,
-        "code_revision": job.code_revision,
-        "normalization_version": NORMALIZATION_VERSION,
-        "example_contract_version": EXAMPLE_CONTRACT_VERSION,
-        "split_version": SPLIT_VERSION,
-        "validation_ratio": str(VALIDATION_RATIO),
-        "source_example_count": train_count + validation_count,
-        "source_group_count": len({item.group_id for item in [*train, *validation]}),
-        "source_reference_count": sum(len(item.source_chunk_ids) for item in [*train, *validation]),
-        "train_example_count": train_count,
-        "validation_example_count": validation_count,
-        "files": {
-            "train.jsonl": digest(train),
-            "validation.jsonl": digest(validation),
-            "provenance.jsonl": digest(provenance),
-        },
-    }

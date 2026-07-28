@@ -510,143 +510,175 @@ def import_sft_source(
 
         expected_manifest = parsed.manifest
         with SftArtifactStore(settings.data_dir) as store:
-            if initial_status == "registered":
-                try:
-                    staged = store.stage_source(
-                        scope.department,
-                        parsed.source_bundle_id,
-                        parsed.import_attempt_id,
-                        manifest=manifest_raw,
-                        examples=examples_raw,
-                    )
-                except SftArtifactError:
+            verification = None
+            retained = None
+            try:
+                if initial_status == "registered":
+                    try:
+                        staged = store.stage_source(
+                            scope.department,
+                            parsed.source_bundle_id,
+                            parsed.import_attempt_id,
+                            manifest=manifest_raw,
+                            examples=examples_raw,
+                        )
+                    except SftArtifactError:
+                        try:
+                            staged = store.open_source_stage(
+                                scope.department, parsed.source_bundle_id, parsed.import_attempt_id
+                            )
+                        except SftArtifactError:
+                            verification = store.open_retained_final(
+                                scope.department,
+                                parsed.source_bundle_id,
+                                category="source",
+                                attempt_id=parsed.import_attempt_id,
+                                allowlist=frozenset(SOURCE_FILES),
+                                expected=expected_manifest,
+                            )
+                            _mark_attempt_published(
+                                factory,
+                                principal,
+                                scope,
+                                attempt_id,
+                                expected_status="registered",
+                                include_staged_transition=True,
+                            )
+                            initial_status = "published"
+                        else:
+                            _mark_attempt_staged(factory, principal, scope, attempt_id)
+                            published = store.publish(
+                                staged,
+                                allowlist=frozenset(SOURCE_FILES),
+                                expected=expected_manifest,
+                                retain=True,
+                            )
+                            retained = published
+                            verification = store.verify_retained_final(
+                                published,
+                                allowlist=frozenset(SOURCE_FILES),
+                                expected=expected_manifest,
+                            )
+                            retained = None
+                            _mark_attempt_published(
+                                factory, principal, scope, attempt_id, expected_status="staged"
+                            )
+                            initial_status = "published"
+                    else:
+                        _mark_attempt_staged(factory, principal, scope, attempt_id)
+                        published = store.publish(
+                            staged,
+                            allowlist=frozenset(SOURCE_FILES),
+                            expected=expected_manifest,
+                            retain=True,
+                        )
+                        retained = published
+                        verification = store.verify_retained_final(
+                            published,
+                            allowlist=frozenset(SOURCE_FILES),
+                            expected=expected_manifest,
+                        )
+                        retained = None
+                        _mark_attempt_published(
+                            factory, principal, scope, attempt_id, expected_status="staged"
+                        )
+                        initial_status = "published"
+                elif initial_status == "staged":
                     try:
                         staged = store.open_source_stage(
                             scope.department, parsed.source_bundle_id, parsed.import_attempt_id
                         )
                     except SftArtifactError:
-                        store.verify_source_final(
-                            scope.department, parsed.source_bundle_id, expected=expected_manifest
-                        )
-                        _mark_attempt_published(
-                            factory,
-                            principal,
-                            scope,
-                            attempt_id,
-                            expected_status="registered",
-                            include_staged_transition=True,
-                        )
-                        initial_status = "published"
-                    else:
-                        _mark_attempt_staged(factory, principal, scope, attempt_id)
-                        try:
-                            store.publish(
-                                staged,
-                                allowlist=frozenset(SOURCE_FILES),
-                                expected=expected_manifest,
-                            )
-                        finally:
-                            staged.close()
-                        store.verify_source_final(
-                            scope.department, parsed.source_bundle_id, expected=expected_manifest
-                        )
-                        _mark_attempt_published(
-                            factory, principal, scope, attempt_id, expected_status="staged"
-                        )
-                        initial_status = "published"
-                else:
-                    _mark_attempt_staged(factory, principal, scope, attempt_id)
-                    try:
-                        store.publish(
-                            staged,
+                        verification = store.open_retained_final(
+                            scope.department,
+                            parsed.source_bundle_id,
+                            category="source",
+                            attempt_id=parsed.import_attempt_id,
                             allowlist=frozenset(SOURCE_FILES),
                             expected=expected_manifest,
                         )
-                    finally:
-                        staged.close()
-                    store.verify_source_final(
-                        scope.department, parsed.source_bundle_id, expected=expected_manifest
-                    )
+                    else:
+                        published = store.publish(
+                            staged,
+                            allowlist=frozenset(SOURCE_FILES),
+                            expected=expected_manifest,
+                            retain=True,
+                        )
+                        retained = published
+                        verification = store.verify_retained_final(
+                            published,
+                            allowlist=frozenset(SOURCE_FILES),
+                            expected=expected_manifest,
+                        )
+                        retained = None
                     _mark_attempt_published(
                         factory, principal, scope, attempt_id, expected_status="staged"
                     )
                     initial_status = "published"
-            elif initial_status == "staged":
-                try:
-                    staged = store.open_source_stage(
-                        scope.department, parsed.source_bundle_id, parsed.import_attempt_id
+                elif initial_status == "published":
+                    verification = store.open_retained_final(
+                        scope.department,
+                        parsed.source_bundle_id,
+                        category="source",
+                        attempt_id=parsed.import_attempt_id,
+                        allowlist=frozenset(SOURCE_FILES),
+                        expected=expected_manifest,
                     )
-                except SftArtifactError:
-                    store.verify_source_final(
-                        scope.department, parsed.source_bundle_id, expected=expected_manifest
-                    )
-                else:
-                    try:
-                        store.publish(
-                            staged,
-                            allowlist=frozenset(SOURCE_FILES),
-                            expected=expected_manifest,
-                        )
-                    finally:
-                        staged.close()
-                    store.verify_source_final(
-                        scope.department, parsed.source_bundle_id, expected=expected_manifest
-                    )
-                _mark_attempt_published(
-                    factory, principal, scope, attempt_id, expected_status="staged"
-                )
-                initial_status = "published"
-            with SftArtifactStore(settings.data_dir) as final_store:
-                final_store.verify_source_final(
-                    scope.department, parsed.source_bundle_id, expected=expected_manifest
-                )
-            with factory.begin() as session:
-                authorization = _reauthorize_attempt(
-                    session, principal, scope, attempt_id, "published"
-                )
-                attempt = session.get(SftSourceImportAttempt, attempt_id, with_for_update=True)
-                if attempt is None or attempt.status != "published":
+                if verification is None or initial_status != "published":
                     raise SftImportConfigurationError("SFT source import is unavailable.")
-                validate_source_authority(
-                    session,
-                    department_id,
-                    source_chunk_ids,
-                    expected_fingerprint=attempt.authority_snapshot_sha256,
-                    lock=True,
-                )
-                source = SftSourceBundle(
-                    id=parsed.source_bundle_id,
-                    department_id=department_id,
-                    imported_by_user_id=authorization.identity.id,
-                    status="active",
-                    artifact_contract_version=SOURCE_ARTIFACT_CONTRACT_VERSION,
-                    normalization_version=NORMALIZATION_VERSION,
-                    example_contract_version=EXAMPLE_CONTRACT_VERSION,
-                    example_count=len(parsed.examples),
-                    group_count=parsed.group_count,
-                    source_reference_count=parsed.source_reference_count,
-                    manifest_sha256=manifest_sha256,
-                    examples_sha256=parsed.examples_sha256,
-                    authority_snapshot_sha256=attempt.authority_snapshot_sha256,
-                    examples_byte_size=parsed.examples_byte_size,
-                )
-                session.add(source)
-                attempt.status = "committed"
-                attempt.committed_at = _clock(session)
-                attempt.version += 1
-                append_mutation_audit(
-                    session,
-                    actor=authorization.identity,
-                    actor_subject=principal.subject,
-                    request_scope=scope,
-                    action="sft.source.import",
-                    resource_type="sft_source_bundle",
-                    resource_id=source.id,
-                )
-                session.flush()
-                return SftSourceImportResult(
-                    source.id, department_id, source.example_count, source.group_count, True
-                )
+                with factory.begin() as session:
+                    authorization = _reauthorize_attempt(
+                        session, principal, scope, attempt_id, "published"
+                    )
+                    attempt = session.get(SftSourceImportAttempt, attempt_id, with_for_update=True)
+                    if attempt is None or attempt.status != "published":
+                        raise SftImportConfigurationError("SFT source import is unavailable.")
+                    validate_source_authority(
+                        session,
+                        department_id,
+                        source_chunk_ids,
+                        expected_fingerprint=attempt.authority_snapshot_sha256,
+                        lock=True,
+                    )
+                    verification.recheck_identity()
+                    source = SftSourceBundle(
+                        id=parsed.source_bundle_id,
+                        department_id=department_id,
+                        imported_by_user_id=authorization.identity.id,
+                        status="active",
+                        artifact_contract_version=SOURCE_ARTIFACT_CONTRACT_VERSION,
+                        normalization_version=NORMALIZATION_VERSION,
+                        example_contract_version=EXAMPLE_CONTRACT_VERSION,
+                        example_count=len(parsed.examples),
+                        group_count=parsed.group_count,
+                        source_reference_count=parsed.source_reference_count,
+                        manifest_sha256=manifest_sha256,
+                        examples_sha256=parsed.examples_sha256,
+                        authority_snapshot_sha256=attempt.authority_snapshot_sha256,
+                        examples_byte_size=parsed.examples_byte_size,
+                    )
+                    session.add(source)
+                    attempt.status = "committed"
+                    attempt.committed_at = _clock(session)
+                    attempt.version += 1
+                    append_mutation_audit(
+                        session,
+                        actor=authorization.identity,
+                        actor_subject=principal.subject,
+                        request_scope=scope,
+                        action="sft.source.import",
+                        resource_type="sft_source_bundle",
+                        resource_id=source.id,
+                    )
+                    session.flush()
+                    return SftSourceImportResult(
+                        source.id, department_id, source.example_count, source.group_count, True
+                    )
+            finally:
+                if verification is not None:
+                    verification.close()
+                elif retained is not None:
+                    retained.close()
     except (SftContractError, SftArtifactError, SftSourceAuthorityError) as error:
         raise SftImportConfigurationError("SFT source import failed.") from error
     except ServiceError as error:
@@ -696,15 +728,10 @@ def _read_external_source(source_directory: Path) -> tuple[bytes, bytes]:
                     chunks.extend(part)
                     if len(chunks) > maximum:
                         raise SftImportConfigurationError("SFT source is too large.")
-                if os.fstat(fd) != metadata:
+                if not _same_stable_file(metadata, os.fstat(fd)):
                     raise SftImportConfigurationError("SFT source changed while reading.")
                 current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                if (
-                    current.st_dev != metadata.st_dev
-                    or current.st_ino != metadata.st_ino
-                    or current.st_size != metadata.st_size
-                    or current.st_nlink != metadata.st_nlink
-                ):
+                if not _same_stable_file(metadata, current):
                     raise SftImportConfigurationError("SFT source changed while reading.")
                 entries[name] = metadata
                 values.append(bytes(chunks))
@@ -712,7 +739,7 @@ def _read_external_source(source_directory: Path) -> tuple[bytes, bytes]:
                 os.close(fd)
         if set(os.listdir(directory_fd)) != {"manifest.json", "examples.jsonl"}:
             raise SftImportConfigurationError("SFT source changed while reading.")
-        if os.fstat(directory_fd) != directory_stat or set(entries) != {
+        if not _same_stable_directory(directory_stat, os.fstat(directory_fd)) or set(entries) != {
             "manifest.json",
             "examples.jsonl",
         }:
@@ -838,6 +865,37 @@ def _open_directory_chain(path: Path) -> int:
     except OSError:
         os.close(descriptor)
         raise
+
+
+def _same_stable_file(first: os.stat_result, second: os.stat_result) -> bool:
+    """Compare read integrity fields while deliberately ignoring atime."""
+
+    return (
+        stat.S_ISREG(first.st_mode)
+        and stat.S_ISREG(second.st_mode)
+        and first.st_dev == second.st_dev
+        and first.st_ino == second.st_ino
+        and first.st_uid == second.st_uid
+        and stat.S_IMODE(first.st_mode) == stat.S_IMODE(second.st_mode)
+        and first.st_nlink == second.st_nlink
+        and first.st_size == second.st_size
+        and first.st_mtime_ns == second.st_mtime_ns
+        and first.st_ctime_ns == second.st_ctime_ns
+    )
+
+
+def _same_stable_directory(first: os.stat_result, second: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(first.st_mode)
+        and stat.S_ISDIR(second.st_mode)
+        and first.st_dev == second.st_dev
+        and first.st_ino == second.st_ino
+        and first.st_uid == second.st_uid
+        and stat.S_IMODE(first.st_mode) == stat.S_IMODE(second.st_mode)
+        and first.st_nlink == second.st_nlink
+        and first.st_mtime_ns == second.st_mtime_ns
+        and first.st_ctime_ns == second.st_ctime_ns
+    )
 
 
 def _scoped_build(
