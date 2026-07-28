@@ -414,7 +414,9 @@ def test_large_source_import_separates_lock_free_capture_and_final_locking(
         if "INSERT INTO sft_source_import_attempts" in statement
     )
     assert registration_index > statements.index(authority_queries[2])
-    assert all(len(parameters) <= 513 for _statement, parameters in authority_queries)
+    assert all(
+        chunk_parameter_count(parameters) <= 512 for _statement, parameters in authority_queries
+    )
     with Session(engine) as session:
         source = session.get(SftSourceBundle, source_bundle_id)
         attempt = session.execute(
