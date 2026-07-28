@@ -365,7 +365,18 @@ def test_large_source_import_separates_lock_free_capture_and_final_locking(
         for statement, parameters in statements
         if "document_chunks" in statement and "SELECT" in statement
     ]
-    assert [len(parameters) - 1 for _statement, parameters in dry_authority] == [512, 512, 1]
+
+    def chunk_parameter_count(parameters: object) -> int:
+        """Count only selector UUIDs; authority queries also bind fixed scope values."""
+
+        assert isinstance(parameters, dict)
+        return sum(value in chunk_ids for value in parameters.values())
+
+    assert [chunk_parameter_count(parameters) for _statement, parameters in dry_authority] == [
+        512,
+        512,
+        1,
+    ]
     assert all("FOR UPDATE" not in statement for statement, _parameters in dry_authority)
     assert commits
 
@@ -385,7 +396,7 @@ def test_large_source_import_separates_lock_free_capture_and_final_locking(
         for statement, parameters in statements
         if "document_chunks" in statement and "SELECT" in statement
     ]
-    assert [len(parameters) - 1 for _statement, parameters in authority_queries] == [
+    assert [chunk_parameter_count(parameters) for _statement, parameters in authority_queries] == [
         512,
         512,
         1,
