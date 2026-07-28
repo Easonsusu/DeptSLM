@@ -13,7 +13,12 @@ import pytest
 
 from app.authorization import DepartmentScope
 from app.sft_artifacts import DATASET_FILES, STAGE_MARKER, SftArtifactError, SftArtifactStore
-from app.sft_authority import SftAuthorityReference, _fingerprint
+from app.sft_authority import (
+    SftAuthorityReference,
+    _fingerprint,
+    capture_source_authority,
+    write_authority_mapping,
+)
 from app.sft_domain import (
     SftContractError,
     canonical_json_bytes,
@@ -439,14 +444,25 @@ def _child_request(tmp_path):
         dir_fd=stage.stage_fd,
     )
     try:
+        authority_bytes = bytearray()
         for item in authority:
-            os.write(descriptor, canonical_json_bytes(item) + b"\n")
+            line = canonical_json_bytes(item) + b"\n"
+            os.write(descriptor, line)
+            authority_bytes.extend(line)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    selector_fd = os.open(
+        ".deptslm-selector.jsonl", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=stage.stage_fd
+    )
+    authority_fd = os.open(
+        ".deptslm-authority.jsonl", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=stage.stage_fd
+    )
     request = {
         "source_fd": source_fd,
         "stage_fd": stage.stage_fd,
+        "selector_fd": selector_fd,
+        "authority_fd": authority_fd,
         "department_id": str(parsed.department_id),
         "source_bundle_id": str(parsed.source_bundle_id),
         "build_id": str(stage.resource_id),
@@ -455,13 +471,15 @@ def _child_request(tmp_path):
         "code_revision": "a" * 40,
         "authority_fingerprint": "b" * 64,
         "authority_count": len(authority),
+        "authority_mapping_sha256": hashlib.sha256(authority_bytes).hexdigest(),
+        "authority_mapping_byte_size": len(authority_bytes),
     }
-    return store, source_fd, stage, request
+    return store, source_fd, selector_fd, authority_fd, stage, request
 
 
 def test_supervision_exec_child_heartbeats_and_returns_content_free_result(tmp_path) -> None:
     heartbeats: list[bool] = []
-    store, source_fd, stage, request = _child_request(tmp_path)
+    store, source_fd, selector_fd, authority_fd, stage, request = _child_request(tmp_path)
     try:
         result = run_claimed_operation(
             timeout_seconds=5,
@@ -471,7 +489,7 @@ def test_supervision_exec_child_heartbeats_and_returns_content_free_result(tmp_p
             error=_OperationError,
             operation=SftChildOperation.BUILD_DATASET,
             request=request,
-            pass_fds=(source_fd, stage.stage_fd),
+            pass_fds=(source_fd, stage.stage_fd, selector_fd, authority_fd),
         )
         assert set(result) == {
             "source",
@@ -487,13 +505,138 @@ def test_supervision_exec_child_heartbeats_and_returns_content_free_result(tmp_p
     finally:
         stage.close()
         os.close(source_fd)
+        os.close(selector_fd)
+        os.close(authority_fd)
         store.close()
+
+
+def test_child_rejects_same_uid_authority_mapping_replacement(tmp_path) -> None:
+    store, source_fd, selector_fd, authority_fd, stage, request = _child_request(tmp_path)
+    try:
+        os.unlink(".deptslm-authority.jsonl", dir_fd=stage.stage_fd)
+        replacement = os.open(
+            ".deptslm-authority.jsonl",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=stage.stage_fd,
+        )
+        try:
+            os.write(replacement, b'{"chunk_id":"not-the-retained-descriptor"}\n')
+            os.fsync(replacement)
+        finally:
+            os.close(replacement)
+        with pytest.raises(_OperationError, match="source_authority_changed"):
+            run_claimed_operation(
+                timeout_seconds=5,
+                heartbeat_seconds=1,
+                should_stop=lambda: False,
+                heartbeat=lambda: None,
+                error=_OperationError,
+                operation=SftChildOperation.BUILD_DATASET,
+                request=request,
+                pass_fds=(source_fd, stage.stage_fd, selector_fd, authority_fd),
+            )
+        assert os.stat(".deptslm-authority.jsonl", dir_fd=stage.stage_fd).st_nlink == 1
+    finally:
+        stage.close()
+        os.close(source_fd)
+        os.close(selector_fd)
+        os.close(authority_fd)
+        store.close()
+
+
+def test_source_import_authority_batches_every_unique_selector(monkeypatch) -> None:
+    from app import sft_authority
+
+    department_id = uuid4()
+    source_chunk_ids = {uuid4() for _ in range(1025)}
+    seen: list[tuple] = []
+
+    def references(_session, received_department_id, batch, *, lock):
+        assert received_department_id == department_id
+        assert lock is True
+        seen.append(batch)
+        return tuple(
+            SimpleNamespace(
+                chunk_id=chunk_id,
+                private_value=lambda chunk_id=chunk_id: {"chunk_id": str(chunk_id)},
+            )
+            for chunk_id in batch
+        )
+
+    monkeypatch.setattr(sft_authority, "_references_for_chunk_ids", references)
+    snapshot = capture_source_authority(
+        SimpleNamespace(), department_id, source_chunk_ids, lock=True
+    )
+    assert [len(batch) for batch in seen] == [512, 512, 1]
+    assert snapshot.references == ()
+    assert snapshot.selector_count == len(source_chunk_ids)
+    assert len(snapshot.fingerprint) == 64
+
+
+def test_authority_mapping_retains_its_exact_descriptor_and_digest(tmp_path, monkeypatch) -> None:
+    from app import sft_authority
+
+    stage_path = tmp_path / "stage"
+    stage_path.mkdir(mode=0o700)
+    stage_fd = os.open(stage_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    chunk_id = uuid4()
+    selector_fd = os.open(
+        "selector.jsonl",
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=stage_fd,
+    )
+    try:
+        os.write(selector_fd, str(chunk_id).encode("ascii") + b"\n")
+        os.fsync(selector_fd)
+        reference = SimpleNamespace(
+            chunk_id=chunk_id,
+            private_value=lambda: {"private": "authority"},
+            provenance_value=lambda: {
+                "document_id": str(uuid4()),
+                "extraction_id": str(uuid4()),
+                "indexing_id": str(uuid4()),
+                "chunk_id": str(chunk_id),
+                "vector_attempt_id": str(uuid4()),
+            },
+        )
+        monkeypatch.setattr(
+            sft_authority,
+            "_references_for_chunk_ids",
+            lambda _session, _department_id, batch, *, lock: (
+                (reference,) if batch == (chunk_id,) else ()
+            ),
+        )
+        session = SimpleNamespace(
+            get_bind=lambda: SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+        )
+        mapping = write_authority_mapping(
+            session,
+            uuid4(),
+            selector_fd,
+            stage_fd,
+            checkpoint=lambda: None,
+        )
+        try:
+            payload = os.read(mapping.descriptor, mapping.byte_size + 1)
+            assert len(payload) == mapping.byte_size
+            assert hashlib.sha256(payload).hexdigest() == mapping.sha256
+            assert os.fstat(mapping.descriptor).st_nlink == 1
+            assert mapping.snapshot.selector_count == 1
+        finally:
+            mapping.close()
+    finally:
+        os.close(selector_fd)
+        os.close(stage_fd)
 
 
 def test_descriptor_backed_authority_never_expands_the_ipc_frame() -> None:
     request = {
         "source_fd": 3,
         "stage_fd": 4,
+        "selector_fd": 5,
+        "authority_fd": 6,
         "department_id": str(uuid4()),
         "source_bundle_id": str(uuid4()),
         "build_id": str(uuid4()),
@@ -502,6 +645,8 @@ def test_descriptor_backed_authority_never_expands_the_ipc_frame() -> None:
         "code_revision": "a" * 40,
         "authority_fingerprint": "b" * 64,
         "authority_count": 800_000,
+        "authority_mapping_sha256": "c" * 64,
+        "authority_mapping_byte_size": 800_000,
     }
     assert len(_frame({"operation": "build_dataset", "request": request}, 64 * 1024 * 1024)) < 2048
     assert "authority" not in request
@@ -712,6 +857,33 @@ def test_parent_lease_checkpoint_renews_and_fails_closed(monkeypatch) -> None:
     )
     with pytest.raises(SftQueueError, match="worker_shutdown"):
         stopped()
+
+
+def test_each_parent_operation_gets_an_independent_deadline(monkeypatch) -> None:
+    from app import sft_queue
+
+    clock = [10.0]
+    monkeypatch.setattr(sft_queue.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(sft_queue, "renew_lease", lambda *_args: None)
+    first = _LeaseCheckpoint(
+        factory=SimpleNamespace(),
+        job=SimpleNamespace(),
+        lease_seconds=3,
+        operation_seconds=1,
+        should_stop=lambda: False,
+    )
+    first()
+    clock[0] = 11.0
+    with pytest.raises(SftQueueError, match="worker_timeout"):
+        first()
+    second = _LeaseCheckpoint(
+        factory=SimpleNamespace(),
+        job=SimpleNamespace(),
+        lease_seconds=3,
+        operation_seconds=1,
+        should_stop=lambda: False,
+    )
+    second()
 
 
 def test_supervision_timeout_terminates_before_unbounded_child_io() -> None:

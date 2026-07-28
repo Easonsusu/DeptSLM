@@ -149,6 +149,27 @@ class SftAuthoritySnapshot:
     selector_count: int
 
 
+@dataclass(slots=True)
+class SftAuthorityMapping:
+    """One retained, verified descriptor for the private provenance mapping.
+
+    The parent never reopens this mapping by pathname after its authority
+    transaction.  The child receives this descriptor plus the exact digest and
+    size, and independently proves that the stage entry is still this file.
+    """
+
+    snapshot: SftAuthoritySnapshot
+    descriptor: int
+    sha256: str
+    byte_size: int
+
+    def close(self) -> None:
+        try:
+            os.close(self.descriptor)
+        except OSError:
+            pass
+
+
 def capture_source_authority(
     session: Session,
     department_id: UUID,
@@ -156,20 +177,21 @@ def capture_source_authority(
     *,
     lock: bool = False,
 ) -> SftAuthoritySnapshot:
-    """Capture a small in-process source set for source-import code paths."""
+    """Capture an import-time source set in bounded database batches.
+
+    Import parsing is allowed to retain its bounded UUID selector, but no
+    authority query may turn that selector into one unbounded ``IN`` clause or
+    a complete row set in memory.
+    """
 
     if not source_chunk_ids:
         raise SftSourceAuthorityError()
-    references = _references_for_chunk_ids(
+    return _snapshot_for_batches(
         session,
         department_id,
-        tuple(sorted(source_chunk_ids, key=lambda item: item.bytes)),
+        _uuid_batches(sorted(source_chunk_ids, key=lambda item: item.bytes)),
         lock=lock,
-    )
-    return SftAuthoritySnapshot(
-        references=references,
-        fingerprint=_fingerprint(references),
-        selector_count=len(references),
+        checkpoint=_noop,
     )
 
 
@@ -194,7 +216,7 @@ def write_authority_mapping(
     stage_fd: int,
     *,
     checkpoint: _Checkpoint,
-) -> SftAuthoritySnapshot:
+) -> SftAuthorityMapping:
     """Stream a sorted selector into bounded DB batches and a private mapping.
 
     ``selector_fd`` stays open with the caller so its exact descriptor can be
@@ -210,8 +232,11 @@ def write_authority_mapping(
         session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
     _private_directory(stage_fd, writable=True)
     output = _open_new_private_file(stage_fd, AUTHORITY_FILE)
+    returned = False
     try:
-        digest = hashlib.sha256()
+        private_digest = hashlib.sha256()
+        mapping_digest = hashlib.sha256()
+        byte_size = 0
         count = 0
         previous: UUID | None = None
         for batch in _selector_batches(selector_fd, checkpoint=checkpoint):
@@ -222,25 +247,33 @@ def write_authority_mapping(
                 if previous is not None and reference.chunk_id.bytes <= previous.bytes:
                     raise SftSourceAuthorityError()
                 private = _canonical(reference.private_value())
-                digest.update(private + b"\n")
-                _write_all(output, _canonical(reference.provenance_value()) + b"\n", checkpoint)
+                private_digest.update(private + b"\n")
+                provenance = _canonical(reference.provenance_value()) + b"\n"
+                _write_all(output, provenance, checkpoint)
+                mapping_digest.update(provenance)
+                byte_size += len(provenance)
                 previous = reference.chunk_id
                 count += 1
             checkpoint()
-        if count < 1:
+        if count < 1 or byte_size < 1:
             raise SftSourceAuthorityError()
         os.fsync(output)
         _entry_stable(stage_fd, AUTHORITY_FILE, output)
-        return SftAuthoritySnapshot((), digest.hexdigest(), count)
-    except Exception:
-        try:
-            os.unlink(AUTHORITY_FILE, dir_fd=stage_fd)
-            os.fsync(stage_fd)
-        except OSError:
-            pass
-        raise
+        if os.fstat(output).st_size != byte_size:
+            raise SftSourceAuthorityError()
+        os.lseek(output, 0, os.SEEK_SET)
+        returned = True
+        return SftAuthorityMapping(
+            SftAuthoritySnapshot((), private_digest.hexdigest(), count),
+            output,
+            mapping_digest.hexdigest(),
+            byte_size,
+        )
     finally:
-        os.close(output)
+        # On a failed write, leave the entry for descriptor-bound stage cleanup
+        # instead of reopening or unlinking a possibly substituted pathname.
+        if not returned:
+            os.close(output)
 
 
 def validate_authority_selector(
@@ -274,6 +307,35 @@ def validate_authority_selector(
     if count != expected_count or snapshot.fingerprint != expected_fingerprint:
         raise SftSourceAuthorityError()
     return snapshot
+
+
+def _snapshot_for_batches(
+    session: Session,
+    department_id: UUID,
+    batches: Iterable[tuple[UUID, ...]],
+    *,
+    lock: bool,
+    checkpoint: _Checkpoint,
+) -> SftAuthoritySnapshot:
+    digest = hashlib.sha256()
+    count = 0
+    previous: UUID | None = None
+    for batch in batches:
+        if not batch or len(batch) > SELECTOR_BATCH_SIZE:
+            raise SftSourceAuthorityError()
+        if previous is not None and batch[0].bytes <= previous.bytes:
+            raise SftSourceAuthorityError()
+        references = _references_for_chunk_ids(session, department_id, batch, lock=lock)
+        for reference in references:
+            if previous is not None and reference.chunk_id.bytes <= previous.bytes:
+                raise SftSourceAuthorityError()
+            digest.update(_canonical(reference.private_value()) + b"\n")
+            previous = reference.chunk_id
+            count += 1
+        checkpoint()
+    if count < 1:
+        raise SftSourceAuthorityError()
+    return SftAuthoritySnapshot((), digest.hexdigest(), count)
 
 
 def _references_for_chunk_ids(
@@ -460,6 +522,11 @@ def _selector_batches(
         raise SftSourceAuthorityError() from error
 
 
+def _uuid_batches(values: list[UUID]) -> Iterable[tuple[UUID, ...]]:
+    for offset in range(0, len(values), SELECTOR_BATCH_SIZE):
+        yield tuple(values[offset : offset + SELECTOR_BATCH_SIZE])
+
+
 def _fingerprint(references: tuple[SftAuthorityReference, ...]) -> str:
     if not references:
         raise SftSourceAuthorityError()
@@ -493,7 +560,7 @@ def _open_new_private_file(directory_fd: int, name: str) -> int:
     try:
         return os.open(
             name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
             0o600,
             dir_fd=directory_fd,
         )

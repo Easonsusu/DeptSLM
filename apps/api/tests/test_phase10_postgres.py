@@ -267,6 +267,49 @@ def test_phase10_claim_reclaim_keeps_old_attempt_discoverable(engine) -> None:
         assert attempts[1].publication_attempt_id == second.publication_attempt_id
 
 
+def test_phase10_claim_time_terminal_failure_also_terminalizes_attempt(engine) -> None:
+    factory = sessionmaker(engine)
+    code_revision = "e" * 40
+    with Session(engine) as session:
+        department, identity, source = _phase10_source(session)
+        department.status = "archived"
+        build = SftDatasetBuild(
+            department_id=department.id,
+            source_bundle_id=source.id,
+            requested_by_user_id=identity.id,
+            status="queued",
+            review_status="not_ready",
+            attempt_number=1,
+            code_revision=code_revision,
+            artifact_contract_version="phase10-sft-dataset-v1",
+            example_contract_version="phase10-sft-example-v1",
+            normalization_version="phase10-sft-normalization-v1",
+            split_version="phase10-sft-group-split-v1",
+            validation_ratio="0.10",
+            source_example_count=2,
+            source_group_count=2,
+            source_reference_count=2,
+        )
+        session.add(build)
+        session.commit()
+        build_id = build.id
+
+    assert claim_next(factory, uuid4(), lease_seconds=1, code_revision=code_revision) is None
+    with Session(engine) as session:
+        build = session.get(SftDatasetBuild, build_id)
+        assert build is not None
+        attempts = session.scalars(
+            select(SftDatasetBuildAttempt)
+            .where(SftDatasetBuildAttempt.build_id == build_id)
+            .order_by(SftDatasetBuildAttempt.attempt_number)
+        ).all()
+        assert build.status == "failed"
+        assert build.error_code == "department_unavailable"
+        assert [(attempt.status, attempt.finished_at is not None) for attempt in attempts] == [
+            ("failed", True)
+        ]
+
+
 def test_phase10_reconciliation_registers_every_possible_surface() -> None:
     attempt = SimpleNamespace(
         source_bundle_id=uuid4(),

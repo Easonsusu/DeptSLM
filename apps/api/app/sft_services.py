@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -441,6 +441,11 @@ def import_sft_source(
         principal = AuthenticatedPrincipal(subject=actor_subject, issuer=actor_issuer)
         scope = DepartmentRequestScope(DepartmentScope(department_id))
         with factory.begin() as session:
+            if session.get_bind().dialect.name == "postgresql":
+                # Source authority may span many bounded queries.  Establish
+                # one immutable PostgreSQL view before any authorization or
+                # source lookup in this transaction.
+                session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
             authorization = authorize_transaction(
                 session,
                 principal,
@@ -463,7 +468,9 @@ def import_sft_source(
                         False,
                     )
                 raise SftImportConfigurationError("SFT source bundle identifier already exists.")
-            authority = validate_source_authority(session, department_id, source_chunk_ids)
+            authority = validate_source_authority(
+                session, department_id, source_chunk_ids, lock=True
+            )
             if not apply:
                 return SftSourceImportResult(
                     parsed.source_bundle_id,
@@ -627,6 +634,8 @@ def import_sft_source(
                 if verification is None or initial_status != "published":
                     raise SftImportConfigurationError("SFT source import is unavailable.")
                 with factory.begin() as session:
+                    if session.get_bind().dialect.name == "postgresql":
+                        session.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
                     authorization = _reauthorize_attempt(
                         session, principal, scope, attempt_id, "published"
                     )

@@ -30,6 +30,7 @@ from app.sft_artifacts import (
     SftFinalArtifactVerification,
 )
 from app.sft_authority import (
+    SftAuthorityMapping,
     SftSourceAuthorityError,
     validate_authority_selector,
     write_authority_mapping,
@@ -153,7 +154,8 @@ def claim_next(
             ).scalar_one_or_none()
             now = session.scalar(select(func.clock_timestamp()))
             if department is None or department.status != "active":
-                _terminal_failure(row, now, "department_unavailable")
+                terminal_attempt = _terminal_attempt_for_claim_failure(session, row, now)
+                _terminal_failure(row, terminal_attempt, now, "department_unavailable")
                 return None
 
             stale_id: UUID | None = None
@@ -288,29 +290,38 @@ def process_build(
     """Build only under one live claim, without parent-side source parsing."""
 
     scope = DepartmentScope(job.department_id)
-    guard = _LeaseCheckpoint(
-        factory,
-        job,
-        lease_seconds=lease_seconds,
-        operation_seconds=operation_seconds,
-        should_stop=should_stop,
-    )
     verification: SftFinalArtifactVerification | None = None
     staged = None
     selector_fd: int | None = None
+    authority_mapping: SftAuthorityMapping | None = None
+
+    def checkpoint() -> _LeaseCheckpoint:
+        """Start a fresh bounded deadline for one parent-owned operation."""
+
+        result = _LeaseCheckpoint(
+            factory,
+            job,
+            lease_seconds=lease_seconds,
+            operation_seconds=operation_seconds,
+            should_stop=should_stop,
+        )
+        result()
+        return result
+
     try:
-        guard()
         if job.stale_publication_attempt_id is not None:
-            _cleanup_stale_attempt(factory, data_dir, scope, job, checkpoint=guard)
-            guard()
-        source = _load_source_metadata(factory, job, checkpoint=guard)
+            _cleanup_stale_attempt(factory, data_dir, scope, job, checkpoint=checkpoint())
+        source = _load_source_metadata(factory, job, checkpoint=checkpoint())
         with SftArtifactStore(data_dir) as store:
-            guard()
+            open_source = checkpoint()
             source_fd = store.open_source_directory(scope, job.source_bundle_id)
             try:
+                open_source()
+                prepare_stage = checkpoint()
                 staged = store.prepare_dataset_stage(scope, job.id, job.publication_attempt_id)
                 if staged.stage_fd is None:
                     raise SftQueueError("dataset_publication_failed")
+                prepare_stage()
                 selector_result = _supervise(
                     factory,
                     job,
@@ -327,26 +338,28 @@ def process_build(
                     pass_fds=(source_fd, staged.stage_fd),
                 )
                 selector = _validate_selector_result(selector_result, source)
+                map_authority = checkpoint()
                 selector_fd = store.open_stage_scratch(
                     staged,
                     _SELECTOR_FILE,
                     expected=ArtifactDigest(selector["sha256"], selector["byte_size"]),
-                    checkpoint=guard,
+                    checkpoint=map_authority,
                 )
                 with factory() as session:
-                    authority = write_authority_mapping(
+                    authority_mapping = write_authority_mapping(
                         session,
                         job.department_id,
                         selector_fd,
                         staged.stage_fd,
-                        checkpoint=guard,
+                        checkpoint=map_authority,
                     )
+                authority = authority_mapping.snapshot
                 if (
                     authority.fingerprint != source.authority_snapshot_sha256
                     or authority.selector_count != selector["count"]
                 ):
                     raise SftQueueError("source_authority_changed")
-                guard()
+                map_authority()
                 result = _supervise(
                     factory,
                     job,
@@ -357,11 +370,16 @@ def process_build(
                     request=_build_request(
                         source_fd,
                         staged.stage_fd,
+                        selector_fd,
                         job,
-                        authority.fingerprint,
-                        authority.selector_count,
+                        authority_mapping,
                     ),
-                    pass_fds=(source_fd, staged.stage_fd),
+                    pass_fds=(
+                        source_fd,
+                        staged.stage_fd,
+                        selector_fd,
+                        authority_mapping.descriptor,
+                    ),
                 )
             finally:
                 try:
@@ -369,28 +387,36 @@ def process_build(
                 except OSError:
                     pass
             manifest, train_count, validation_count = _validate_child_result(result, source, job)
+            record_manifest = checkpoint()
             _record_publication_manifest(factory, job, manifest)
-            guard()
+            record_manifest()
+            verify_staged = checkpoint()
             store.verify_staged(
-                staged, allowlist=DATASET_FILES, expected=manifest, checkpoint=guard
+                staged, allowlist=DATASET_FILES, expected=manifest, checkpoint=verify_staged
             )
-            guard()
+            verify_staged()
+            publish = checkpoint()
             published = store.publish(
                 staged,
                 allowlist=DATASET_FILES,
                 expected=manifest,
                 retain=True,
-                checkpoint=guard,
+                checkpoint=publish,
             )
             staged = published
+            publish()
+            mark_published = checkpoint()
             _mark_attempt_published(factory, job)
-            guard()
+            mark_published()
+            verify_final = checkpoint()
             verification = store.verify_retained_final(
-                published, allowlist=DATASET_FILES, expected=manifest, checkpoint=guard
+                published, allowlist=DATASET_FILES, expected=manifest, checkpoint=verify_final
             )
             staged = None
+            verify_final()
             # Extend server-time ownership immediately before the short commit.
             renew_lease(factory, job, lease_seconds)
+            finalize = checkpoint()
             _complete(
                 factory,
                 job,
@@ -401,7 +427,7 @@ def process_build(
                 publication_manifest=manifest,
                 train_count=train_count,
                 validation_count=validation_count,
-                guard=guard,
+                guard=finalize,
                 lease_seconds=lease_seconds,
             )
     except SftQueueError as error:
@@ -420,6 +446,8 @@ def process_build(
                 os.close(selector_fd)
             except OSError:
                 pass
+        if authority_mapping is not None:
+            authority_mapping.close()
         if verification is not None:
             verification.close()
         elif staged is not None:
@@ -606,23 +634,27 @@ def _mark_attempt_published(factory: sessionmaker[Session], job: ClaimedSftBuild
 def _build_request(
     source_fd: int,
     stage_fd: int,
+    selector_fd: int,
     job: ClaimedSftBuild,
-    authority_fingerprint: str,
-    authority_count: int,
+    authority_mapping: SftAuthorityMapping,
 ) -> dict[str, object]:
     """Closed, content-free IPC request; authority data stays descriptor-backed."""
 
     return {
         "source_fd": source_fd,
         "stage_fd": stage_fd,
+        "selector_fd": selector_fd,
+        "authority_fd": authority_mapping.descriptor,
         "department_id": str(job.department_id),
         "source_bundle_id": str(job.source_bundle_id),
         "build_id": str(job.id),
         "publication_attempt_id": str(job.publication_attempt_id),
         "attempt_number": job.attempt_number,
         "code_revision": job.code_revision,
-        "authority_fingerprint": authority_fingerprint,
-        "authority_count": authority_count,
+        "authority_fingerprint": authority_mapping.snapshot.fingerprint,
+        "authority_count": authority_mapping.snapshot.selector_count,
+        "authority_mapping_sha256": authority_mapping.sha256,
+        "authority_mapping_byte_size": authority_mapping.byte_size,
     }
 
 
@@ -905,7 +937,50 @@ def _contract(job: ClaimedSftBuild):
     )
 
 
-def _terminal_failure(row: SftDatasetBuild, now, code: str) -> None:
+def _terminal_attempt_for_claim_failure(
+    session: Session, row: SftDatasetBuild, now
+) -> SftDatasetBuildAttempt:
+    """Return the exact attempt that must terminalize with a claim failure."""
+
+    if row.status == "running":
+        if row.publication_attempt_id is None:
+            raise SftQueueError("database_unavailable")
+        attempt = session.execute(
+            select(SftDatasetBuildAttempt)
+            .where(
+                SftDatasetBuildAttempt.department_id == row.department_id,
+                SftDatasetBuildAttempt.build_id == row.id,
+                SftDatasetBuildAttempt.publication_attempt_id == row.publication_attempt_id,
+                SftDatasetBuildAttempt.status == "running",
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if attempt is None:
+            raise SftQueueError("database_unavailable")
+        return attempt
+    if row.status != "queued":
+        raise SftQueueError("database_unavailable")
+    attempt = SftDatasetBuildAttempt(
+        department_id=row.department_id,
+        build_id=row.id,
+        attempt_number=row.attempt_number,
+        publication_attempt_id=uuid4(),
+        code_revision=row.code_revision,
+        status="running",
+        claimed_at=now,
+        version=1,
+    )
+    session.add(attempt)
+    return attempt
+
+
+def _terminal_failure(
+    row: SftDatasetBuild, attempt: SftDatasetBuildAttempt, now, code: str
+) -> None:
+    """Atomically terminalize a build and its exact durable attempt."""
+
+    if attempt.status != "running":
+        raise SftQueueError("database_unavailable")
     row.status = "failed"
     row.error_code = code
     row.finished_at = now
@@ -913,3 +988,6 @@ def _terminal_failure(row: SftDatasetBuild, now, code: str) -> None:
     row.worker_id = None
     row.claim_token = None
     row.version += 1
+    attempt.status = "failed"
+    attempt.finished_at = now
+    attempt.version += 1

@@ -88,6 +88,8 @@ def _build_dataset(request: dict[str, object]) -> dict[str, object]:
     required = {
         "source_fd",
         "stage_fd",
+        "selector_fd",
+        "authority_fd",
         "department_id",
         "source_bundle_id",
         "build_id",
@@ -96,11 +98,15 @@ def _build_dataset(request: dict[str, object]) -> dict[str, object]:
         "code_revision",
         "authority_fingerprint",
         "authority_count",
+        "authority_mapping_sha256",
+        "authority_mapping_byte_size",
     }
     if set(request) != required:
         raise SftContractError("dataset_publication_failed")
     source_fd = _fd(request["source_fd"])
     stage_fd = _fd(request["stage_fd"])
+    selector_fd = _fd(request["selector_fd"])
+    authority_fd = _fd(request["authority_fd"])
     department_id = _uuid(request["department_id"])
     source_bundle_id = _uuid(request["source_bundle_id"])
     build_id = _uuid(request["build_id"])
@@ -108,6 +114,8 @@ def _build_dataset(request: dict[str, object]) -> dict[str, object]:
     attempt_number = request["attempt_number"]
     code_revision = request["code_revision"]
     fingerprint = request["authority_fingerprint"]
+    authority_mapping_sha256 = request["authority_mapping_sha256"]
+    authority_mapping_byte_size = request["authority_mapping_byte_size"]
     if (
         type(attempt_number) is not int
         or attempt_number < 1
@@ -115,6 +123,10 @@ def _build_dataset(request: dict[str, object]) -> dict[str, object]:
         or len(code_revision) > 40
         or not isinstance(fingerprint, str)
         or len(fingerprint) != 64
+        or not isinstance(authority_mapping_sha256, str)
+        or len(authority_mapping_sha256) != 64
+        or type(authority_mapping_byte_size) is not int
+        or authority_mapping_byte_size < 1
     ):
         raise SftContractError("dataset_publication_failed")
     _private_directory(source_fd, writable=False)
@@ -133,7 +145,13 @@ def _build_dataset(request: dict[str, object]) -> dict[str, object]:
     authority_count = request["authority_count"]
     if type(authority_count) is not int or authority_count < 1:
         raise SftContractError("source_authority_changed")
-    authorities = _read_authorities(stage_fd)
+    authorities = _read_authorities(
+        stage_fd,
+        authority_fd,
+        expected_sha256=authority_mapping_sha256,
+        expected_byte_size=authority_mapping_byte_size,
+        expected_count=authority_count,
+    )
     source_chunk_ids = {item for example in source.examples for item in example.source_chunk_ids}
     if len(authorities) != authority_count or set(authorities) != source_chunk_ids:
         raise SftContractError("source_authority_changed")
@@ -177,8 +195,8 @@ def _build_dataset(request: dict[str, object]) -> dict[str, object]:
     manifest_digest = _write_bytes(
         stage_fd, "manifest.json", canonical_json_bytes(manifest) + b"\n"
     )
-    _unlink_exact(stage_fd, _AUTHORITY_FILE)
-    _unlink_exact(stage_fd, _SELECTOR_FILE)
+    _unlink_descriptor_entry(stage_fd, _AUTHORITY_FILE, authority_fd)
+    _unlink_descriptor_entry(stage_fd, _SELECTOR_FILE, selector_fd)
     _fsync(stage_fd)
     if set(os.listdir(stage_fd)) != set(DATASET_FILES) | {STAGE_MARKER}:
         raise SftContractError("dataset_publication_failed")
@@ -267,51 +285,73 @@ def _boundary_probe(request: dict[str, object]) -> dict[str, object]:
     }
 
 
-def _read_authorities(directory_fd: int) -> dict[UUID, _AuthorityReference]:
-    descriptor = os.open(_AUTHORITY_FILE, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-    try:
-        before = _private_regular_file(descriptor, maximum=512 * 1024 * 1024)
-        result: dict[UUID, _AuthorityReference] = {}
-        buffered = bytearray()
+def _read_authorities(
+    directory_fd: int,
+    descriptor: int,
+    *,
+    expected_sha256: str,
+    expected_byte_size: int,
+    expected_count: int,
+) -> dict[UUID, _AuthorityReference]:
+    """Consume only the descriptor retained by the authority transaction.
+
+    The stage pathname is compared with this already-open descriptor before
+    and after the read, but never reopened to authorize the content.
+    """
+
+    before = _private_regular_file(descriptor, maximum=512 * 1024 * 1024)
+    current = os.stat(_AUTHORITY_FILE, dir_fd=directory_fd, follow_symlinks=False)
+    if not _same_file(before, current) or before.st_size != expected_byte_size:
+        raise SftContractError("source_authority_changed")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    byte_size = 0
+    result: dict[UUID, _AuthorityReference] = {}
+    buffered = bytearray()
+    while True:
+        block = os.read(descriptor, 64 * 1024)
+        if not block:
+            break
+        digest.update(block)
+        byte_size += len(block)
+        buffered.extend(block)
         while True:
-            block = os.read(descriptor, 64 * 1024)
-            if not block:
+            marker = buffered.find(b"\n")
+            if marker < 0:
+                if len(buffered) > _AUTHORITY_LINE_LIMIT:
+                    raise SftContractError("source_authority_changed")
                 break
-            buffered.extend(block)
-            while True:
-                marker = buffered.find(b"\n")
-                if marker < 0:
-                    if len(buffered) > _AUTHORITY_LINE_LIMIT:
-                        raise SftContractError("source_authority_changed")
-                    break
-                raw = bytes(buffered[:marker])
-                del buffered[: marker + 1]
-                try:
-                    value = json.loads(raw.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    raise SftContractError("source_authority_changed") from error
-                if not isinstance(value, dict) or set(value) != {
-                    "document_id",
-                    "extraction_id",
-                    "indexing_id",
-                    "chunk_id",
-                    "vector_attempt_id",
-                }:
-                    raise SftContractError("source_authority_changed")
-                normalized = {key: str(_uuid(item)) for key, item in value.items()}
-                chunk_id = UUID(normalized["chunk_id"])
-                if chunk_id in result:
-                    raise SftContractError("source_authority_changed")
-                result[chunk_id] = _AuthorityReference(normalized)
-        if buffered or not result:
-            raise SftContractError("source_authority_changed")
-        after = os.fstat(descriptor)
-        current = os.stat(_AUTHORITY_FILE, dir_fd=directory_fd, follow_symlinks=False)
-        if not _same_file(before, after) or not _same_file(before, current):
-            raise SftContractError("source_authority_changed")
-        return result
-    finally:
-        os.close(descriptor)
+            raw = bytes(buffered[:marker])
+            del buffered[: marker + 1]
+            try:
+                value = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise SftContractError("source_authority_changed") from error
+            if not isinstance(value, dict) or set(value) != {
+                "document_id",
+                "extraction_id",
+                "indexing_id",
+                "chunk_id",
+                "vector_attempt_id",
+            }:
+                raise SftContractError("source_authority_changed")
+            normalized = {key: str(_uuid(item)) for key, item in value.items()}
+            chunk_id = UUID(normalized["chunk_id"])
+            if chunk_id in result:
+                raise SftContractError("source_authority_changed")
+            result[chunk_id] = _AuthorityReference(normalized)
+    if (
+        buffered
+        or len(result) != expected_count
+        or byte_size != expected_byte_size
+        or digest.hexdigest() != expected_sha256
+    ):
+        raise SftContractError("source_authority_changed")
+    after = os.fstat(descriptor)
+    current = os.stat(_AUTHORITY_FILE, dir_fd=directory_fd, follow_symlinks=False)
+    if not _same_file(before, after) or not _same_file(before, current):
+        raise SftContractError("source_authority_changed")
+    return result
 
 
 def _write_selector(directory_fd: int, values: list[UUID]) -> dict[str, object]:
@@ -489,9 +529,12 @@ def _private_regular_file(descriptor: int, *, maximum: int) -> os.stat_result:
     return metadata
 
 
-def _unlink_exact(directory_fd: int, name: str) -> None:
-    metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+def _unlink_descriptor_entry(directory_fd: int, name: str, descriptor: int) -> None:
+    """Unlink only the exact scratch entry backed by an inherited descriptor."""
+
+    metadata = os.fstat(descriptor)
+    current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if not _same_file(metadata, current):
         raise SftContractError("dataset_publication_failed")
     os.unlink(name, dir_fd=directory_fd)
 
