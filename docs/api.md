@@ -233,6 +233,20 @@ Implemented evaluator-only metadata endpoints are:
 - `GET /departments/{department_id}/evaluation-runs/{run_id}`
 - `POST /departments/{department_id}/evaluation-runs/{run_id}/cancel`
 
+### Phase 10 SFT dataset metadata
+
+Phase 10 exposes content-free, department-scoped metadata only. It has no source, dataset, manifest, provenance, download, model, training, or adapter endpoint.
+
+- `GET /departments/{department_id}/sft/sources`
+- `GET /departments/{department_id}/sft/sources/{source_bundle_id}`
+- `POST /departments/{department_id}/sft/sources/{source_bundle_id}/builds`
+- `GET /departments/{department_id}/sft/builds`
+- `GET /departments/{department_id}/sft/builds/{build_id}`
+- `POST /departments/{department_id}/sft/builds/{build_id}/cancel`
+- `PATCH /departments/{department_id}/sft/builds/{build_id}/review`
+
+Source import and maintenance are explicit administrator commands, not browser uploads. Build controls require a same-department active `system_admin`, `department_admin`, or `instructor`; review, archive, purge, and reconciliation are restricted to the first two roles. Every mutation body is byte-bounded and parsed as closed UTF-8 JSON before Pydantic validation. Public responses never disclose user identities, source chunk identifiers, document identifiers, hashes, paths, artifact bytes, model information, or error internals.
+
 Active same-department `system_admin`, `department_admin`, and `instructor` roles may use them; student, viewer, and cross-department access are denied. Lists use bounded opaque department/resource-bound cursors. Run creation accepts exactly `{}` and returns 202; cancellation requires `expected_version`. Responses contain content-free metadata and aggregate numbers only. There is no public suite upload, case/result content, artifact download, raw search, or generated-answer replay endpoint.
 
 ## Security considerations for future endpoints

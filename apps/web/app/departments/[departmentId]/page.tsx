@@ -13,9 +13,10 @@ export default async function DepartmentAnswerPage({
           <span className="brandMark" aria-hidden="true">D</span>
           DeptSLM
         </a>
-        <a className="phaseBadge" href={`/departments/${departmentId}/feedback`}>
-          Phase 8 review
-        </a>
+        <span>
+          <a className="phaseBadge" href={`/departments/${departmentId}/feedback`}>Phase 8 review</a>{" "}
+          <a className="phaseBadge" href={`/departments/${departmentId}/sft`}>Phase 10 datasets</a>
+        </span>
       </nav>
       <RagAnswerPanel departmentId={departmentId} />
     </main>

@@ -7,6 +7,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -145,6 +146,30 @@ EVALUATION_ERROR_CODES = (
     "result_publication_failed",
     "claim_lost",
     "cancelled",
+)
+SFT_SOURCE_STATUSES = ("active", "archived", "purged")
+SFT_IMPORT_ATTEMPT_STATUSES = (
+    "registered",
+    "staged",
+    "published",
+    "committed",
+    "failed",
+    "abandoned",
+)
+SFT_BUILD_STATUSES = ("queued", "running", "succeeded", "failed", "cancelled")
+SFT_BUILD_REVIEW_STATUSES = ("not_ready", "pending", "approved", "rejected", "archived", "purged")
+SFT_BUILD_ERROR_CODES = (
+    "source_artifact_missing",
+    "source_artifact_mismatch",
+    "source_contract_invalid",
+    "source_authority_changed",
+    "department_unavailable",
+    "requester_unauthorized",
+    "dataset_publication_failed",
+    "claim_lost",
+    "cancelled",
+    "worker_shutdown",
+    "database_unavailable",
 )
 
 
@@ -1720,6 +1745,426 @@ class EvaluationCaseResult(Base):
     answer_contract_valid: Mapped[bool] = mapped_column(Boolean, nullable=False)
     case_gate_passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
     error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = utc_timestamp()
+
+
+class SftSourceBundle(Base):
+    """Metadata-only ownership record for a human-authored external SFT source bundle."""
+
+    __tablename__ = "sft_source_bundles"
+    __table_args__ = (
+        UniqueConstraint("id", "department_id", name="uq_sft_source_bundle_department"),
+        CheckConstraint(
+            "status IN ('active','archived','purged')", name="ck_sft_source_bundle_status"
+        ),
+        CheckConstraint(
+            "artifact_contract_version = 'phase10-sft-source-v1'",
+            name="ck_sft_source_bundle_artifact_contract",
+        ),
+        CheckConstraint(
+            "normalization_version = 'phase10-sft-normalization-v1'",
+            name="ck_sft_source_bundle_normalization_version",
+        ),
+        CheckConstraint(
+            "example_contract_version = 'phase10-sft-example-v1'",
+            name="ck_sft_source_bundle_example_contract",
+        ),
+        CheckConstraint("example_count BETWEEN 2 AND 100000", name="ck_sft_source_bundle_examples"),
+        CheckConstraint("group_count >= 2", name="ck_sft_source_bundle_groups"),
+        CheckConstraint(
+            "source_reference_count >= example_count", name="ck_sft_source_bundle_references"
+        ),
+        CheckConstraint(
+            "manifest_sha256 ~ '^[0-9a-f]{64}$' AND examples_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND authority_snapshot_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_sft_source_bundle_hashes",
+        ),
+        CheckConstraint(
+            "examples_byte_size BETWEEN 1 AND 536870912", name="ck_sft_source_bundle_size"
+        ),
+        CheckConstraint("version > 0", name="ck_sft_source_bundle_version"),
+        CheckConstraint(
+            "(status = 'active' AND archived_at IS NULL AND purged_at IS NULL) OR "
+            "(status = 'archived' AND archived_at IS NOT NULL AND purged_at IS NULL) OR "
+            "(status = 'purged' AND purged_at IS NOT NULL)",
+            name="ck_sft_source_bundle_lifecycle",
+        ),
+        Index(
+            "ix_sft_source_bundle_department_status_created",
+            "department_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(
+        ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False
+    )
+    imported_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    artifact_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    normalization_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    example_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    example_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    group_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_reference_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    examples_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    authority_snapshot_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    examples_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class SftSourceImportAttempt(Base):
+    """Durable content-free source-import staging ownership."""
+
+    __tablename__ = "sft_source_import_attempts"
+    __table_args__ = (
+        UniqueConstraint("id", "department_id", "source_bundle_id", name="uq_sft_import_scope"),
+        CheckConstraint(
+            "status IN ('registered','staged','published','committed','failed','abandoned')",
+            name="ck_sft_source_import_status",
+        ),
+        CheckConstraint("version > 0", name="ck_sft_source_import_version"),
+        CheckConstraint(
+            "(status = 'registered' AND staged_at IS NULL AND published_at IS NULL "
+            "AND committed_at IS NULL AND failed_at IS NULL AND abandoned_at IS NULL) OR "
+            "(status = 'staged' AND staged_at IS NOT NULL AND published_at IS NULL "
+            "AND committed_at IS NULL AND failed_at IS NULL AND abandoned_at IS NULL) OR "
+            "(status = 'published' AND staged_at IS NOT NULL AND published_at IS NOT NULL "
+            "AND committed_at IS NULL AND failed_at IS NULL AND abandoned_at IS NULL) OR "
+            "(status = 'committed' AND committed_at IS NOT NULL) OR "
+            "(status = 'failed' AND failed_at IS NOT NULL) OR "
+            "(status = 'abandoned' AND abandoned_at IS NOT NULL)",
+            name="ck_sft_source_import_lifecycle",
+        ),
+        Index("ix_sft_source_import_department_status", "department_id", "status", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_bundle_id: Mapped[UUID] = mapped_column(nullable=False)
+    import_attempt_id: Mapped[UUID] = mapped_column(nullable=False, unique=True)
+    stage_id: Mapped[UUID] = mapped_column(nullable=False)
+    imported_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="registered")
+    manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    examples_sha256: Mapped[str | None] = mapped_column(String(64))
+    authority_snapshot_sha256: Mapped[str | None] = mapped_column(String(64))
+    artifact_manifest: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    examples_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    staged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    failed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    abandoned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleanup_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class SftDatasetBuild(Base):
+    """Content-free dataset-build state, review lifecycle, and worker claim authority."""
+
+    __tablename__ = "sft_dataset_builds"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_bundle_id", "department_id"],
+            ["sft_source_bundles.id", "sft_source_bundles.department_id"],
+            name="fk_sft_build_source_scope",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("id", "department_id", "source_bundle_id", name="uq_sft_build_scope"),
+        UniqueConstraint("id", "department_id", name="uq_sft_build_department"),
+        CheckConstraint(
+            "status IN ('queued','running','succeeded','failed','cancelled')",
+            name="ck_sft_build_status",
+        ),
+        CheckConstraint(
+            "review_status IN ('not_ready','pending','approved','rejected','archived','purged')",
+            name="ck_sft_build_review_status",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            "'source_artifact_missing','source_artifact_mismatch','source_contract_invalid',"
+            "'source_authority_changed','department_unavailable','requester_unauthorized',"
+            "'dataset_publication_failed','claim_lost','cancelled','worker_shutdown',"
+            "'worker_timeout','database_unavailable')",
+            name="ck_sft_build_error_code",
+        ),
+        CheckConstraint("attempt_number > 0 AND version > 0", name="ck_sft_build_versions"),
+        CheckConstraint(
+            "artifact_contract_version = 'phase10-sft-dataset-v1'",
+            name="ck_sft_build_artifact_contract",
+        ),
+        CheckConstraint(
+            "example_contract_version = 'phase10-sft-example-v1'",
+            name="ck_sft_build_example_contract",
+        ),
+        CheckConstraint(
+            "normalization_version = 'phase10-sft-normalization-v1'",
+            name="ck_sft_build_normalization_contract",
+        ),
+        CheckConstraint(
+            "split_version = 'phase10-sft-group-split-v1'",
+            name="ck_sft_build_split_contract",
+        ),
+        CheckConstraint("validation_ratio = 0.10", name="ck_sft_build_validation_ratio"),
+        CheckConstraint(
+            "source_example_count BETWEEN 2 AND 100000 AND source_group_count >= 2 "
+            "AND source_reference_count >= source_example_count",
+            name="ck_sft_build_source_counts",
+        ),
+        CheckConstraint(
+            "(status = 'queued' AND review_status = 'not_ready' AND worker_id IS NULL "
+            "AND claim_token IS NULL AND lease_expires_at IS NULL AND started_at IS NULL "
+            "AND finished_at IS NULL AND publication_attempt_id IS NULL AND error_code IS NULL) OR "
+            "status <> 'queued'",
+            name="ck_sft_build_queued_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'running' AND review_status = 'not_ready' AND worker_id IS NOT NULL "
+            "AND claim_token IS NOT NULL AND lease_expires_at IS NOT NULL "
+            "AND started_at IS NOT NULL AND finished_at IS NULL "
+            "AND publication_attempt_id IS NOT NULL AND error_code IS NULL) OR "
+            "status <> 'running'",
+            name="ck_sft_build_running_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'succeeded' AND review_status IN "
+            "('pending','approved','rejected','archived','purged') "
+            "AND finished_at IS NOT NULL AND train_example_count > 0 "
+            "AND validation_example_count > 0 "
+            "AND result_manifest_sha256 IS NOT NULL AND train_sha256 IS NOT NULL "
+            "AND validation_sha256 IS NOT NULL AND provenance_sha256 IS NOT NULL "
+            "AND error_code IS NULL) OR "
+            "status <> 'succeeded'",
+            name="ck_sft_build_succeeded_lifecycle",
+        ),
+        Index("ix_sft_build_department_status_created", "department_id", "status", "created_at"),
+        Index("ix_sft_build_claim", "status", "lease_expires_at", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_bundle_id: Mapped[UUID] = mapped_column(nullable=False)
+    requested_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    review_status: Mapped[str] = mapped_column(String(16), nullable=False, default="not_ready")
+    worker_id: Mapped[UUID | None] = mapped_column()
+    claim_token: Mapped[UUID | None] = mapped_column()
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    publication_attempt_id: Mapped[UUID | None] = mapped_column()
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    artifact_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    example_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    normalization_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    split_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    validation_ratio: Mapped[Decimal] = mapped_column(Numeric(3, 2), nullable=False)
+    source_example_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_group_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_reference_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    train_example_count: Mapped[int | None] = mapped_column(Integer)
+    validation_example_count: Mapped[int | None] = mapped_column(Integer)
+    result_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    train_sha256: Mapped[str | None] = mapped_column(String(64))
+    train_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    validation_sha256: Mapped[str | None] = mapped_column(String(64))
+    validation_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    provenance_sha256: Mapped[str | None] = mapped_column(String(64))
+    provenance_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    publication_manifest: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    artifact_cleanup_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    requested_at: Mapped[datetime] = utc_timestamp()
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_by_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT")
+    )
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class SftDatasetBuildAttempt(Base):
+    """Durable, content-free ownership for every external build publication attempt."""
+
+    __tablename__ = "sft_dataset_build_attempts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["build_id", "department_id"],
+            ["sft_dataset_builds.id", "sft_dataset_builds.department_id"],
+            name="fk_sft_build_attempt_scope",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("id", "department_id", "build_id", name="uq_sft_build_attempt_scope"),
+        UniqueConstraint("build_id", "attempt_number", name="uq_sft_build_attempt_number"),
+        UniqueConstraint("publication_attempt_id", name="uq_sft_build_attempt_publication"),
+        CheckConstraint(
+            "status IN ('running','reclaimed','succeeded','failed','cancelled')",
+            name="ck_sft_build_attempt_status",
+        ),
+        CheckConstraint("attempt_number > 0 AND version > 0", name="ck_sft_build_attempt_versions"),
+        CheckConstraint(
+            "(status = 'running' AND claimed_at IS NOT NULL AND finished_at IS NULL) OR "
+            "(status = 'reclaimed' AND finished_at IS NOT NULL) OR "
+            "(status = 'succeeded' AND published_at IS NOT NULL AND finished_at IS NOT NULL) OR "
+            "(status IN ('failed','cancelled') AND finished_at IS NOT NULL)",
+            name="ck_sft_build_attempt_lifecycle",
+        ),
+        Index(
+            "ix_sft_build_attempt_department_status",
+            "department_id",
+            "status",
+            "created_at",
+        ),
+        Index(
+            "uq_sft_build_attempt_active",
+            "build_id",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    build_id: Mapped[UUID] = mapped_column(nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    ownership_manifest: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    registered_at: Mapped[datetime] = utc_timestamp()
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleanup_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class SftArtifactReconciliationOperation(Base):
+    """Content-free durable Phase 10 artifact reconciliation batch."""
+
+    __tablename__ = "sft_artifact_reconciliation_operations"
+    __table_args__ = (
+        UniqueConstraint("id", "department_id", name="uq_sft_reconciliation_operation_scope"),
+        CheckConstraint(
+            "operation_type IN ('reconcile','purge')",
+            name="ck_sft_reconciliation_operation_type",
+        ),
+        CheckConstraint(
+            "status IN ('registered','completed','completed_with_blocks')",
+            name="ck_sft_reconciliation_operation_status",
+        ),
+        CheckConstraint(
+            "(status = 'registered' AND completed_at IS NULL) OR "
+            "(status IN ('completed','completed_with_blocks') AND completed_at IS NOT NULL)",
+            name="ck_sft_reconciliation_operation_lifecycle",
+        ),
+        CheckConstraint(
+            "limit_value BETWEEN 1 AND 1000", name="ck_sft_reconciliation_operation_limit"
+        ),
+        Index("ix_sft_reconciliation_operation_department", "department_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(
+        ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False
+    )
+    requested_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    limit_value: Mapped[int] = mapped_column(Integer, nullable=False)
+    operation_type: Mapped[str] = mapped_column(String(16), nullable=False, default="reconcile")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="registered")
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = utc_timestamp()
+
+
+class SftArtifactReconciliationOperationItem(Base):
+    __tablename__ = "sft_artifact_reconciliation_operation_items"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["operation_id", "department_id"],
+            [
+                "sft_artifact_reconciliation_operations.id",
+                "sft_artifact_reconciliation_operations.department_id",
+            ],
+            name="fk_sft_reconciliation_item_operation_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "status IN ('registered','completed','blocked')",
+            name="ck_sft_reconciliation_item_status",
+        ),
+        CheckConstraint(
+            "(status = 'registered' AND completed_at IS NULL AND blocked_at IS NULL "
+            "AND blocked_reason_code IS NULL) OR "
+            "(status = 'completed' AND completed_at IS NOT NULL AND blocked_at IS NULL "
+            "AND blocked_reason_code IS NULL) OR "
+            "(status = 'blocked' AND completed_at IS NULL AND blocked_at IS NOT NULL "
+            "AND blocked_reason_code IS NOT NULL)",
+            name="ck_sft_reconciliation_item_lifecycle",
+        ),
+        CheckConstraint(
+            "blocked_reason_code IS NULL OR blocked_reason_code IN "
+            "('staging_path_unsafe','artifact_ownership_mismatch','artifact_manifest_invalid',"
+            "'artifact_permissions_invalid','artifact_state_changed')",
+            name="ck_sft_reconciliation_item_reason",
+        ),
+        CheckConstraint(
+            "resource_type IN ('source_stage','source_final','dataset_stage','dataset_final')",
+            name="ck_sft_reconciliation_item_resource_type",
+        ),
+        UniqueConstraint(
+            "operation_id",
+            "resource_type",
+            "resource_id",
+            "attempt_id",
+            name="uq_sft_reconciliation_item",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    operation_id: Mapped[UUID] = mapped_column(nullable=False)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    resource_id: Mapped[UUID] = mapped_column(nullable=False)
+    attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    ownership_manifest: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="registered")
+    blocked_reason_code: Mapped[str | None] = mapped_column(String(48))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = utc_timestamp()
 
 

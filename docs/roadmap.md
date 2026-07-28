@@ -56,7 +56,7 @@ This roadmap separates foundational safety work from product implementation. A l
 
 ## Phase 10 — SFT dataset builder (current; not completed)
 
-- Planning scope only: add reviewed, traceable, department-scoped supervised fine-tuning dataset generation. Phase 10 implementation has not started.
+- Under review: add reviewed, traceable, department-scoped supervised fine-tuning dataset generation from immutable human-authored external source bundles. The implementation has no training, adapter, model, or Phase 11 behavior.
 
 ## Phase 11 — LLaMA-Factory training job generation
 

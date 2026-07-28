@@ -386,3 +386,85 @@ class EvaluationRunResponse(ORMResponse):
 class EvaluationRunListResponse(BaseModel):
     items: list[EvaluationRunResponse]
     next_cursor: str | None
+
+
+class SftSourceResponse(ORMResponse):
+    """Content-free external SFT source metadata."""
+
+    id: UUID
+    department_id: UUID
+    status: str
+    artifact_contract_version: str
+    normalization_version: str
+    example_contract_version: str
+    example_count: int
+    group_count: int
+    source_reference_count: int
+    archived_at: datetime | None
+    purged_at: datetime | None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class SftSourceListResponse(BaseModel):
+    items: list[SftSourceResponse]
+    limit: int
+    offset: int
+
+
+class SftDatasetBuildResponse(ORMResponse):
+    """Content-free SFT dataset-build lifecycle metadata."""
+
+    id: UUID
+    department_id: UUID
+    source_bundle_id: UUID
+    status: str
+    review_status: str
+    artifact_contract_version: str
+    example_contract_version: str
+    normalization_version: str
+    split_version: str
+    validation_ratio: Decimal
+    source_example_count: int
+    source_group_count: int
+    source_reference_count: int
+    train_example_count: int | None
+    validation_example_count: int | None
+    error_code: str | None
+    requested_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    cancellation_requested_at: datetime | None
+    reviewed_at: datetime | None
+    archived_at: datetime | None
+    purged_at: datetime | None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class SftDatasetBuildListResponse(BaseModel):
+    items: list[SftDatasetBuildResponse]
+    limit: int
+    offset: int
+
+
+class SftDatasetBuildCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: StrictInt = Field(ge=1)
+
+
+class SftDatasetBuildReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: str
+    expected_version: StrictInt = Field(ge=1)
+
+    @field_validator("action")
+    @classmethod
+    def validate_action(cls, value: str) -> str:
+        if value not in {"approve", "reject", "archive"}:
+            raise ValueError("action is invalid")
+        return value
