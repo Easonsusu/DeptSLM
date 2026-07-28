@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 import os
 import re
-import time
+import signal
+import threading
 from pathlib import Path
 from uuid import UUID
 
@@ -15,7 +16,7 @@ from app.sft_queue import SftQueueError, claim_next, process_build
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 
 
-def _settings() -> tuple[str, Path, UUID, int, int, str]:
+def _settings() -> tuple[str, Path, UUID, int, int, int, str]:
     database_url = os.getenv("DATABASE_URL", "").strip()
     raw_data_dir = os.getenv("DEPTSLM_DATA_DIR", "").strip()
     raw_worker = os.getenv("DEPTSLM_SFT_WORKER_ID", "").strip()
@@ -33,7 +34,8 @@ def _settings() -> tuple[str, Path, UUID, int, int, str]:
         raise ValueError("SFT worker configuration is invalid")
     lease = _positive(os.getenv("DEPTSLM_SFT_LEASE_SECONDS", "300"))
     poll = _positive(os.getenv("DEPTSLM_SFT_POLL_SECONDS", "5"))
-    return database_url, data_dir, worker_id, lease, poll, revision
+    operation = _positive(os.getenv("DEPTSLM_SFT_OPERATION_SECONDS", "120"))
+    return database_url, data_dir, worker_id, lease, poll, operation, revision
 
 
 def _positive(raw: str) -> int:
@@ -47,24 +49,40 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--poll", action="store_true")
     args = parser.parse_args(argv)
     try:
-        database_url, data_dir, worker_id, lease, poll, revision = _settings()
+        database_url, data_dir, worker_id, lease, poll, operation, revision = _settings()
     except ValueError as error:
         print(str(error), file=os.sys.stderr)
         return 1
     engine = create_database_engine(database_url)
     factory = create_session_factory(engine)
+    shutdown = threading.Event()
+
+    def request_shutdown(_signal, _frame) -> None:
+        shutdown.set()
+
+    previous_term = signal.signal(signal.SIGTERM, request_shutdown)
+    previous_int = signal.signal(signal.SIGINT, request_shutdown)
     try:
-        while True:
+        while not shutdown.is_set():
             try:
                 job = claim_next(factory, worker_id, lease, revision)
                 if job is not None:
-                    process_build(factory, data_dir, job, lease_seconds=lease)
-            except SftQueueError:
-                pass
+                    process_build(
+                        factory,
+                        data_dir,
+                        job,
+                        lease_seconds=lease,
+                        operation_seconds=operation,
+                        should_stop=shutdown.is_set,
+                    )
+            except SftQueueError as error:
+                print(f"sft-worker queue failure: {error.code}", file=os.sys.stderr)
             if not args.poll:
                 return 0
-            time.sleep(poll)
+            shutdown.wait(poll)
     finally:
+        signal.signal(signal.SIGTERM, previous_term)
+        signal.signal(signal.SIGINT, previous_int)
         engine.dispose()
 
 

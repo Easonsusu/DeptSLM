@@ -7,6 +7,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     CheckConstraint,
@@ -1774,7 +1775,8 @@ class SftSourceBundle(Base):
             "source_reference_count >= example_count", name="ck_sft_source_bundle_references"
         ),
         CheckConstraint(
-            "manifest_sha256 ~ '^[0-9a-f]{64}$' AND examples_sha256 ~ '^[0-9a-f]{64}$'",
+            "manifest_sha256 ~ '^[0-9a-f]{64}$' AND examples_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND authority_snapshot_sha256 ~ '^[0-9a-f]{64}$'",
             name="ck_sft_source_bundle_hashes",
         ),
         CheckConstraint(
@@ -1811,6 +1813,7 @@ class SftSourceBundle(Base):
     source_reference_count: Mapped[int] = mapped_column(Integer, nullable=False)
     manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     examples_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    authority_snapshot_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     examples_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -1858,6 +1861,8 @@ class SftSourceImportAttempt(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="registered")
     manifest_sha256: Mapped[str | None] = mapped_column(String(64))
     examples_sha256: Mapped[str | None] = mapped_column(String(64))
+    authority_snapshot_sha256: Mapped[str | None] = mapped_column(String(64))
+    artifact_manifest: Mapped[dict[str, object] | None] = mapped_column(JSON)
     examples_byte_size: Mapped[int | None] = mapped_column(BigInteger)
     staged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -1897,7 +1902,7 @@ class SftDatasetBuild(Base):
             "'source_artifact_missing','source_artifact_mismatch','source_contract_invalid',"
             "'source_authority_changed','department_unavailable','requester_unauthorized',"
             "'dataset_publication_failed','claim_lost','cancelled','worker_shutdown',"
-            "'database_unavailable')",
+            "'worker_timeout','database_unavailable')",
             name="ck_sft_build_error_code",
         ),
         CheckConstraint("attempt_number > 0 AND version > 0", name="ck_sft_build_versions"),
@@ -1985,6 +1990,8 @@ class SftDatasetBuild(Base):
     validation_byte_size: Mapped[int | None] = mapped_column(BigInteger)
     provenance_sha256: Mapped[str | None] = mapped_column(String(64))
     provenance_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    publication_manifest: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    artifact_cleanup_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_code: Mapped[str | None] = mapped_column(String(64))
     requested_at: Mapped[datetime] = utc_timestamp()
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -2010,8 +2017,17 @@ class SftArtifactReconciliationOperation(Base):
     __table_args__ = (
         UniqueConstraint("id", "department_id", name="uq_sft_reconciliation_operation_scope"),
         CheckConstraint(
+            "operation_type IN ('reconcile','purge')",
+            name="ck_sft_reconciliation_operation_type",
+        ),
+        CheckConstraint(
             "status IN ('registered','completed','completed_with_blocks')",
             name="ck_sft_reconciliation_operation_status",
+        ),
+        CheckConstraint(
+            "(status = 'registered' AND completed_at IS NULL) OR "
+            "(status IN ('completed','completed_with_blocks') AND completed_at IS NOT NULL)",
+            name="ck_sft_reconciliation_operation_lifecycle",
         ),
         CheckConstraint(
             "limit_value BETWEEN 1 AND 1000", name="ck_sft_reconciliation_operation_limit"
@@ -2027,6 +2043,7 @@ class SftArtifactReconciliationOperation(Base):
         ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
     )
     limit_value: Mapped[int] = mapped_column(Integer, nullable=False)
+    operation_type: Mapped[str] = mapped_column(String(16), nullable=False, default="reconcile")
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="registered")
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = utc_timestamp()
@@ -2049,10 +2066,23 @@ class SftArtifactReconciliationOperationItem(Base):
             name="ck_sft_reconciliation_item_status",
         ),
         CheckConstraint(
+            "(status = 'registered' AND completed_at IS NULL AND blocked_at IS NULL "
+            "AND blocked_reason_code IS NULL) OR "
+            "(status = 'completed' AND completed_at IS NOT NULL AND blocked_at IS NULL "
+            "AND blocked_reason_code IS NULL) OR "
+            "(status = 'blocked' AND completed_at IS NULL AND blocked_at IS NOT NULL "
+            "AND blocked_reason_code IS NOT NULL)",
+            name="ck_sft_reconciliation_item_lifecycle",
+        ),
+        CheckConstraint(
             "blocked_reason_code IS NULL OR blocked_reason_code IN "
             "('staging_path_unsafe','artifact_ownership_mismatch','artifact_manifest_invalid',"
-            "'artifact_permissions_invalid')",
+            "'artifact_permissions_invalid','artifact_state_changed')",
             name="ck_sft_reconciliation_item_reason",
+        ),
+        CheckConstraint(
+            "resource_type IN ('source_stage','source_final','dataset_stage','dataset_final')",
+            name="ck_sft_reconciliation_item_resource_type",
         ),
         UniqueConstraint(
             "operation_id", "resource_type", "resource_id", name="uq_sft_reconciliation_item"
@@ -2064,6 +2094,8 @@ class SftArtifactReconciliationOperationItem(Base):
     department_id: Mapped[UUID] = mapped_column(nullable=False)
     resource_type: Mapped[str] = mapped_column(String(32), nullable=False)
     resource_id: Mapped[UUID] = mapped_column(nullable=False)
+    attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    ownership_manifest: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="registered")
     blocked_reason_code: Mapped[str | None] = mapped_column(String(48))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

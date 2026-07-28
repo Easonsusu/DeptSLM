@@ -3,18 +3,21 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import time
 from uuid import uuid4
 
 import pytest
 
 from app.authorization import DepartmentScope
-from app.sft_artifacts import DATASET_FILES, SftArtifactStore
+from app.sft_artifacts import DATASET_FILES, SftArtifactError, SftArtifactStore
 from app.sft_domain import (
     SftContractError,
     canonical_json_bytes,
     parse_source_bundle,
     split_examples,
 )
+from app.sft_supervision import run_claimed_operation
 
 
 def _source() -> tuple[bytes, bytes]:
@@ -143,7 +146,7 @@ def test_private_artifacts_are_published_and_read_from_external_root(tmp_path) -
         provenance=provenance,
     )
     published = store.publish(dataset, allowlist=DATASET_FILES)
-    assert published.path.name == str(build_id)
+    assert published.resource_id == build_id
 
 
 def test_final_removal_requires_exact_manifest_ownership(tmp_path) -> None:
@@ -160,19 +163,24 @@ def test_final_removal_requires_exact_manifest_ownership(tmp_path) -> None:
         examples=examples,
     )
     store.publish(staged, allowlist=frozenset({"manifest.json", "examples.jsonl"}))
+    with pytest.raises(SftArtifactError):
+        store.remove_owned_source_final(
+            scope,
+            parsed.source_bundle_id,
+            parsed.import_attempt_id,
+            expected={key: value for key, value in parsed.manifest.items() if key != "files"},
+        )
     assert store.remove_owned_source_final(
         scope,
         parsed.source_bundle_id,
         parsed.import_attempt_id,
-        manifest_sha256=hashlib.sha256(manifest).hexdigest(),
-        examples_sha256=hashlib.sha256(examples).hexdigest(),
+        expected=parsed.manifest,
     )
     assert not store.remove_owned_source_final(
         scope,
         parsed.source_bundle_id,
         parsed.import_attempt_id,
-        manifest_sha256=hashlib.sha256(manifest).hexdigest(),
-        examples_sha256=hashlib.sha256(examples).hexdigest(),
+        expected=parsed.manifest,
     )
 
 
@@ -186,3 +194,73 @@ def test_stage_cleanup_is_exact_attempt_scoped(tmp_path) -> None:
     store.stage_source(scope, source_id, attempt_id, manifest=manifest, examples=examples)
     assert store.remove_owned_source_stage(scope, source_id, attempt_id)
     assert not store.remove_owned_source_stage(scope, source_id, attempt_id)
+
+
+def test_stage_cleanup_recovers_partial_marker_without_parsing_it(tmp_path) -> None:
+    (tmp_path / "training_datasets").mkdir(mode=0o700)
+    store = SftArtifactStore(tmp_path)
+    manifest, examples = _source()
+    parsed = parse_source_bundle(manifest, examples)
+    scope = DepartmentScope(parsed.department_id)
+    staged = store.stage_source(
+        scope,
+        parsed.source_bundle_id,
+        parsed.import_attempt_id,
+        manifest=manifest,
+        examples=examples,
+    )
+    staged.close()
+    marker = (
+        tmp_path
+        / "training_datasets/.staging/sources"
+        / str(scope.value)
+        / str(parsed.source_bundle_id)
+        / str(parsed.import_attempt_id)
+        / ".ownership"
+    )
+    marker.write_bytes(b"")
+    assert store.remove_owned_source_stage(scope, parsed.source_bundle_id, parsed.import_attempt_id)
+
+
+class _OperationError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+def test_supervision_heartbeats_and_returns_child_result() -> None:
+    heartbeats: list[bool] = []
+    result = run_claimed_operation(
+        timeout_seconds=2,
+        heartbeat_seconds=1,
+        should_stop=lambda: False,
+        heartbeat=lambda: heartbeats.append(True),
+        error=_OperationError,
+        operation=lambda: "complete",
+    )
+    assert result == "complete"
+    assert heartbeats
+
+
+def test_supervision_timeout_terminates_blocked_child_group() -> None:
+    with pytest.raises(_OperationError, match="worker_timeout"):
+        run_claimed_operation(
+            timeout_seconds=1,
+            heartbeat_seconds=1,
+            should_stop=lambda: False,
+            heartbeat=lambda: None,
+            error=_OperationError,
+            operation=lambda: time.sleep(5),
+        )
+
+
+def test_supervision_shutdown_prevents_child_publication() -> None:
+    with pytest.raises(_OperationError, match="worker_shutdown"):
+        run_claimed_operation(
+            timeout_seconds=2,
+            heartbeat_seconds=1,
+            should_stop=lambda: True,
+            heartbeat=lambda: None,
+            error=_OperationError,
+            operation=lambda: os.getpid(),
+        )

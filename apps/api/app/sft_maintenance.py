@@ -6,16 +6,15 @@ import os
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.auth import AuthenticatedPrincipal
 from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.models import (
-    PersistentAuditEvent,
     SftArtifactReconciliationOperation,
     SftArtifactReconciliationOperationItem,
     SftDatasetBuild,
@@ -130,104 +129,25 @@ def reconcile_sft_artifacts(
     apply: bool,
 ) -> SftMaintenanceResult:
     _limit(limit)
-    candidates: list[tuple[str, UUID, UUID]] = []
-    try:
-        with factory.begin() as session:
-            principal = AuthenticatedPrincipal(actor_subject, actor_issuer)
-            scope = DepartmentRequestScope(DepartmentScope(department_id))
-            authorization = authorize_transaction(
-                session,
-                principal,
-                scope,
-                SFT_ADMIN_ROLES,
-                lock=True,
-                audit_action="sft.artifact.reconcile.authorization",
-            )
-            attempts = session.scalars(
-                select(SftSourceImportAttempt)
-                .where(
-                    SftSourceImportAttempt.department_id == department_id,
-                    SftSourceImportAttempt.status.in_(("registered", "staged", "published")),
-                )
-                .order_by(SftSourceImportAttempt.created_at)
-                .with_for_update(skip_locked=True)
-                .limit(limit)
-            ).all()
-            builds = session.scalars(
-                select(SftDatasetBuild)
-                .where(
-                    SftDatasetBuild.department_id == department_id,
-                    SftDatasetBuild.status.in_(("failed", "cancelled")),
-                    SftDatasetBuild.publication_attempt_id.is_not(None),
-                )
-                .order_by(SftDatasetBuild.created_at)
-                .with_for_update(skip_locked=True)
-                .limit(max(0, limit - len(attempts)))
-            ).all()
-            if not apply:
-                return SftMaintenanceResult(len(attempts) + len(builds), 0, 0)
-            operation = SftArtifactReconciliationOperation(
-                department_id=department_id,
-                requested_by_user_id=authorization.identity.id,
-                limit_value=limit,
-                status="registered",
-            )
-            session.add(operation)
-            session.flush()
-            for attempt in attempts:
-                session.add(
-                    SftArtifactReconciliationOperationItem(
-                        operation_id=operation.id,
-                        department_id=department_id,
-                        resource_type="source_import",
-                        resource_id=attempt.id,
-                        status="registered",
-                    )
-                )
-                candidates.append(("source", attempt.source_bundle_id, attempt.import_attempt_id))
-            for build in builds:
-                session.add(
-                    SftArtifactReconciliationOperationItem(
-                        operation_id=operation.id,
-                        department_id=department_id,
-                        resource_type="dataset_build",
-                        resource_id=build.id,
-                        status="registered",
-                    )
-                )
-                candidates.append(("dataset", build.id, build.publication_attempt_id))
-            operation.status = "completed"
-            operation.completed_at = session.scalar(select(func.clock_timestamp()))
-            append_mutation_audit(
-                session,
-                actor=authorization.identity,
-                actor_subject=actor_subject,
-                request_scope=scope,
-                action="sft.artifact.reconcile",
-                resource_type="sft_artifact_reconciliation_operation",
-                resource_id=operation.id,
-            )
-    except ServiceError:
-        raise
-    except SQLAlchemyError as error:
-        raise ServiceError(503, "Database unavailable") from error
-    store = SftArtifactStore(data_dir)
-    applied = blocked = 0
-    for kind, resource_id, attempt_id in candidates:
-        try:
-            removed = (
-                store.remove_owned_source_stage(
-                    DepartmentScope(department_id), resource_id, attempt_id
-                )
-                if kind == "source"
-                else store.remove_owned_dataset_stage(
-                    DepartmentScope(department_id), resource_id, attempt_id
-                )
-            )
-            applied += int(removed)
-        except SftArtifactError:
-            blocked += 1
-    return SftMaintenanceResult(len(candidates), applied, blocked)
+    operation_id, items = _register_or_resume_reconciliation(
+        factory,
+        department_id=department_id,
+        actor_issuer=actor_issuer,
+        actor_subject=actor_subject,
+        limit=limit,
+        apply=apply,
+    )
+    if operation_id is None:
+        return SftMaintenanceResult(len(items), 0, 0)
+    return _execute_artifact_operation(
+        factory,
+        data_dir=data_dir,
+        operation_id=operation_id,
+        department_id=department_id,
+        actor_issuer=actor_issuer,
+        actor_subject=actor_subject,
+        items=items,
+    )
 
 
 def purge_sft_artifacts(
@@ -244,6 +164,137 @@ def purge_sft_artifacts(
     _limit(limit)
     if not 30 <= retention_days <= 730:
         raise ServiceError(422, "Invalid SFT retention")
+    operation_id, items = _register_or_resume_purge(
+        factory,
+        department_id=department_id,
+        actor_issuer=actor_issuer,
+        actor_subject=actor_subject,
+        retention_days=retention_days,
+        limit=limit,
+        apply=apply,
+    )
+    if operation_id is None:
+        return SftMaintenanceResult(len(items), 0, 0)
+    return _execute_artifact_operation(
+        factory,
+        data_dir=data_dir,
+        operation_id=operation_id,
+        department_id=department_id,
+        actor_issuer=actor_issuer,
+        actor_subject=actor_subject,
+        items=items,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactOperationItem:
+    id: UUID
+    resource_type: str
+    resource_id: UUID
+    attempt_id: UUID
+    ownership_manifest: dict[str, object]
+
+
+def _register_or_resume_reconciliation(
+    factory: sessionmaker,
+    *,
+    department_id: UUID,
+    actor_issuer: str,
+    actor_subject: str,
+    limit: int,
+    apply: bool,
+) -> tuple[UUID | None, tuple[_ArtifactOperationItem, ...]]:
+    try:
+        with factory.begin() as session:
+            principal = AuthenticatedPrincipal(actor_subject, actor_issuer)
+            scope = DepartmentRequestScope(DepartmentScope(department_id))
+            authorization = authorize_transaction(
+                session,
+                principal,
+                scope,
+                SFT_ADMIN_ROLES,
+                lock=True,
+                audit_action="sft.artifact.reconcile.authorization",
+            )
+            existing = session.execute(
+                select(SftArtifactReconciliationOperation)
+                .where(
+                    SftArtifactReconciliationOperation.department_id == department_id,
+                    SftArtifactReconciliationOperation.operation_type == "reconcile",
+                    SftArtifactReconciliationOperation.status == "registered",
+                )
+                .order_by(
+                    SftArtifactReconciliationOperation.created_at,
+                    SftArtifactReconciliationOperation.id,
+                )
+                .with_for_update()
+                .limit(1)
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing.id, _registered_items(session, existing.id, department_id)
+            attempts = session.scalars(
+                select(SftSourceImportAttempt)
+                .where(
+                    SftSourceImportAttempt.department_id == department_id,
+                    SftSourceImportAttempt.status.in_(("registered", "staged", "published")),
+                )
+                .order_by(SftSourceImportAttempt.created_at, SftSourceImportAttempt.id)
+                .with_for_update(skip_locked=True)
+                .limit(limit)
+            ).all()
+            builds = session.scalars(
+                select(SftDatasetBuild)
+                .where(
+                    SftDatasetBuild.department_id == department_id,
+                    SftDatasetBuild.status.in_(("failed", "cancelled")),
+                    SftDatasetBuild.publication_attempt_id.is_not(None),
+                    SftDatasetBuild.artifact_cleanup_confirmed_at.is_(None),
+                )
+                .order_by(SftDatasetBuild.created_at, SftDatasetBuild.id)
+                .with_for_update(skip_locked=True)
+                .limit(max(0, limit - len(attempts)))
+            ).all()
+            if not apply:
+                return None, _reconciliation_candidates(attempts, builds)
+            operation = SftArtifactReconciliationOperation(
+                department_id=department_id,
+                requested_by_user_id=authorization.identity.id,
+                limit_value=limit,
+                operation_type="reconcile",
+                status="registered",
+            )
+            session.add(operation)
+            session.flush()
+            for candidate in _reconciliation_candidates(attempts, builds):
+                session.add(
+                    SftArtifactReconciliationOperationItem(
+                        operation_id=operation.id,
+                        department_id=department_id,
+                        resource_type=candidate.resource_type,
+                        resource_id=candidate.resource_id,
+                        attempt_id=candidate.attempt_id,
+                        ownership_manifest=candidate.ownership_manifest,
+                        status="registered",
+                    )
+                )
+            session.flush()
+            return operation.id, _registered_items(session, operation.id, department_id)
+    except ServiceError:
+        raise
+    except SQLAlchemyError as error:
+        raise ServiceError(503, "Database unavailable") from error
+
+
+def _register_or_resume_purge(
+    factory: sessionmaker,
+    *,
+    department_id: UUID,
+    actor_issuer: str,
+    actor_subject: str,
+    retention_days: int,
+    limit: int,
+    apply: bool,
+) -> tuple[UUID | None, tuple[_ArtifactOperationItem, ...]]:
     try:
         with factory.begin() as session:
             principal = AuthenticatedPrincipal(actor_subject, actor_issuer)
@@ -256,6 +307,22 @@ def purge_sft_artifacts(
                 lock=True,
                 audit_action="sft.artifact.purge.authorization",
             )
+            existing = session.execute(
+                select(SftArtifactReconciliationOperation)
+                .where(
+                    SftArtifactReconciliationOperation.department_id == department_id,
+                    SftArtifactReconciliationOperation.operation_type == "purge",
+                    SftArtifactReconciliationOperation.status == "registered",
+                )
+                .order_by(
+                    SftArtifactReconciliationOperation.created_at,
+                    SftArtifactReconciliationOperation.id,
+                )
+                .with_for_update()
+                .limit(1)
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing.id, _registered_items(session, existing.id, department_id)
             cutoff = session.scalar(select(func.clock_timestamp())) - timedelta(days=retention_days)
             builds = session.scalars(
                 select(SftDatasetBuild)
@@ -287,81 +354,429 @@ def purge_sft_artifacts(
                 .with_for_update(skip_locked=True)
                 .limit(max(0, limit - len(builds)))
             ).all()
+            candidates = _purge_candidates(session, builds, sources)
             if not apply:
-                return SftMaintenanceResult(len(builds) + len(sources), 0, 0)
-            store = SftArtifactStore(data_dir)
-            applied = 0
-            for build in builds:
-                if build.publication_attempt_id is None or not all(
-                    (
-                        build.result_manifest_sha256,
-                        build.train_sha256,
-                        build.validation_sha256,
-                        build.provenance_sha256,
-                    )
-                ):
-                    continue
-                if store.remove_owned_dataset_final(
-                    scope.department,
-                    build.id,
-                    build.publication_attempt_id,
-                    attempt_number=build.attempt_number,
-                    code_revision=build.code_revision,
-                    manifest_sha256=build.result_manifest_sha256,
-                    train_sha256=build.train_sha256,
-                    validation_sha256=build.validation_sha256,
-                    provenance_sha256=build.provenance_sha256,
-                ):
-                    build.review_status = "purged"
-                    build.purged_at = session.scalar(select(func.clock_timestamp()))
-                    build.version += 1
-                    applied += 1
-            for source in sources:
-                attempt = session.execute(
-                    select(SftSourceImportAttempt)
-                    .where(
-                        SftSourceImportAttempt.department_id == department_id,
-                        SftSourceImportAttempt.source_bundle_id == source.id,
-                        SftSourceImportAttempt.status == "committed",
-                    )
-                    .order_by(SftSourceImportAttempt.committed_at.desc())
-                    .limit(1)
-                ).scalar_one_or_none()
-                if attempt is None:
-                    continue
-                if store.remove_owned_source_final(
-                    scope.department,
-                    source.id,
-                    attempt.import_attempt_id,
-                    manifest_sha256=source.manifest_sha256,
-                    examples_sha256=source.examples_sha256,
-                ):
-                    source.status = "purged"
-                    source.purged_at = session.scalar(select(func.clock_timestamp()))
-                    source.version += 1
-                    applied += 1
-            if applied:
+                return None, tuple(candidates)
+            operation = SftArtifactReconciliationOperation(
+                department_id=department_id,
+                requested_by_user_id=authorization.identity.id,
+                limit_value=limit,
+                operation_type="purge",
+                status="registered",
+            )
+            session.add(operation)
+            session.flush()
+            for candidate in candidates:
                 session.add(
-                    PersistentAuditEvent(
-                        actor_subject=actor_subject,
-                        actor_user_id=authorization.identity.id,
+                    SftArtifactReconciliationOperationItem(
+                        operation_id=operation.id,
                         department_id=department_id,
-                        action="sft.artifact.purge",
-                        resource_type="sft_dataset_build",
-                        resource_id="maintenance",
-                        result="allowed",
-                        reason_code="mutation_applied",
+                        resource_type=candidate.resource_type,
+                        resource_id=candidate.resource_id,
+                        attempt_id=candidate.attempt_id,
+                        ownership_manifest=candidate.ownership_manifest,
+                        status="registered",
                     )
                 )
-            return SftMaintenanceResult(len(builds) + len(sources), applied, 0)
-    except SftArtifactError as error:
-        raise ServiceError(409, "SFT artifact is unavailable") from error
+            session.flush()
+            return operation.id, _registered_items(session, operation.id, department_id)
     except ServiceError:
         raise
     except SQLAlchemyError as error:
         raise ServiceError(503, "Database unavailable") from error
 
 
+def _reconciliation_candidates(
+    attempts: list[SftSourceImportAttempt],
+    builds: list[SftDatasetBuild],
+) -> tuple[_ArtifactOperationItem, ...]:
+    candidates: list[_ArtifactOperationItem] = []
+    for attempt in attempts:
+        target = "source_final" if attempt.status == "published" else "source_stage"
+        candidates.append(
+            _ArtifactOperationItem(
+                id=uuid4(),
+                resource_type=target,
+                resource_id=attempt.source_bundle_id,
+                attempt_id=attempt.import_attempt_id,
+                ownership_manifest=(
+                    dict(attempt.artifact_manifest)
+                    if isinstance(attempt.artifact_manifest, dict)
+                    else {}
+                ),
+            )
+        )
+    for build in builds:
+        if build.publication_attempt_id is None:
+            continue
+        candidates.append(
+            _ArtifactOperationItem(
+                id=uuid4(),
+                resource_type="dataset_stage",
+                resource_id=build.id,
+                attempt_id=build.publication_attempt_id,
+                ownership_manifest={},
+            )
+        )
+        candidates.append(
+            _ArtifactOperationItem(
+                id=uuid4(),
+                resource_type="dataset_final",
+                resource_id=build.id,
+                attempt_id=build.publication_attempt_id,
+                ownership_manifest=(
+                    dict(build.publication_manifest)
+                    if isinstance(build.publication_manifest, dict)
+                    else {}
+                ),
+            )
+        )
+    return tuple(candidates)
+
+
+def _purge_candidates(
+    session: Session,
+    builds: list[SftDatasetBuild],
+    sources: list[SftSourceBundle],
+) -> tuple[_ArtifactOperationItem, ...]:
+    candidates: list[_ArtifactOperationItem] = []
+    for build in builds:
+        if build.publication_attempt_id is None or not isinstance(build.publication_manifest, dict):
+            continue
+        candidates.append(
+            _ArtifactOperationItem(
+                id=uuid4(),
+                resource_type="dataset_final",
+                resource_id=build.id,
+                attempt_id=build.publication_attempt_id,
+                ownership_manifest=dict(build.publication_manifest),
+            )
+        )
+    for source in sources:
+        attempt = session.execute(
+            select(SftSourceImportAttempt)
+            .where(
+                SftSourceImportAttempt.department_id == source.department_id,
+                SftSourceImportAttempt.source_bundle_id == source.id,
+                SftSourceImportAttempt.status == "committed",
+            )
+            .order_by(SftSourceImportAttempt.committed_at.desc(), SftSourceImportAttempt.id)
+            .limit(1)
+        ).scalar_one_or_none()
+        if attempt is None or not isinstance(attempt.artifact_manifest, dict):
+            continue
+        candidates.append(
+            _ArtifactOperationItem(
+                id=uuid4(),
+                resource_type="source_final",
+                resource_id=source.id,
+                attempt_id=attempt.import_attempt_id,
+                ownership_manifest=dict(attempt.artifact_manifest),
+            )
+        )
+    return tuple(candidates)
+
+
+def _registered_items(
+    session: Session, operation_id: UUID, department_id: UUID
+) -> tuple[_ArtifactOperationItem, ...]:
+    items = session.scalars(
+        select(SftArtifactReconciliationOperationItem)
+        .where(
+            SftArtifactReconciliationOperationItem.operation_id == operation_id,
+            SftArtifactReconciliationOperationItem.department_id == department_id,
+            SftArtifactReconciliationOperationItem.status == "registered",
+        )
+        .order_by(
+            SftArtifactReconciliationOperationItem.created_at,
+            SftArtifactReconciliationOperationItem.id,
+        )
+    ).all()
+    return tuple(
+        _ArtifactOperationItem(
+            id=item.id,
+            resource_type=item.resource_type,
+            resource_id=item.resource_id,
+            attempt_id=item.attempt_id,
+            ownership_manifest=dict(item.ownership_manifest),
+        )
+        for item in items
+    )
+
+
 def _limit(value: object) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 1000:
         raise ServiceError(422, "Invalid SFT maintenance limit")
+
+
+def _execute_artifact_operation(
+    factory: sessionmaker,
+    *,
+    data_dir: Path,
+    operation_id: UUID,
+    department_id: UUID,
+    actor_issuer: str,
+    actor_subject: str,
+    items: tuple[_ArtifactOperationItem, ...],
+) -> SftMaintenanceResult:
+    applied = blocked = 0
+    with SftArtifactStore(data_dir) as store:
+        for item in items:
+            try:
+                _remove_item_artifact(store, DepartmentScope(department_id), item)
+                _terminalize_artifact_item(
+                    factory,
+                    operation_id=operation_id,
+                    department_id=department_id,
+                    item_id=item.id,
+                    actor_issuer=actor_issuer,
+                    actor_subject=actor_subject,
+                    completed=True,
+                )
+                applied += 1
+            except SftArtifactError as error:
+                _terminalize_artifact_item(
+                    factory,
+                    operation_id=operation_id,
+                    department_id=department_id,
+                    item_id=item.id,
+                    actor_issuer=actor_issuer,
+                    actor_subject=actor_subject,
+                    completed=False,
+                    reason=_blocked_reason(error.code),
+                )
+                blocked += 1
+    _complete_artifact_operation(factory, operation_id, department_id, actor_issuer, actor_subject)
+    return SftMaintenanceResult(len(items), applied, blocked)
+
+
+def _remove_item_artifact(
+    store: SftArtifactStore, scope: DepartmentScope, item: _ArtifactOperationItem
+) -> bool:
+    if item.resource_type == "source_stage":
+        return store.remove_owned_source_stage(scope, item.resource_id, item.attempt_id)
+    if item.resource_type == "dataset_stage":
+        return store.remove_owned_dataset_stage(scope, item.resource_id, item.attempt_id)
+    if item.resource_type == "source_final":
+        return store.remove_owned_source_final(
+            scope,
+            item.resource_id,
+            item.attempt_id,
+            expected=item.ownership_manifest,
+        )
+    if item.resource_type == "dataset_final":
+        return store.remove_owned_dataset_final(
+            scope,
+            item.resource_id,
+            item.attempt_id,
+            expected=item.ownership_manifest,
+        )
+    raise SftArtifactError("artifact_ownership_mismatch")
+
+
+def _terminalize_artifact_item(
+    factory: sessionmaker,
+    *,
+    operation_id: UUID,
+    department_id: UUID,
+    item_id: UUID,
+    actor_issuer: str,
+    actor_subject: str,
+    completed: bool,
+    reason: str | None = None,
+) -> None:
+    with factory.begin() as session:
+        operation = session.execute(
+            select(SftArtifactReconciliationOperation)
+            .where(
+                SftArtifactReconciliationOperation.id == operation_id,
+                SftArtifactReconciliationOperation.department_id == department_id,
+                SftArtifactReconciliationOperation.status == "registered",
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        item = session.execute(
+            select(SftArtifactReconciliationOperationItem)
+            .where(
+                SftArtifactReconciliationOperationItem.id == item_id,
+                SftArtifactReconciliationOperationItem.operation_id == operation_id,
+                SftArtifactReconciliationOperationItem.department_id == department_id,
+                SftArtifactReconciliationOperationItem.status == "registered",
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if operation is None or item is None:
+            return
+        principal = AuthenticatedPrincipal(actor_subject, actor_issuer)
+        scope = DepartmentRequestScope(DepartmentScope(department_id))
+        authorize_transaction(
+            session,
+            principal,
+            scope,
+            SFT_ADMIN_ROLES,
+            lock=True,
+            audit_action=f"sft.artifact.{operation.operation_type}.authorization",
+        )
+        now = session.scalar(select(func.clock_timestamp()))
+        if completed and operation.operation_type == "purge":
+            if not _finalize_purge_resource(session, item, department_id, now):
+                completed = False
+                reason = "artifact_state_changed"
+        if completed and operation.operation_type == "reconcile":
+            _finalize_reconciliation_resource(session, item, department_id, now)
+        if completed:
+            item.status = "completed"
+            item.completed_at = now
+        else:
+            item.status = "blocked"
+            item.blocked_at = now
+            item.blocked_reason_code = reason or "artifact_ownership_mismatch"
+
+
+def _complete_artifact_operation(
+    factory: sessionmaker,
+    operation_id: UUID,
+    department_id: UUID,
+    actor_issuer: str,
+    actor_subject: str,
+) -> None:
+    with factory.begin() as session:
+        operation = session.execute(
+            select(SftArtifactReconciliationOperation)
+            .where(
+                SftArtifactReconciliationOperation.id == operation_id,
+                SftArtifactReconciliationOperation.department_id == department_id,
+                SftArtifactReconciliationOperation.status == "registered",
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if operation is None:
+            return
+        items = session.scalars(
+            select(SftArtifactReconciliationOperationItem).where(
+                SftArtifactReconciliationOperationItem.operation_id == operation_id
+            )
+        ).all()
+        if any(item.status == "registered" for item in items):
+            return
+        principal = AuthenticatedPrincipal(actor_subject, actor_issuer)
+        scope = DepartmentRequestScope(DepartmentScope(department_id))
+        authorization = authorize_transaction(
+            session,
+            principal,
+            scope,
+            SFT_ADMIN_ROLES,
+            lock=True,
+            audit_action=f"sft.artifact.{operation.operation_type}.authorization",
+        )
+        operation.status = (
+            "completed_with_blocks"
+            if any(item.status == "blocked" for item in items)
+            else "completed"
+        )
+        operation.completed_at = session.scalar(select(func.clock_timestamp()))
+        if any(item.status == "completed" for item in items):
+            append_mutation_audit(
+                session,
+                actor=authorization.identity,
+                actor_subject=actor_subject,
+                request_scope=scope,
+                action=f"sft.artifact.{operation.operation_type}",
+                resource_type="sft_artifact_reconciliation_operation",
+                resource_id=operation.id,
+            )
+
+
+def _finalize_purge_resource(
+    session: Session,
+    item: SftArtifactReconciliationOperationItem,
+    department_id: UUID,
+    now,
+) -> bool:
+    if item.resource_type == "dataset_final":
+        build = session.execute(
+            select(SftDatasetBuild)
+            .where(
+                SftDatasetBuild.id == item.resource_id,
+                SftDatasetBuild.department_id == department_id,
+                SftDatasetBuild.status == "succeeded",
+                SftDatasetBuild.review_status.in_(("rejected", "archived")),
+                SftDatasetBuild.publication_attempt_id == item.attempt_id,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if build is None:
+            return False
+        build.review_status = "purged"
+        build.purged_at = now
+        build.version += 1
+        return True
+    if item.resource_type == "source_final":
+        source = session.execute(
+            select(SftSourceBundle)
+            .where(
+                SftSourceBundle.id == item.resource_id,
+                SftSourceBundle.department_id == department_id,
+                SftSourceBundle.status == "archived",
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if source is None:
+            return False
+        source.status = "purged"
+        source.purged_at = now
+        source.version += 1
+        return True
+    return False
+
+
+def _finalize_reconciliation_resource(
+    session: Session,
+    item: SftArtifactReconciliationOperationItem,
+    department_id: UUID,
+    now,
+) -> None:
+    if item.resource_type in {"source_stage", "source_final"}:
+        attempt = session.execute(
+            select(SftSourceImportAttempt)
+            .where(
+                SftSourceImportAttempt.department_id == department_id,
+                SftSourceImportAttempt.source_bundle_id == item.resource_id,
+                SftSourceImportAttempt.import_attempt_id == item.attempt_id,
+                SftSourceImportAttempt.status.in_(("registered", "staged", "published")),
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if attempt is not None:
+            attempt.status = "failed"
+            attempt.failed_at = now
+            attempt.cleanup_confirmed_at = now
+            attempt.version += 1
+        return
+    if item.resource_type in {"dataset_stage", "dataset_final"}:
+        build = session.execute(
+            select(SftDatasetBuild)
+            .where(
+                SftDatasetBuild.id == item.resource_id,
+                SftDatasetBuild.department_id == department_id,
+                SftDatasetBuild.publication_attempt_id == item.attempt_id,
+                SftDatasetBuild.status.in_(("failed", "cancelled")),
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if build is not None:
+            build.artifact_cleanup_confirmed_at = now
+            build.version += 1
+
+
+def _blocked_reason(code: str) -> str:
+    return (
+        code
+        if code
+        in {
+            "staging_path_unsafe",
+            "artifact_ownership_mismatch",
+            "artifact_permissions_invalid",
+        }
+        else "artifact_manifest_invalid"
+    )

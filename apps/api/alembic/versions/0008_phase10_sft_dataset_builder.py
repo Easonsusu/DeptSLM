@@ -31,6 +31,7 @@ def upgrade() -> None:
         sa.Column("source_reference_count", sa.Integer(), nullable=False),
         sa.Column("manifest_sha256", sa.String(64), nullable=False),
         sa.Column("examples_sha256", sa.String(64), nullable=False),
+        sa.Column("authority_snapshot_sha256", sa.String(64), nullable=False),
         sa.Column("examples_byte_size", sa.BigInteger(), nullable=False),
         sa.Column("archived_at", sa.DateTime(timezone=True)),
         sa.Column("purged_at", sa.DateTime(timezone=True)),
@@ -64,7 +65,8 @@ def upgrade() -> None:
             "source_reference_count >= example_count", name="ck_sft_source_bundle_references"
         ),
         sa.CheckConstraint(
-            "manifest_sha256 ~ '^[0-9a-f]{64}$' AND examples_sha256 ~ '^[0-9a-f]{64}$'",
+            "manifest_sha256 ~ '^[0-9a-f]{64}$' AND examples_sha256 ~ '^[0-9a-f]{64}$' "
+            "AND authority_snapshot_sha256 ~ '^[0-9a-f]{64}$'",
             name="ck_sft_source_bundle_hashes",
         ),
         sa.CheckConstraint(
@@ -101,6 +103,8 @@ def upgrade() -> None:
         sa.Column("status", sa.String(16), nullable=False),
         sa.Column("manifest_sha256", sa.String(64)),
         sa.Column("examples_sha256", sa.String(64)),
+        sa.Column("authority_snapshot_sha256", sa.String(64)),
+        sa.Column("artifact_manifest", sa.JSON()),
         sa.Column("examples_byte_size", sa.BigInteger()),
         sa.Column("staged_at", sa.DateTime(timezone=True)),
         sa.Column("published_at", sa.DateTime(timezone=True)),
@@ -178,6 +182,8 @@ def upgrade() -> None:
         sa.Column("validation_byte_size", sa.BigInteger()),
         sa.Column("provenance_sha256", sa.String(64)),
         sa.Column("provenance_byte_size", sa.BigInteger()),
+        sa.Column("publication_manifest", sa.JSON()),
+        sa.Column("artifact_cleanup_confirmed_at", sa.DateTime(timezone=True)),
         sa.Column("error_code", sa.String(64)),
         sa.Column(
             "requested_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
@@ -209,7 +215,7 @@ def upgrade() -> None:
             "('source_artifact_missing','source_artifact_mismatch','source_contract_invalid',"
             "'source_authority_changed','department_unavailable','requester_unauthorized',"
             "'dataset_publication_failed','claim_lost','cancelled','worker_shutdown',"
-            "'database_unavailable')",
+            "'worker_timeout','database_unavailable')",
             name="ck_sft_build_error_code",
         ),
         sa.CheckConstraint("attempt_number > 0 AND version > 0", name="ck_sft_build_versions"),
@@ -289,6 +295,7 @@ def upgrade() -> None:
         sa.Column("department_id", sa.Uuid(), nullable=False),
         sa.Column("requested_by_user_id", sa.Uuid(), nullable=False),
         sa.Column("limit_value", sa.Integer(), nullable=False),
+        sa.Column("operation_type", sa.String(16), nullable=False),
         sa.Column("status", sa.String(24), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True)),
         sa.Column(
@@ -297,6 +304,15 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "status IN ('registered','completed','completed_with_blocks')",
             name="ck_sft_reconciliation_operation_status",
+        ),
+        sa.CheckConstraint(
+            "operation_type IN ('reconcile','purge')",
+            name="ck_sft_reconciliation_operation_type",
+        ),
+        sa.CheckConstraint(
+            "(status = 'registered' AND completed_at IS NULL) OR "
+            "(status IN ('completed','completed_with_blocks') AND completed_at IS NOT NULL)",
+            name="ck_sft_reconciliation_operation_lifecycle",
         ),
         sa.CheckConstraint(
             "limit_value BETWEEN 1 AND 1000", name="ck_sft_reconciliation_operation_limit"
@@ -320,6 +336,8 @@ def upgrade() -> None:
         sa.Column("department_id", sa.Uuid(), nullable=False),
         sa.Column("resource_type", sa.String(32), nullable=False),
         sa.Column("resource_id", sa.Uuid(), nullable=False),
+        sa.Column("attempt_id", sa.Uuid(), nullable=False),
+        sa.Column("ownership_manifest", sa.JSON(), nullable=False),
         sa.Column("status", sa.String(16), nullable=False),
         sa.Column("blocked_reason_code", sa.String(48)),
         sa.Column("completed_at", sa.DateTime(timezone=True)),
@@ -332,10 +350,23 @@ def upgrade() -> None:
             name="ck_sft_reconciliation_item_status",
         ),
         sa.CheckConstraint(
+            "(status = 'registered' AND completed_at IS NULL AND blocked_at IS NULL "
+            "AND blocked_reason_code IS NULL) OR "
+            "(status = 'completed' AND completed_at IS NOT NULL AND blocked_at IS NULL "
+            "AND blocked_reason_code IS NULL) OR "
+            "(status = 'blocked' AND completed_at IS NULL AND blocked_at IS NOT NULL "
+            "AND blocked_reason_code IS NOT NULL)",
+            name="ck_sft_reconciliation_item_lifecycle",
+        ),
+        sa.CheckConstraint(
             "blocked_reason_code IS NULL OR blocked_reason_code IN "
             "('staging_path_unsafe','artifact_ownership_mismatch','artifact_manifest_invalid',"
-            "'artifact_permissions_invalid')",
+            "'artifact_permissions_invalid','artifact_state_changed')",
             name="ck_sft_reconciliation_item_reason",
+        ),
+        sa.CheckConstraint(
+            "resource_type IN ('source_stage','source_final','dataset_stage','dataset_final')",
+            name="ck_sft_reconciliation_item_resource_type",
         ),
         sa.ForeignKeyConstraint(
             ["operation_id", "department_id"],

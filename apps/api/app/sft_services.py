@@ -17,9 +17,14 @@ from sqlalchemy.orm import Session
 
 from app.auth import AuthenticatedPrincipal, DepartmentRole
 from app.authorization import DepartmentRequestScope, DepartmentScope
-from app.models import SftDatasetBuild, SftSourceBundle, SftSourceImportAttempt
-from app.services import ALL_ROLES, ServiceError, append_mutation_audit, authorize_transaction
-from app.sft_artifacts import SftArtifactError, SftArtifactStore
+from app.models import (
+    SftArtifactReconciliationOperationItem,
+    SftDatasetBuild,
+    SftSourceBundle,
+    SftSourceImportAttempt,
+)
+from app.services import ServiceError, append_mutation_audit, authorize_transaction
+from app.sft_artifacts import SOURCE_FILES, SftArtifactError, SftArtifactStore
 from app.sft_authority import SftSourceAuthorityError, validate_source_authority
 from app.sft_domain import (
     DATASET_ARTIFACT_CONTRACT_VERSION,
@@ -68,7 +73,8 @@ class SftImportSettings:
                 "DEPTSLM_DATA_DIR must be an existing absolute directory."
             )
         try:
-            SftArtifactStore(data_dir)
+            with SftArtifactStore(data_dir):
+                pass
         except SftArtifactError as error:
             raise SftImportConfigurationError("SFT dataset storage is unavailable.") from error
         return cls(database_url=database_url, data_dir=data_dir)
@@ -97,7 +103,7 @@ def list_sft_sources(
             session,
             principal,
             request_scope,
-            ALL_ROLES,
+            SFT_AUTHOR_ROLES,
             lock=False,
             audit_action="sft.source.list.authorization",
         )
@@ -127,7 +133,7 @@ def read_sft_source(
             session,
             principal,
             request_scope,
-            ALL_ROLES,
+            SFT_AUTHOR_ROLES,
             lock=False,
             audit_action="sft.source.read.authorization",
         )
@@ -230,7 +236,7 @@ def list_sft_builds(
             session,
             principal,
             request_scope,
-            ALL_ROLES,
+            SFT_AUTHOR_ROLES,
             lock=False,
             audit_action="sft.build.list.authorization",
         )
@@ -260,7 +266,7 @@ def read_sft_build(
             session,
             principal,
             request_scope,
-            ALL_ROLES,
+            SFT_AUTHOR_ROLES,
             lock=False,
             audit_action="sft.build.read.authorization",
         )
@@ -346,9 +352,28 @@ def review_sft_build(
             lock=True,
             audit_action="sft.build.review.authorization",
         )
-        build = _scoped_build(session, request_scope.department, build_id, lock=True)
+        pending_purge = (
+            select(SftArtifactReconciliationOperationItem.id)
+            .where(
+                SftArtifactReconciliationOperationItem.department_id
+                == request_scope.department.value,
+                SftArtifactReconciliationOperationItem.resource_type == "dataset_final",
+                SftArtifactReconciliationOperationItem.resource_id == build_id,
+                SftArtifactReconciliationOperationItem.status == "registered",
+            )
+            .exists()
+        )
+        build = session.execute(
+            select(SftDatasetBuild)
+            .where(
+                SftDatasetBuild.id == build_id,
+                SftDatasetBuild.department_id == request_scope.department.value,
+                ~pending_purge,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
         if build is None:
-            raise ServiceError(404, "SFT dataset build not found")
+            raise ServiceError(409, "SFT dataset build review conflict")
         if build.version != expected_version:
             raise ServiceError(409, "SFT dataset build version conflict")
         if build.status != "succeeded":
@@ -390,27 +415,32 @@ def import_sft_source(
     source_directory: Path,
     apply: bool,
 ) -> SftSourceImportResult:
-    """Verify an external source then stage/publish it under exact database ownership."""
+    """Durably register, stage, publish, and commit a verified source bundle.
 
-    if not source_directory.is_absolute():
-        raise SftImportConfigurationError("--source-dir must be an absolute directory.")
-    source_directory = Path(os.path.abspath(source_directory))
-    repository_root = Path(__file__).parents[3]
-    if source_directory == repository_root or source_directory.is_relative_to(repository_root):
-        raise SftImportConfigurationError("--source-dir must be outside the repository.")
+    Parsing and every filesystem operation are deliberately outside database
+    transactions.  Each crash boundary has a committed import attempt that
+    reconciliation can inspect without accepting unknown external state.
+    """
+
+    _validate_source_directory(source_directory, settings.data_dir)
+    source_directory = Path(os.path.abspath(os.fspath(source_directory)))
     manifest_raw, examples_raw = _read_external_source(source_directory)
     parsed = parse_source_bundle(manifest_raw, examples_raw)
     if parsed.department_id != department_id:
         raise SftImportConfigurationError("SFT source department does not match --department-id.")
+    manifest_sha256 = hashlib.sha256(manifest_raw).hexdigest()
+    source_chunk_ids = {
+        chunk_id for example in parsed.examples for chunk_id in example.source_chunk_ids
+    }
     engine = None
     try:
         from app.database import create_database_engine, create_session_factory
 
         engine = create_database_engine(settings.database_url)
         factory = create_session_factory(engine)
+        principal = AuthenticatedPrincipal(subject=actor_subject, issuer=actor_issuer)
+        scope = DepartmentRequestScope(DepartmentScope(department_id))
         with factory.begin() as session:
-            principal = AuthenticatedPrincipal(subject=actor_subject, issuer=actor_issuer)
-            scope = DepartmentRequestScope(DepartmentScope(department_id))
             authorization = authorize_transaction(
                 session,
                 principal,
@@ -422,7 +452,7 @@ def import_sft_source(
             existing = _scoped_source(session, scope.department, parsed.source_bundle_id, lock=True)
             if existing is not None:
                 if (
-                    existing.manifest_sha256 == hashlib.sha256(manifest_raw).hexdigest()
+                    existing.manifest_sha256 == manifest_sha256
                     and existing.examples_sha256 == parsed.examples_sha256
                 ):
                     return SftSourceImportResult(
@@ -430,14 +460,10 @@ def import_sft_source(
                         department_id,
                         existing.example_count,
                         existing.group_count,
-                        apply,
+                        False,
                     )
                 raise SftImportConfigurationError("SFT source bundle identifier already exists.")
-            validate_source_authority(
-                session,
-                department_id,
-                {chunk_id for example in parsed.examples for chunk_id in example.source_chunk_ids},
-            )
+            authority = validate_source_authority(session, department_id, source_chunk_ids)
             if not apply:
                 return SftSourceImportResult(
                     parsed.source_bundle_id,
@@ -446,68 +472,181 @@ def import_sft_source(
                     parsed.group_count,
                     False,
                 )
-            attempt = SftSourceImportAttempt(
-                id=uuid4(),
-                department_id=department_id,
-                source_bundle_id=parsed.source_bundle_id,
-                import_attempt_id=parsed.import_attempt_id,
-                stage_id=parsed.stage_id,
-                imported_by_user_id=authorization.identity.id,
-                status="registered",
-            )
-            session.add(attempt)
-            session.flush()
-            store = SftArtifactStore(settings.data_dir)
-            staged = store.stage_source(
-                scope.department,
-                parsed.source_bundle_id,
-                parsed.import_attempt_id,
-                manifest=manifest_raw,
-                examples=examples_raw,
-            )
-            attempt.status = "staged"
-            attempt.staged_at = _clock(session)
-            attempt.manifest_sha256 = hashlib.sha256(manifest_raw).hexdigest()
-            attempt.examples_sha256 = parsed.examples_sha256
-            attempt.examples_byte_size = parsed.examples_byte_size
-            published = store.publish(
-                staged, allowlist=frozenset({"manifest.json", "examples.jsonl"})
-            )
-            attempt.status = "published"
-            attempt.published_at = _clock(session)
-            source = SftSourceBundle(
-                id=parsed.source_bundle_id,
-                department_id=department_id,
-                imported_by_user_id=authorization.identity.id,
-                status="active",
-                artifact_contract_version=SOURCE_ARTIFACT_CONTRACT_VERSION,
-                normalization_version=NORMALIZATION_VERSION,
-                example_contract_version=EXAMPLE_CONTRACT_VERSION,
-                example_count=len(parsed.examples),
-                group_count=parsed.group_count,
-                source_reference_count=parsed.source_reference_count,
-                manifest_sha256=published.files[0][1].sha256
-                if published.files[0][0] == "manifest.json"
-                else hashlib.sha256(manifest_raw).hexdigest(),
-                examples_sha256=parsed.examples_sha256,
-                examples_byte_size=parsed.examples_byte_size,
-            )
-            session.add(source)
-            attempt.status = "committed"
-            attempt.committed_at = _clock(session)
-            append_mutation_audit(
-                session,
-                actor=authorization.identity,
-                actor_subject=principal.subject,
-                request_scope=scope,
-                action="sft.source.import",
-                resource_type="sft_source_bundle",
-                resource_id=source.id,
-            )
-            session.flush()
-            return SftSourceImportResult(
-                source.id, department_id, source.example_count, source.group_count, True
-            )
+            attempt = session.execute(
+                select(SftSourceImportAttempt)
+                .where(
+                    SftSourceImportAttempt.department_id == department_id,
+                    SftSourceImportAttempt.import_attempt_id == parsed.import_attempt_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if attempt is None:
+                attempt = SftSourceImportAttempt(
+                    id=uuid4(),
+                    department_id=department_id,
+                    source_bundle_id=parsed.source_bundle_id,
+                    import_attempt_id=parsed.import_attempt_id,
+                    stage_id=parsed.stage_id,
+                    imported_by_user_id=authorization.identity.id,
+                    status="registered",
+                    manifest_sha256=manifest_sha256,
+                    examples_sha256=parsed.examples_sha256,
+                    authority_snapshot_sha256=authority.fingerprint,
+                    artifact_manifest=parsed.manifest,
+                    examples_byte_size=parsed.examples_byte_size,
+                )
+                session.add(attempt)
+                session.flush()
+            elif (
+                attempt.source_bundle_id != parsed.source_bundle_id
+                or attempt.manifest_sha256 != manifest_sha256
+                or attempt.examples_sha256 != parsed.examples_sha256
+                or attempt.authority_snapshot_sha256 != authority.fingerprint
+                or attempt.status not in {"registered", "staged", "published"}
+            ):
+                raise SftImportConfigurationError("SFT source import is unavailable.")
+            attempt_id = attempt.id
+            initial_status = attempt.status
+
+        expected_manifest = parsed.manifest
+        with SftArtifactStore(settings.data_dir) as store:
+            if initial_status == "registered":
+                try:
+                    staged = store.stage_source(
+                        scope.department,
+                        parsed.source_bundle_id,
+                        parsed.import_attempt_id,
+                        manifest=manifest_raw,
+                        examples=examples_raw,
+                    )
+                except SftArtifactError:
+                    try:
+                        staged = store.open_source_stage(
+                            scope.department, parsed.source_bundle_id, parsed.import_attempt_id
+                        )
+                    except SftArtifactError:
+                        store.verify_source_final(
+                            scope.department, parsed.source_bundle_id, expected=expected_manifest
+                        )
+                        _mark_attempt_published(
+                            factory,
+                            principal,
+                            scope,
+                            attempt_id,
+                            expected_status="registered",
+                            include_staged_transition=True,
+                        )
+                        initial_status = "published"
+                    else:
+                        _mark_attempt_staged(factory, principal, scope, attempt_id)
+                        try:
+                            store.publish(
+                                staged,
+                                allowlist=frozenset(SOURCE_FILES),
+                                expected=expected_manifest,
+                            )
+                        finally:
+                            staged.close()
+                        store.verify_source_final(
+                            scope.department, parsed.source_bundle_id, expected=expected_manifest
+                        )
+                        _mark_attempt_published(
+                            factory, principal, scope, attempt_id, expected_status="staged"
+                        )
+                        initial_status = "published"
+                else:
+                    _mark_attempt_staged(factory, principal, scope, attempt_id)
+                    try:
+                        store.publish(
+                            staged,
+                            allowlist=frozenset(SOURCE_FILES),
+                            expected=expected_manifest,
+                        )
+                    finally:
+                        staged.close()
+                    store.verify_source_final(
+                        scope.department, parsed.source_bundle_id, expected=expected_manifest
+                    )
+                    _mark_attempt_published(
+                        factory, principal, scope, attempt_id, expected_status="staged"
+                    )
+                    initial_status = "published"
+            elif initial_status == "staged":
+                try:
+                    staged = store.open_source_stage(
+                        scope.department, parsed.source_bundle_id, parsed.import_attempt_id
+                    )
+                except SftArtifactError:
+                    store.verify_source_final(
+                        scope.department, parsed.source_bundle_id, expected=expected_manifest
+                    )
+                else:
+                    try:
+                        store.publish(
+                            staged,
+                            allowlist=frozenset(SOURCE_FILES),
+                            expected=expected_manifest,
+                        )
+                    finally:
+                        staged.close()
+                    store.verify_source_final(
+                        scope.department, parsed.source_bundle_id, expected=expected_manifest
+                    )
+                _mark_attempt_published(
+                    factory, principal, scope, attempt_id, expected_status="staged"
+                )
+                initial_status = "published"
+            with SftArtifactStore(settings.data_dir) as final_store:
+                final_store.verify_source_final(
+                    scope.department, parsed.source_bundle_id, expected=expected_manifest
+                )
+            with factory.begin() as session:
+                authorization = _reauthorize_attempt(
+                    session, principal, scope, attempt_id, "published"
+                )
+                attempt = session.get(SftSourceImportAttempt, attempt_id, with_for_update=True)
+                if attempt is None or attempt.status != "published":
+                    raise SftImportConfigurationError("SFT source import is unavailable.")
+                validate_source_authority(
+                    session,
+                    department_id,
+                    source_chunk_ids,
+                    expected_fingerprint=attempt.authority_snapshot_sha256,
+                    lock=True,
+                )
+                source = SftSourceBundle(
+                    id=parsed.source_bundle_id,
+                    department_id=department_id,
+                    imported_by_user_id=authorization.identity.id,
+                    status="active",
+                    artifact_contract_version=SOURCE_ARTIFACT_CONTRACT_VERSION,
+                    normalization_version=NORMALIZATION_VERSION,
+                    example_contract_version=EXAMPLE_CONTRACT_VERSION,
+                    example_count=len(parsed.examples),
+                    group_count=parsed.group_count,
+                    source_reference_count=parsed.source_reference_count,
+                    manifest_sha256=manifest_sha256,
+                    examples_sha256=parsed.examples_sha256,
+                    authority_snapshot_sha256=attempt.authority_snapshot_sha256,
+                    examples_byte_size=parsed.examples_byte_size,
+                )
+                session.add(source)
+                attempt.status = "committed"
+                attempt.committed_at = _clock(session)
+                attempt.version += 1
+                append_mutation_audit(
+                    session,
+                    actor=authorization.identity,
+                    actor_subject=principal.subject,
+                    request_scope=scope,
+                    action="sft.source.import",
+                    resource_type="sft_source_bundle",
+                    resource_id=source.id,
+                )
+                session.flush()
+                return SftSourceImportResult(
+                    source.id, department_id, source.example_count, source.group_count, True
+                )
     except (SftContractError, SftArtifactError, SftSourceAuthorityError) as error:
         raise SftImportConfigurationError("SFT source import failed.") from error
     except ServiceError as error:
@@ -523,14 +662,20 @@ def _read_external_source(source_directory: Path) -> tuple[bytes, bytes]:
     """Read only the two exact regular source files without symlink traversal."""
 
     try:
-        directory_fd = os.open(source_directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directory_fd = _open_directory_chain(source_directory)
         directory_stat = os.fstat(directory_fd)
-        if not stat.S_ISDIR(directory_stat.st_mode) or directory_stat.st_nlink != 2:
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or directory_stat.st_nlink != 2
+            or directory_stat.st_uid != os.geteuid()
+            or directory_stat.st_mode & 0o022
+        ):
             raise SftImportConfigurationError("SFT source directory is unsafe.")
         names = set(os.listdir(directory_fd))
         if names != {"manifest.json", "examples.jsonl"}:
             raise SftImportConfigurationError("SFT source directory has unexpected entries.")
         values: list[bytes] = []
+        entries: dict[str, os.stat_result] = {}
         for name, maximum in (("manifest.json", 128 * 1024), ("examples.jsonl", 512 * 1024 * 1024)):
             fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
             try:
@@ -538,6 +683,8 @@ def _read_external_source(source_directory: Path) -> tuple[bytes, bytes]:
                 if (
                     not stat.S_ISREG(metadata.st_mode)
                     or metadata.st_nlink != 1
+                    or metadata.st_uid != os.geteuid()
+                    or metadata.st_mode & 0o022
                     or metadata.st_size > maximum
                 ):
                     raise SftImportConfigurationError("SFT source file is unsafe.")
@@ -551,9 +698,25 @@ def _read_external_source(source_directory: Path) -> tuple[bytes, bytes]:
                         raise SftImportConfigurationError("SFT source is too large.")
                 if os.fstat(fd) != metadata:
                     raise SftImportConfigurationError("SFT source changed while reading.")
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if (
+                    current.st_dev != metadata.st_dev
+                    or current.st_ino != metadata.st_ino
+                    or current.st_size != metadata.st_size
+                    or current.st_nlink != metadata.st_nlink
+                ):
+                    raise SftImportConfigurationError("SFT source changed while reading.")
+                entries[name] = metadata
                 values.append(bytes(chunks))
             finally:
                 os.close(fd)
+        if set(os.listdir(directory_fd)) != {"manifest.json", "examples.jsonl"}:
+            raise SftImportConfigurationError("SFT source changed while reading.")
+        if os.fstat(directory_fd) != directory_stat or set(entries) != {
+            "manifest.json",
+            "examples.jsonl",
+        }:
+            raise SftImportConfigurationError("SFT source changed while reading.")
         return values[0], values[1]
     except OSError as error:
         raise SftImportConfigurationError("SFT source directory is unavailable.") from error
@@ -571,6 +734,110 @@ def _scoped_source(
         SftSourceBundle.id == source_id, SftSourceBundle.department_id == scope.value
     )
     return session.execute(statement.with_for_update() if lock else statement).scalar_one_or_none()
+
+
+def _reauthorize_attempt(
+    session: Session,
+    principal: AuthenticatedPrincipal,
+    request_scope: DepartmentRequestScope,
+    attempt_id: UUID,
+    status: str,
+):
+    authorization = authorize_transaction(
+        session,
+        principal,
+        request_scope,
+        SFT_AUTHOR_ROLES,
+        lock=True,
+        audit_action="sft.source.import.authorization",
+    )
+    attempt = session.execute(
+        select(SftSourceImportAttempt)
+        .where(
+            SftSourceImportAttempt.id == attempt_id,
+            SftSourceImportAttempt.department_id == request_scope.department.value,
+            SftSourceImportAttempt.status == status,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if attempt is None:
+        raise SftImportConfigurationError("SFT source import is unavailable.")
+    return authorization
+
+
+def _mark_attempt_staged(
+    factory,
+    principal: AuthenticatedPrincipal,
+    request_scope: DepartmentRequestScope,
+    attempt_id: UUID,
+) -> None:
+    with factory.begin() as session:
+        _reauthorize_attempt(session, principal, request_scope, attempt_id, "registered")
+        attempt = session.get(SftSourceImportAttempt, attempt_id, with_for_update=True)
+        if attempt is None:
+            raise SftImportConfigurationError("SFT source import is unavailable.")
+        attempt.status = "staged"
+        attempt.staged_at = _clock(session)
+        attempt.version += 1
+
+
+def _mark_attempt_published(
+    factory,
+    principal: AuthenticatedPrincipal,
+    request_scope: DepartmentRequestScope,
+    attempt_id: UUID,
+    *,
+    expected_status: str,
+    include_staged_transition: bool = False,
+) -> None:
+    with factory.begin() as session:
+        _reauthorize_attempt(session, principal, request_scope, attempt_id, expected_status)
+        attempt = session.get(SftSourceImportAttempt, attempt_id, with_for_update=True)
+        if attempt is None:
+            raise SftImportConfigurationError("SFT source import is unavailable.")
+        now = _clock(session)
+        if include_staged_transition:
+            attempt.staged_at = now
+        attempt.status = "published"
+        attempt.published_at = now
+        attempt.version += 1
+
+
+def _validate_source_directory(source_directory: Path, data_dir: Path) -> None:
+    if not isinstance(source_directory, Path) or not source_directory.is_absolute():
+        raise SftImportConfigurationError("--source-dir must be an absolute directory.")
+    raw_source = os.path.abspath(os.fspath(source_directory))
+    repository_root = os.path.abspath(os.fspath(Path(__file__).parents[3]))
+    runtime_root = os.path.abspath(os.fspath(data_dir))
+    try:
+        if (
+            os.path.commonpath((raw_source, repository_root)) == repository_root
+            or os.path.commonpath((raw_source, runtime_root)) == runtime_root
+        ):
+            raise SftImportConfigurationError(
+                "--source-dir must be outside repository and runtime storage."
+            )
+    except OSError as error:
+        raise SftImportConfigurationError("SFT source directory is unavailable.") from error
+
+
+def _open_directory_chain(path: Path) -> int:
+    """Open every source path component without following a symlink."""
+
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except OSError:
+        os.close(descriptor)
+        raise
 
 
 def _scoped_build(

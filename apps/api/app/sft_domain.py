@@ -293,10 +293,18 @@ def dataset_record(example: SftExample) -> dict[str, object]:
     }
 
 
-def provenance_record(example: SftExample, *, split: str) -> dict[str, object]:
+def provenance_record(
+    example: SftExample, *, split: str, authorities: dict[UUID, object]
+) -> dict[str, object]:
+    source_authority = []
+    for chunk_id in example.source_chunk_ids:
+        authority = authorities.get(chunk_id)
+        if authority is None or not hasattr(authority, "provenance_value"):
+            raise SftContractError("dataset_publication_failed")
+        source_authority.append(authority.provenance_value())
     return {
         "example_id": str(example.example_id),
         "group_id": str(example.group_id),
         "split": split,
-        "source_chunk_ids": [str(value) for value in example.source_chunk_ids],
+        "source_authority": source_authority,
     }
