@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import pytest
 
-from app import sft_artifacts, training_job_queue
+from app import training_job_queue
 from app.authorization import DepartmentScope
 from app.sft_artifacts import SftArtifactError, SftArtifactStore
 from app.training_job_child import _build as build_child_bundle
@@ -237,7 +237,7 @@ def test_authorized_final_deletion_requires_complete_manifest_before_tombstone(t
     operation_id = uuid4()
     with SftArtifactStore(tmp_path) as store:
         with pytest.raises(SftArtifactError, match="artifact_manifest_invalid"):
-            store.remove_authorized_training_job_final(
+            store.prepare_authorized_training_job_tombstone(
                 scope, job_id, attempt_id, operation_id, expected={}
             )
         assert store.verify_training_job_final(scope, job_id, expected=expected)
@@ -253,27 +253,36 @@ def test_authorized_final_deletion_requires_complete_manifest_before_tombstone(t
 
 
 @pytest.mark.parametrize("crash_after_unlink", range(1, len(TRAINING_JOB_FILES) + 1))
-def test_authorized_final_tombstone_recovers_after_each_file_unlink(
-    tmp_path, monkeypatch, crash_after_unlink: int
+def test_bound_tombstone_recovers_after_each_file_unlink_across_store_instances(
+    tmp_path, crash_after_unlink: int
 ) -> None:
     scope, job_id, attempt_id, expected = _publish_job_final(tmp_path)
     operation_id = uuid4()
-    original_unlink = sft_artifacts._unlink_exact
-    unlinks = 0
-
-    def crash_after_exact_unlink(directory_fd: int, name: str) -> None:
-        nonlocal unlinks
-        original_unlink(directory_fd, name)
-        unlinks += 1
-        if unlinks == crash_after_unlink:
-            raise RuntimeError("simulated deletion crash")
-
-    monkeypatch.setattr(sft_artifacts, "_unlink_exact", crash_after_exact_unlink)
     with SftArtifactStore(tmp_path) as store:
-        with pytest.raises(RuntimeError, match="simulated deletion crash"):
-            store.remove_authorized_training_job_final(
-                scope, job_id, attempt_id, operation_id, expected=expected
+        identity = store.prepare_authorized_training_job_tombstone(
+            scope, job_id, attempt_id, operation_id, expected=expected
+        )
+    assert isinstance(identity, dict)
+    names = list(identity["remaining_files"])
+    for index, name in enumerate(names):
+        step = dict(identity)
+        step["remaining_files"] = list(identity["remaining_files"])
+        step["unlinking_file"] = name
+        with SftArtifactStore(tmp_path) as store:
+            assert store.unlink_bound_training_job_tombstone_file(
+                scope, job_id, operation_id, identity=step, name=name
             )
+        if index == crash_after_unlink - 1:
+            # Simulate a restart after the unlink but before its database
+            # progress record. The durable in-flight member is the only
+            # accepted missing-file state on retry.
+            with SftArtifactStore(tmp_path) as store:
+                assert store.unlink_bound_training_job_tombstone_file(
+                    scope, job_id, operation_id, identity=step, name=name
+                )
+        identity = dict(step)
+        identity["remaining_files"] = [value for value in names if value not in names[: index + 1]]
+        identity["unlinking_file"] = None
     final = tmp_path / "training_datasets" / "jobs" / str(scope.value) / str(job_id)
     tombstone = (
         tmp_path
@@ -285,27 +294,21 @@ def test_authorized_final_tombstone_recovers_after_each_file_unlink(
         / str(operation_id)
     )
     assert not final.exists() and tombstone.is_dir()
-    monkeypatch.setattr(sft_artifacts, "_unlink_exact", original_unlink)
     with SftArtifactStore(tmp_path) as store:
-        assert store.remove_authorized_training_job_final(
-            scope, job_id, attempt_id, operation_id, expected=expected
+        assert store.remove_bound_training_job_tombstone_directory(
+            scope, job_id, operation_id, identity=identity
         )
     assert not tombstone.exists()
 
 
-def test_tombstone_rejects_unexpected_entries_without_deleting(tmp_path, monkeypatch) -> None:
+def test_tombstone_rejects_substituted_private_directory_without_deleting(tmp_path) -> None:
     scope, job_id, attempt_id, expected = _publish_job_final(tmp_path)
     operation_id = uuid4()
-
-    def stop_after_move(*_args, **_kwargs) -> None:
-        raise SftArtifactError("artifact_ownership_mismatch")
-
-    monkeypatch.setattr(sft_artifacts, "_remove_tombstone_files", stop_after_move)
     with SftArtifactStore(tmp_path) as store:
-        with pytest.raises(SftArtifactError, match="final_deletion_recovery_required"):
-            store.remove_authorized_training_job_final(
-                scope, job_id, attempt_id, operation_id, expected=expected
-            )
+        identity = store.prepare_authorized_training_job_tombstone(
+            scope, job_id, attempt_id, operation_id, expected=expected
+        )
+    assert isinstance(identity, dict)
     tombstone = (
         tmp_path
         / "training_datasets"
@@ -315,30 +318,31 @@ def test_tombstone_rejects_unexpected_entries_without_deleting(tmp_path, monkeyp
         / str(job_id)
         / str(operation_id)
     )
-    (tombstone / "unexpected").write_bytes(b"x")
-    (tombstone / "unexpected").chmod(0o600)
-    monkeypatch.undo()
+    parked = tombstone.parent / "parked"
+    os.rename(tombstone, parked)
+    tombstone.mkdir(mode=0o700)
+    sentinel = tombstone / "manifest.json"
+    sentinel.write_bytes(b"replacement")
+    sentinel.chmod(0o600)
+    name = identity["remaining_files"][0]
+    step = dict(identity)
+    step["unlinking_file"] = name
     with SftArtifactStore(tmp_path) as store:
         with pytest.raises(SftArtifactError, match="final_deletion_recovery_required"):
-            store.remove_authorized_training_job_final(
-                scope, job_id, attempt_id, operation_id, expected=expected
+            store.unlink_bound_training_job_tombstone_file(
+                scope, job_id, operation_id, identity=step, name=name
             )
-    assert (tombstone / "unexpected").exists()
+    assert sentinel.exists() and parked.is_dir()
 
 
-def test_tombstone_rejects_a_hard_linked_allowlisted_file(tmp_path, monkeypatch) -> None:
+def test_tombstone_rejects_same_uid_allowlisted_file_substitution(tmp_path) -> None:
     scope, job_id, attempt_id, expected = _publish_job_final(tmp_path)
     operation_id = uuid4()
-
-    def stop_after_move(*_args, **_kwargs) -> None:
-        raise SftArtifactError("artifact_ownership_mismatch")
-
-    monkeypatch.setattr(sft_artifacts, "_remove_tombstone_files", stop_after_move)
     with SftArtifactStore(tmp_path) as store:
-        with pytest.raises(SftArtifactError, match="final_deletion_recovery_required"):
-            store.remove_authorized_training_job_final(
-                scope, job_id, attempt_id, operation_id, expected=expected
-            )
+        identity = store.prepare_authorized_training_job_tombstone(
+            scope, job_id, attempt_id, operation_id, expected=expected
+        )
+    assert isinstance(identity, dict)
     tombstone = (
         tmp_path
         / "training_datasets"
@@ -348,43 +352,73 @@ def test_tombstone_rejects_a_hard_linked_allowlisted_file(tmp_path, monkeypatch)
         / str(job_id)
         / str(operation_id)
     )
-    external_link = tmp_path / "linked-training.yaml"
-    os.link(tombstone / "training.yaml", external_link)
-    monkeypatch.undo()
+    target = tombstone / "training.yaml"
+    target.unlink()
+    target.write_bytes(b"same-uid replacement")
+    target.chmod(0o600)
+    name = "training.yaml"
+    step = dict(identity)
+    step["unlinking_file"] = name
     with SftArtifactStore(tmp_path) as store:
         with pytest.raises(SftArtifactError, match="final_deletion_recovery_required"):
-            store.remove_authorized_training_job_final(
+            store.unlink_bound_training_job_tombstone_file(
+                scope, job_id, operation_id, identity=step, name=name
+            )
+    assert target.exists() and tombstone.exists()
+
+
+def test_partial_unbound_tombstone_is_fenced_and_never_cleaned(tmp_path) -> None:
+    scope, job_id, attempt_id, expected = _publish_job_final(tmp_path)
+    operation_id = uuid4()
+    with SftArtifactStore(tmp_path) as store:
+        identity = store.prepare_authorized_training_job_tombstone(
+            scope, job_id, attempt_id, operation_id, expected=expected
+        )
+    assert isinstance(identity, dict)
+    tombstone = (
+        tmp_path
+        / "training_datasets"
+        / ".deleting"
+        / "jobs"
+        / str(scope.value)
+        / str(job_id)
+        / str(operation_id)
+    )
+    (tombstone / "training.yaml").unlink()
+    with SftArtifactStore(tmp_path) as restarted_store:
+        with pytest.raises(SftArtifactError, match="final_deletion_recovery_required"):
+            restarted_store.prepare_authorized_training_job_tombstone(
                 scope, job_id, attempt_id, operation_id, expected=expected
             )
-    assert external_link.exists() and tombstone.exists()
+    assert tombstone.is_dir() and not (tombstone / "training.yaml").exists()
 
 
-def test_tombstone_parent_substitution_is_detected_without_touching_replacement(
-    tmp_path, monkeypatch
-) -> None:
+def test_tombstone_parent_substitution_is_detected_without_touching_replacement(tmp_path) -> None:
     scope, job_id, attempt_id, expected = _publish_job_final(tmp_path)
     operation_id = uuid4()
     job_parent = (
         tmp_path / "training_datasets" / ".deleting" / "jobs" / str(scope.value) / str(job_id)
     )
-    original = sft_artifacts._remove_tombstone_files
-
-    def substitute_parent(directory_fd: int, *, checkpoint) -> None:
-        parked = job_parent.parent / "parked"
-        os.rename(job_parent, parked)
-        job_parent.mkdir(mode=0o700)
-        replacement = job_parent / str(operation_id)
-        replacement.mkdir(mode=0o700)
-        sentinel = replacement / "foreign"
-        sentinel.write_bytes(b"x")
-        sentinel.chmod(0o600)
-        original(directory_fd, checkpoint=checkpoint)
-
-    monkeypatch.setattr(sft_artifacts, "_remove_tombstone_files", substitute_parent)
+    with SftArtifactStore(tmp_path) as store:
+        identity = store.prepare_authorized_training_job_tombstone(
+            scope, job_id, attempt_id, operation_id, expected=expected
+        )
+    assert isinstance(identity, dict)
+    parked = job_parent.parent / "parked"
+    os.rename(job_parent, parked)
+    job_parent.mkdir(mode=0o700)
+    replacement = job_parent / str(operation_id)
+    replacement.mkdir(mode=0o700)
+    sentinel = replacement / "foreign"
+    sentinel.write_bytes(b"x")
+    sentinel.chmod(0o600)
+    name = identity["remaining_files"][0]
+    step = dict(identity)
+    step["unlinking_file"] = name
     with SftArtifactStore(tmp_path) as store:
         with pytest.raises(SftArtifactError, match="final_deletion_recovery_required"):
-            store.remove_authorized_training_job_final(
-                scope, job_id, attempt_id, operation_id, expected=expected
+            store.unlink_bound_training_job_tombstone_file(
+                scope, job_id, operation_id, identity=step, name=name
             )
     assert (job_parent / str(operation_id) / "foreign").exists()
 

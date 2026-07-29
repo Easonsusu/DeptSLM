@@ -2450,6 +2450,10 @@ class TrainingJobArtifactOperation(Base):
             "(operation_type = 'purge' AND retention_days BETWEEN 30 AND 730)",
             name="ck_training_job_operation_retention",
         ),
+        CheckConstraint(
+            "purged_job_count >= 0 AND version > 0",
+            name="ck_training_job_operation_progress",
+        ),
         Index("ix_training_job_operation_department", "department_id", "created_at"),
     )
 
@@ -2464,7 +2468,10 @@ class TrainingJobArtifactOperation(Base):
     retention_days: Mapped[int | None] = mapped_column(Integer)
     operation_type: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="registered")
+    purged_job_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    success_audited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = utc_timestamp()
 
 
@@ -2489,7 +2496,7 @@ class TrainingJobPurgeReservation(Base):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
-            "status IN ('registered','deletion_authorized','terminalized')",
+            "status IN ('registered','deletion_authorized','tombstone_bound','terminalized')",
             name="ck_training_job_purge_reservation_status",
         ),
         CheckConstraint(
@@ -2511,8 +2518,13 @@ class TrainingJobPurgeReservation(Base):
         ),
         CheckConstraint(
             "(status = 'registered' AND deletion_authorized_at IS NULL "
+            "AND tombstone_bound_at IS NULL AND tombstone_identity IS NULL "
             "AND terminalized_at IS NULL) "
             "OR (status = 'deletion_authorized' AND deletion_authorized_at IS NOT NULL "
+            "AND tombstone_bound_at IS NULL AND tombstone_identity IS NULL "
+            "AND terminalized_at IS NULL) OR (status = 'tombstone_bound' "
+            "AND deletion_authorized_at IS NOT NULL AND tombstone_bound_at IS NOT NULL "
+            "AND tombstone_identity IS NOT NULL AND json_typeof(tombstone_identity) = 'object' "
             "AND terminalized_at IS NULL) OR (status = 'terminalized' "
             "AND terminalized_at IS NOT NULL)",
             name="ck_training_job_purge_reservation_lifecycle",
@@ -2524,7 +2536,9 @@ class TrainingJobPurgeReservation(Base):
             "uq_training_job_purge_reservation_active",
             "training_job_id",
             unique=True,
-            postgresql_where=text("status IN ('registered','deletion_authorized')"),
+            postgresql_where=text(
+                "status IN ('registered','deletion_authorized','tombstone_bound')"
+            ),
         ),
         Index(
             "ix_training_job_purge_reservation_operation",
@@ -2548,6 +2562,8 @@ class TrainingJobPurgeReservation(Base):
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="registered")
     registered_at: Mapped[datetime] = utc_timestamp()
     deletion_authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tombstone_bound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tombstone_identity: Mapped[dict[str, object] | None] = mapped_column(JSON)
     terminalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = utc_timestamp()

@@ -86,6 +86,13 @@ class _AuthoritativeFinal:
     manifest: dict[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class _BoundTombstoneStep:
+    candidate: _Candidate
+    identity: dict[str, object]
+    name: str | None
+
+
 _BLOCKED_REASONS = frozenset(
     {
         "staging_path_unsafe",
@@ -122,7 +129,9 @@ def archive_training_job(
                 .where(
                     TrainingJobPurgeReservation.department_id == department_id,
                     TrainingJobPurgeReservation.training_job_id == training_job_id,
-                    TrainingJobPurgeReservation.status.in_(("registered", "deletion_authorized")),
+                    TrainingJobPurgeReservation.status.in_(
+                        ("registered", "deletion_authorized", "tombstone_bound")
+                    ),
                 )
                 .with_for_update()
             ).scalar_one_or_none()
@@ -346,6 +355,8 @@ def _register_candidates(
                 retention_days=retention_days,
                 operation_type=operation_type,
                 status="registered",
+                purged_job_count=0,
+                version=1,
             )
             session.add(operation)
             session.flush()
@@ -559,11 +570,16 @@ def _close_empty_registered_operation(
         .where(
             TrainingJobPurgeReservation.operation_id == operation.id,
             TrainingJobPurgeReservation.department_id == department_id,
-            TrainingJobPurgeReservation.status.in_(("registered", "deletion_authorized")),
+            TrainingJobPurgeReservation.status.in_(
+                ("registered", "deletion_authorized", "tombstone_bound")
+            ),
         )
         .with_for_update()
     ).all()
-    if any(reservation.status == "deletion_authorized" for reservation in reservations):
+    if any(
+        reservation.status in {"deletion_authorized", "tombstone_bound"}
+        for reservation in reservations
+    ):
         raise ServiceError(409, "Training-job purge authority changed")
     now = session.scalar(select(func.clock_timestamp()))
     for reservation in reservations:
@@ -674,11 +690,27 @@ def _execute_purge(
         actor_subject=actor_subject,
         operation_id=operation_id,
     )
-    final_outcomes = _remove_candidates(
+    binding_outcomes = _bind_final_tombstones(
         data_dir,
         department_id,
         final_candidates,
         purge_operation_id=operation_id,
+    )
+    _persist_tombstone_bindings(
+        factory,
+        department_id=department_id,
+        actor_issuer=actor_issuer,
+        actor_subject=actor_subject,
+        operation_id=operation_id,
+        outcomes=binding_outcomes,
+    )
+    final_outcomes = _remove_bound_tombstones(
+        factory,
+        data_dir=data_dir,
+        department_id=department_id,
+        actor_issuer=actor_issuer,
+        actor_subject=actor_subject,
+        operation_id=operation_id,
     )
     _persist_purge_final_outcomes(
         factory,
@@ -688,7 +720,7 @@ def _execute_purge(
         operation_id=operation_id,
         outcomes=final_outcomes,
     )
-    outcomes = {**stage_outcomes, **final_outcomes}
+    outcomes = {**stage_outcomes, **binding_outcomes, **final_outcomes}
     return TrainingJobMaintenanceResult(
         len(candidates),
         sum(completed for completed, _reason in outcomes.values()),
@@ -700,8 +732,6 @@ def _remove_candidates(
     data_dir: Path,
     department_id: UUID,
     candidates: tuple[_Candidate, ...],
-    *,
-    purge_operation_id: UUID | None = None,
 ) -> dict[tuple[UUID, UUID, str], tuple[bool, str | None]]:
     outcomes: dict[tuple[UUID, UUID, str], tuple[bool, str | None]] = {}
     scope = DepartmentScope(department_id)
@@ -713,27 +743,274 @@ def _remove_candidates(
                         scope, candidate.training_job_id, candidate.attempt_id
                     )
                 elif candidate.surface == "final" and candidate.manifest is not None:
-                    if purge_operation_id is None:
-                        store.remove_owned_training_job_final(
-                            scope,
-                            candidate.training_job_id,
-                            candidate.attempt_id,
-                            expected=candidate.manifest,
-                        )
-                    else:
-                        store.remove_authorized_training_job_final(
-                            scope,
-                            candidate.training_job_id,
-                            candidate.attempt_id,
-                            purge_operation_id,
-                            expected=candidate.manifest,
-                        )
+                    store.remove_owned_training_job_final(
+                        scope,
+                        candidate.training_job_id,
+                        candidate.attempt_id,
+                        expected=candidate.manifest,
+                    )
                 else:
                     raise SftArtifactError("artifact_ownership_mismatch")
             outcomes[_candidate_key(candidate)] = (True, None)
         except SftArtifactError as error:
             outcomes[_candidate_key(candidate)] = (False, _blocked_reason(error))
     return outcomes
+
+
+def _bind_final_tombstones(
+    data_dir: Path,
+    department_id: UUID,
+    candidates: tuple[_Candidate, ...],
+    *,
+    purge_operation_id: UUID,
+) -> dict[tuple[UUID, UUID, str], tuple[bool, dict[str, object] | str | None]]:
+    """Move exact finals, then capture a complete tombstone identity only."""
+
+    outcomes: dict[tuple[UUID, UUID, str], tuple[bool, dict[str, object] | str | None]] = {}
+    scope = DepartmentScope(department_id)
+    for candidate in candidates:
+        if candidate.surface != "final" or candidate.manifest is None:
+            outcomes[_candidate_key(candidate)] = (False, "artifact_ownership_mismatch")
+            continue
+        try:
+            with SftArtifactStore(data_dir) as store:
+                identity = store.prepare_authorized_training_job_tombstone(
+                    scope,
+                    candidate.training_job_id,
+                    candidate.attempt_id,
+                    purge_operation_id,
+                    expected=candidate.manifest,
+                )
+            if identity is None:
+                raise SftArtifactError("final_deletion_recovery_required")
+            outcomes[_candidate_key(candidate)] = (True, identity)
+        except SftArtifactError as error:
+            outcomes[_candidate_key(candidate)] = (False, _blocked_reason(error))
+    return outcomes
+
+
+def _persist_tombstone_bindings(
+    factory: sessionmaker[Session],
+    *,
+    department_id: UUID,
+    actor_issuer: str,
+    actor_subject: str,
+    operation_id: UUID,
+    outcomes: dict[tuple[UUID, UUID, str], tuple[bool, dict[str, object] | str | None]],
+) -> None:
+    """Commit an exact tombstone identity before any member can be unlinked."""
+
+    if not outcomes:
+        return
+    try:
+        with factory.begin() as session:
+            _authorize(session, department_id, actor_issuer, actor_subject)
+            _locked_operation(session, operation_id, department_id, "purge")
+            now = session.scalar(select(func.clock_timestamp()))
+            for key, (bound, value) in outcomes.items():
+                training_job_id, attempt_id, surface = key
+                if surface != "final" or not bound or not isinstance(value, dict):
+                    # A failed move/bind remains actively fenced.  It must
+                    # never become a blocked terminal item merely because a
+                    # crash left a partial or absent tombstone.
+                    continue
+                reservation = session.execute(
+                    select(TrainingJobPurgeReservation)
+                    .where(
+                        TrainingJobPurgeReservation.operation_id == operation_id,
+                        TrainingJobPurgeReservation.department_id == department_id,
+                        TrainingJobPurgeReservation.training_job_id == training_job_id,
+                        TrainingJobPurgeReservation.status == "deletion_authorized",
+                    )
+                    .with_for_update()
+                ).scalar_one_or_none()
+                if reservation is None:
+                    raise ServiceError(409, "Training-job purge authority changed")
+                _job, _attempts, items, owner = _assert_purge_authority(
+                    session, department_id, reservation, now
+                )
+                if owner.attempt.publication_attempt_id != attempt_id:
+                    raise ServiceError(409, "Training-job purge authority changed")
+                final_item = _final_item(items, owner)
+                if final_item.status != "registered":
+                    raise ServiceError(409, "Training-job purge authority changed")
+                reservation.tombstone_identity = dict(value)
+                reservation.tombstone_bound_at = now
+                reservation.status = "tombstone_bound"
+                reservation.version += 1
+    except ServiceError:
+        raise
+    except SQLAlchemyError as error:
+        raise ServiceError(503, "Database unavailable") from error
+
+
+def _remove_bound_tombstones(
+    factory: sessionmaker[Session],
+    *,
+    data_dir: Path,
+    department_id: UUID,
+    actor_issuer: str,
+    actor_subject: str,
+    operation_id: UUID,
+) -> dict[tuple[UUID, UUID, str], tuple[bool, str | None]]:
+    """Resume only persisted, identity-bound tombstones one durable unlink at a time."""
+
+    outcomes: dict[tuple[UUID, UUID, str], tuple[bool, str | None]] = {}
+    while True:
+        step = _begin_bound_tombstone_step(
+            factory,
+            department_id=department_id,
+            actor_issuer=actor_issuer,
+            actor_subject=actor_subject,
+            operation_id=operation_id,
+            completed=outcomes,
+        )
+        if step is None:
+            return outcomes
+        key = _candidate_key(step.candidate)
+        try:
+            with SftArtifactStore(data_dir) as store:
+                if step.name is None:
+                    store.remove_bound_training_job_tombstone_directory(
+                        DepartmentScope(department_id),
+                        step.candidate.training_job_id,
+                        operation_id,
+                        identity=step.identity,
+                    )
+                else:
+                    present = store.unlink_bound_training_job_tombstone_file(
+                        DepartmentScope(department_id),
+                        step.candidate.training_job_id,
+                        operation_id,
+                        identity=step.identity,
+                        name=step.name,
+                    )
+                    if not present:
+                        raise SftArtifactError("final_deletion_recovery_required")
+            if step.name is None:
+                outcomes[key] = (True, None)
+            else:
+                _finish_bound_tombstone_unlink(
+                    factory,
+                    department_id=department_id,
+                    actor_issuer=actor_issuer,
+                    actor_subject=actor_subject,
+                    operation_id=operation_id,
+                    step=step,
+                )
+        except SftArtifactError as error:
+            outcomes[key] = (False, _blocked_reason(error))
+        if key in outcomes and not outcomes[key][0]:
+            # Do not spin on a substituted, partial, or otherwise unsafe
+            # bound surface.  The reservation intentionally remains active.
+            continue
+
+
+def _begin_bound_tombstone_step(
+    factory: sessionmaker[Session],
+    *,
+    department_id: UUID,
+    actor_issuer: str,
+    actor_subject: str,
+    operation_id: UUID,
+    completed: dict[tuple[UUID, UUID, str], tuple[bool, str | None]],
+) -> _BoundTombstoneStep | None:
+    try:
+        with factory.begin() as session:
+            _authorize(session, department_id, actor_issuer, actor_subject)
+            _locked_operation(session, operation_id, department_id, "purge")
+            now = session.scalar(select(func.clock_timestamp()))
+            reservations = _active_reservations(session, operation_id, department_id)
+            for reservation in reservations:
+                if reservation.status != "tombstone_bound":
+                    continue
+                job, _attempts, items, owner = _assert_purge_authority(
+                    session, department_id, reservation, now
+                )
+                candidate = _Candidate(
+                    job.id,
+                    owner.attempt.publication_attempt_id,
+                    "final",
+                    dict(owner.manifest),
+                )
+                key = _candidate_key(candidate)
+                if key in completed:
+                    continue
+                final_item = _final_item(items, owner)
+                if final_item.status != "registered" or not isinstance(
+                    reservation.tombstone_identity, dict
+                ):
+                    raise ServiceError(409, "Training-job purge authority changed")
+                identity = dict(reservation.tombstone_identity)
+                remaining = identity.get("remaining_files")
+                inflight = identity.get("unlinking_file")
+                if not isinstance(remaining, list) or any(
+                    not isinstance(name, str) for name in remaining
+                ):
+                    raise ServiceError(409, "Training-job purge authority changed")
+                name = (
+                    inflight if isinstance(inflight, str) else (remaining[0] if remaining else None)
+                )
+                if name is not None and inflight is None:
+                    identity["unlinking_file"] = name
+                    reservation.tombstone_identity = identity
+                    reservation.version += 1
+                return _BoundTombstoneStep(candidate, identity, name)
+            return None
+    except ServiceError:
+        raise
+    except SQLAlchemyError as error:
+        raise ServiceError(503, "Database unavailable") from error
+
+
+def _finish_bound_tombstone_unlink(
+    factory: sessionmaker[Session],
+    *,
+    department_id: UUID,
+    actor_issuer: str,
+    actor_subject: str,
+    operation_id: UUID,
+    step: _BoundTombstoneStep,
+) -> None:
+    if step.name is None:
+        raise ServiceError(409, "Training-job purge authority changed")
+    try:
+        with factory.begin() as session:
+            _authorize(session, department_id, actor_issuer, actor_subject)
+            _locked_operation(session, operation_id, department_id, "purge")
+            now = session.scalar(select(func.clock_timestamp()))
+            reservation = session.execute(
+                select(TrainingJobPurgeReservation)
+                .where(
+                    TrainingJobPurgeReservation.operation_id == operation_id,
+                    TrainingJobPurgeReservation.department_id == department_id,
+                    TrainingJobPurgeReservation.training_job_id == step.candidate.training_job_id,
+                    TrainingJobPurgeReservation.status == "tombstone_bound",
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if reservation is None:
+                raise ServiceError(409, "Training-job purge authority changed")
+            _job, _attempts, _items, owner = _assert_purge_authority(
+                session, department_id, reservation, now
+            )
+            if owner.attempt.publication_attempt_id != step.candidate.attempt_id:
+                raise ServiceError(409, "Training-job purge authority changed")
+            identity = reservation.tombstone_identity
+            if not isinstance(identity, dict) or identity != step.identity:
+                raise ServiceError(409, "Training-job purge authority changed")
+            remaining = identity.get("remaining_files")
+            if identity.get("unlinking_file") != step.name or not isinstance(remaining, list):
+                raise ServiceError(409, "Training-job purge authority changed")
+            identity = dict(identity)
+            identity["remaining_files"] = [name for name in remaining if name != step.name]
+            identity["unlinking_file"] = None
+            reservation.tombstone_identity = identity
+            reservation.version += 1
+    except ServiceError:
+        raise
+    except SQLAlchemyError as error:
+        raise ServiceError(503, "Database unavailable") from error
 
 
 def _candidate_key(candidate: _Candidate) -> tuple[UUID, UUID, str]:
@@ -859,7 +1136,7 @@ def _persist_purge_stage_outcomes(
 ) -> None:
     try:
         with factory.begin() as session:
-            _authorize(session, department_id, actor_issuer, actor_subject)
+            scope, authorization = _authorize(session, department_id, actor_issuer, actor_subject)
             operation = _locked_operation(session, operation_id, department_id, "purge")
             now = session.scalar(select(func.clock_timestamp()))
             for key, (completed, reason) in outcomes.items():
@@ -881,7 +1158,15 @@ def _persist_purge_stage_outcomes(
                         attempt.publication_attempt_id,
                         now,
                     )
-            _close_purge_operation_if_terminal(session, operation, department_id, now)
+            _close_purge_operation_if_terminal(
+                session,
+                operation,
+                department_id,
+                now,
+                audit_actor=authorization.identity,
+                audit_subject=actor_subject,
+                audit_scope=scope,
+            )
     except ServiceError:
         raise
     except SQLAlchemyError as error:
@@ -900,7 +1185,7 @@ def _authorize_final_deletion(
 
     try:
         with factory.begin() as session:
-            _authorize(session, department_id, actor_issuer, actor_subject)
+            scope, authorization = _authorize(session, department_id, actor_issuer, actor_subject)
             operation = _locked_operation(session, operation_id, department_id, "purge")
             now = session.scalar(select(func.clock_timestamp()))
             result: list[_Candidate] = []
@@ -908,6 +1193,8 @@ def _authorize_final_deletion(
                 job, _attempts, items, owner = _assert_purge_authority(
                     session, department_id, reservation, now
                 )
+                if reservation.status == "tombstone_bound":
+                    continue
                 if any(item.status == "blocked" for item in items):
                     _terminalize_reservation(reservation, now)
                     continue
@@ -935,7 +1222,15 @@ def _authorize_final_deletion(
                         dict(owner.manifest),
                     )
                 )
-            _close_purge_operation_if_terminal(session, operation, department_id, now)
+            _close_purge_operation_if_terminal(
+                session,
+                operation,
+                department_id,
+                now,
+                audit_actor=authorization.identity,
+                audit_subject=actor_subject,
+                audit_scope=scope,
+            )
             return tuple(result)
     except ServiceError:
         raise
@@ -959,7 +1254,6 @@ def _persist_purge_final_outcomes(
             scope, authorization = _authorize(session, department_id, actor_issuer, actor_subject)
             operation = _locked_operation(session, operation_id, department_id, "purge")
             now = session.scalar(select(func.clock_timestamp()))
-            purged_count = 0
             for key, (completed, reason) in outcomes.items():
                 training_job_id, attempt_id, surface = key
                 if surface != "final":
@@ -970,7 +1264,7 @@ def _persist_purge_final_outcomes(
                         TrainingJobPurgeReservation.operation_id == operation_id,
                         TrainingJobPurgeReservation.department_id == department_id,
                         TrainingJobPurgeReservation.training_job_id == training_job_id,
-                        TrainingJobPurgeReservation.status == "deletion_authorized",
+                        TrainingJobPurgeReservation.status == "tombstone_bound",
                     )
                     .with_for_update()
                 ).scalar_one_or_none()
@@ -1014,18 +1308,17 @@ def _persist_purge_final_outcomes(
                     job.purged_at = now
                     job.version += 1
                     _terminalize_reservation(reservation, now)
-                    purged_count += 1
-            _close_purge_operation_if_terminal(session, operation, department_id, now)
-            if purged_count:
-                append_mutation_audit(
-                    session,
-                    actor=authorization.identity,
-                    actor_subject=actor_subject,
-                    request_scope=scope,
-                    action="training.job.purge",
-                    resource_type="training_job_artifact_operation",
-                    resource_id=operation.id,
-                )
+                    operation.purged_job_count += 1
+                    operation.version += 1
+            _close_purge_operation_if_terminal(
+                session,
+                operation,
+                department_id,
+                now,
+                audit_actor=authorization.identity,
+                audit_subject=actor_subject,
+                audit_scope=scope,
+            )
     except ServiceError:
         raise
     except SQLAlchemyError as error:
@@ -1097,7 +1390,9 @@ def _active_reservations(
         .where(
             TrainingJobPurgeReservation.operation_id == operation_id,
             TrainingJobPurgeReservation.department_id == department_id,
-            TrainingJobPurgeReservation.status.in_(("registered", "deletion_authorized")),
+            TrainingJobPurgeReservation.status.in_(
+                ("registered", "deletion_authorized", "tombstone_bound")
+            ),
         )
         .order_by(TrainingJobPurgeReservation.training_job_id)
         .with_for_update()
@@ -1250,6 +1545,10 @@ def _close_purge_operation_if_terminal(
     operation: TrainingJobArtifactOperation,
     department_id: UUID,
     now,
+    *,
+    audit_actor=None,
+    audit_subject: str | None = None,
+    audit_scope: DepartmentRequestScope | None = None,
 ) -> None:
     active = session.scalar(
         select(func.count())
@@ -1257,7 +1556,9 @@ def _close_purge_operation_if_terminal(
         .where(
             TrainingJobPurgeReservation.operation_id == operation.id,
             TrainingJobPurgeReservation.department_id == department_id,
-            TrainingJobPurgeReservation.status.in_(("registered", "deletion_authorized")),
+            TrainingJobPurgeReservation.status.in_(
+                ("registered", "deletion_authorized", "tombstone_bound")
+            ),
         )
     )
     if active:
@@ -1273,13 +1574,32 @@ def _close_purge_operation_if_terminal(
     )
     operation.status = "completed_with_blocks" if blocked else "completed"
     operation.completed_at = now
+    operation.version += 1
+    if (
+        operation.operation_type == "purge"
+        and operation.purged_job_count > 0
+        and operation.success_audited_at is None
+    ):
+        if audit_actor is None or audit_subject is None or audit_scope is None:
+            raise ServiceError(409, "Training-job purge audit is unavailable")
+        append_mutation_audit(
+            session,
+            actor=audit_actor,
+            actor_subject=audit_subject,
+            request_scope=audit_scope,
+            action="training.job.purge",
+            resource_type="training_job_artifact_operation",
+            resource_id=operation.id,
+        )
+        operation.success_audited_at = now
+        operation.version += 1
 
 
 def _purge_reservation_matches(
     reservation: TrainingJobPurgeReservation, job: TrainingJob, now
 ) -> bool:
     return (
-        reservation.status in {"registered", "deletion_authorized"}
+        reservation.status in {"registered", "deletion_authorized", "tombstone_bound"}
         and job.status == "succeeded"
         and job.purged_at is None
         and job.review_status == reservation.expected_review_status

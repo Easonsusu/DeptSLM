@@ -350,7 +350,9 @@ def _require_no_active_purge_reservation(session: Session, job: TrainingJob) -> 
         .where(
             TrainingJobPurgeReservation.department_id == job.department_id,
             TrainingJobPurgeReservation.training_job_id == job.id,
-            TrainingJobPurgeReservation.status.in_(("registered", "deletion_authorized")),
+            TrainingJobPurgeReservation.status.in_(
+                ("registered", "deletion_authorized", "tombstone_bound")
+            ),
         )
         .with_for_update()
     ).scalar_one_or_none()

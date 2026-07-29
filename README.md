@@ -32,8 +32,10 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > first, then commits final-deletion authorization before touching that one
 > final surface. Each long parent operation has an independent deadline and
 > the final transaction renews only before locks. A reservation binds the
-> exact owner, closed manifest, and UUID tombstone; verified final bundles move
-> without replacement into private deletion storage before resumable cleanup.
+> exact owner, closed manifest, and UUID tombstone namespace. After a verified
+> no-replace move, cleanup commits the exact tombstone directory, parent, and
+> fixed-file identities before unlinking any member. Retries reject substituted
+> paths or files; a single purge operation emits at most one success audit.
 > Blocked pre-move cleanup leaves the final intact, while post-move interruption
 > keeps the reservation active. Review changes are rejected while a reservation
 > is active. This remains a draft review boundary, not training execution.

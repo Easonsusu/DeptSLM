@@ -945,7 +945,7 @@ class SftArtifactStore:
             checkpoint=checkpoint,
         )
 
-    def remove_authorized_training_job_final(
+    def prepare_authorized_training_job_tombstone(
         self,
         scope: DepartmentScope,
         training_job_id: UUID,
@@ -954,14 +954,13 @@ class SftArtifactStore:
         *,
         expected: dict[str, object],
         checkpoint: _Checkpoint | None = None,
-    ) -> bool:
-        """Durably move an authorized final bundle into an exact tombstone.
+    ) -> dict[str, object] | None:
+        """Move and bind a complete final bundle without deleting a member.
 
-        The final directory is fully verified before the no-replace move.  Once
-        moved, its former pathname is never trusted again: cleanup uses only
-        the retained tombstone descriptor and accepts a private subset of the
-        fixed final-file allowlist so every interrupted unlink sequence can be
-        resumed without parsing content.
+        The caller must durably commit the returned closed identity before it
+        invokes any cleanup method.  A UUID tombstone name is only a namespace
+        key: this method captures the complete descriptor-relative directory,
+        parent, and fixed-file identities that authorize a later unlink.
         """
 
         if (
@@ -1036,15 +1035,28 @@ class SftArtifactStore:
                 tombstone = final
                 final = None
             if tombstone is None:
-                return False
-            _remove_tombstone_files(tombstone, checkpoint=check)
-            _rmdir_exact(tombstone_parent, str(purge_operation_id), tombstone)
-            _fsync(tombstone_parent)
-            _entry_matches(self._deleting_jobs_fd, str(scope.value), tombstone_department)
-            _entry_matches(tombstone_department, str(training_job_id), tombstone_parent)
-            os.close(tombstone)
-            tombstone = None
-            return True
+                # An authorized-but-unbound absent final/tombstone pair is not
+                # evidence of deletion.  The maintenance layer keeps its
+                # recovery fence active and fails closed.
+                return None
+            verified = _verify_files(
+                tombstone,
+                TRAINING_JOB_FILES,
+                {},
+                marker_allowed=False,
+                checkpoint=check,
+            )
+            manifest = _parse_manifest(
+                _read_file_at(tombstone, "manifest.json", maximum=256 * 1024, checkpoint=check)
+            )
+            _require_exact_manifest(manifest, TRAINING_JOB_FILES, verified, expected)
+            if manifest.get("publication_attempt_id") != str(publication_attempt_id):
+                raise SftArtifactError("artifact_manifest_invalid")
+            return _capture_tombstone_identity(
+                tombstone_department,
+                tombstone_parent,
+                tombstone,
+            )
         except SftArtifactError as error:
             if moved or tombstone is not None:
                 raise SftArtifactError("final_deletion_recovery_required") from error
@@ -1067,6 +1079,107 @@ class SftArtifactStore:
                     except OSError:
                         pass
 
+    def unlink_bound_training_job_tombstone_file(
+        self,
+        scope: DepartmentScope,
+        training_job_id: UUID,
+        purge_operation_id: UUID,
+        *,
+        identity: dict[str, object],
+        name: str,
+        checkpoint: _Checkpoint | None = None,
+    ) -> bool:
+        """Unlink one pre-authorized fixed member from a bound tombstone.
+
+        ``False`` means that the tombstone is absent.  That is only a valid
+        idempotent result once the caller has durably recorded every member as
+        unlinked; the method never treats it as permission to finish a job.
+        """
+
+        if name not in TRAINING_JOB_FILES:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        check = checkpoint or _noop
+        department: int | None = None
+        parent: int | None = None
+        tombstone: int | None = None
+        try:
+            department, parent = self._open_existing_tombstone_parent(scope, training_job_id)
+            _require_bound_tombstone_parent_identity(
+                self._deleting_jobs_fd, scope, training_job_id, department, parent, identity
+            )
+            try:
+                tombstone = _open_private_child(parent, str(purge_operation_id))
+            except FileNotFoundError:
+                return False
+            _require_bound_tombstone_identity(parent, purge_operation_id, tombstone, identity)
+            check()
+            _unlink_bound_tombstone_file(tombstone, identity, name)
+            _fsync(tombstone)
+            _require_bound_tombstone_identity(parent, purge_operation_id, tombstone, identity)
+            return True
+        except SftArtifactError:
+            raise
+        except OSError as error:
+            raise SftArtifactError("final_deletion_recovery_required") from error
+        finally:
+            for descriptor in (tombstone, parent, department):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+
+    def remove_bound_training_job_tombstone_directory(
+        self,
+        scope: DepartmentScope,
+        training_job_id: UUID,
+        purge_operation_id: UUID,
+        *,
+        identity: dict[str, object],
+        checkpoint: _Checkpoint | None = None,
+    ) -> bool:
+        """Remove an empty, durably bound tombstone directory only."""
+
+        check = checkpoint or _noop
+        _validate_tombstone_identity(identity)
+        if identity["remaining_files"] or identity["unlinking_file"] is not None:
+            raise SftArtifactError("final_deletion_recovery_required")
+        department: int | None = None
+        parent: int | None = None
+        tombstone: int | None = None
+        try:
+            department, parent = self._open_existing_tombstone_parent(scope, training_job_id)
+            _require_bound_tombstone_parent_identity(
+                self._deleting_jobs_fd, scope, training_job_id, department, parent, identity
+            )
+            try:
+                tombstone = _open_private_child(parent, str(purge_operation_id))
+            except FileNotFoundError:
+                return True
+            _require_bound_tombstone_identity(parent, purge_operation_id, tombstone, identity)
+            check()
+            if os.listdir(tombstone):
+                raise SftArtifactError("final_deletion_recovery_required")
+            _rmdir_exact(parent, str(purge_operation_id), tombstone)
+            _fsync(parent)
+            _require_bound_tombstone_parent_identity(
+                self._deleting_jobs_fd, scope, training_job_id, department, parent, identity
+            )
+            os.close(tombstone)
+            tombstone = None
+            return True
+        except SftArtifactError:
+            raise
+        except OSError as error:
+            raise SftArtifactError("final_deletion_recovery_required") from error
+        finally:
+            for descriptor in (tombstone, parent, department):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+
     def _open_tombstone_parent(
         self, scope: DepartmentScope, training_job_id: UUID
     ) -> tuple[int, int]:
@@ -1075,6 +1188,19 @@ class SftArtifactStore:
         department = _ensure_private_child(self._deleting_jobs_fd, str(scope.value))
         try:
             job = _ensure_private_child(department, str(training_job_id))
+        except Exception:
+            os.close(department)
+            raise
+        return department, job
+
+    def _open_existing_tombstone_parent(
+        self, scope: DepartmentScope, training_job_id: UUID
+    ) -> tuple[int, int]:
+        """Open an existing exact tombstone chain without creating a path."""
+
+        department = _open_private_child(self._deleting_jobs_fd, str(scope.value))
+        try:
+            job = _open_private_child(department, str(training_job_id))
         except Exception:
             os.close(department)
             raise
@@ -1720,41 +1846,222 @@ def _remove_contents(directory_fd: int, *, checkpoint: _Checkpoint) -> None:
     _fsync(directory_fd)
 
 
-def _remove_tombstone_files(directory_fd: int, *, checkpoint: _Checkpoint) -> None:
-    """Delete only a private subset of the immutable training-job file set.
+_TOMBSTONE_IDENTITY_VERSION = 1
 
-    The tombstone may represent any crash point after a completed final bundle
-    was renamed.  It is therefore intentionally *not* parsed or rehashed.  Its
-    exact UUID descriptor chain plus the durable reservation authorize removal;
-    every present entry must still be a private, single-link regular file in
-    the reviewed fixed allowlist.
-    """
 
-    _require_private_directory(directory_fd, writable=True)
-    permitted = set(TRAINING_JOB_FILES)
-    names = set(os.listdir(directory_fd))
-    if not names.issubset(permitted):
+def _capture_tombstone_identity(
+    department_fd: int, parent_fd: int, tombstone_fd: int
+) -> dict[str, object]:
+    """Capture a closed, content-free identity before any tombstone cleanup."""
+
+    _require_private_directory(department_fd, writable=True)
+    _require_private_directory(parent_fd, writable=True)
+    _require_private_directory(tombstone_fd, writable=True)
+    files = {
+        name: _tombstone_file_identity(tombstone_fd, name) for name in sorted(TRAINING_JOB_FILES)
+    }
+    return {
+        "version": _TOMBSTONE_IDENTITY_VERSION,
+        "department": _tombstone_directory_identity(os.fstat(department_fd)),
+        "parent": _tombstone_directory_identity(os.fstat(parent_fd)),
+        "directory": _tombstone_directory_identity(os.fstat(tombstone_fd)),
+        "files": files,
+        "remaining_files": sorted(TRAINING_JOB_FILES),
+        "unlinking_file": None,
+    }
+
+
+def _tombstone_directory_identity(metadata: os.stat_result) -> dict[str, int]:
+    if not stat.S_ISDIR(metadata.st_mode):
         raise SftArtifactError("artifact_ownership_mismatch")
-    for name in sorted(names):
-        checkpoint()
-        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_mode & 0o077
-            or metadata.st_nlink != 1
-        ):
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+
+
+def _tombstone_file_identity(directory_fd: int, name: str) -> dict[str, int]:
+    metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+        or metadata.st_nlink != 1
+    ):
+        raise SftArtifactError("artifact_ownership_mismatch")
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        opened = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not _same_file(opened, current):
             raise SftArtifactError("artifact_ownership_mismatch")
-        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
-        try:
-            opened = os.fstat(descriptor)
-            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            if not _same_file(opened, current):
-                raise SftArtifactError("artifact_ownership_mismatch")
-        finally:
-            os.close(descriptor)
+        return {
+            "device": opened.st_dev,
+            "inode": opened.st_ino,
+            "uid": opened.st_uid,
+            "mode": stat.S_IMODE(opened.st_mode),
+            "link_count": opened.st_nlink,
+            "byte_size": opened.st_size,
+            "mtime_ns": opened.st_mtime_ns,
+            "ctime_ns": opened.st_ctime_ns,
+        }
+    finally:
+        os.close(descriptor)
+
+
+def _require_bound_tombstone_parent_identity(
+    deleting_jobs_fd: int,
+    scope: DepartmentScope,
+    training_job_id: UUID,
+    department_fd: int,
+    parent_fd: int,
+    identity: dict[str, object],
+) -> None:
+    _validate_tombstone_identity(identity)
+    _entry_matches(deleting_jobs_fd, str(scope.value), department_fd)
+    _entry_matches(department_fd, str(training_job_id), parent_fd)
+    _require_private_directory(department_fd, writable=True)
+    _require_private_directory(parent_fd, writable=True)
+    if not _same_tombstone_directory_identity(
+        os.fstat(department_fd), identity["department"]
+    ) or not _same_tombstone_directory_identity(os.fstat(parent_fd), identity["parent"]):
+        raise SftArtifactError("final_deletion_recovery_required")
+
+
+def _require_bound_tombstone_identity(
+    parent_fd: int, purge_operation_id: UUID, tombstone_fd: int, identity: dict[str, object]
+) -> None:
+    _validate_tombstone_identity(identity)
+    _entry_matches(parent_fd, str(purge_operation_id), tombstone_fd)
+    _require_private_directory(tombstone_fd, writable=True)
+    if not _same_tombstone_directory_identity(os.fstat(tombstone_fd), identity["directory"]):
+        raise SftArtifactError("final_deletion_recovery_required")
+
+
+def _same_tombstone_directory_identity(metadata: os.stat_result, expected: object) -> bool:
+    if not isinstance(expected, dict) or set(expected) != {"device", "inode", "uid", "mode"}:
+        return False
+    values = _tombstone_directory_identity(metadata)
+    return all(type(expected[key]) is int and expected[key] == values[key] for key in values)
+
+
+def _same_tombstone_file_identity(metadata: os.stat_result, expected: object) -> bool:
+    required = {
+        "device",
+        "inode",
+        "uid",
+        "mode",
+        "link_count",
+        "byte_size",
+        "mtime_ns",
+        "ctime_ns",
+    }
+    if not isinstance(expected, dict) or set(expected) != required:
+        return False
+    values = {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "link_count": metadata.st_nlink,
+        "byte_size": metadata.st_size,
+        "mtime_ns": metadata.st_mtime_ns,
+        "ctime_ns": metadata.st_ctime_ns,
+    }
+    return stat.S_ISREG(metadata.st_mode) and all(
+        type(expected[key]) is int and expected[key] == values[key] for key in values
+    )
+
+
+def _validate_tombstone_identity(identity: dict[str, object]) -> None:
+    required = {
+        "version",
+        "department",
+        "parent",
+        "directory",
+        "files",
+        "remaining_files",
+        "unlinking_file",
+    }
+    if not isinstance(identity, dict) or set(identity) != required:
+        raise SftArtifactError("final_deletion_recovery_required")
+    if identity["version"] != _TOMBSTONE_IDENTITY_VERSION:
+        raise SftArtifactError("final_deletion_recovery_required")
+    if not all(
+        isinstance(identity[key], dict)
+        and set(identity[key]) == {"device", "inode", "uid", "mode"}
+        and all(type(value) is int for value in identity[key].values())
+        for key in ("department", "parent", "directory")
+    ):
+        raise SftArtifactError("final_deletion_recovery_required")
+    files = identity["files"]
+    remaining = identity["remaining_files"]
+    inflight = identity["unlinking_file"]
+    if (
+        not isinstance(files, dict)
+        or set(files) != set(TRAINING_JOB_FILES)
+        or not isinstance(remaining, list)
+        or len(remaining) != len(set(remaining))
+        or set(remaining) - set(TRAINING_JOB_FILES)
+        or remaining != sorted(remaining)
+        or (inflight is not None and (not isinstance(inflight, str) or inflight not in remaining))
+    ):
+        raise SftArtifactError("final_deletion_recovery_required")
+    required_file = {
+        "device",
+        "inode",
+        "uid",
+        "mode",
+        "link_count",
+        "byte_size",
+        "mtime_ns",
+        "ctime_ns",
+    }
+    if any(
+        not isinstance(value, dict)
+        or set(value) != required_file
+        or any(type(field) is not int for field in value.values())
+        for value in files.values()
+    ):
+        raise SftArtifactError("final_deletion_recovery_required")
+
+
+def _unlink_bound_tombstone_file(directory_fd: int, identity: dict[str, object], name: str) -> None:
+    """Unlink only the persisted current member of an exact tombstone."""
+
+    _validate_tombstone_identity(identity)
+    remaining = set(identity["remaining_files"])
+    inflight = identity["unlinking_file"]
+    if name not in remaining or inflight != name:
+        raise SftArtifactError("final_deletion_recovery_required")
+    names = set(os.listdir(directory_fd))
+    expected_present = remaining - {name}
+    if names not in (expected_present, expected_present | {name}):
+        raise SftArtifactError("final_deletion_recovery_required")
+    files = identity["files"]
+    for current in sorted(names):
+        metadata = os.stat(current, dir_fd=directory_fd, follow_symlinks=False)
+        if not _same_tombstone_file_identity(metadata, files[current]):
+            raise SftArtifactError("final_deletion_recovery_required")
+    if name not in names:
+        # The durable in-flight marker was committed before the unlink.  A
+        # crash after that unlink is therefore the sole accepted missing-file
+        # state; no other unexpected absence can be mistaken for progress.
+        return
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        opened = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not (
+            _same_tombstone_file_identity(opened, files[name])
+            and _same_tombstone_file_identity(current, files[name])
+        ):
+            raise SftArtifactError("final_deletion_recovery_required")
         _unlink_exact(directory_fd, name)
-        _fsync(directory_fd)
+    finally:
+        os.close(descriptor)
 
 
 def _same_file(first: os.stat_result, second: os.stat_result) -> bool:

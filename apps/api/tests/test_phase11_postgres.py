@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from alembic import command
-from app import sft_artifacts, training_job_maintenance
+from app import training_job_maintenance
 from app.auth import AuthenticatedPrincipal
 from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.database import create_database_engine
@@ -121,13 +121,23 @@ def test_phase11_metadata_schema_is_content_free_and_registered(engine) -> None:
     assert {"publication_attempt_id", "ownership_manifest", "cleanup_confirmed_at"}.issubset(
         attempt_columns
     )
-    assert {"operation_type", "limit_value", "retention_days", "status"}.issubset(operation_columns)
+    assert {
+        "operation_type",
+        "limit_value",
+        "retention_days",
+        "status",
+        "purged_job_count",
+        "success_audited_at",
+        "version",
+    }.issubset(operation_columns)
     assert {
         "expected_job_version",
         "expected_review_status",
         "retention_anchor_at",
         "retention_days",
         "deletion_authorized_at",
+        "tombstone_bound_at",
+        "tombstone_identity",
         "authoritative_publication_attempt_id",
         "authoritative_manifest",
         "tombstone_operation_id",
@@ -929,7 +939,7 @@ def test_phase11_purge_recovers_after_final_deletion_before_database_commit(
                 TrainingJobPurgeReservation.training_job_id == job_id
             )
         )
-        assert reservation is not None and reservation.status == "deletion_authorized"
+        assert reservation is not None and reservation.status == "tombstone_bound"
     monkeypatch.setattr(training_job_maintenance, "_persist_purge_final_outcomes", original)
     result = purge_training_job_artifacts(
         factory,
@@ -971,14 +981,16 @@ def test_phase11_purge_keeps_tombstone_reservation_active_until_cleanup_resumes(
         job.reviewed_at = datetime.now(UTC) - timedelta(days=31)
         job.version += 1
 
-    original = sft_artifacts._remove_tombstone_files
+    original = SftArtifactStore.unlink_bound_training_job_tombstone_file
 
-    def interrupt_after_tombstone_contents(*args, **kwargs) -> None:
+    def interrupt_after_tombstone_member(*args, **kwargs) -> None:
         original(*args, **kwargs)
         raise SftArtifactError("artifact_ownership_mismatch")
 
     monkeypatch.setattr(
-        sft_artifacts, "_remove_tombstone_files", interrupt_after_tombstone_contents
+        SftArtifactStore,
+        "unlink_bound_training_job_tombstone_file",
+        interrupt_after_tombstone_member,
     )
     result = purge_training_job_artifacts(
         factory,
@@ -999,7 +1011,7 @@ def test_phase11_purge_keeps_tombstone_reservation_active_until_cleanup_resumes(
             )
         )
         assert job is not None and job.review_status == "rejected" and job.purged_at is None
-        assert reservation is not None and reservation.status == "deletion_authorized"
+        assert reservation is not None and reservation.status == "tombstone_bound"
         assert reservation.tombstone_operation_id == reservation.operation_id
         assert reservation.authoritative_publication_attempt_id is not None
         assert isinstance(reservation.authoritative_manifest, dict)
@@ -1012,7 +1024,7 @@ def test_phase11_purge_keeps_tombstone_reservation_active_until_cleanup_resumes(
             .count()
             == 0
         )
-    monkeypatch.setattr(sft_artifacts, "_remove_tombstone_files", original)
+    monkeypatch.setattr(SftArtifactStore, "unlink_bound_training_job_tombstone_file", original)
     recovered = purge_training_job_artifacts(
         factory,
         data_dir=root,
@@ -1027,6 +1039,134 @@ def test_phase11_purge_keeps_tombstone_reservation_active_until_cleanup_resumes(
     with factory() as session:
         job = session.get(TrainingJob, job_id)
         assert job is not None and job.review_status == "purged" and job.purged_at is not None
+        assert (
+            session.query(PersistentAuditEvent)
+            .filter(
+                PersistentAuditEvent.department_id == department_id,
+                PersistentAuditEvent.action == "training.job.purge",
+            )
+            .count()
+            == 1
+        )
+
+
+def test_phase11_multi_job_purge_emits_one_audit_only_after_recovery(
+    engine, tmp_path: Path, monkeypatch
+) -> None:
+    """One operation may purge many jobs but can record only one success audit."""
+
+    factory = sessionmaker(engine)
+    root = tmp_path / "runtime"
+    with factory.begin() as session:
+        department, identity, dataset = _approved_dataset(session)
+        _publish_private_dataset(root, department, dataset)
+        first = _enqueue(
+            session, department, identity, dataset, code_revision=_unique_code_revision()
+        )
+        second = _enqueue(
+            session, department, identity, dataset, code_revision=_unique_code_revision()
+        )
+        department_id, issuer, subject = department.id, identity.issuer, identity.subject
+        first_id, second_id = first.id, second.id
+        revisions = {first.id: first.code_revision, second.id: second.code_revision}
+    for job_id in (first_id, second_id):
+        claim = claim_next(factory, uuid4(), 30, revisions[job_id])
+        assert claim is not None and claim.id == job_id
+        process_training_job(factory, root, claim, lease_seconds=30, operation_seconds=20)
+    with factory.begin() as session:
+        for job_id in (first_id, second_id):
+            job = session.get(TrainingJob, job_id)
+            assert job is not None
+            job.review_status = "rejected"
+            job.reviewed_at = datetime.now(UTC) - timedelta(days=31)
+            job.version += 1
+
+    original = SftArtifactStore.unlink_bound_training_job_tombstone_file
+
+    def interrupt_second_job(store, scope, job_id, operation_id, **kwargs):
+        result = original(store, scope, job_id, operation_id, **kwargs)
+        if job_id == second_id:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        return result
+
+    monkeypatch.setattr(
+        SftArtifactStore,
+        "unlink_bound_training_job_tombstone_file",
+        interrupt_second_job,
+    )
+    first_result = purge_training_job_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department_id,
+        actor_issuer=issuer,
+        actor_subject=subject,
+        retention_days=30,
+        limit=2,
+        apply=True,
+    )
+    assert first_result.applied_count > 0 and first_result.blocked_count == 1
+    with factory() as session:
+        operation = session.scalar(
+            select(TrainingJobArtifactOperation)
+            .where(TrainingJobArtifactOperation.department_id == department_id)
+            .order_by(TrainingJobArtifactOperation.created_at.desc())
+        )
+        assert operation is not None and operation.status == "registered"
+        assert operation.purged_job_count == 1 and operation.success_audited_at is None
+        assert (
+            session.query(PersistentAuditEvent)
+            .filter(
+                PersistentAuditEvent.department_id == department_id,
+                PersistentAuditEvent.action == "training.job.purge",
+                PersistentAuditEvent.resource_id == operation.id,
+            )
+            .count()
+            == 0
+        )
+    monkeypatch.setattr(SftArtifactStore, "unlink_bound_training_job_tombstone_file", original)
+    recovered = purge_training_job_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department_id,
+        actor_issuer=issuer,
+        actor_subject=subject,
+        retention_days=30,
+        limit=2,
+        apply=True,
+    )
+    assert recovered.applied_count > 0 and recovered.blocked_count == 0
+    with factory() as session:
+        operation = session.scalar(
+            select(TrainingJobArtifactOperation)
+            .where(TrainingJobArtifactOperation.department_id == department_id)
+            .order_by(TrainingJobArtifactOperation.created_at.desc())
+        )
+        assert operation is not None
+        assert operation.status == "completed" and operation.purged_job_count == 2
+        assert operation.success_audited_at is not None
+        assert (
+            session.query(PersistentAuditEvent)
+            .filter(
+                PersistentAuditEvent.department_id == department_id,
+                PersistentAuditEvent.action == "training.job.purge",
+                PersistentAuditEvent.resource_id == operation.id,
+            )
+            .count()
+            == 1
+        )
+
+    repeated = purge_training_job_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department_id,
+        actor_issuer=issuer,
+        actor_subject=subject,
+        retention_days=30,
+        limit=2,
+        apply=True,
+    )
+    assert (repeated.eligible_count, repeated.applied_count, repeated.blocked_count) == (0, 0, 0)
+    with factory() as session:
         assert (
             session.query(PersistentAuditEvent)
             .filter(

@@ -303,7 +303,10 @@ def upgrade() -> None:
         sa.Column("retention_days", sa.Integer()),
         sa.Column("operation_type", sa.String(16), nullable=False),
         sa.Column("status", sa.String(24), nullable=False),
+        sa.Column("purged_job_count", sa.Integer(), nullable=False),
+        sa.Column("success_audited_at", sa.DateTime(timezone=True)),
         sa.Column("completed_at", sa.DateTime(timezone=True)),
+        sa.Column("version", sa.Integer(), nullable=False),
         sa.Column(
             "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
         ),
@@ -326,6 +329,10 @@ def upgrade() -> None:
             "(operation_type = 'reconcile' AND retention_days IS NULL) OR "
             "(operation_type = 'purge' AND retention_days BETWEEN 30 AND 730)",
             name="ck_training_job_operation_retention",
+        ),
+        sa.CheckConstraint(
+            "purged_job_count >= 0 AND version > 0",
+            name="ck_training_job_operation_progress",
         ),
         sa.ForeignKeyConstraint(["department_id"], ["departments.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(
@@ -361,13 +368,15 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("deletion_authorized_at", sa.DateTime(timezone=True)),
+        sa.Column("tombstone_bound_at", sa.DateTime(timezone=True)),
+        sa.Column("tombstone_identity", sa.JSON()),
         sa.Column("terminalized_at", sa.DateTime(timezone=True)),
         sa.Column("version", sa.Integer(), nullable=False),
         sa.Column(
             "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
         ),
         sa.CheckConstraint(
-            "status IN ('registered','deletion_authorized','terminalized')",
+            "status IN ('registered','deletion_authorized','tombstone_bound','terminalized')",
             name="ck_training_job_purge_reservation_status",
         ),
         sa.CheckConstraint(
@@ -389,8 +398,13 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "(status = 'registered' AND deletion_authorized_at IS NULL "
+            "AND tombstone_bound_at IS NULL AND tombstone_identity IS NULL "
             "AND terminalized_at IS NULL) "
             "OR (status = 'deletion_authorized' AND deletion_authorized_at IS NOT NULL "
+            "AND tombstone_bound_at IS NULL AND tombstone_identity IS NULL "
+            "AND terminalized_at IS NULL) OR (status = 'tombstone_bound' "
+            "AND deletion_authorized_at IS NOT NULL AND tombstone_bound_at IS NOT NULL "
+            "AND tombstone_identity IS NOT NULL AND json_typeof(tombstone_identity) = 'object' "
             "AND terminalized_at IS NULL) OR (status = 'terminalized' "
             "AND terminalized_at IS NOT NULL)",
             name="ck_training_job_purge_reservation_lifecycle",
@@ -420,7 +434,7 @@ def upgrade() -> None:
         "training_job_purge_reservations",
         ["training_job_id"],
         unique=True,
-        postgresql_where=sa.text("status IN ('registered','deletion_authorized')"),
+        postgresql_where=sa.text("status IN ('registered','deletion_authorized','tombstone_bound')"),
     )
     op.create_index(
         "ix_training_job_purge_reservation_operation",
