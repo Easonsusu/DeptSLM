@@ -330,13 +330,19 @@ def test_phase11_approved_dataset_claims_with_exact_live_lease(engine) -> None:
         department, identity, dataset = _approved_dataset(session)
         job = _enqueue(session, department, identity, dataset)
         job_id = job.id
+        expected_snapshot = (
+            dataset.source_bundle_id,
+            dataset.publication_attempt_id,
+            dataset.train_sha256,
+            dataset.source_reference_count,
+        )
     claim = claim_next(factory, uuid4(), 30, "a" * 40)
     assert claim is not None and claim.id == job_id
     assert (
-        claim.dataset_source_bundle_id == dataset.source_bundle_id
-        and claim.dataset_publication_attempt_id == dataset.publication_attempt_id
-        and claim.dataset_train_sha256 == dataset.train_sha256
-        and claim.dataset_source_reference_count == dataset.source_reference_count
+        claim.dataset_source_bundle_id == expected_snapshot[0]
+        and claim.dataset_publication_attempt_id == expected_snapshot[1]
+        and claim.dataset_train_sha256 == expected_snapshot[2]
+        and claim.dataset_source_reference_count == expected_snapshot[3]
     )
     renew_lease(factory, claim, 30)
     with factory() as session:
@@ -452,6 +458,11 @@ def test_phase11_snapshot_drift_fails_before_artifact_open(engine, field, value)
         dataset = session.get(SftDatasetBuild, claim.dataset_build_id)
         assert dataset is not None
         setattr(dataset, field, value())
+        # The source-count constraint deliberately forbids a source example
+        # count that exceeds the reference count. Preserve that invariant so
+        # this test reaches the Phase 11 snapshot-authority comparison.
+        if field == "source_example_count":
+            dataset.source_reference_count = dataset.source_example_count
     with pytest.raises(TrainingJobQueueError, match="dataset_authority_changed"):
         _load_eligible_dataset(factory, claim, lambda: None)  # type: ignore[arg-type]
 
