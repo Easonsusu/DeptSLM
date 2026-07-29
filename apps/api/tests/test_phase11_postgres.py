@@ -1120,7 +1120,7 @@ def test_phase11_multi_job_purge_emits_one_audit_only_after_recovery(
             .filter(
                 PersistentAuditEvent.department_id == department_id,
                 PersistentAuditEvent.action == "training.job.purge",
-                PersistentAuditEvent.resource_id == operation.id,
+                PersistentAuditEvent.resource_id == str(operation.id),
             )
             .count()
             == 0
@@ -1151,7 +1151,7 @@ def test_phase11_multi_job_purge_emits_one_audit_only_after_recovery(
             .filter(
                 PersistentAuditEvent.department_id == department_id,
                 PersistentAuditEvent.action == "training.job.purge",
-                PersistentAuditEvent.resource_id == operation.id,
+                PersistentAuditEvent.resource_id == str(operation.id),
             )
             .count()
             == 1
