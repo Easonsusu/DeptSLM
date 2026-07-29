@@ -141,6 +141,25 @@ class _Lease:
         self._local_check()
 
 
+def _new_operation_lease(
+    factory: sessionmaker[Session],
+    job: ClaimedTrainingJob,
+    *,
+    lease_seconds: int,
+    operation_seconds: int,
+    should_stop: Callable[[], bool],
+) -> _Lease:
+    """Allocate one independent deadline for one parent worker operation."""
+
+    return _Lease(
+        factory,
+        job,
+        lease_seconds=lease_seconds,
+        operation_seconds=operation_seconds,
+        should_stop=should_stop,
+    )
+
+
 def claim_next(
     factory: sessionmaker[Session], worker_id: UUID, lease_seconds: int, code_revision: str
 ) -> ClaimedTrainingJob | None:
@@ -359,24 +378,25 @@ def process_training_job(
     preverified = None
     final: SftFinalArtifactVerification | None = None
 
-    lease_guard = _Lease(
-        factory,
-        job,
-        lease_seconds=lease_seconds,
-        operation_seconds=operation_seconds,
-        should_stop=should_stop,
-    )
-
     def guard() -> _Lease:
-        lease_guard()
-        return lease_guard
+        """Create one full-budget lease guard for exactly one parent operation."""
+
+        return _new_operation_lease(
+            factory,
+            job,
+            lease_seconds=lease_seconds,
+            operation_seconds=operation_seconds,
+            should_stop=should_stop,
+        )
 
     try:
         if job.stale_publication_attempt_id is not None:
             _cleanup_stale_attempt(
                 factory, data_dir, scope, job, job.stale_publication_attempt_id, guard
             )
-        _load_eligible_dataset(factory, job, guard())
+        dataset_guard = guard()
+        _load_eligible_dataset(factory, job, dataset_guard)
+        dataset_guard()
         with SftArtifactStore(data_dir) as store:
             source_guard = guard()
             source = store.open_retained_final(
@@ -390,11 +410,17 @@ def process_training_job(
             )
             source_guard()
             stage_guard = guard()
-            staged = store.prepare_training_job_stage(scope, job.id, job.publication_attempt_id)
+            staged = store.prepare_training_job_stage(
+                scope,
+                job.id,
+                job.publication_attempt_id,
+                checkpoint=stage_guard,
+            )
             if staged.stage_fd is None or source.artifact.stage_fd is None:
                 raise TrainingJobQueueError("training_job_publication_failed")
             stage_guard()
             child_guard = guard()
+            child_guard()
             result = run_training_job_child(
                 timeout_seconds=operation_seconds,
                 heartbeat_seconds=max(1, lease_seconds),
@@ -413,6 +439,7 @@ def process_training_job(
             child_guard()
             manifest, train_count, validation_count = _validate_child_result(result, job)
             record_guard = guard()
+            record_guard()
             _record_attempt_manifest(factory, job, manifest)
             record_guard()
             pre_guard = guard()
@@ -431,7 +458,11 @@ def process_training_job(
             final = store.verify_preverified_final(preverified, checkpoint=post_guard)
             preverified = None
             post_guard()
+            published_guard = guard()
+            published_guard()
             _mark_attempt_published(factory, job)
+            published_guard()
+            final_transaction_guard = guard()
             _complete(
                 factory,
                 job,
@@ -440,7 +471,7 @@ def process_training_job(
                 manifest,
                 train_count,
                 validation_count,
-                lease_guard,
+                final_transaction_guard,
             )
     except TrainingJobQueueError as error:
         _fail_or_cancel(factory, job, error.code)

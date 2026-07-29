@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import pytest
 
-from app import training_job_queue
+from app import sft_artifacts, training_job_queue
 from app.authorization import DepartmentScope
 from app.sft_artifacts import SftArtifactError, SftArtifactStore
 from app.training_job_child import _build as build_child_bundle
@@ -53,6 +53,57 @@ def _bundle():
         evaluation_contamination_reviewed=True,
         dataset=validate_phase10_records(_records(), _records()),
     )
+
+
+def _publish_job_final(tmp_path):
+    """Publish one exact synthetic job bundle for tombstone-bound deletion tests."""
+
+    (tmp_path / "training_datasets").mkdir(mode=0o700)
+    department_id, job_id, attempt_id = uuid4(), uuid4(), uuid4()
+    scope = DepartmentScope(department_id)
+    bundle = build_bundle(
+        department_id=department_id,
+        training_job_id=job_id,
+        dataset_build_id=uuid4(),
+        publication_attempt_id=attempt_id,
+        execution_scope_id=uuid4(),
+        attempt_number=1,
+        code_revision="a" * 40,
+        dataset_build_version=1,
+        dataset_manifest_sha256="b" * 64,
+        dataset_artifact_contract_version="phase10-sft-dataset-v1",
+        dataset_example_contract_version="phase10-sft-example-v1",
+        dataset_normalization_version="phase10-sft-normalization-v1",
+        dataset_split_version="phase10-sft-group-split-v1",
+        profile_id="phase11-qwen3-0.6b-lora-v1",
+        dataset_rights_attested=True,
+        evaluation_contamination_reviewed=True,
+        dataset=validate_phase10_records(_records(), _records()),
+    )
+    expected = parse_job_manifest(bundle.manifest)
+    with SftArtifactStore(tmp_path) as store:
+        staged = store.prepare_training_job_stage(scope, job_id, attempt_id)
+        assert staged.stage_fd is not None
+        for name, value in (
+            ("manifest.json", bundle.manifest),
+            ("training.yaml", bundle.training_yaml),
+            ("dataset_info.json", bundle.dataset_info),
+            ("train.jsonl", _records()),
+            ("validation.jsonl", _records()),
+        ):
+            descriptor = os.open(
+                name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=staged.stage_fd
+            )
+            try:
+                os.write(descriptor, value)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        verified = store.preverify_staged(staged, allowlist=TRAINING_JOB_FILES, expected=expected)
+        store.transition_stage_marker(verified)
+        store.rename_preverified_stage(verified)
+        store.verify_preverified_final(verified).close()
+    return scope, job_id, attempt_id, expected
 
 
 def test_bundle_is_fixed_and_content_free_except_descriptor_metadata() -> None:
@@ -179,6 +230,163 @@ def test_private_training_job_artifact_requires_exact_manifest(tmp_path) -> None
         with pytest.raises(SftArtifactError):
             store.remove_owned_training_job_final(scope, job_id, attempt_id, expected={})
         assert store.remove_owned_training_job_final(scope, job_id, attempt_id, expected=expected)
+
+
+def test_authorized_final_deletion_requires_complete_manifest_before_tombstone(tmp_path) -> None:
+    scope, job_id, attempt_id, expected = _publish_job_final(tmp_path)
+    operation_id = uuid4()
+    with SftArtifactStore(tmp_path) as store:
+        with pytest.raises(SftArtifactError, match="artifact_manifest_invalid"):
+            store.remove_authorized_training_job_final(
+                scope, job_id, attempt_id, operation_id, expected={}
+            )
+        assert store.verify_training_job_final(scope, job_id, expected=expected)
+    assert not (
+        tmp_path
+        / "training_datasets"
+        / ".deleting"
+        / "jobs"
+        / str(scope.value)
+        / str(job_id)
+        / str(operation_id)
+    ).exists()
+
+
+@pytest.mark.parametrize("crash_after_unlink", range(1, len(TRAINING_JOB_FILES) + 1))
+def test_authorized_final_tombstone_recovers_after_each_file_unlink(
+    tmp_path, monkeypatch, crash_after_unlink: int
+) -> None:
+    scope, job_id, attempt_id, expected = _publish_job_final(tmp_path)
+    operation_id = uuid4()
+    original_unlink = sft_artifacts._unlink_exact
+    unlinks = 0
+
+    def crash_after_exact_unlink(directory_fd: int, name: str) -> None:
+        nonlocal unlinks
+        original_unlink(directory_fd, name)
+        unlinks += 1
+        if unlinks == crash_after_unlink:
+            raise RuntimeError("simulated deletion crash")
+
+    monkeypatch.setattr(sft_artifacts, "_unlink_exact", crash_after_exact_unlink)
+    with SftArtifactStore(tmp_path) as store:
+        with pytest.raises(RuntimeError, match="simulated deletion crash"):
+            store.remove_authorized_training_job_final(
+                scope, job_id, attempt_id, operation_id, expected=expected
+            )
+    final = tmp_path / "training_datasets" / "jobs" / str(scope.value) / str(job_id)
+    tombstone = (
+        tmp_path
+        / "training_datasets"
+        / ".deleting"
+        / "jobs"
+        / str(scope.value)
+        / str(job_id)
+        / str(operation_id)
+    )
+    assert not final.exists() and tombstone.is_dir()
+    monkeypatch.setattr(sft_artifacts, "_unlink_exact", original_unlink)
+    with SftArtifactStore(tmp_path) as store:
+        assert store.remove_authorized_training_job_final(
+            scope, job_id, attempt_id, operation_id, expected=expected
+        )
+    assert not tombstone.exists()
+
+
+def test_tombstone_rejects_unexpected_entries_without_deleting(tmp_path, monkeypatch) -> None:
+    scope, job_id, attempt_id, expected = _publish_job_final(tmp_path)
+    operation_id = uuid4()
+
+    def stop_after_move(*_args, **_kwargs) -> None:
+        raise SftArtifactError("artifact_ownership_mismatch")
+
+    monkeypatch.setattr(sft_artifacts, "_remove_tombstone_files", stop_after_move)
+    with SftArtifactStore(tmp_path) as store:
+        with pytest.raises(SftArtifactError, match="final_deletion_recovery_required"):
+            store.remove_authorized_training_job_final(
+                scope, job_id, attempt_id, operation_id, expected=expected
+            )
+    tombstone = (
+        tmp_path
+        / "training_datasets"
+        / ".deleting"
+        / "jobs"
+        / str(scope.value)
+        / str(job_id)
+        / str(operation_id)
+    )
+    (tombstone / "unexpected").write_bytes(b"x")
+    (tombstone / "unexpected").chmod(0o600)
+    monkeypatch.undo()
+    with SftArtifactStore(tmp_path) as store:
+        with pytest.raises(SftArtifactError, match="final_deletion_recovery_required"):
+            store.remove_authorized_training_job_final(
+                scope, job_id, attempt_id, operation_id, expected=expected
+            )
+    assert (tombstone / "unexpected").exists()
+
+
+def test_tombstone_rejects_a_hard_linked_allowlisted_file(tmp_path, monkeypatch) -> None:
+    scope, job_id, attempt_id, expected = _publish_job_final(tmp_path)
+    operation_id = uuid4()
+
+    def stop_after_move(*_args, **_kwargs) -> None:
+        raise SftArtifactError("artifact_ownership_mismatch")
+
+    monkeypatch.setattr(sft_artifacts, "_remove_tombstone_files", stop_after_move)
+    with SftArtifactStore(tmp_path) as store:
+        with pytest.raises(SftArtifactError, match="final_deletion_recovery_required"):
+            store.remove_authorized_training_job_final(
+                scope, job_id, attempt_id, operation_id, expected=expected
+            )
+    tombstone = (
+        tmp_path
+        / "training_datasets"
+        / ".deleting"
+        / "jobs"
+        / str(scope.value)
+        / str(job_id)
+        / str(operation_id)
+    )
+    external_link = tmp_path / "linked-training.yaml"
+    os.link(tombstone / "training.yaml", external_link)
+    monkeypatch.undo()
+    with SftArtifactStore(tmp_path) as store:
+        with pytest.raises(SftArtifactError, match="final_deletion_recovery_required"):
+            store.remove_authorized_training_job_final(
+                scope, job_id, attempt_id, operation_id, expected=expected
+            )
+    assert external_link.exists() and tombstone.exists()
+
+
+def test_tombstone_parent_substitution_is_detected_without_touching_replacement(
+    tmp_path, monkeypatch
+) -> None:
+    scope, job_id, attempt_id, expected = _publish_job_final(tmp_path)
+    operation_id = uuid4()
+    job_parent = (
+        tmp_path / "training_datasets" / ".deleting" / "jobs" / str(scope.value) / str(job_id)
+    )
+    original = sft_artifacts._remove_tombstone_files
+
+    def substitute_parent(directory_fd: int, *, checkpoint) -> None:
+        parked = job_parent.parent / "parked"
+        os.rename(job_parent, parked)
+        job_parent.mkdir(mode=0o700)
+        replacement = job_parent / str(operation_id)
+        replacement.mkdir(mode=0o700)
+        sentinel = replacement / "foreign"
+        sentinel.write_bytes(b"x")
+        sentinel.chmod(0o600)
+        original(directory_fd, checkpoint=checkpoint)
+
+    monkeypatch.setattr(sft_artifacts, "_remove_tombstone_files", substitute_parent)
+    with SftArtifactStore(tmp_path) as store:
+        with pytest.raises(SftArtifactError, match="final_deletion_recovery_required"):
+            store.remove_authorized_training_job_final(
+                scope, job_id, attempt_id, operation_id, expected=expected
+            )
+    assert (job_parent / str(operation_id) / "foreign").exists()
 
 
 def test_child_streams_only_exact_retained_dataset_descriptors(tmp_path) -> None:
@@ -323,3 +531,27 @@ def test_final_transaction_check_never_renews_an_elapsed_parent_lease(monkeypatc
     assert not renewals
     lease.renew_before_final_transaction()
     assert len(renewals) == 1
+
+
+def test_each_parent_operation_receives_a_fresh_independent_deadline(monkeypatch) -> None:
+    """An exhausted operation must not consume the next operation's budget."""
+
+    first = training_job_queue._new_operation_lease(  # noqa: SLF001
+        None,
+        None,
+        lease_seconds=1,
+        operation_seconds=10,
+        should_stop=lambda: False,  # type: ignore[arg-type]
+    )
+    monkeypatch.setattr(training_job_queue.time, "monotonic", lambda: first.deadline + 1)
+    with pytest.raises(training_job_queue.TrainingJobQueueError, match="worker_timeout"):
+        first.final_transaction_check()
+    second = training_job_queue._new_operation_lease(  # noqa: SLF001
+        None,
+        None,
+        lease_seconds=1,
+        operation_seconds=10,
+        should_stop=lambda: False,  # type: ignore[arg-type]
+    )
+    second.final_transaction_check()
+    assert second.deadline > first.deadline

@@ -355,6 +355,14 @@ def _register_candidates(
                     anchor = _retention_anchor(job)
                     if anchor is None:
                         raise ServiceError(409, "Training job purge is unavailable")
+                    final_candidates = [
+                        candidate
+                        for candidate in candidates
+                        if candidate.training_job_id == job.id and candidate.surface == "final"
+                    ]
+                    if len(final_candidates) != 1 or final_candidates[0].manifest is None:
+                        raise ServiceError(409, "Training job purge authority changed")
+                    final_candidate = final_candidates[0]
                     session.add(
                         TrainingJobPurgeReservation(
                             id=uuid4(),
@@ -365,6 +373,9 @@ def _register_candidates(
                             expected_review_status=job.review_status,
                             retention_anchor_at=anchor,
                             retention_days=retention_days,
+                            authoritative_publication_attempt_id=final_candidate.attempt_id,
+                            authoritative_manifest=dict(final_candidate.manifest),
+                            tombstone_operation_id=operation.id,
                             status="registered",
                             version=1,
                         )
@@ -663,7 +674,12 @@ def _execute_purge(
         actor_subject=actor_subject,
         operation_id=operation_id,
     )
-    final_outcomes = _remove_candidates(data_dir, department_id, final_candidates)
+    final_outcomes = _remove_candidates(
+        data_dir,
+        department_id,
+        final_candidates,
+        purge_operation_id=operation_id,
+    )
     _persist_purge_final_outcomes(
         factory,
         department_id=department_id,
@@ -684,6 +700,8 @@ def _remove_candidates(
     data_dir: Path,
     department_id: UUID,
     candidates: tuple[_Candidate, ...],
+    *,
+    purge_operation_id: UUID | None = None,
 ) -> dict[tuple[UUID, UUID, str], tuple[bool, str | None]]:
     outcomes: dict[tuple[UUID, UUID, str], tuple[bool, str | None]] = {}
     scope = DepartmentScope(department_id)
@@ -695,12 +713,21 @@ def _remove_candidates(
                         scope, candidate.training_job_id, candidate.attempt_id
                     )
                 elif candidate.surface == "final" and candidate.manifest is not None:
-                    store.remove_owned_training_job_final(
-                        scope,
-                        candidate.training_job_id,
-                        candidate.attempt_id,
-                        expected=candidate.manifest,
-                    )
+                    if purge_operation_id is None:
+                        store.remove_owned_training_job_final(
+                            scope,
+                            candidate.training_job_id,
+                            candidate.attempt_id,
+                            expected=candidate.manifest,
+                        )
+                    else:
+                        store.remove_authorized_training_job_final(
+                            scope,
+                            candidate.training_job_id,
+                            candidate.attempt_id,
+                            purge_operation_id,
+                            expected=candidate.manifest,
+                        )
                 else:
                     raise SftArtifactError("artifact_ownership_mismatch")
             outcomes[_candidate_key(candidate)] = (True, None)
@@ -734,6 +761,8 @@ def _limit(value: int) -> None:
 
 
 def _blocked_reason(error: SftArtifactError) -> str:
+    if error.code == "final_deletion_recovery_required":
+        return error.code
     return error.code if error.code in _BLOCKED_REASONS else "artifact_ownership_mismatch"
 
 
@@ -953,10 +982,16 @@ def _persist_purge_final_outcomes(
                 if owner.attempt.publication_attempt_id != attempt_id:
                     raise ServiceError(409, "Training-job purge authority changed")
                 item = _locked_item(session, operation_id, department_id, *key)
-                _record_item_outcome(item, completed, reason, now)
                 if not completed:
+                    if reason == "final_deletion_recovery_required":
+                        # The final path may already have moved into its exact
+                        # tombstone.  Keep the durable reservation and item
+                        # active so the same operation can resume safely.
+                        continue
+                    _record_item_outcome(item, False, reason, now)
                     _terminalize_reservation(reservation, now)
                     continue
+                _record_item_outcome(item, True, None, now)
                 for attempt in attempts:
                     _confirm_attempt_if_complete(
                         session,
@@ -1100,6 +1135,8 @@ def _assert_purge_authority(
     if job is None or not attempts or not _purge_reservation_matches(reservation, job, now):
         raise ServiceError(409, "Training-job purge authority changed")
     owner = _authoritative_final(job, attempts)
+    if not _reservation_binds_owner(reservation, owner):
+        raise ServiceError(409, "Training-job purge authority changed")
     if any(not _terminal_attempt(attempt) for attempt in attempts):
         raise ServiceError(409, "Training-job purge authority changed")
     items = _locked_job_items(session, reservation.operation_id, department_id, job.id)
@@ -1249,4 +1286,16 @@ def _purge_reservation_matches(
         and job.version == reservation.expected_job_version
         and _retention_anchor(job) == reservation.retention_anchor_at
         and reservation.retention_anchor_at <= now - timedelta(days=reservation.retention_days)
+    )
+
+
+def _reservation_binds_owner(
+    reservation: TrainingJobPurgeReservation, owner: _AuthoritativeFinal
+) -> bool:
+    """Keep the durable deletion reservation tied to one exact final owner."""
+
+    return (
+        reservation.authoritative_publication_attempt_id == owner.attempt.publication_attempt_id
+        and reservation.authoritative_manifest == owner.manifest
+        and reservation.tombstone_operation_id == reservation.operation_id
     )

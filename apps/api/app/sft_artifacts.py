@@ -11,7 +11,9 @@ import hashlib
 import json
 import os
 import stat
+import sys
 from collections.abc import Callable
+from ctypes import CDLL, c_char_p, c_int, c_uint, get_errno
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -41,6 +43,7 @@ class SftArtifactError(RuntimeError):
                 "artifact_manifest_invalid",
                 "artifact_permissions_invalid",
                 "staging_path_unsafe",
+                "final_deletion_recovery_required",
             }
             else "dataset_publication_failed"
         )
@@ -183,6 +186,9 @@ class SftArtifactStore:
         self._sources_fd = _ensure_private_child(self._root_fd, "sources")
         self._datasets_fd = _ensure_private_child(self._root_fd, "datasets")
         self._jobs_fd = _ensure_private_child(self._root_fd, "jobs")
+        deleting = _ensure_private_child(self._root_fd, ".deleting")
+        self._deleting_jobs_fd = _ensure_private_child(deleting, "jobs")
+        os.close(deleting)
         staging = _ensure_private_child(self._root_fd, ".staging")
         self._staging_sources_fd = _ensure_private_child(staging, "sources")
         self._staging_datasets_fd = _ensure_private_child(staging, "datasets")
@@ -194,6 +200,7 @@ class SftArtifactStore:
             getattr(self, "_staging_datasets_fd", None),
             getattr(self, "_staging_jobs_fd", None),
             getattr(self, "_staging_sources_fd", None),
+            getattr(self, "_deleting_jobs_fd", None),
             getattr(self, "_jobs_fd", None),
             getattr(self, "_datasets_fd", None),
             getattr(self, "_sources_fd", None),
@@ -280,10 +287,14 @@ class SftArtifactStore:
         scope: DepartmentScope,
         training_job_id: UUID,
         publication_attempt_id: UUID,
+        *,
+        checkpoint: _Checkpoint | None = None,
     ) -> SftStagedArtifact:
         """Create only the exact private Phase 11 job stage for its child writer."""
 
-        return self._prepare_stage(
+        check = checkpoint or _noop
+        check()
+        staged = self._prepare_stage(
             self._staging_jobs_fd,
             self._jobs_fd,
             "training_job",
@@ -291,6 +302,8 @@ class SftArtifactStore:
             training_job_id,
             publication_attempt_id,
         )
+        check()
+        return staged
 
     def publish(
         self,
@@ -932,6 +945,141 @@ class SftArtifactStore:
             checkpoint=checkpoint,
         )
 
+    def remove_authorized_training_job_final(
+        self,
+        scope: DepartmentScope,
+        training_job_id: UUID,
+        publication_attempt_id: UUID,
+        purge_operation_id: UUID,
+        *,
+        expected: dict[str, object],
+        checkpoint: _Checkpoint | None = None,
+    ) -> bool:
+        """Durably move an authorized final bundle into an exact tombstone.
+
+        The final directory is fully verified before the no-replace move.  Once
+        moved, its former pathname is never trusted again: cleanup uses only
+        the retained tombstone descriptor and accepts a private subset of the
+        fixed final-file allowlist so every interrupted unlink sequence can be
+        resumed without parsing content.
+        """
+
+        if (
+            not isinstance(scope, DepartmentScope)
+            or training_job_id.int == 0
+            or publication_attempt_id.int == 0
+            or purge_operation_id.int == 0
+        ):
+            raise SftArtifactError("artifact_ownership_mismatch")
+        check = checkpoint or _noop
+        final_parent: int | None = None
+        tombstone_department: int | None = None
+        tombstone_parent: int | None = None
+        final: int | None = None
+        tombstone: int | None = None
+        moved = False
+        try:
+            tombstone_department, tombstone_parent = self._open_tombstone_parent(
+                scope, training_job_id
+            )
+            try:
+                final_parent = _open_private_child(self._jobs_fd, str(scope.value))
+            except FileNotFoundError:
+                final_parent = None
+            if final_parent is not None:
+                try:
+                    final = _open_private_child(final_parent, str(training_job_id))
+                except FileNotFoundError:
+                    final = None
+            try:
+                tombstone = _open_private_child(tombstone_parent, str(purge_operation_id))
+            except FileNotFoundError:
+                tombstone = None
+            if final is not None and tombstone is not None:
+                raise SftArtifactError("artifact_ownership_mismatch")
+            _entry_matches(self._deleting_jobs_fd, str(scope.value), tombstone_department)
+            _entry_matches(tombstone_department, str(training_job_id), tombstone_parent)
+            if final is not None:
+                check()
+                verified = _verify_files(
+                    final,
+                    TRAINING_JOB_FILES,
+                    {},
+                    marker_allowed=False,
+                    checkpoint=check,
+                )
+                manifest = _parse_manifest(
+                    _read_file_at(final, "manifest.json", maximum=256 * 1024, checkpoint=check)
+                )
+                _require_exact_manifest(manifest, TRAINING_JOB_FILES, verified, expected)
+                if manifest.get("publication_attempt_id") != str(publication_attempt_id):
+                    raise SftArtifactError("artifact_manifest_invalid")
+                if final_parent is None:
+                    raise SftArtifactError("artifact_ownership_mismatch")
+                if os.fstat(final_parent).st_dev != os.fstat(tombstone_parent).st_dev:
+                    raise SftArtifactError("artifact_ownership_mismatch")
+                check()
+                _entry_matches(self._jobs_fd, str(scope.value), final_parent)
+                _entry_matches(self._deleting_jobs_fd, str(scope.value), tombstone_department)
+                _entry_matches(tombstone_department, str(training_job_id), tombstone_parent)
+                _entry_matches(final_parent, str(training_job_id), final)
+                _rename_no_replace(
+                    final_parent,
+                    str(training_job_id),
+                    tombstone_parent,
+                    str(purge_operation_id),
+                )
+                moved = True
+                _fsync(final_parent)
+                _fsync(tombstone_parent)
+                _entry_matches(tombstone_parent, str(purge_operation_id), final)
+                tombstone = final
+                final = None
+            if tombstone is None:
+                return False
+            _remove_tombstone_files(tombstone, checkpoint=check)
+            _rmdir_exact(tombstone_parent, str(purge_operation_id), tombstone)
+            _fsync(tombstone_parent)
+            _entry_matches(self._deleting_jobs_fd, str(scope.value), tombstone_department)
+            _entry_matches(tombstone_department, str(training_job_id), tombstone_parent)
+            os.close(tombstone)
+            tombstone = None
+            return True
+        except SftArtifactError as error:
+            if moved or tombstone is not None:
+                raise SftArtifactError("final_deletion_recovery_required") from error
+            raise
+        except OSError as error:
+            if moved or tombstone is not None:
+                raise SftArtifactError("final_deletion_recovery_required") from error
+            raise SftArtifactError("artifact_ownership_mismatch") from error
+        finally:
+            for descriptor in (
+                tombstone,
+                final,
+                tombstone_parent,
+                tombstone_department,
+                final_parent,
+            ):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+
+    def _open_tombstone_parent(
+        self, scope: DepartmentScope, training_job_id: UUID
+    ) -> tuple[int, int]:
+        """Return the exact private tombstone parent for one purge operation."""
+
+        department = _ensure_private_child(self._deleting_jobs_fd, str(scope.value))
+        try:
+            job = _ensure_private_child(department, str(training_job_id))
+        except Exception:
+            os.close(department)
+            raise
+        return department, job
+
     def _stage(
         self,
         staging_root_fd: int,
@@ -1246,6 +1394,58 @@ def _unlink_exact(directory_fd: int, name: str) -> None:
     os.unlink(name, dir_fd=directory_fd)
 
 
+def _rename_no_replace(
+    source_parent_fd: int,
+    source_name: str,
+    destination_parent_fd: int,
+    destination_name: str,
+) -> None:
+    """Move one directory without ever replacing a preexisting tombstone.
+
+    Python's ``os.rename`` may replace the destination.  Use the operating
+    system's no-replace primitive instead, failing closed on an unsupported
+    platform rather than risking a foreign tombstone.
+    """
+
+    _safe_name(source_name)
+    _safe_name(destination_name)
+    libc = CDLL(None, use_errno=True)
+    source = source_name.encode("ascii")
+    destination = destination_name.encode("ascii")
+    if sys.platform == "darwin":
+        operation = getattr(libc, "renameatx_np", None)
+        if operation is None:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        operation.argtypes = (c_int, c_char_p, c_int, c_char_p, c_uint)
+        operation.restype = c_int
+        result = operation(
+            source_parent_fd,
+            source,
+            destination_parent_fd,
+            destination,
+            0x00000004,  # RENAME_EXCL
+        )
+    else:
+        operation = getattr(libc, "renameat2", None)
+        if operation is None:
+            raise SftArtifactError("artifact_ownership_mismatch")
+        operation.argtypes = (c_int, c_char_p, c_int, c_char_p, c_uint)
+        operation.restype = c_int
+        result = operation(
+            source_parent_fd,
+            source,
+            destination_parent_fd,
+            destination,
+            1,  # RENAME_NOREPLACE
+        )
+    if result == 0:
+        return
+    error_number = get_errno()
+    if error_number:
+        raise OSError(error_number, os.strerror(error_number))
+    raise SftArtifactError("artifact_ownership_mismatch")
+
+
 def _write_file(directory_fd: int, name: str, value: bytes) -> ArtifactDigest:
     if not isinstance(value, bytes) or not value:
         raise SftArtifactError()
@@ -1518,6 +1718,43 @@ def _remove_contents(directory_fd: int, *, checkpoint: _Checkpoint) -> None:
         else:
             raise SftArtifactError("staging_path_unsafe")
     _fsync(directory_fd)
+
+
+def _remove_tombstone_files(directory_fd: int, *, checkpoint: _Checkpoint) -> None:
+    """Delete only a private subset of the immutable training-job file set.
+
+    The tombstone may represent any crash point after a completed final bundle
+    was renamed.  It is therefore intentionally *not* parsed or rehashed.  Its
+    exact UUID descriptor chain plus the durable reservation authorize removal;
+    every present entry must still be a private, single-link regular file in
+    the reviewed fixed allowlist.
+    """
+
+    _require_private_directory(directory_fd, writable=True)
+    permitted = set(TRAINING_JOB_FILES)
+    names = set(os.listdir(directory_fd))
+    if not names.issubset(permitted):
+        raise SftArtifactError("artifact_ownership_mismatch")
+    for name in sorted(names):
+        checkpoint()
+        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+            or metadata.st_nlink != 1
+        ):
+            raise SftArtifactError("artifact_ownership_mismatch")
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+        try:
+            opened = os.fstat(descriptor)
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not _same_file(opened, current):
+                raise SftArtifactError("artifact_ownership_mismatch")
+        finally:
+            os.close(descriptor)
+        _unlink_exact(directory_fd, name)
+        _fsync(directory_fd)
 
 
 def _same_file(first: os.stat_result, second: os.stat_result) -> bool:

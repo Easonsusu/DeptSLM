@@ -2501,6 +2501,15 @@ class TrainingJobPurgeReservation(Base):
             name="ck_training_job_purge_reservation_values",
         ),
         CheckConstraint(
+            "authoritative_publication_attempt_id IS NOT NULL AND "
+            "authoritative_manifest IS NOT NULL AND tombstone_operation_id IS NOT NULL",
+            name="ck_training_job_purge_reservation_authority",
+        ),
+        CheckConstraint(
+            "tombstone_operation_id = operation_id",
+            name="ck_training_job_purge_reservation_tombstone_operation",
+        ),
+        CheckConstraint(
             "(status = 'registered' AND deletion_authorized_at IS NULL "
             "AND terminalized_at IS NULL) "
             "OR (status = 'deletion_authorized' AND deletion_authorized_at IS NOT NULL "
@@ -2533,6 +2542,9 @@ class TrainingJobPurgeReservation(Base):
     expected_review_status: Mapped[str] = mapped_column(String(16), nullable=False)
     retention_anchor_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     retention_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    authoritative_publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    authoritative_manifest: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    tombstone_operation_id: Mapped[UUID] = mapped_column(nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="registered")
     registered_at: Mapped[datetime] = utc_timestamp()
     deletion_authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

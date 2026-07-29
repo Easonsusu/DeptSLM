@@ -350,6 +350,9 @@ def upgrade() -> None:
         sa.Column("expected_review_status", sa.String(16), nullable=False),
         sa.Column("retention_anchor_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("retention_days", sa.Integer(), nullable=False),
+        sa.Column("authoritative_publication_attempt_id", sa.Uuid(), nullable=False),
+        sa.Column("authoritative_manifest", sa.JSON(), nullable=False),
+        sa.Column("tombstone_operation_id", sa.Uuid(), nullable=False),
         sa.Column("status", sa.String(24), nullable=False),
         sa.Column(
             "registered_at",
@@ -374,6 +377,15 @@ def upgrade() -> None:
         sa.CheckConstraint(
             "retention_days BETWEEN 30 AND 730 AND expected_job_version > 0 AND version > 0",
             name="ck_training_job_purge_reservation_values",
+        ),
+        sa.CheckConstraint(
+            "authoritative_publication_attempt_id IS NOT NULL AND "
+            "authoritative_manifest IS NOT NULL AND tombstone_operation_id IS NOT NULL",
+            name="ck_training_job_purge_reservation_authority",
+        ),
+        sa.CheckConstraint(
+            "tombstone_operation_id = operation_id",
+            name="ck_training_job_purge_reservation_tombstone_operation",
         ),
         sa.CheckConstraint(
             "(status = 'registered' AND deletion_authorized_at IS NULL "

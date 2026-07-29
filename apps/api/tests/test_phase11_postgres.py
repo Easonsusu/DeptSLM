@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from alembic import command
-from app import training_job_maintenance
+from app import sft_artifacts, training_job_maintenance
 from app.auth import AuthenticatedPrincipal
 from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.database import create_database_engine
@@ -37,7 +37,7 @@ from app.models import (
 )
 from app.schemas import TrainingJobCreateRequest
 from app.services import ServiceError
-from app.sft_artifacts import SftArtifactStore
+from app.sft_artifacts import SftArtifactError, SftArtifactStore
 from app.training_job_maintenance import (
     _register_candidates,
     archive_training_job,
@@ -128,6 +128,9 @@ def test_phase11_metadata_schema_is_content_free_and_registered(engine) -> None:
         "retention_anchor_at",
         "retention_days",
         "deletion_authorized_at",
+        "authoritative_publication_attempt_id",
+        "authoritative_manifest",
+        "tombstone_operation_id",
     }.issubset(reservation_columns)
     assert forbidden.isdisjoint(
         job_columns | attempt_columns | operation_columns | reservation_columns
@@ -939,6 +942,88 @@ def test_phase11_purge_recovers_after_final_deletion_before_database_commit(
         apply=True,
     )
     assert (result.eligible_count, result.applied_count, result.blocked_count) == (1, 1, 0)
+    with factory() as session:
+        job = session.get(TrainingJob, job_id)
+        assert job is not None and job.review_status == "purged" and job.purged_at is not None
+        assert (
+            session.query(PersistentAuditEvent)
+            .filter(
+                PersistentAuditEvent.department_id == department_id,
+                PersistentAuditEvent.action == "training.job.purge",
+            )
+            .count()
+            == 1
+        )
+
+
+def test_phase11_purge_keeps_tombstone_reservation_active_until_cleanup_resumes(
+    engine, tmp_path: Path, monkeypatch
+) -> None:
+    """A post-rename cleanup interruption cannot terminalize final deletion."""
+
+    factory = sessionmaker(engine)
+    root = tmp_path / "runtime"
+    department_id, issuer, subject, job_id = _succeeded_training_job(factory, root)
+    with factory.begin() as session:
+        job = session.get(TrainingJob, job_id)
+        assert job is not None
+        job.review_status = "rejected"
+        job.reviewed_at = datetime.now(UTC) - timedelta(days=31)
+        job.version += 1
+
+    original = sft_artifacts._remove_tombstone_files
+
+    def interrupt_after_tombstone_contents(*args, **kwargs) -> None:
+        original(*args, **kwargs)
+        raise SftArtifactError("artifact_ownership_mismatch")
+
+    monkeypatch.setattr(
+        sft_artifacts, "_remove_tombstone_files", interrupt_after_tombstone_contents
+    )
+    result = purge_training_job_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department_id,
+        actor_issuer=issuer,
+        actor_subject=subject,
+        retention_days=30,
+        limit=1,
+        apply=True,
+    )
+    assert (result.eligible_count, result.applied_count, result.blocked_count) == (1, 0, 1)
+    with factory() as session:
+        job = session.get(TrainingJob, job_id)
+        reservation = session.scalar(
+            select(TrainingJobPurgeReservation).where(
+                TrainingJobPurgeReservation.training_job_id == job_id
+            )
+        )
+        assert job is not None and job.review_status == "rejected" and job.purged_at is None
+        assert reservation is not None and reservation.status == "deletion_authorized"
+        assert reservation.tombstone_operation_id == reservation.operation_id
+        assert reservation.authoritative_publication_attempt_id is not None
+        assert isinstance(reservation.authoritative_manifest, dict)
+        assert (
+            session.query(PersistentAuditEvent)
+            .filter(
+                PersistentAuditEvent.department_id == department_id,
+                PersistentAuditEvent.action == "training.job.purge",
+            )
+            .count()
+            == 0
+        )
+    monkeypatch.setattr(sft_artifacts, "_remove_tombstone_files", original)
+    recovered = purge_training_job_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department_id,
+        actor_issuer=issuer,
+        actor_subject=subject,
+        retention_days=30,
+        limit=1,
+        apply=True,
+    )
+    assert (recovered.eligible_count, recovered.applied_count, recovered.blocked_count) == (1, 1, 0)
     with factory() as session:
         job = session.get(TrainingJob, job_id)
         assert job is not None and job.review_status == "purged" and job.purged_at is not None
