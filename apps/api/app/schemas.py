@@ -6,7 +6,15 @@ from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from app.auth import DepartmentRole, MembershipStatus
 from app.rag_feedback_domain import (
@@ -457,6 +465,98 @@ class SftDatasetBuildCancelRequest(BaseModel):
 
 
 class SftDatasetBuildReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: str
+    expected_version: StrictInt = Field(ge=1)
+
+    @field_validator("action")
+    @classmethod
+    def validate_action(cls, value: str) -> str:
+        if value not in {"approve", "reject", "archive"}:
+            raise ValueError("action is invalid")
+        return value
+
+
+class TrainingJobResponse(ORMResponse):
+    """Content-free Phase 11 job-generation metadata only."""
+
+    id: UUID
+    department_id: UUID
+    dataset_build_id: UUID
+    profile_id: str
+    base_model_id: str
+    base_model_revision: str
+    llamafactory_version: str
+    status: str
+    review_status: str
+    train_example_count: int | None
+    validation_example_count: int | None
+    artifact_contract_version: str
+    manifest_contract_version: str
+    configuration_contract_version: str
+    dataset_info_contract_version: str
+    execution_profile_contract_version: str
+    dataset_artifact_contract_version: str
+    dataset_example_contract_version: str
+    dataset_normalization_version: str
+    dataset_split_version: str
+    requested_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    cancellation_requested_at: datetime | None
+    reviewed_at: datetime | None
+    archived_at: datetime | None
+    purged_at: datetime | None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class TrainingJobListResponse(BaseModel):
+    items: list[TrainingJobResponse]
+    limit: int
+    offset: int
+
+
+class TrainingJobCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dataset_build_id: UUID
+    profile_id: str
+    expected_dataset_version: StrictInt = Field(ge=1)
+    dataset_rights_confirmed: StrictBool
+    evaluation_contamination_reviewed: StrictBool
+
+    @field_validator("dataset_build_id")
+    @classmethod
+    def validate_dataset_build_id(cls, value: UUID) -> UUID:
+        if value.int == 0:
+            raise ValueError("dataset build identifier is invalid")
+        return value
+
+    @field_validator("profile_id")
+    @classmethod
+    def validate_profile(cls, value: str) -> str:
+        if value not in {"phase11-qwen3-0.6b-lora-v1", "phase11-qwen3-0.6b-qlora-nf4-v1"}:
+            raise ValueError("profile is invalid")
+        return value
+
+    @field_validator("dataset_rights_confirmed", "evaluation_contamination_reviewed")
+    @classmethod
+    def require_attestation(cls, value: bool) -> bool:
+        if value is not True:
+            raise ValueError("attestation is required")
+        return value
+
+
+class TrainingJobCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: StrictInt = Field(ge=1)
+
+
+class TrainingJobReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     action: str

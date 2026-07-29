@@ -47,6 +47,7 @@ services:
       DEPTSLM_RAG_REQUEST_TIMEOUT_SECONDS: "${DEPTSLM_RAG_REQUEST_TIMEOUT_SECONDS:-30}"
       DEPTSLM_RAG_FEEDBACK_RETENTION_DAYS: "${DEPTSLM_RAG_FEEDBACK_RETENTION_DAYS:-180}"
       DEPTSLM_EVALUATION_CODE_REVISION: "${DEPTSLM_EVALUATION_CODE_REVISION:-}"
+      DEPTSLM_TRAINING_JOB_CODE_REVISION: "${DEPTSLM_TRAINING_JOB_CODE_REVISION:-}"
       ENVIRONMENT: "${ENVIRONMENT:-development}"
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
@@ -333,6 +334,34 @@ services:
       DEPTSLM_SFT_CODE_REVISION: "${DEPTSLM_SFT_CODE_REVISION:?Set the exact lowercase 40-character code revision}"
       DEPTSLM_SFT_POLL_SECONDS: "${DEPTSLM_SFT_POLL_SECONDS:-5}"
       DEPTSLM_SFT_LEASE_SECONDS: "${DEPTSLM_SFT_LEASE_SECONDS:-300}"
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/training_datasets"
+        target: /runtime/deptslm/training_datasets
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  training-job-worker:
+    build:
+      context: .
+      dockerfile: services/training-job-worker/Dockerfile
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      DEPTSLM_TRAINING_JOB_WORKER_ID: "${DEPTSLM_TRAINING_JOB_WORKER_ID:-00000000-0000-0000-0000-000000000011}"
+      DEPTSLM_TRAINING_JOB_CODE_REVISION: "${DEPTSLM_TRAINING_JOB_CODE_REVISION:?Set the exact lowercase 40-character code revision}"
+      DEPTSLM_TRAINING_JOB_POLL_SECONDS: "${DEPTSLM_TRAINING_JOB_POLL_SECONDS:-5}"
+      DEPTSLM_TRAINING_JOB_LEASE_SECONDS: "${DEPTSLM_TRAINING_JOB_LEASE_SECONDS:-300}"
+      DEPTSLM_TRAINING_JOB_OPERATION_SECONDS: "${DEPTSLM_TRAINING_JOB_OPERATION_SECONDS:-120}"
       ENVIRONMENT: "${ENVIRONMENT:-development}"
     read_only: true
     cap_drop:

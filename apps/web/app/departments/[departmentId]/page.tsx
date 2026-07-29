@@ -16,6 +16,7 @@ export default async function DepartmentAnswerPage({
         <span>
           <a className="phaseBadge" href={`/departments/${departmentId}/feedback`}>Phase 8 review</a>{" "}
           <a className="phaseBadge" href={`/departments/${departmentId}/sft`}>Phase 10 datasets</a>
+          <a className="phaseBadge" href={`/departments/${departmentId}/training`}>Phase 11 training jobs</a>
         </span>
       </nav>
       <RagAnswerPanel departmentId={departmentId} />

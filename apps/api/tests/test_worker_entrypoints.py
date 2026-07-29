@@ -14,6 +14,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 WORKER_ENTRYPOINTS = (
     REPOSITORY_ROOT / "services" / "rag-worker" / "entrypoint.sh",
     REPOSITORY_ROOT / "services" / "training-worker" / "entrypoint.sh",
+    REPOSITORY_ROOT / "services" / "training-job-worker" / "entrypoint.sh",
 )
 
 
@@ -21,7 +22,7 @@ def prepare_worker_storage(entrypoint: Path, data_dir: Path) -> None:
     """Create the worker-specific external storage root used by entrypoint tests."""
 
     data_dir.mkdir(exist_ok=True)
-    if entrypoint.parent.name == "training-worker":
+    if entrypoint.parent.name in {"training-worker", "training-job-worker"}:
         (data_dir / "training_datasets").mkdir(mode=0o700, exist_ok=True)
 
 

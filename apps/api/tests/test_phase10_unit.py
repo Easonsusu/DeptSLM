@@ -362,6 +362,12 @@ def test_retained_final_descriptor_rejects_path_substitution(tmp_path) -> None:
         with pytest.raises(SftArtifactError, match="artifact_ownership_mismatch"):
             verification.recheck_identity()
         assert target.is_dir()
+        # Restoring the old inode must not erase the descriptor-chain evidence
+        # that its containing directory was substituted in the interim.
+        target.rmdir()
+        replacement.rename(target)
+        with pytest.raises(SftArtifactError, match="artifact_ownership_mismatch"):
+            verification.recheck_identity()
     finally:
         verification.close()
 

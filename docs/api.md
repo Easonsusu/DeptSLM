@@ -237,6 +237,10 @@ Implemented evaluator-only metadata endpoints are:
 
 Phase 10 exposes content-free, department-scoped metadata only. It has no source, dataset, manifest, provenance, download, model, training, or adapter endpoint.
 
+### Phase 11 training-job metadata
+
+`POST /departments/{department_id}/training/jobs` accepts a closed, stream-bounded request identifying one approved Phase 10 dataset, its expected metadata version, a fixed LoRA or QLoRA profile, and two affirmative governance attestations. `GET /departments/{department_id}/training/jobs` and `GET /departments/{department_id}/training/jobs/{training_job_id}` return safe lifecycle, profile, model contract, counts, timestamps, and version metadata. `POST .../cancel` and `PATCH .../review` use optimistic versions and constrained transitions. There is no endpoint for datasets, configs, manifests, hashes, paths, raw arguments, model files, adapters, logs, or execution. Jobs generate bundles only; they never invoke LlamaFactory or train a model.
+
 - `GET /departments/{department_id}/sft/sources`
 - `GET /departments/{department_id}/sft/sources/{source_bundle_id}`
 - `POST /departments/{department_id}/sft/sources/{source_bundle_id}/builds`
