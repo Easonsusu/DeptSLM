@@ -2383,12 +2383,15 @@ class TrainingJobAttempt(Base):
             "(status = 'registered' AND claimed_at IS NULL AND finished_at IS NULL) OR "
             "(status = 'running' AND claimed_at IS NOT NULL AND finished_at IS NULL) OR "
             "(status = 'staged' AND claimed_at IS NOT NULL AND staged_at IS NOT NULL "
-            "AND ownership_manifest IS NOT NULL AND finished_at IS NULL) OR "
+            "AND ownership_manifest IS NOT NULL AND json_typeof(ownership_manifest) = 'object' "
+            "AND finished_at IS NULL) OR "
             "(status = 'published' AND claimed_at IS NOT NULL AND staged_at IS NOT NULL "
             "AND published_at IS NOT NULL AND ownership_manifest IS NOT NULL "
+            "AND json_typeof(ownership_manifest) = 'object' "
             "AND finished_at IS NULL) OR "
             "(status = 'succeeded' AND claimed_at IS NOT NULL AND staged_at IS NOT NULL "
             "AND published_at IS NOT NULL AND ownership_manifest IS NOT NULL "
+            "AND json_typeof(ownership_manifest) = 'object' "
             "AND finished_at IS NOT NULL) OR "
             "(status IN ('failed','cancelled','reclaimed') AND finished_at IS NOT NULL)",
             name="ck_training_job_attempt_lifecycle",

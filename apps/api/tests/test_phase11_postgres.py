@@ -757,7 +757,7 @@ def test_phase11_blocked_historical_stage_leaves_authoritative_final_intact(
     stage_path = (
         root
         / "training_datasets"
-        / "staging"
+        / ".staging"
         / "jobs"
         / str(department_id)
         / str(job_id)
