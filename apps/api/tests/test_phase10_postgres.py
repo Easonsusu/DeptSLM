@@ -71,7 +71,7 @@ def test_phase10_migration_cycle_reaches_exact_head(engine) -> None:
     command.upgrade(config, "head")
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0008_phase10_sft_dataset_builder"
+            "0009_phase11_training_jobs"
         )
 
 
