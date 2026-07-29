@@ -156,7 +156,7 @@ jobs:
             sleep 1
           done
           python -m alembic upgrade head
-          test "$(python -m alembic current | awk '{print $1}')" = "0009_phase11_training_job_generation"
+          test "$(python -m alembic current | awk '{print $1}')" = "0009_phase11_training_jobs"
           python -m pytest
       - name: Run one-shot worker smoke test
         working-directory: apps/api
@@ -261,7 +261,7 @@ jobs:
           assert pathlib.Path("/app/alembic/versions/0006_phase8_rag_feedback.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0007_phase9_evaluation_runner.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0008_phase10_sft_dataset_builder.py").is_file()
-          assert pathlib.Path("/app/alembic/versions/0009_phase11_training_job_generation.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0009_phase11_training_jobs.py").is_file()
           import app.evaluation_admin
           import app.evaluation_services
           import app.sft_services

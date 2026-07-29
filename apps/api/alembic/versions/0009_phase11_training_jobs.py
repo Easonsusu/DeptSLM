@@ -1,6 +1,6 @@
 """Add metadata-only Phase 11 LlamaFactory job-generation state.
 
-Revision ID: 0009_phase11_training_job_generation
+Revision ID: 0009_phase11_training_jobs
 Revises: 0008_phase10_sft_dataset_builder
 """
 
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision = "0009_phase11_training_job_generation"
+revision = "0009_phase11_training_jobs"
 down_revision = "0008_phase10_sft_dataset_builder"
 branch_labels = None
 depends_on = None
