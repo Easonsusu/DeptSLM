@@ -211,7 +211,7 @@ def test_child_streams_only_exact_retained_dataset_descriptors(tmp_path) -> None
         "normalization_version": "phase10-sft-normalization-v1",
         "example_contract_version": "phase10-sft-example-v1",
         "split_version": "phase10-sft-group-split-v1",
-        "validation_ratio": "0.200000",
+        "validation_ratio": "0.10",
         "source_example_count": 384,
         "source_group_count": 384,
         "source_reference_count": 384,
@@ -251,6 +251,12 @@ def test_child_streams_only_exact_retained_dataset_descriptors(tmp_path) -> None
                 "code_revision": "a" * 40,
                 "dataset_build_version": 1,
                 "dataset_manifest_sha256": sha256(values["manifest.json"]).hexdigest(),
+                "dataset_source_bundle_id": manifest["source_bundle_id"],
+                "dataset_status": "succeeded",
+                "dataset_review_status": "approved",
+                "dataset_publication_attempt_id": manifest["publication_attempt_id"],
+                "dataset_publication_attempt_number": 1,
+                "dataset_code_revision": "a" * 40,
                 "dataset_artifact_contract_version": "phase10-sft-dataset-v1",
                 "dataset_example_contract_version": "phase10-sft-example-v1",
                 "dataset_normalization_version": "phase10-sft-normalization-v1",
@@ -258,6 +264,11 @@ def test_child_streams_only_exact_retained_dataset_descriptors(tmp_path) -> None
                 "profile_id": "phase11-qwen3-0.6b-lora-v1",
                 "dataset_rights_attested": True,
                 "evaluation_contamination_reviewed": True,
+                "dataset_train_example_count": 256,
+                "dataset_validation_example_count": 128,
+                "dataset_source_example_count": 384,
+                "dataset_source_group_count": 384,
+                "dataset_source_reference_count": 384,
                 **{
                     f"expected_{name.removesuffix('.jsonl').removesuffix('.json')}_sha256": sha256(
                         value

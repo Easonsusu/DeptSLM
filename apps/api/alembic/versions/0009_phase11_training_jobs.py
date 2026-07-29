@@ -41,6 +41,23 @@ def upgrade() -> None:
         sa.Column("dataset_split_version", sa.String(100), nullable=False),
         sa.Column("dataset_build_version", sa.Integer(), nullable=False),
         sa.Column("dataset_manifest_sha256", sa.String(64), nullable=False),
+        sa.Column("dataset_source_bundle_id", sa.Uuid(), nullable=False),
+        sa.Column("dataset_status", sa.String(16), nullable=False),
+        sa.Column("dataset_review_status", sa.String(16), nullable=False),
+        sa.Column("dataset_publication_attempt_id", sa.Uuid(), nullable=False),
+        sa.Column("dataset_publication_attempt_number", sa.Integer(), nullable=False),
+        sa.Column("dataset_code_revision", sa.String(40), nullable=False),
+        sa.Column("dataset_train_sha256", sa.String(64), nullable=False),
+        sa.Column("dataset_train_byte_size", sa.BigInteger(), nullable=False),
+        sa.Column("dataset_validation_sha256", sa.String(64), nullable=False),
+        sa.Column("dataset_validation_byte_size", sa.BigInteger(), nullable=False),
+        sa.Column("dataset_provenance_sha256", sa.String(64), nullable=False),
+        sa.Column("dataset_provenance_byte_size", sa.BigInteger(), nullable=False),
+        sa.Column("dataset_train_example_count", sa.Integer(), nullable=False),
+        sa.Column("dataset_validation_example_count", sa.Integer(), nullable=False),
+        sa.Column("dataset_source_example_count", sa.Integer(), nullable=False),
+        sa.Column("dataset_source_group_count", sa.Integer(), nullable=False),
+        sa.Column("dataset_source_reference_count", sa.Integer(), nullable=False),
         sa.Column("dataset_rights_attested", sa.Boolean(), nullable=False),
         sa.Column("evaluation_contamination_reviewed", sa.Boolean(), nullable=False),
         sa.Column("execution_scope_id", sa.Uuid(), nullable=False),
@@ -115,6 +132,17 @@ def upgrade() -> None:
             "dataset_normalization_version = 'phase10-sft-normalization-v1' AND "
             "dataset_split_version = 'phase10-sft-group-split-v1'",
             name="ck_training_job_dataset_contracts",
+        ),
+        sa.CheckConstraint(
+            "dataset_status = 'succeeded' AND dataset_review_status = 'approved'",
+            name="ck_training_job_dataset_snapshot_lifecycle",
+        ),
+        sa.CheckConstraint(
+            "dataset_publication_attempt_number > 0 AND dataset_train_example_count > 0 "
+            "AND dataset_validation_example_count > 0 AND dataset_source_example_count >= 2 "
+            "AND dataset_source_group_count >= 2 AND "
+            "dataset_source_reference_count >= dataset_source_example_count",
+            name="ck_training_job_dataset_snapshot_counts",
         ),
         sa.CheckConstraint(
             "maximum_record_content_bytes = 7680", name="ck_training_job_record_limit"
@@ -302,6 +330,78 @@ def upgrade() -> None:
     )
 
     op.create_table(
+        "training_job_purge_reservations",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("operation_id", sa.Uuid(), nullable=False),
+        sa.Column("department_id", sa.Uuid(), nullable=False),
+        sa.Column("training_job_id", sa.Uuid(), nullable=False),
+        sa.Column("expected_job_version", sa.Integer(), nullable=False),
+        sa.Column("expected_review_status", sa.String(16), nullable=False),
+        sa.Column("retention_anchor_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("retention_days", sa.Integer(), nullable=False),
+        sa.Column("status", sa.String(24), nullable=False),
+        sa.Column(
+            "registered_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
+        sa.Column("deletion_authorized_at", sa.DateTime(timezone=True)),
+        sa.Column("terminalized_at", sa.DateTime(timezone=True)),
+        sa.Column("version", sa.Integer(), nullable=False),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False
+        ),
+        sa.CheckConstraint(
+            "status IN ('registered','deletion_authorized','terminalized')",
+            name="ck_training_job_purge_reservation_status",
+        ),
+        sa.CheckConstraint(
+            "expected_review_status IN ('rejected','archived')",
+            name="ck_training_job_purge_reservation_review",
+        ),
+        sa.CheckConstraint(
+            "retention_days BETWEEN 30 AND 730 AND expected_job_version > 0 AND version > 0",
+            name="ck_training_job_purge_reservation_values",
+        ),
+        sa.CheckConstraint(
+            "(status = 'registered' AND deletion_authorized_at IS NULL AND terminalized_at IS NULL) "
+            "OR (status = 'deletion_authorized' AND deletion_authorized_at IS NOT NULL "
+            "AND terminalized_at IS NULL) OR (status = 'terminalized' "
+            "AND deletion_authorized_at IS NOT NULL AND terminalized_at IS NOT NULL)",
+            name="ck_training_job_purge_reservation_lifecycle",
+        ),
+        sa.ForeignKeyConstraint(
+            ["operation_id", "department_id"],
+            [
+                "training_job_artifact_operations.id",
+                "training_job_artifact_operations.department_id",
+            ],
+            name="fk_training_job_purge_reservation_operation_scope",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["training_job_id", "department_id"],
+            ["training_jobs.id", "training_jobs.department_id"],
+            name="fk_training_job_purge_reservation_job_scope",
+            ondelete="RESTRICT",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint(
+            "operation_id", "training_job_id", name="uq_training_job_purge_reservation_operation"
+        ),
+    )
+    op.create_index(
+        "uq_training_job_purge_reservation_active",
+        "training_job_purge_reservations",
+        ["training_job_id"],
+        unique=True,
+        postgresql_where=sa.text("status IN ('registered','deletion_authorized')"),
+    )
+    op.create_index(
+        "ix_training_job_purge_reservation_operation",
+        "training_job_purge_reservations",
+        ["operation_id", "status", "created_at"],
+    )
+
+    op.create_table(
         "training_job_artifact_operation_items",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("operation_id", sa.Uuid(), nullable=False),
@@ -384,6 +484,13 @@ def downgrade() -> None:
         "ix_training_job_operation_item_status", table_name="training_job_artifact_operation_items"
     )
     op.drop_table("training_job_artifact_operation_items")
+    op.drop_index(
+        "ix_training_job_purge_reservation_operation", table_name="training_job_purge_reservations"
+    )
+    op.drop_index(
+        "uq_training_job_purge_reservation_active", table_name="training_job_purge_reservations"
+    )
+    op.drop_table("training_job_purge_reservations")
     op.drop_index(
         "ix_training_job_operation_department", table_name="training_job_artifact_operations"
     )

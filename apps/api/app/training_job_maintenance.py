@@ -19,6 +19,7 @@ from app.models import (
     TrainingJobArtifactOperation,
     TrainingJobArtifactOperationItem,
     TrainingJobAttempt,
+    TrainingJobPurgeReservation,
 )
 from app.services import ServiceError, append_mutation_audit, authorize_transaction
 from app.sft_artifacts import SftArtifactError, SftArtifactStore
@@ -104,6 +105,17 @@ def archive_training_job(
             ).scalar_one_or_none()
             if job is None:
                 raise ServiceError(404, "Training job not found")
+            active_reservation = session.execute(
+                select(TrainingJobPurgeReservation)
+                .where(
+                    TrainingJobPurgeReservation.department_id == department_id,
+                    TrainingJobPurgeReservation.training_job_id == training_job_id,
+                    TrainingJobPurgeReservation.status.in_(("registered", "deletion_authorized")),
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if active_reservation is not None:
+                raise ServiceError(409, "Training job purge is in progress")
             if job.status != "succeeded" or job.review_status not in {"approved", "rejected"}:
                 raise ServiceError(409, "Training job cannot be archived")
             if not apply:
@@ -116,7 +128,7 @@ def archive_training_job(
                 actor=authorization.identity,
                 actor_subject=actor_subject,
                 request_scope=scope,
-                action="training.job.archive",
+                action="training.job.review.archive",
                 resource_type="training_job",
                 resource_id=job.id,
             )
@@ -210,6 +222,7 @@ def _register_candidates(
     try:
         with factory.begin() as session:
             _scope, authorization = _authorize(session, department_id, actor_issuer, actor_subject)
+            jobs: list[TrainingJob] = []
             existing = session.execute(
                 select(TrainingJobArtifactOperation)
                 .where(
@@ -306,6 +319,26 @@ def _register_candidates(
             )
             session.add(operation)
             session.flush()
+            if operation_type == "purge":
+                assert retention_days is not None
+                for job in jobs:
+                    anchor = _retention_anchor(job)
+                    if anchor is None:
+                        raise ServiceError(409, "Training job purge is unavailable")
+                    session.add(
+                        TrainingJobPurgeReservation(
+                            id=uuid4(),
+                            operation_id=operation.id,
+                            department_id=department_id,
+                            training_job_id=job.id,
+                            expected_job_version=job.version,
+                            expected_review_status=job.review_status,
+                            retention_anchor_at=anchor,
+                            retention_days=retention_days,
+                            status="registered",
+                            version=1,
+                        )
+                    )
             for candidate in candidates:
                 session.add(
                     TrainingJobArtifactOperationItem(
@@ -344,6 +377,17 @@ def _candidates(attempts: list[TrainingJobAttempt]) -> list[_Candidate]:
     return result
 
 
+def _attempt_surfaces(attempts: list[TrainingJobAttempt]) -> set[tuple[UUID, str]]:
+    """All and only the surfaces registered for an exact terminal attempt set."""
+
+    surfaces: set[tuple[UUID, str]] = set()
+    for attempt in attempts:
+        surfaces.add((attempt.publication_attempt_id, "stage"))
+        if isinstance(attempt.ownership_manifest, dict):
+            surfaces.add((attempt.publication_attempt_id, "final"))
+    return surfaces
+
+
 def _execute(
     factory: sessionmaker[Session],
     data_dir: Path,
@@ -358,7 +402,15 @@ def _execute(
         return TrainingJobMaintenanceResult(len(candidates), 0, 0)
     if operation_id is None:
         raise ServiceError(409, "Training-job maintenance operation is unavailable")
+    _authorize_purge_deletion(
+        factory,
+        department_id=department_id,
+        actor_issuer=actor_issuer,
+        actor_subject=actor_subject,
+        operation_id=operation_id,
+    )
     applied = 0
+    purged_count = 0
     outcomes: dict[tuple[UUID, UUID, str], tuple[bool, str | None]] = {}
     scope = DepartmentScope(department_id)
     for candidate in candidates:
@@ -473,18 +525,6 @@ def _execute(
                     attempt.version += 1
             if operation.operation_type == "purge":
                 for training_job_id in {candidate.training_job_id for candidate in candidates}:
-                    job_candidates = [
-                        candidate
-                        for candidate in candidates
-                        if candidate.training_job_id == training_job_id
-                    ]
-                    if not all(
-                        outcomes[
-                            (candidate.training_job_id, candidate.attempt_id, candidate.surface)
-                        ][0]
-                        for candidate in job_candidates
-                    ):
-                        continue
                     attempts = session.scalars(
                         select(TrainingJobAttempt)
                         .where(
@@ -508,8 +548,23 @@ def _execute(
                         )
                         .with_for_update()
                     ).all()
-                    if not items or any(item.status != "completed" for item in items):
+                    if (
+                        not items
+                        or {(item.publication_attempt_id, item.resource_surface) for item in items}
+                        != _attempt_surfaces(attempts)
+                        or any(item.status != "completed" for item in items)
+                    ):
                         continue
+                    reservation = session.execute(
+                        select(TrainingJobPurgeReservation)
+                        .where(
+                            TrainingJobPurgeReservation.operation_id == operation_id,
+                            TrainingJobPurgeReservation.department_id == department_id,
+                            TrainingJobPurgeReservation.training_job_id == training_job_id,
+                            TrainingJobPurgeReservation.status == "deletion_authorized",
+                        )
+                        .with_for_update()
+                    ).scalar_one_or_none()
                     job = session.execute(
                         select(TrainingJob)
                         .where(
@@ -521,24 +576,49 @@ def _execute(
                         )
                         .with_for_update()
                     ).scalar_one_or_none()
-                    if job is not None and _purge_retention_satisfied(job, now, operation):
+                    if (
+                        job is not None
+                        and reservation is not None
+                        and _purge_reservation_matches(reservation, job, now)
+                    ):
                         job.review_status = "purged"
                         job.purged_at = now
                         job.version += 1
+                        purged_count += 1
             blocked = len(candidates) - applied
             operation.status = "completed_with_blocks" if blocked else "completed"
             operation.completed_at = now
-            if applied:
+            if operation.operation_type == "purge":
+                reservations = session.scalars(
+                    select(TrainingJobPurgeReservation)
+                    .where(
+                        TrainingJobPurgeReservation.operation_id == operation_id,
+                        TrainingJobPurgeReservation.department_id == department_id,
+                        TrainingJobPurgeReservation.status == "deletion_authorized",
+                    )
+                    .with_for_update()
+                ).all()
+                for reservation in reservations:
+                    reservation.status = "terminalized"
+                    reservation.terminalized_at = now
+                    reservation.version += 1
+            if applied and operation.operation_type == "reconcile":
                 append_mutation_audit(
                     session,
                     actor=authorization.identity,
                     actor_subject=actor_subject,
                     request_scope=scope_request,
-                    action=(
-                        "training.job.reconcile"
-                        if operation.operation_type == "reconcile"
-                        else "training.job.purge"
-                    ),
+                    action="training.job.reconcile",
+                    resource_type="training_job_artifact_operation",
+                    resource_id=operation.id,
+                )
+            if purged_count:
+                append_mutation_audit(
+                    session,
+                    actor=authorization.identity,
+                    actor_subject=actor_subject,
+                    request_scope=scope_request,
+                    action="training.job.purge",
                     resource_type="training_job_artifact_operation",
                     resource_id=operation.id,
                 )
@@ -573,17 +653,127 @@ def _blocked_reason(error: SftArtifactError) -> str:
     return error.code if error.code in _BLOCKED_REASONS else "artifact_ownership_mismatch"
 
 
-def _purge_retention_satisfied(
-    job: TrainingJob, now, operation: TrainingJobArtifactOperation
-) -> bool:
-    if (
-        operation.operation_type != "purge"
-        or operation.retention_days is None
-        or job.status != "succeeded"
-        or job.review_status not in {"rejected", "archived"}
-    ):
-        return False
-    cutoff = now - timedelta(days=operation.retention_days)
+def _retention_anchor(job: TrainingJob):
     if job.review_status == "rejected":
-        return job.reviewed_at is not None and job.reviewed_at <= cutoff
-    return job.archived_at is not None and job.archived_at <= cutoff
+        return job.reviewed_at
+    if job.review_status == "archived":
+        return job.archived_at
+    return None
+
+
+def _purge_reservation_matches(
+    reservation: TrainingJobPurgeReservation, job: TrainingJob, now
+) -> bool:
+    return (
+        reservation.status == "deletion_authorized"
+        and job.status == "succeeded"
+        and job.purged_at is None
+        and job.review_status == reservation.expected_review_status
+        and job.version == reservation.expected_job_version
+        and _retention_anchor(job) == reservation.retention_anchor_at
+        and reservation.retention_anchor_at <= now - timedelta(days=reservation.retention_days)
+    )
+
+
+def _authorize_purge_deletion(
+    factory: sessionmaker[Session],
+    *,
+    department_id: UUID,
+    actor_issuer: str,
+    actor_subject: str,
+    operation_id: UUID,
+) -> None:
+    """Durably fence purge authority before any external descriptor deletion."""
+
+    try:
+        with factory.begin() as session:
+            _authorize(session, department_id, actor_issuer, actor_subject)
+            operation = session.execute(
+                select(TrainingJobArtifactOperation)
+                .where(
+                    TrainingJobArtifactOperation.id == operation_id,
+                    TrainingJobArtifactOperation.department_id == department_id,
+                    TrainingJobArtifactOperation.status == "registered",
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if operation is None:
+                raise ServiceError(409, "Training-job maintenance operation is unavailable")
+            if operation.operation_type != "purge":
+                return
+            now = session.scalar(select(func.clock_timestamp()))
+            reservations = session.scalars(
+                select(TrainingJobPurgeReservation)
+                .where(
+                    TrainingJobPurgeReservation.operation_id == operation_id,
+                    TrainingJobPurgeReservation.department_id == department_id,
+                    TrainingJobPurgeReservation.status.in_(("registered", "deletion_authorized")),
+                )
+                .order_by(TrainingJobPurgeReservation.training_job_id)
+                .with_for_update()
+            ).all()
+            if not reservations:
+                raise ServiceError(409, "Training-job purge reservation is unavailable")
+            for reservation in reservations:
+                job = session.execute(
+                    select(TrainingJob)
+                    .where(
+                        TrainingJob.id == reservation.training_job_id,
+                        TrainingJob.department_id == department_id,
+                    )
+                    .with_for_update()
+                ).scalar_one_or_none()
+                attempts = session.scalars(
+                    select(TrainingJobAttempt)
+                    .where(
+                        TrainingJobAttempt.department_id == department_id,
+                        TrainingJobAttempt.training_job_id == reservation.training_job_id,
+                    )
+                    .with_for_update()
+                ).all()
+                items = session.scalars(
+                    select(TrainingJobArtifactOperationItem)
+                    .where(
+                        TrainingJobArtifactOperationItem.operation_id == operation_id,
+                        TrainingJobArtifactOperationItem.department_id == department_id,
+                        TrainingJobArtifactOperationItem.training_job_id
+                        == reservation.training_job_id,
+                    )
+                    .with_for_update()
+                ).all()
+                if (
+                    job is None
+                    or not attempts
+                    or any(
+                        attempt.status not in {"succeeded", "failed", "cancelled", "reclaimed"}
+                        for attempt in attempts
+                    )
+                    or {(item.publication_attempt_id, item.resource_surface) for item in items}
+                    != _attempt_surfaces(attempts)
+                    or any(item.status != "registered" for item in items)
+                    or not _purge_reservation_predelete_matches(reservation, job, now)
+                ):
+                    raise ServiceError(409, "Training-job purge authority changed")
+            for reservation in reservations:
+                if reservation.status == "registered":
+                    reservation.status = "deletion_authorized"
+                    reservation.deletion_authorized_at = now
+                    reservation.version += 1
+    except ServiceError:
+        raise
+    except SQLAlchemyError as error:
+        raise ServiceError(503, "Database unavailable") from error
+
+
+def _purge_reservation_predelete_matches(
+    reservation: TrainingJobPurgeReservation, job: TrainingJob, now
+) -> bool:
+    return (
+        reservation.status in {"registered", "deletion_authorized"}
+        and job.status == "succeeded"
+        and job.purged_at is None
+        and job.review_status == reservation.expected_review_status
+        and job.version == reservation.expected_job_version
+        and _retention_anchor(job) == reservation.retention_anchor_at
+        and reservation.retention_anchor_at <= now - timedelta(days=reservation.retention_days)
+    )

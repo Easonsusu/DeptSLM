@@ -71,7 +71,10 @@ def test_opt_in_llamafactory_parser_accepts_exact_generated_profiles(
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("TRANSFORMERS_OFFLINE", "1")
     monkeypatch.setenv("HF_HOME", "/nonexistent/deptslm-llamafactory-smoke-cache")
-    from llamafactory.hparams.parser import get_train_args
+    # `_parse_train_args` is the strict 0.9.5 HfArgumentParser path.  Unlike
+    # `get_train_args`, it does not perform launch, device, tokenizer, model,
+    # dataset, or trainer validation.
+    from llamafactory.hparams.parser import _parse_train_args
 
     config = _config(profile_id)
     assert config["packing"] is False
@@ -79,7 +82,7 @@ def test_opt_in_llamafactory_parser_accepts_exact_generated_profiles(
     assert config["enable_liger_kernel"] is False
     assert config["use_unsloth"] is False
     assert "use_liger_kernel" not in config
-    parsed = get_train_args(config)
+    parsed = _parse_train_args(config)
     model_args, data_args, _training_args, finetuning_args, _generation_args = parsed
     assert data_args.packing is False
     assert data_args.neat_packing is False
@@ -98,8 +101,8 @@ def test_opt_in_llamafactory_parser_accepts_exact_generated_profiles(
         invalid = deepcopy(config)
         invalid[key] = value
         with pytest.raises(ValueError):
-            get_train_args(invalid)
+            _parse_train_args(invalid)
     invalid = deepcopy(_config("phase11-qwen3-0.6b-qlora-nf4-v1"))
     invalid["quantization_method"] = "bitsandbytes"
     with pytest.raises(ValueError):
-        get_train_args(invalid)
+        _parse_train_args(invalid)

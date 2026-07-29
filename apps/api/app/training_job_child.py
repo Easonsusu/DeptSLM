@@ -86,6 +86,12 @@ def _build(request: dict[str, object]) -> dict[str, object]:
         "code_revision",
         "dataset_build_version",
         "dataset_manifest_sha256",
+        "dataset_source_bundle_id",
+        "dataset_status",
+        "dataset_review_status",
+        "dataset_publication_attempt_id",
+        "dataset_publication_attempt_number",
+        "dataset_code_revision",
         "dataset_artifact_contract_version",
         "dataset_example_contract_version",
         "dataset_normalization_version",
@@ -93,6 +99,11 @@ def _build(request: dict[str, object]) -> dict[str, object]:
         "profile_id",
         "dataset_rights_attested",
         "evaluation_contamination_reviewed",
+        "dataset_train_example_count",
+        "dataset_validation_example_count",
+        "dataset_source_example_count",
+        "dataset_source_group_count",
+        "dataset_source_reference_count",
         "expected_manifest_sha256",
         "expected_manifest_byte_size",
         "expected_train_sha256",
@@ -104,6 +115,21 @@ def _build(request: dict[str, object]) -> dict[str, object]:
     }
     if set(request) != expected:
         raise TrainingJobContractError("training_job_publication_failed")
+    if (
+        request["dataset_status"] != "succeeded"
+        or request["dataset_review_status"] != "approved"
+        or _positive(request["dataset_train_example_count"]) < 1
+        or _positive(request["dataset_validation_example_count"]) < 1
+        or _positive(request["dataset_source_example_count"]) < 2
+        or _positive(request["dataset_source_group_count"]) < 2
+        or _positive(request["dataset_source_reference_count"])
+        < _positive(request["dataset_source_example_count"])
+    ):
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    _uuid(request["dataset_source_bundle_id"])
+    _uuid(request["dataset_publication_attempt_id"])
+    _positive(request["dataset_publication_attempt_number"])
+    _revision(request["dataset_code_revision"])
     stage_fd = _fd(request["stage_fd"])
     _directory(stage_fd, writable=True)
     if set(os.listdir(stage_fd)) != {STAGE_MARKER}:
@@ -216,10 +242,20 @@ def _validate_phase10_manifest(
     if (
         manifest.get("artifact_contract_version") != request["dataset_artifact_contract_version"]
         or manifest.get("department_id") != request["department_id"]
+        or manifest.get("source_bundle_id") != request["dataset_source_bundle_id"]
         or manifest.get("build_id") != request["dataset_build_id"]
+        or manifest.get("publication_attempt_id") != request["dataset_publication_attempt_id"]
+        or manifest.get("attempt_number") != request["dataset_publication_attempt_number"]
+        or manifest.get("code_revision") != request["dataset_code_revision"]
         or manifest.get("normalization_version") != request["dataset_normalization_version"]
         or manifest.get("example_contract_version") != request["dataset_example_contract_version"]
         or manifest.get("split_version") != request["dataset_split_version"]
+        or manifest.get("validation_ratio") != "0.10"
+        or manifest.get("source_example_count") != request["dataset_source_example_count"]
+        or manifest.get("source_group_count") != request["dataset_source_group_count"]
+        or manifest.get("source_reference_count") != request["dataset_source_reference_count"]
+        or manifest.get("train_example_count") != request["dataset_train_example_count"]
+        or manifest.get("validation_example_count") != request["dataset_validation_example_count"]
         or _digest(raw) != request["dataset_manifest_sha256"]
     ):
         raise TrainingJobContractError("dataset_artifact_mismatch")

@@ -2213,6 +2213,17 @@ class TrainingJob(Base):
             "dataset_split_version = 'phase10-sft-group-split-v1'",
             name="ck_training_job_dataset_contracts",
         ),
+        CheckConstraint(
+            "dataset_status = 'succeeded' AND dataset_review_status = 'approved'",
+            name="ck_training_job_dataset_snapshot_lifecycle",
+        ),
+        CheckConstraint(
+            "dataset_publication_attempt_number > 0 AND dataset_train_example_count > 0 "
+            "AND dataset_validation_example_count > 0 AND dataset_source_example_count >= 2 "
+            "AND dataset_source_group_count >= 2 AND "
+            "dataset_source_reference_count >= dataset_source_example_count",
+            name="ck_training_job_dataset_snapshot_counts",
+        ),
         CheckConstraint("maximum_record_content_bytes = 7680", name="ck_training_job_record_limit"),
         CheckConstraint("attempt_number > 0 AND version > 0", name="ck_training_job_versions"),
         CheckConstraint(
@@ -2277,6 +2288,23 @@ class TrainingJob(Base):
     dataset_split_version: Mapped[str] = mapped_column(String(100), nullable=False)
     dataset_build_version: Mapped[int] = mapped_column(Integer, nullable=False)
     dataset_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_source_bundle_id: Mapped[UUID] = mapped_column(nullable=False)
+    dataset_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    dataset_review_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    dataset_publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    dataset_publication_attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    dataset_train_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_train_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    dataset_validation_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_validation_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    dataset_provenance_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_provenance_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    dataset_train_example_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_validation_example_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_source_example_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_source_group_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_source_reference_count: Mapped[int] = mapped_column(Integer, nullable=False)
     dataset_rights_attested: Mapped[bool] = mapped_column(Boolean, nullable=False)
     evaluation_contamination_reviewed: Mapped[bool] = mapped_column(Boolean, nullable=False)
     execution_scope_id: Mapped[UUID] = mapped_column(nullable=False)
@@ -2427,6 +2455,79 @@ class TrainingJobArtifactOperation(Base):
     operation_type: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="registered")
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = utc_timestamp()
+
+
+class TrainingJobPurgeReservation(Base):
+    """Durable authority fence for a purge operation before external deletion."""
+
+    __tablename__ = "training_job_purge_reservations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["operation_id", "department_id"],
+            [
+                "training_job_artifact_operations.id",
+                "training_job_artifact_operations.department_id",
+            ],
+            name="fk_training_job_purge_reservation_operation_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["training_job_id", "department_id"],
+            ["training_jobs.id", "training_jobs.department_id"],
+            name="fk_training_job_purge_reservation_job_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "status IN ('registered','deletion_authorized','terminalized')",
+            name="ck_training_job_purge_reservation_status",
+        ),
+        CheckConstraint(
+            "expected_review_status IN ('rejected','archived')",
+            name="ck_training_job_purge_reservation_review",
+        ),
+        CheckConstraint(
+            "retention_days BETWEEN 30 AND 730 AND expected_job_version > 0 AND version > 0",
+            name="ck_training_job_purge_reservation_values",
+        ),
+        CheckConstraint(
+            "(status = 'registered' AND deletion_authorized_at IS NULL "
+            "AND terminalized_at IS NULL) "
+            "OR (status = 'deletion_authorized' AND deletion_authorized_at IS NOT NULL "
+            "AND terminalized_at IS NULL) OR (status = 'terminalized' "
+            "AND deletion_authorized_at IS NOT NULL AND terminalized_at IS NOT NULL)",
+            name="ck_training_job_purge_reservation_lifecycle",
+        ),
+        UniqueConstraint(
+            "operation_id", "training_job_id", name="uq_training_job_purge_reservation_operation"
+        ),
+        Index(
+            "uq_training_job_purge_reservation_active",
+            "training_job_id",
+            unique=True,
+            postgresql_where=text("status IN ('registered','deletion_authorized')"),
+        ),
+        Index(
+            "ix_training_job_purge_reservation_operation",
+            "operation_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    operation_id: Mapped[UUID] = mapped_column(nullable=False)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    training_job_id: Mapped[UUID] = mapped_column(nullable=False)
+    expected_job_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_review_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    retention_anchor_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    retention_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="registered")
+    registered_at: Mapped[datetime] = utc_timestamp()
+    deletion_authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    terminalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = utc_timestamp()
 
 

@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import AuthenticatedPrincipal, DepartmentRole
 from app.authorization import DepartmentRequestScope
-from app.models import SftDatasetBuild, TrainingJob
+from app.models import SftDatasetBuild, TrainingJob, TrainingJobPurgeReservation
 from app.schemas import TrainingJobCreateRequest
 from app.services import ServiceError, append_mutation_audit, authorize_transaction
 from app.training_job_domain import (
@@ -89,6 +89,23 @@ def enqueue_training_job(
             dataset_split_version=dataset.split_version,
             dataset_build_version=dataset.version,
             dataset_manifest_sha256=dataset.result_manifest_sha256,
+            dataset_source_bundle_id=dataset.source_bundle_id,
+            dataset_status=dataset.status,
+            dataset_review_status=dataset.review_status,
+            dataset_publication_attempt_id=dataset.publication_attempt_id,
+            dataset_publication_attempt_number=dataset.attempt_number,
+            dataset_code_revision=dataset.code_revision,
+            dataset_train_sha256=dataset.train_sha256,
+            dataset_train_byte_size=dataset.train_byte_size,
+            dataset_validation_sha256=dataset.validation_sha256,
+            dataset_validation_byte_size=dataset.validation_byte_size,
+            dataset_provenance_sha256=dataset.provenance_sha256,
+            dataset_provenance_byte_size=dataset.provenance_byte_size,
+            dataset_train_example_count=dataset.train_example_count,
+            dataset_validation_example_count=dataset.validation_example_count,
+            dataset_source_example_count=dataset.source_example_count,
+            dataset_source_group_count=dataset.source_group_count,
+            dataset_source_reference_count=dataset.source_reference_count,
             dataset_rights_attested=True,
             evaluation_contamination_reviewed=True,
             execution_scope_id=uuid4(),
@@ -198,6 +215,7 @@ def cancel_training_job(
         )
         job = _locked_job(session, request_scope, training_job_id)
         _version(job, expected_version)
+        _require_no_active_purge_reservation(session, job)
         if job.status == "queued":
             job.status = "cancelled"
             job.error_code = "cancelled"
@@ -244,6 +262,7 @@ def review_training_job(
         )
         job = _locked_job(session, request_scope, training_job_id)
         _version(job, expected_version)
+        _require_no_active_purge_reservation(session, job)
         transitions = {
             "approve": ("pending", "approved"),
             "reject": ("pending", "rejected"),
@@ -308,6 +327,14 @@ def _require_eligible_dataset(dataset: SftDatasetBuild, expected_version: int) -
         or dataset.train_byte_size is None
         or dataset.validation_byte_size is None
         or dataset.provenance_byte_size is None
+        or dataset.publication_attempt_id is None
+        or dataset.train_example_count is None
+        or dataset.validation_example_count is None
+        or dataset.train_example_count < 1
+        or dataset.validation_example_count < 1
+        or dataset.source_example_count < 2
+        or dataset.source_group_count < 2
+        or dataset.source_reference_count < dataset.source_example_count
         or dataset.artifact_contract_version != "phase10-sft-dataset-v1"
         or dataset.example_contract_version != "phase10-sft-example-v1"
         or dataset.normalization_version != "phase10-sft-normalization-v1"
@@ -315,6 +342,20 @@ def _require_eligible_dataset(dataset: SftDatasetBuild, expected_version: int) -
         or not isinstance(dataset.publication_manifest, dict)
     ):
         raise ServiceError(409, "Training dataset is unavailable")
+
+
+def _require_no_active_purge_reservation(session: Session, job: TrainingJob) -> None:
+    reservation = session.execute(
+        select(TrainingJobPurgeReservation)
+        .where(
+            TrainingJobPurgeReservation.department_id == job.department_id,
+            TrainingJobPurgeReservation.training_job_id == job.id,
+            TrainingJobPurgeReservation.status.in_(("registered", "deletion_authorized")),
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if reservation is not None:
+        raise ServiceError(409, "Training job purge is in progress")
 
 
 def _version(job: TrainingJob, expected_version: int) -> None:

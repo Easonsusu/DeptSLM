@@ -73,6 +73,23 @@ class ClaimedTrainingJob:
     code_revision: str
     dataset_build_version: int
     dataset_manifest_sha256: str
+    dataset_source_bundle_id: UUID
+    dataset_status: str
+    dataset_review_status: str
+    dataset_publication_attempt_id: UUID
+    dataset_publication_attempt_number: int
+    dataset_code_revision: str
+    dataset_train_sha256: str
+    dataset_train_byte_size: int
+    dataset_validation_sha256: str
+    dataset_validation_byte_size: int
+    dataset_provenance_sha256: str
+    dataset_provenance_byte_size: int
+    dataset_train_example_count: int
+    dataset_validation_example_count: int
+    dataset_source_example_count: int
+    dataset_source_group_count: int
+    dataset_source_reference_count: int
     dataset_artifact_contract_version: str
     dataset_example_contract_version: str
     dataset_normalization_version: str
@@ -204,26 +221,43 @@ def claim_next(
                 )
             )
             return ClaimedTrainingJob(
-                row.id,
-                row.department_id,
-                row.dataset_build_id,
-                row.requested_by_user_id,
-                row.profile_id,
-                publication_attempt_id,
-                execution_scope_id,
-                row.attempt_number,
-                worker_id,
-                claim_token,
-                row.code_revision,
-                row.dataset_build_version,
-                row.dataset_manifest_sha256,
-                row.dataset_artifact_contract_version,
-                row.dataset_example_contract_version,
-                row.dataset_normalization_version,
-                row.dataset_split_version,
-                row.dataset_rights_attested,
-                row.evaluation_contamination_reviewed,
-                stale_attempt,
+                id=row.id,
+                department_id=row.department_id,
+                dataset_build_id=row.dataset_build_id,
+                requested_by_user_id=row.requested_by_user_id,
+                profile_id=row.profile_id,
+                publication_attempt_id=publication_attempt_id,
+                execution_scope_id=execution_scope_id,
+                attempt_number=row.attempt_number,
+                worker_id=worker_id,
+                claim_token=claim_token,
+                code_revision=row.code_revision,
+                dataset_build_version=row.dataset_build_version,
+                dataset_manifest_sha256=row.dataset_manifest_sha256,
+                dataset_source_bundle_id=row.dataset_source_bundle_id,
+                dataset_status=row.dataset_status,
+                dataset_review_status=row.dataset_review_status,
+                dataset_publication_attempt_id=row.dataset_publication_attempt_id,
+                dataset_publication_attempt_number=row.dataset_publication_attempt_number,
+                dataset_code_revision=row.dataset_code_revision,
+                dataset_train_sha256=row.dataset_train_sha256,
+                dataset_train_byte_size=row.dataset_train_byte_size,
+                dataset_validation_sha256=row.dataset_validation_sha256,
+                dataset_validation_byte_size=row.dataset_validation_byte_size,
+                dataset_provenance_sha256=row.dataset_provenance_sha256,
+                dataset_provenance_byte_size=row.dataset_provenance_byte_size,
+                dataset_train_example_count=row.dataset_train_example_count,
+                dataset_validation_example_count=row.dataset_validation_example_count,
+                dataset_source_example_count=row.dataset_source_example_count,
+                dataset_source_group_count=row.dataset_source_group_count,
+                dataset_source_reference_count=row.dataset_source_reference_count,
+                dataset_artifact_contract_version=row.dataset_artifact_contract_version,
+                dataset_example_contract_version=row.dataset_example_contract_version,
+                dataset_normalization_version=row.dataset_normalization_version,
+                dataset_split_version=row.dataset_split_version,
+                dataset_rights_attested=row.dataset_rights_attested,
+                evaluation_contamination_reviewed=row.evaluation_contamination_reviewed,
+                stale_publication_attempt_id=stale_attempt,
             )
     except TrainingJobQueueError:
         raise
@@ -329,16 +363,16 @@ def process_training_job(
             _cleanup_stale_attempt(
                 factory, data_dir, scope, job, job.stale_publication_attempt_id, guard
             )
-        dataset = _load_eligible_dataset(factory, job, guard())
+        _load_eligible_dataset(factory, job, guard())
         with SftArtifactStore(data_dir) as store:
             source_guard = guard()
             source = store.open_retained_final(
                 scope,
                 job.dataset_build_id,
                 category="dataset",
-                attempt_id=dataset.publication_attempt_id,
+                attempt_id=job.dataset_publication_attempt_id,
                 allowlist=DATASET_FILES,
-                expected=_dataset_manifest(dataset),
+                expected=_dataset_manifest(job),
                 checkpoint=source_guard,
             )
             source_guard()
@@ -354,7 +388,7 @@ def process_training_job(
                 should_stop=should_stop,
                 heartbeat=child_guard,
                 error=TrainingJobQueueError,
-                request=_child_request(source, staged.stage_fd, job, dataset),
+                request=_child_request(source, staged.stage_fd, job),
                 pass_fds=(
                     source.descriptor("manifest.json")[0],
                     source.descriptor("train.jsonl")[0],
@@ -364,7 +398,7 @@ def process_training_job(
                 ),
             )
             child_guard()
-            manifest, train_count, validation_count = _validate_child_result(result, job, dataset)
+            manifest, train_count, validation_count = _validate_child_result(result, job)
             record_guard = guard()
             _record_attempt_manifest(factory, job, manifest)
             record_guard()
@@ -390,7 +424,6 @@ def process_training_job(
             _complete(
                 factory,
                 job,
-                dataset,
                 source,
                 final,
                 manifest,
@@ -443,20 +476,8 @@ def _load_eligible_dataset(
 
 
 def _child_request(
-    source: SftFinalArtifactVerification,
-    stage_fd: int,
-    job: ClaimedTrainingJob,
-    dataset: SftDatasetBuild,
+    source: SftFinalArtifactVerification, stage_fd: int, job: ClaimedTrainingJob
 ) -> dict[str, object]:
-    if (
-        dataset.train_sha256 is None
-        or dataset.validation_sha256 is None
-        or dataset.provenance_sha256 is None
-        or dataset.train_byte_size is None
-        or dataset.validation_byte_size is None
-        or dataset.provenance_byte_size is None
-    ):
-        raise TrainingJobQueueError("dataset_artifact_mismatch")
     files = dict(source.files)
     required = {"manifest.json", "train.jsonl", "validation.jsonl", "provenance.jsonl"}
     if set(files) != required:
@@ -482,6 +503,12 @@ def _child_request(
         "code_revision": job.code_revision,
         "dataset_build_version": job.dataset_build_version,
         "dataset_manifest_sha256": job.dataset_manifest_sha256,
+        "dataset_source_bundle_id": str(job.dataset_source_bundle_id),
+        "dataset_status": job.dataset_status,
+        "dataset_review_status": job.dataset_review_status,
+        "dataset_publication_attempt_id": str(job.dataset_publication_attempt_id),
+        "dataset_publication_attempt_number": job.dataset_publication_attempt_number,
+        "dataset_code_revision": job.dataset_code_revision,
         "dataset_artifact_contract_version": job.dataset_artifact_contract_version,
         "dataset_example_contract_version": job.dataset_example_contract_version,
         "dataset_normalization_version": job.dataset_normalization_version,
@@ -491,17 +518,22 @@ def _child_request(
         "evaluation_contamination_reviewed": job.evaluation_contamination_reviewed,
         "expected_manifest_sha256": files["manifest.json"].sha256,
         "expected_manifest_byte_size": files["manifest.json"].byte_size,
-        "expected_train_sha256": dataset.train_sha256,
-        "expected_train_byte_size": dataset.train_byte_size,
-        "expected_validation_sha256": dataset.validation_sha256,
-        "expected_validation_byte_size": dataset.validation_byte_size,
-        "expected_provenance_sha256": dataset.provenance_sha256,
-        "expected_provenance_byte_size": dataset.provenance_byte_size,
+        "dataset_train_example_count": job.dataset_train_example_count,
+        "dataset_validation_example_count": job.dataset_validation_example_count,
+        "dataset_source_example_count": job.dataset_source_example_count,
+        "dataset_source_group_count": job.dataset_source_group_count,
+        "dataset_source_reference_count": job.dataset_source_reference_count,
+        "expected_train_sha256": job.dataset_train_sha256,
+        "expected_train_byte_size": job.dataset_train_byte_size,
+        "expected_validation_sha256": job.dataset_validation_sha256,
+        "expected_validation_byte_size": job.dataset_validation_byte_size,
+        "expected_provenance_sha256": job.dataset_provenance_sha256,
+        "expected_provenance_byte_size": job.dataset_provenance_byte_size,
     }
 
 
 def _validate_child_result(
-    result: object, job: ClaimedTrainingJob, dataset: SftDatasetBuild
+    result: object, job: ClaimedTrainingJob
 ) -> tuple[dict[str, object], int, int]:
     if not isinstance(result, dict) or set(result) != {
         "publication_manifest",
@@ -521,8 +553,8 @@ def _validate_child_result(
     if (
         train_count < 1
         or validation_count < 1
-        or train_count != dataset.train_example_count
-        or validation_count != dataset.validation_example_count
+        or train_count != job.dataset_train_example_count
+        or validation_count != job.dataset_validation_example_count
     ):
         raise TrainingJobQueueError("dataset_artifact_mismatch")
     if (
@@ -540,6 +572,9 @@ def _record_attempt_manifest(
 ) -> None:
     try:
         with factory.begin() as session:
+            row = session.execute(
+                select(TrainingJob).where(*_owned(job), _live()).with_for_update()
+            ).scalar_one_or_none()
             attempt = session.execute(
                 select(TrainingJobAttempt)
                 .where(
@@ -550,8 +585,9 @@ def _record_attempt_manifest(
                 )
                 .with_for_update()
             ).scalar_one_or_none()
-            if attempt is None:
+            if row is None or row.cancellation_requested_at is not None or attempt is None:
                 raise TrainingJobQueueError("claim_lost")
+            row.publication_manifest = manifest
             attempt.ownership_manifest = manifest
             attempt.status = "staged"
             attempt.staged_at = session.scalar(select(func.clock_timestamp()))
@@ -592,7 +628,6 @@ def _mark_attempt_published(factory: sessionmaker[Session], job: ClaimedTraining
 def _complete(
     factory: sessionmaker[Session],
     job: ClaimedTrainingJob,
-    dataset: SftDatasetBuild,
     source: SftFinalArtifactVerification,
     final: SftFinalArtifactVerification,
     manifest: dict[str, object],
@@ -653,7 +688,7 @@ def _complete(
                 or not _dataset_matches(job, current_dataset)
             ):
                 raise TrainingJobQueueError("dataset_authority_changed")
-            if row.publication_manifest != manifest:
+            if row.publication_manifest != manifest or attempt.ownership_manifest != manifest:
                 raise TrainingJobQueueError("training_job_publication_failed")
             guard.final_check()
             now = session.scalar(select(func.clock_timestamp()))
@@ -814,18 +849,66 @@ def _live():
 
 def _dataset_matches(job: ClaimedTrainingJob, row: SftDatasetBuild) -> bool:
     return (
-        row.version == job.dataset_build_version
+        row.source_bundle_id == job.dataset_source_bundle_id
+        and row.status == job.dataset_status == "succeeded"
+        and row.review_status == job.dataset_review_status == "approved"
+        and row.version == job.dataset_build_version
         and row.result_manifest_sha256 == job.dataset_manifest_sha256
+        and row.publication_attempt_id == job.dataset_publication_attempt_id
+        and row.attempt_number == job.dataset_publication_attempt_number
+        and row.code_revision == job.dataset_code_revision
+        and row.train_sha256 == job.dataset_train_sha256
+        and row.train_byte_size == job.dataset_train_byte_size
+        and row.validation_sha256 == job.dataset_validation_sha256
+        and row.validation_byte_size == job.dataset_validation_byte_size
+        and row.provenance_sha256 == job.dataset_provenance_sha256
+        and row.provenance_byte_size == job.dataset_provenance_byte_size
+        and row.train_example_count == job.dataset_train_example_count
+        and row.validation_example_count == job.dataset_validation_example_count
+        and row.source_example_count == job.dataset_source_example_count
+        and row.source_group_count == job.dataset_source_group_count
+        and row.source_reference_count == job.dataset_source_reference_count
         and row.artifact_contract_version == job.dataset_artifact_contract_version
         and row.example_contract_version == job.dataset_example_contract_version
         and row.normalization_version == job.dataset_normalization_version
         and row.split_version == job.dataset_split_version
         and isinstance(row.publication_manifest, dict)
-        and row.publication_attempt_id is not None
+        and row.purged_at is None
     )
 
 
-def _dataset_manifest(dataset: SftDatasetBuild) -> dict[str, object]:
-    if not isinstance(dataset.publication_manifest, dict):
-        raise TrainingJobQueueError("dataset_artifact_mismatch")
-    return dataset.publication_manifest
+def _dataset_manifest(job: ClaimedTrainingJob) -> dict[str, object]:
+    """Return the exact retained Phase 10 manifest expected from the job snapshot."""
+
+    return {
+        "artifact_contract_version": job.dataset_artifact_contract_version,
+        "department_id": str(job.department_id),
+        "source_bundle_id": str(job.dataset_source_bundle_id),
+        "build_id": str(job.dataset_build_id),
+        "publication_attempt_id": str(job.dataset_publication_attempt_id),
+        "attempt_number": job.dataset_publication_attempt_number,
+        "code_revision": job.dataset_code_revision,
+        "normalization_version": job.dataset_normalization_version,
+        "example_contract_version": job.dataset_example_contract_version,
+        "split_version": job.dataset_split_version,
+        "validation_ratio": "0.10",
+        "source_example_count": job.dataset_source_example_count,
+        "source_group_count": job.dataset_source_group_count,
+        "source_reference_count": job.dataset_source_reference_count,
+        "train_example_count": job.dataset_train_example_count,
+        "validation_example_count": job.dataset_validation_example_count,
+        "files": {
+            "train.jsonl": {
+                "sha256": job.dataset_train_sha256,
+                "byte_size": job.dataset_train_byte_size,
+            },
+            "validation.jsonl": {
+                "sha256": job.dataset_validation_sha256,
+                "byte_size": job.dataset_validation_byte_size,
+            },
+            "provenance.jsonl": {
+                "sha256": job.dataset_provenance_sha256,
+                "byte_size": job.dataset_provenance_byte_size,
+            },
+        },
+    }
