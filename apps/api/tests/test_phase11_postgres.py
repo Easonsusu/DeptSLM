@@ -239,6 +239,8 @@ def _enqueue(
     department: Department,
     identity: UserIdentity,
     dataset: SftDatasetBuild,
+    *,
+    code_revision: str = "a" * 40,
 ):
     return enqueue_training_job(
         session,
@@ -251,8 +253,12 @@ def _enqueue(
             dataset_rights_confirmed=True,
             evaluation_contamination_reviewed=True,
         ),
-        code_revision="a" * 40,
+        code_revision=code_revision,
     )
+
+
+def _unique_code_revision() -> str:
+    return f"{uuid4().hex}{uuid4().hex[:8]}"
 
 
 def _phase10_records(example_id: str) -> bytes:
@@ -335,9 +341,10 @@ def _succeeded_training_job(factory, root: Path):
     with factory.begin() as session:
         department, identity, dataset = _approved_dataset(session)
         _publish_private_dataset(root, department, dataset)
-        job = _enqueue(session, department, identity, dataset)
+        code_revision = _unique_code_revision()
+        job = _enqueue(session, department, identity, dataset, code_revision=code_revision)
         values = department.id, identity.issuer, identity.subject, job.id
-    claim = claim_next(factory, uuid4(), 30, "a" * 40)
+    claim = claim_next(factory, uuid4(), 30, code_revision)
     assert claim is not None and claim.id == values[3]
     process_training_job(factory, root, claim, lease_seconds=30, operation_seconds=20)
     return values
@@ -381,9 +388,10 @@ def test_phase11_real_worker_publishes_one_descriptor_bound_bundle(engine, tmp_p
     with factory.begin() as session:
         department, identity, dataset = _approved_dataset(session)
         _publish_private_dataset(root, department, dataset)
-        job = _enqueue(session, department, identity, dataset)
+        code_revision = _unique_code_revision()
+        job = _enqueue(session, department, identity, dataset, code_revision=code_revision)
         department_id, job_id = department.id, job.id
-    claim = claim_next(factory, uuid4(), 30, "a" * 40)
+    claim = claim_next(factory, uuid4(), 30, code_revision)
     assert claim is not None and claim.id == job_id
     process_training_job(factory, root, claim, lease_seconds=30, operation_seconds=20)
     with factory() as session:
@@ -524,14 +532,15 @@ def test_phase11_active_purge_reservation_fences_review_and_archive(engine, tmp_
     with factory.begin() as session:
         department, identity, dataset = _approved_dataset(session)
         _publish_private_dataset(root, department, dataset)
-        job = _enqueue(session, department, identity, dataset)
+        code_revision = _unique_code_revision()
+        job = _enqueue(session, department, identity, dataset, code_revision=code_revision)
         department_id, issuer, subject, job_id = (
             department.id,
             identity.issuer,
             identity.subject,
             job.id,
         )
-    claim = claim_next(factory, uuid4(), 30, "a" * 40)
+    claim = claim_next(factory, uuid4(), 30, code_revision)
     assert claim is not None and claim.id == job_id
     process_training_job(factory, root, claim, lease_seconds=30, operation_seconds=20)
     with factory.begin() as session:
@@ -706,14 +715,15 @@ def test_phase11_blocked_historical_stage_leaves_authoritative_final_intact(
     with factory.begin() as session:
         department, identity, dataset = _approved_dataset(session)
         _publish_private_dataset(root, department, dataset)
-        job = _enqueue(session, department, identity, dataset)
+        code_revision = _unique_code_revision()
+        job = _enqueue(session, department, identity, dataset, code_revision=code_revision)
         department_id, issuer, subject, job_id = (
             department.id,
             identity.issuer,
             identity.subject,
             job.id,
         )
-    claim = claim_next(factory, uuid4(), 30, "a" * 40)
+    claim = claim_next(factory, uuid4(), 30, code_revision)
     assert claim is not None and claim.id == job_id
     process_training_job(factory, root, claim, lease_seconds=30, operation_seconds=20)
     historical_attempt_id = uuid4()
@@ -791,14 +801,15 @@ def test_phase11_purge_has_one_authoritative_final_and_historical_stage_only(
     with factory.begin() as session:
         department, identity, dataset = _approved_dataset(session)
         _publish_private_dataset(root, department, dataset)
-        job = _enqueue(session, department, identity, dataset)
+        code_revision = _unique_code_revision()
+        job = _enqueue(session, department, identity, dataset, code_revision=code_revision)
         department_id, issuer, subject, job_id = (
             department.id,
             identity.issuer,
             identity.subject,
             job.id,
         )
-    claim = claim_next(factory, uuid4(), 30, "a" * 40)
+    claim = claim_next(factory, uuid4(), 30, code_revision)
     assert claim is not None and claim.id == job_id
     process_training_job(factory, root, claim, lease_seconds=30, operation_seconds=20)
     historical_attempt_id = uuid4()
