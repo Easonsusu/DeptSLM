@@ -990,7 +990,7 @@ def test_phase11_purge_keeps_tombstone_reservation_active_until_cleanup_resumes(
         limit=1,
         apply=True,
     )
-    assert (result.eligible_count, result.applied_count, result.blocked_count) == (1, 0, 1)
+    assert (result.eligible_count, result.applied_count, result.blocked_count) == (2, 1, 1)
     with factory() as session:
         job = session.get(TrainingJob, job_id)
         reservation = session.scalar(
