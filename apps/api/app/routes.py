@@ -98,6 +98,11 @@ from app.schemas import (
     SftDatasetBuildReviewRequest,
     SftSourceListResponse,
     SftSourceResponse,
+    TrainingJobCancelRequest,
+    TrainingJobCreateRequest,
+    TrainingJobListResponse,
+    TrainingJobResponse,
+    TrainingJobReviewRequest,
     VectorIndexingListResponse,
     VectorIndexingResponse,
 )
@@ -128,6 +133,19 @@ from app.sft_services import (
     read_sft_build,
     read_sft_source,
     review_sft_build,
+)
+from app.training_job_request_body import (
+    TRAINING_JOB_BODY_MAX_BYTES,
+    TRAINING_JOB_MUTATION_BODY_MAX_BYTES,
+    TrainingJobBodyError,
+    read_bounded_training_job_object,
+)
+from app.training_job_services import (
+    cancel_training_job,
+    enqueue_training_job,
+    list_training_jobs,
+    read_training_job,
+    review_training_job,
 )
 from app.vector_index_services import (
     enqueue_indexing,
@@ -178,6 +196,17 @@ async def _validated_sft_body(request: Request, model, *, maximum_bytes: int):
         return model.model_validate(payload)
     except ValidationError:
         raise HTTPException(422, "Invalid SFT request") from None
+
+
+async def _validated_training_job_body(request: Request, model, *, maximum_bytes: int):
+    try:
+        payload = await read_bounded_training_job_object(request, maximum_bytes=maximum_bytes)
+    except TrainingJobBodyError as error:
+        raise HTTPException(error.status_code, error.detail) from None
+    try:
+        return model.model_validate(payload)
+    except ValidationError:
+        raise HTTPException(422, "Invalid training job request") from None
 
 
 async def _require_empty_sft_body(request: Request) -> None:
@@ -1190,6 +1219,136 @@ async def patch_sft_build_review(
                 principal,
                 request_scope,
                 build_id,
+                action=body.action,
+                expected_version=body.expected_version,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/training/jobs",
+    response_model=TrainingJobResponse,
+    status_code=202,
+    tags=["training-jobs"],
+)
+async def post_training_job(
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> TrainingJobResponse:
+    body = await _validated_training_job_body(
+        request, TrainingJobCreateRequest, maximum_bytes=TRAINING_JOB_BODY_MAX_BYTES
+    )
+    try:
+        return TrainingJobResponse.model_validate(
+            enqueue_training_job(
+                session,
+                principal,
+                request_scope,
+                body,
+                code_revision=request.app.state.settings.training_job_code_revision,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/training/jobs",
+    response_model=TrainingJobListResponse,
+    tags=["training-jobs"],
+)
+def get_training_jobs(
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> TrainingJobListResponse:
+    try:
+        rows = list_training_jobs(session, principal, request_scope, limit=limit, offset=offset)
+        return TrainingJobListResponse(
+            items=[TrainingJobResponse.model_validate(row) for row in rows],
+            limit=limit,
+            offset=offset,
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/training/jobs/{training_job_id}",
+    response_model=TrainingJobResponse,
+    tags=["training-jobs"],
+)
+def get_training_job(
+    training_job_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> TrainingJobResponse:
+    try:
+        return TrainingJobResponse.model_validate(
+            read_training_job(session, principal, request_scope, training_job_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/training/jobs/{training_job_id}/cancel",
+    response_model=TrainingJobResponse,
+    tags=["training-jobs"],
+)
+async def post_training_job_cancel(
+    training_job_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> TrainingJobResponse:
+    body = await _validated_training_job_body(
+        request, TrainingJobCancelRequest, maximum_bytes=TRAINING_JOB_MUTATION_BODY_MAX_BYTES
+    )
+    try:
+        return TrainingJobResponse.model_validate(
+            cancel_training_job(
+                session,
+                principal,
+                request_scope,
+                training_job_id,
+                expected_version=body.expected_version,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.patch(
+    "/departments/{department_id}/training/jobs/{training_job_id}/review",
+    response_model=TrainingJobResponse,
+    tags=["training-jobs"],
+)
+async def patch_training_job_review(
+    training_job_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> TrainingJobResponse:
+    body = await _validated_training_job_body(
+        request, TrainingJobReviewRequest, maximum_bytes=TRAINING_JOB_MUTATION_BODY_MAX_BYTES
+    )
+    try:
+        return TrainingJobResponse.model_validate(
+            review_training_job(
+                session,
+                principal,
+                request_scope,
+                training_job_id,
                 action=body.action,
                 expected_version=body.expected_version,
             )

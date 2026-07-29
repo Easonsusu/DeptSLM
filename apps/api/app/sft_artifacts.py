@@ -17,6 +17,7 @@ from pathlib import Path
 from uuid import UUID
 
 from app.authorization import DepartmentScope
+from app.training_job_domain import TRAINING_JOB_FILES
 
 SOURCE_FILES = frozenset({"manifest.json", "examples.jsonl"})
 DATASET_FILES = frozenset({"manifest.json", "train.jsonl", "validation.jsonl", "provenance.jsonl"})
@@ -34,6 +35,8 @@ class SftArtifactError(RuntimeError):
                 "source_artifact_missing",
                 "source_artifact_mismatch",
                 "dataset_publication_failed",
+                "training_job_publication_failed",
+                "dataset_artifact_mismatch",
                 "artifact_ownership_mismatch",
                 "artifact_permissions_invalid",
                 "staging_path_unsafe",
@@ -164,15 +167,19 @@ class SftArtifactStore:
         self._root_fd = _open_directory_path(data_dir / "training_datasets", writable=True)
         self._sources_fd = _ensure_private_child(self._root_fd, "sources")
         self._datasets_fd = _ensure_private_child(self._root_fd, "datasets")
+        self._jobs_fd = _ensure_private_child(self._root_fd, "jobs")
         staging = _ensure_private_child(self._root_fd, ".staging")
         self._staging_sources_fd = _ensure_private_child(staging, "sources")
         self._staging_datasets_fd = _ensure_private_child(staging, "datasets")
+        self._staging_jobs_fd = _ensure_private_child(staging, "jobs")
         os.close(staging)
 
     def close(self) -> None:
         for descriptor in (
             getattr(self, "_staging_datasets_fd", None),
+            getattr(self, "_staging_jobs_fd", None),
             getattr(self, "_staging_sources_fd", None),
+            getattr(self, "_jobs_fd", None),
             getattr(self, "_datasets_fd", None),
             getattr(self, "_sources_fd", None),
             getattr(self, "_root_fd", None),
@@ -253,6 +260,23 @@ class SftArtifactStore:
             publication_attempt_id,
         )
 
+    def prepare_training_job_stage(
+        self,
+        scope: DepartmentScope,
+        training_job_id: UUID,
+        publication_attempt_id: UUID,
+    ) -> SftStagedArtifact:
+        """Create only the exact private Phase 11 job stage for its child writer."""
+
+        return self._prepare_stage(
+            self._staging_jobs_fd,
+            self._jobs_fd,
+            "training_job",
+            scope,
+            training_job_id,
+            publication_attempt_id,
+        )
+
     def publish(
         self,
         staged: SftStagedArtifact,
@@ -329,7 +353,7 @@ class SftArtifactStore:
             artifact.stage_parent_fd is None
             or artifact.stage_fd is None
             or artifact.final_parent_fd is None
-            or allowlist not in {SOURCE_FILES, DATASET_FILES}
+            or allowlist not in {SOURCE_FILES, DATASET_FILES, TRAINING_JOB_FILES}
         ):
             raise SftArtifactError("artifact_ownership_mismatch")
         check = checkpoint or _noop
@@ -554,6 +578,17 @@ class SftArtifactStore:
     ) -> dict[str, ArtifactDigest]:
         return self._verify_final(self._datasets_fd, scope, build_id, DATASET_FILES, expected)
 
+    def verify_training_job_final(
+        self,
+        scope: DepartmentScope,
+        training_job_id: UUID,
+        *,
+        expected: dict[str, object],
+    ) -> dict[str, ArtifactDigest]:
+        return self._verify_final(
+            self._jobs_fd, scope, training_job_id, TRAINING_JOB_FILES, expected
+        )
+
     def verify_retained_final(
         self,
         artifact: SftStagedArtifact,
@@ -566,7 +601,7 @@ class SftArtifactStore:
 
         if artifact.stage_fd is None or artifact.final_parent_fd is None:
             raise SftArtifactError("artifact_ownership_mismatch")
-        if allowlist not in {SOURCE_FILES, DATASET_FILES}:
+        if allowlist not in {SOURCE_FILES, DATASET_FILES, TRAINING_JOB_FILES}:
             raise SftArtifactError()
         check = checkpoint or _noop
         check()
@@ -655,9 +690,13 @@ class SftArtifactStore:
     ) -> SftFinalArtifactVerification:
         """Open an already-published final artifact without reopening at commit."""
 
-        if category not in {"source", "dataset"}:
+        if category not in {"source", "dataset", "training_job"}:
             raise SftArtifactError("artifact_ownership_mismatch")
-        root = self._sources_fd if category == "source" else self._datasets_fd
+        root = {
+            "source": self._sources_fd,
+            "dataset": self._datasets_fd,
+            "training_job": self._jobs_fd,
+        }[category]
         parent = _open_private_child(root, str(scope.value))
         directory: int | None = None
         try:
@@ -765,6 +804,22 @@ class SftArtifactStore:
             checkpoint=checkpoint,
         )
 
+    def remove_owned_training_job_stage(
+        self,
+        scope: DepartmentScope,
+        training_job_id: UUID,
+        publication_attempt_id: UUID,
+        *,
+        checkpoint: _Checkpoint | None = None,
+    ) -> bool:
+        return self._remove_stage(
+            self._staging_jobs_fd,
+            scope,
+            training_job_id,
+            publication_attempt_id,
+            checkpoint=checkpoint,
+        )
+
     def open_dataset_stage(
         self, scope: DepartmentScope, build_id: UUID, publication_attempt_id: UUID
     ) -> SftStagedArtifact:
@@ -776,6 +831,19 @@ class SftArtifactStore:
             build_id,
             publication_attempt_id,
             DATASET_FILES,
+        )
+
+    def open_training_job_stage(
+        self, scope: DepartmentScope, training_job_id: UUID, publication_attempt_id: UUID
+    ) -> SftStagedArtifact:
+        return self._open_stage(
+            self._staging_jobs_fd,
+            self._jobs_fd,
+            "training_job",
+            scope,
+            training_job_id,
+            publication_attempt_id,
+            TRAINING_JOB_FILES,
         )
 
     def remove_owned_source_final(
@@ -810,6 +878,24 @@ class SftArtifactStore:
             scope,
             build_id,
             DATASET_FILES,
+            expected,
+            checkpoint=checkpoint,
+        )
+
+    def remove_owned_training_job_final(
+        self,
+        scope: DepartmentScope,
+        training_job_id: UUID,
+        publication_attempt_id: UUID,
+        *,
+        expected: dict[str, object],
+        checkpoint: _Checkpoint | None = None,
+    ) -> bool:
+        return self._remove_final(
+            self._jobs_fd,
+            scope,
+            training_job_id,
+            TRAINING_JOB_FILES,
             expected,
             checkpoint=checkpoint,
         )
@@ -1317,7 +1403,45 @@ def _require_exact_manifest(
         "validation_example_count",
         "files",
     }
-    required = required_source if allowlist == SOURCE_FILES else required_dataset
+    required_training_job = {
+        "artifact_contract_version",
+        "manifest_contract_version",
+        "configuration_contract_version",
+        "dataset_info_contract_version",
+        "execution_profile_contract_version",
+        "department_id",
+        "training_job_id",
+        "publication_attempt_id",
+        "execution_scope_id",
+        "attempt_number",
+        "code_revision",
+        "dataset_build_id",
+        "dataset_build_version",
+        "dataset_artifact_contract_version",
+        "dataset_example_contract_version",
+        "dataset_normalization_version",
+        "dataset_split_version",
+        "dataset_manifest_sha256",
+        "train_example_count",
+        "validation_example_count",
+        "base_model_id",
+        "base_model_revision",
+        "base_model_license",
+        "llamafactory_version",
+        "profile_id",
+        "maximum_record_content_bytes",
+        "tokenizer_preflight_required",
+        "dataset_rights_attested",
+        "evaluation_contamination_reviewed",
+        "files",
+    }
+    required = (
+        required_source
+        if allowlist == SOURCE_FILES
+        else required_dataset
+        if allowlist == DATASET_FILES
+        else required_training_job
+    )
     if set(manifest) != required:
         raise SftArtifactError("artifact_ownership_mismatch")
     _require_manifest_files(manifest, allowlist, verified)

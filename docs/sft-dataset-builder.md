@@ -1,6 +1,6 @@
 # Phase 10 SFT dataset builder
 
-Phase 10 is under review. It builds private, department-scoped supervised fine-tuning dataset artifacts from immutable human-authored source bundles; it does not train a model, use LLaMA-Factory, create an adapter, or begin Phase 11 or Phase 12.
+Phase 10 is completed. It builds private, department-scoped supervised fine-tuning dataset artifacts from immutable human-authored source bundles; it does not train a model, use LlamaFactory, or create an adapter. Phase 11 consumes only explicitly approved Phase 10 dataset metadata and artifacts through its separate reviewed boundary; Phase 12 has not started.
 
 ## Source and authority contract
 

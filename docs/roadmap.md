@@ -54,13 +54,13 @@ This roadmap separates foundational safety work from product implementation. A l
 - Phase 9 merged its reviewed immutable external evaluation-suite boundary, exact production-policy reuse, deterministic retrieval and answer metrics, explicit Decimal quality gates, and content-free result publication.
 - It also merged complete ground-truth final authority, supervised worker and publication lifecycle controls, descriptor-bound artifact integrity, crash recovery, and bounded reconciliation. It adds no LLM judge, feedback-derived data, production changes, training data, or Phase 10 behavior.
 
-## Phase 10 — SFT dataset builder (current; not completed)
+## Phase 10 — SFT dataset builder (completed)
 
-- Under review: add reviewed, traceable, department-scoped supervised fine-tuning dataset generation from immutable human-authored external source bundles. The implementation has no training, adapter, model, or Phase 11 behavior.
+- Phase 10 merged reviewed, traceable, department-scoped supervised fine-tuning dataset generation from immutable human-authored external source bundles. It has no training, adapter, or model execution.
 
-## Phase 11 — LLaMA-Factory training job generation
+## Phase 11 — LLaMA-Factory training job generation (current; not completed)
 
-- Generate controlled LoRA or QLoRA job configurations without placing datasets, logs, or weights in Git.
+- Under review: generate controlled, immutable LoRA or QLoRA job bundles from one approved Phase 10 dataset, without invoking LlamaFactory, training a model, creating adapters, or placing datasets, logs, or weights in Git.
 
 ## Phase 12 — LoRA adapter registry
 

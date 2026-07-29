@@ -147,6 +147,10 @@ Phase 9 final suite files are exactly `manifest.json` and `cases.jsonl`; final r
 
 Phase 10 source bundles and final dataset artifacts live only under `DEPTSLM_DATA_DIR/training_datasets`, never in the checkout. Source bundles are exactly `manifest.json` and `examples.jsonl`; final builds are exactly `manifest.json`, `train.jsonl`, `validation.jsonl`, and `provenance.jsonl`. Directories are UUID-derived and private; regular files are private, no-follow, and hard-link resistant. Leased dataset publication retains the exact stage directory and file descriptors across separately bounded staged verification, marker removal, rename/durability, and post-rename digest verification; only the final short metadata transaction follows. No phase reopens a previously authorized path or hashes payload files while final PostgreSQL locks are held. The API never mounts `training_datasets`; only the isolated dataset-builder worker may mount it read-write.
 
+## Phase 11 training-job bundles
+
+Phase 11 writes only private job bundles below `DEPTSLM_DATA_DIR/training_datasets/jobs/<department UUID>/<training job UUID>`. A final bundle contains exactly `manifest.json`, `training.yaml`, `dataset_info.json`, `train.jsonl`, and `validation.jsonl`; staging adds only the private marker. The API never mounts this directory. The isolated bundle worker verifies and copies an approved Phase 10 dataset through descriptors; it does not execute the configuration or mount `model_cache`, `adapters`, logs, or model outputs. Generated job bundles, like all runtime data, are never committed to Git.
+
 Instructions, target responses, source chunk identifiers, paths, and manifests are contentful external data. PostgreSQL keeps no such content and public APIs do not disclose it. Reconciliation and purge are explicit, department-scoped, dry-run by default, bounded, and do not claim backup deletion. Google Drive remains external development storage, not a production object store or backup.
 
 ## Google Drive limitations

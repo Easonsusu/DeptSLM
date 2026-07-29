@@ -30,6 +30,10 @@ erDiagram
 - `departments`: UUID department with a unique canonical lowercase slug, display name, lifecycle status, and version. Slugs are immutable through Phase 3 APIs.
 - `memberships`: unique `(user_id, department_id)` assignment with one reviewed role, lifecycle status, optional expiry, creator, and version. Security foreign keys use `RESTRICT`, not cascading deletion.
 - `audit_events`: append-only application interface for safe mutation metadata. It intentionally has no token, secret, request body, document, training content, or database URL fields.
+
+## Phase 11 training-job metadata
+
+`training_jobs`, `training_job_attempts`, and bounded artifact-operation rows record department scope, the exact Phase 10 dataset snapshot, fixed LlamaFactory/model/profile contracts, lifecycle, review state, execution ownership, content-free file digests and counts, and retention cleanup state. They contain no dataset records, configuration bytes, source identifiers, artifact paths, model outputs, adapters, logs, tokens, or credentials. Composite department constraints keep attempts and cleanup operations scoped to the same job department.
 - `documents`: department-owned source metadata with an internal uploader relation, normalized filename, canonical media type, positive size, SHA-256 digest, lifecycle state, version, and timestamps. It stores no body or path, and public document schemas do not expose internal identity IDs; see [document-model.md](document-model.md).
 - `document_extractions`: immutable attempt history and PostgreSQL queue state, including source/pipeline identity, claim lease, safe result metadata, and an allowlisted error code. It stores no content, path, filename, stderr, or exception.
 - `document_chunks`: department/document/extraction-scoped offsets, byte size, internal digest, and mutually exclusive page/line provenance. Chunk text remains external.

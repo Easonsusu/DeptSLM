@@ -33,6 +33,13 @@ from app.sft_services import (
     SftImportSettings,
     import_sft_source,
 )
+from app.training_job_maintenance import (
+    TrainingJobMaintenanceConfigurationError,
+    TrainingJobMaintenanceSettings,
+    archive_training_job,
+    purge_training_job_artifacts,
+    reconcile_training_job_artifacts,
+)
 
 SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -145,6 +152,24 @@ def _parser() -> argparse.ArgumentParser:
     sft_purge.add_argument("--actor-subject", required=True)
     sft_purge.add_argument("--limit", type=_purge_limit, default=500)
     sft_purge.add_argument("--apply", action="store_true")
+    training_archive = commands.add_parser("archive-training-job")
+    training_archive.add_argument("--department-id", required=True, type=_nonzero_uuid)
+    training_archive.add_argument("--training-job-id", required=True, type=_nonzero_uuid)
+    training_archive.add_argument("--actor-issuer", required=True)
+    training_archive.add_argument("--actor-subject", required=True)
+    training_archive.add_argument("--apply", action="store_true")
+    training_reconcile = commands.add_parser("reconcile-training-job-artifacts")
+    training_reconcile.add_argument("--department-id", required=True, type=_nonzero_uuid)
+    training_reconcile.add_argument("--actor-issuer", required=True)
+    training_reconcile.add_argument("--actor-subject", required=True)
+    training_reconcile.add_argument("--limit", type=_purge_limit, default=500)
+    training_reconcile.add_argument("--apply", action="store_true")
+    training_purge = commands.add_parser("purge-training-job-artifacts")
+    training_purge.add_argument("--department-id", required=True, type=_nonzero_uuid)
+    training_purge.add_argument("--actor-issuer", required=True)
+    training_purge.add_argument("--actor-subject", required=True)
+    training_purge.add_argument("--limit", type=_purge_limit, default=500)
+    training_purge.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -248,6 +273,57 @@ def main(argv: list[str] | None = None) -> int:
                 f"blocked: {result.blocked_count}."
             )
             return 0
+        if args.command in {
+            "archive-training-job",
+            "reconcile-training-job-artifacts",
+            "purge-training-job-artifacts",
+        }:
+            settings = TrainingJobMaintenanceSettings.from_environment()
+            engine = create_database_engine(settings.database_url)
+            factory = create_session_factory(engine)
+            try:
+                if args.command == "archive-training-job":
+                    applied = archive_training_job(
+                        factory,
+                        department_id=args.department_id,
+                        training_job_id=args.training_job_id,
+                        actor_issuer=args.actor_issuer,
+                        actor_subject=args.actor_subject,
+                        apply=args.apply,
+                    )
+                    print(
+                        "Archived training job." if applied else "Validated training-job archive."
+                    )
+                    return 0
+                if args.command == "reconcile-training-job-artifacts":
+                    result = reconcile_training_job_artifacts(
+                        factory,
+                        data_dir=settings.data_dir,
+                        department_id=args.department_id,
+                        actor_issuer=args.actor_issuer,
+                        actor_subject=args.actor_subject,
+                        limit=args.limit,
+                        apply=args.apply,
+                    )
+                else:
+                    result = purge_training_job_artifacts(
+                        factory,
+                        data_dir=settings.data_dir,
+                        department_id=args.department_id,
+                        actor_issuer=args.actor_issuer,
+                        actor_subject=args.actor_subject,
+                        retention_days=settings.retention_days,
+                        limit=args.limit,
+                        apply=args.apply,
+                    )
+            finally:
+                engine.dispose()
+            print(
+                "Eligible: "
+                f"{result.eligible_count}; applied: {result.applied_count}; "
+                f"blocked: {result.blocked_count}."
+            )
+            return 0
         settings = FeedbackPurgeSettings.from_environment()
         result = purge_rag_feedback(
             settings,
@@ -263,6 +339,7 @@ def main(argv: list[str] | None = None) -> int:
         FeedbackPurgeConfigurationError,
         SftImportConfigurationError,
         SftMaintenanceConfigurationError,
+        TrainingJobMaintenanceConfigurationError,
         ServiceError,
     ) as error:
         print(str(error), file=sys.stderr)

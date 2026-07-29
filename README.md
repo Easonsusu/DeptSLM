@@ -4,19 +4,26 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 
 > **Phase 9 status:** Completed. The merged department-scoped evaluation runner imports immutable external suites through verified descriptors, reuses the exact Phase 7 production policy in killable leased workers, computes deterministic metrics and explicit Decimal gates, and publishes content-free numeric results only after final all-source authority checks. Phase 8 feedback remains separate from evaluation ground truth.
 
-> **Phase 10 status:** Under review. It adds a department-scoped builder for
+> **Phase 10 status:** Completed. It added a department-scoped builder for
 > human-authored supervised fine-tuning dataset artifacts. Source examples and
 > resulting datasets remain private external files; PostgreSQL and public APIs
 > expose metadata only. PostgreSQL intentionally stores closed, content-free
 > ownership manifests for exact attempt-scoped cleanup, never source content,
 > source references, artifact paths, or dataset bytes. It does not train
-> models, create adapters, or begin Phase 11 or Phase 12 work. Import first
+> models or create adapters. Import first
 > completes a short lock-taking authorization transaction, then captures
 > authority in a repeatable-read, read-only, lock-free batch scan; final
 > publication reauthorizes and repeats the exact selector scan under locks.
 > Leased dataset publication gives independent deadlines to staged verification,
 > marker transition, rename/durability, post-rename verification, and final
 > metadata commit.
+
+> **Phase 11 status:** Under review. It generates reviewable, department-scoped
+> LlamaFactory 0.9.5 LoRA or QLoRA job bundles from one approved Phase 10
+> dataset. It copies only verified dataset bytes into private external bundle
+> storage and publishes content-free metadata. It never installs or invokes
+> LlamaFactory, loads a tokenizer or model, executes training, writes adapters,
+> or begins Phase 12.
 
 Each evaluation publication has a server-generated attempt UUID and a positive run attempt number. Final suite/result manifests are closed schemas and removal requires descriptor-verified exact department, resource, ownership UUID, run attempt, code revision, payload digests, and sizes. Staging has a separate private UUID-path ownership contract so a supervised child killed during directory or payload creation can be removed without parsing partial content. The exact descriptor chain is opened once through deletion; a staging marker is housekeeping only, so missing, zero-byte, truncated, or partial marker states remain recoverable. Reconciliation registers a resumable content-free batch before deletion. Unsafe entries terminalize as fixed-code blocked items and cannot starve later valid items; completed batches write one audit only when deletion succeeded. It is dry-run by default, department-scoped, restricted to system or department administrators, and accepts a strict limit of 1 through 1000. PostgreSQL and external storage are not transactionally atomic: an orphaned external result after a crash is never retrieval or evaluation authority. Reconciliation does not delete backups or persistent audit history.
 
@@ -48,7 +55,8 @@ DeptSLM/
 ├── services/
 │   ├── rag-worker/           # Extraction plus isolated Phase 6 indexing paths
 │   ├── rag-runtime/          # Private supervised Phase 7 model runtime
-│   └── training-worker/      # Future fine-tuning jobs
+│   ├── training-worker/      # Phase 10 dataset builder
+│   └── training-job-worker/  # Phase 11 bundle generator only
 ├── packages/
 │   └── shared/               # Future shared contracts and utilities
 ├── data/
