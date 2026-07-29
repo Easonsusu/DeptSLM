@@ -898,8 +898,12 @@ def _remove_bound_tombstones(
                     operation_id=operation_id,
                     step=step,
                 )
-        except SftArtifactError as error:
-            outcomes[key] = (False, _blocked_reason(error))
+        except SftArtifactError:
+            # After the identity has been committed, no cleanup error may
+            # terminalize the reservation. It may represent a post-unlink
+            # crash, descriptor churn, or a transient filesystem failure; the
+            # exact bound surface must remain fenced for recovery.
+            outcomes[key] = (False, "final_deletion_recovery_required")
         if key in outcomes and not outcomes[key][0]:
             # Do not spin on a substituted, partial, or otherwise unsafe
             # bound surface.  The reservation intentionally remains active.

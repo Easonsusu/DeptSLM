@@ -367,7 +367,8 @@ def test_phase11_approved_dataset_claims_with_exact_live_lease(engine) -> None:
     factory = sessionmaker(engine)
     with factory.begin() as session:
         department, identity, dataset = _approved_dataset(session)
-        job = _enqueue(session, department, identity, dataset)
+        code_revision = _unique_code_revision()
+        job = _enqueue(session, department, identity, dataset, code_revision=code_revision)
         job_id = job.id
         expected_snapshot = (
             dataset.source_bundle_id,
@@ -375,7 +376,7 @@ def test_phase11_approved_dataset_claims_with_exact_live_lease(engine) -> None:
             dataset.train_sha256,
             dataset.source_reference_count,
         )
-    claim = claim_next(factory, uuid4(), 30, "a" * 40)
+    claim = claim_next(factory, uuid4(), 30, code_revision)
     assert claim is not None and claim.id == job_id
     assert (
         claim.dataset_source_bundle_id == expected_snapshot[0]
@@ -673,14 +674,15 @@ def test_phase11_stage_only_reconciliation_confirms_exact_attempt(engine, tmp_pa
     factory = sessionmaker(engine)
     with factory.begin() as session:
         department, identity, dataset = _approved_dataset(session)
-        job = _enqueue(session, department, identity, dataset)
+        code_revision = _unique_code_revision()
+        job = _enqueue(session, department, identity, dataset, code_revision=code_revision)
         department_id, issuer, subject, job_id = (
             department.id,
             identity.issuer,
             identity.subject,
             job.id,
         )
-    claim = claim_next(factory, uuid4(), 30, "a" * 40)
+    claim = claim_next(factory, uuid4(), 30, code_revision)
     assert claim is not None and claim.id == job_id
     root = tmp_path / "runtime"
     (root / "training_datasets").mkdir(parents=True, mode=0o700)
