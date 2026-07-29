@@ -27,10 +27,13 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > or begins Phase 12.
 
 > **Phase 11 hardening:** A job captures a complete, content-free approved
-> Phase 10 authority snapshot. Purge first commits a durable job-level
-> reservation and rechecks it before exact external-artifact deletion; review
-> changes are rejected while that reservation is active. This remains a draft
-> review boundary, not training execution.
+> Phase 10 authority snapshot. Each succeeded job has one validated
+> authoritative final bundle owner; purge cleans historical attempt stages
+> first, then commits final-deletion authorization before touching that one
+> final surface. Blocked prerequisite cleanup leaves the final intact, and
+> deletion-authorized crashes recover idempotently. Review changes are rejected
+> while a reservation is active. This remains a draft review boundary, not
+> training execution.
 
 Each evaluation publication has a server-generated attempt UUID and a positive run attempt number. Final suite/result manifests are closed schemas and removal requires descriptor-verified exact department, resource, ownership UUID, run attempt, code revision, payload digests, and sizes. Staging has a separate private UUID-path ownership contract so a supervised child killed during directory or payload creation can be removed without parsing partial content. The exact descriptor chain is opened once through deletion; a staging marker is housekeeping only, so missing, zero-byte, truncated, or partial marker states remain recoverable. Reconciliation registers a resumable content-free batch before deletion. Unsafe entries terminalize as fixed-code blocked items and cannot starve later valid items; completed batches write one audit only when deletion succeeded. It is dry-run by default, department-scoped, restricted to system or department administrators, and accepts a strict limit of 1 through 1000. PostgreSQL and external storage are not transactionally atomic: an orphaned external result after a crash is never retrieval or evaluation authority. Reconciliation does not delete backups or persistent audit history.
 

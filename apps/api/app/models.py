@@ -2253,10 +2253,13 @@ class TrainingJob(Base):
             "(status = 'succeeded' AND review_status IN "
             "('pending','approved','rejected','archived','purged') "
             "AND finished_at IS NOT NULL AND train_example_count > 0 "
-            "AND validation_example_count > 0 "
+            "AND validation_example_count > 0 AND publication_attempt_id IS NOT NULL "
+            "AND publication_manifest IS NOT NULL AND json_typeof(publication_manifest) = 'object' "
             "AND result_manifest_sha256 IS NOT NULL AND training_config_sha256 IS NOT NULL "
-            "AND dataset_info_sha256 IS NOT NULL AND train_sha256 IS NOT NULL "
-            "AND validation_sha256 IS NOT NULL "
+            "AND training_config_byte_size > 0 AND dataset_info_sha256 IS NOT NULL "
+            "AND dataset_info_byte_size > 0 AND train_sha256 IS NOT NULL "
+            "AND train_byte_size > 0 AND validation_sha256 IS NOT NULL "
+            "AND validation_byte_size > 0 "
             "AND error_code IS NULL) OR status <> 'succeeded'",
             name="ck_training_job_succeeded_lifecycle",
         ),
@@ -2380,9 +2383,13 @@ class TrainingJobAttempt(Base):
             "(status = 'registered' AND claimed_at IS NULL AND finished_at IS NULL) OR "
             "(status = 'running' AND claimed_at IS NOT NULL AND finished_at IS NULL) OR "
             "(status = 'staged' AND claimed_at IS NOT NULL AND staged_at IS NOT NULL "
+            "AND ownership_manifest IS NOT NULL AND finished_at IS NULL) OR "
+            "(status = 'published' AND claimed_at IS NOT NULL AND staged_at IS NOT NULL "
+            "AND published_at IS NOT NULL AND ownership_manifest IS NOT NULL "
             "AND finished_at IS NULL) OR "
-            "(status = 'published' AND published_at IS NOT NULL AND finished_at IS NULL) OR "
-            "(status = 'succeeded' AND published_at IS NOT NULL AND finished_at IS NOT NULL) OR "
+            "(status = 'succeeded' AND claimed_at IS NOT NULL AND staged_at IS NOT NULL "
+            "AND published_at IS NOT NULL AND ownership_manifest IS NOT NULL "
+            "AND finished_at IS NOT NULL) OR "
             "(status IN ('failed','cancelled','reclaimed') AND finished_at IS NOT NULL)",
             name="ck_training_job_attempt_lifecycle",
         ),
@@ -2495,7 +2502,7 @@ class TrainingJobPurgeReservation(Base):
             "AND terminalized_at IS NULL) "
             "OR (status = 'deletion_authorized' AND deletion_authorized_at IS NOT NULL "
             "AND terminalized_at IS NULL) OR (status = 'terminalized' "
-            "AND deletion_authorized_at IS NOT NULL AND terminalized_at IS NOT NULL)",
+            "AND terminalized_at IS NOT NULL)",
             name="ck_training_job_purge_reservation_lifecycle",
         ),
         UniqueConstraint(

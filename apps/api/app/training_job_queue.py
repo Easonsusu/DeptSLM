@@ -116,17 +116,29 @@ class _Lease:
         self.should_stop = should_stop
         self.last_heartbeat = 0.0
 
-    def __call__(self) -> None:
+    def _local_check(self) -> None:
         if self.should_stop():
             raise TrainingJobQueueError("worker_shutdown")
         if time.monotonic() >= self.deadline:
             raise TrainingJobQueueError("worker_timeout")
+
+    def __call__(self) -> None:
+        self._local_check()
         if time.monotonic() >= self.last_heartbeat + max(0.1, self.lease_seconds / 3):
             renew_lease(self.factory, self.job, self.lease_seconds)
             self.last_heartbeat = time.monotonic()
 
-    def final_check(self) -> None:
-        self()
+    def renew_before_final_transaction(self) -> None:
+        """Renew once before final locking; never from inside that transaction."""
+
+        self._local_check()
+        renew_lease(self.factory, self.job, self.lease_seconds)
+        self.last_heartbeat = time.monotonic()
+
+    def final_transaction_check(self) -> None:
+        """No-I/O shutdown/deadline check for the already-open final transaction."""
+
+        self._local_check()
 
 
 def claim_next(
@@ -347,16 +359,17 @@ def process_training_job(
     preverified = None
     final: SftFinalArtifactVerification | None = None
 
+    lease_guard = _Lease(
+        factory,
+        job,
+        lease_seconds=lease_seconds,
+        operation_seconds=operation_seconds,
+        should_stop=should_stop,
+    )
+
     def guard() -> _Lease:
-        value = _Lease(
-            factory,
-            job,
-            lease_seconds=lease_seconds,
-            operation_seconds=operation_seconds,
-            should_stop=should_stop,
-        )
-        value()
-        return value
+        lease_guard()
+        return lease_guard
 
     try:
         if job.stale_publication_attempt_id is not None:
@@ -419,8 +432,6 @@ def process_training_job(
             preverified = None
             post_guard()
             _mark_attempt_published(factory, job)
-            renew_lease(factory, job, lease_seconds)
-            finalize_guard = guard()
             _complete(
                 factory,
                 job,
@@ -429,8 +440,7 @@ def process_training_job(
                 manifest,
                 train_count,
                 validation_count,
-                finalize_guard,
-                lease_seconds,
+                lease_guard,
             )
     except TrainingJobQueueError as error:
         _fail_or_cancel(factory, job, error.code)
@@ -634,11 +644,14 @@ def _complete(
     train_count: int,
     validation_count: int,
     guard: _Lease,
-    lease_seconds: int,
 ) -> None:
     try:
         files = dict(final.files)
+        # This is the last renewable parent-operation checkpoint. The final
+        # transaction itself must never open another connection to renew.
+        guard.renew_before_final_transaction()
         with factory.begin() as session:
+            guard.final_transaction_check()
             row = session.execute(
                 select(TrainingJob).where(*_owned(job), _live()).with_for_update()
             ).scalar_one_or_none()
@@ -690,7 +703,7 @@ def _complete(
                 raise TrainingJobQueueError("dataset_authority_changed")
             if row.publication_manifest != manifest or attempt.ownership_manifest != manifest:
                 raise TrainingJobQueueError("training_job_publication_failed")
-            guard.final_check()
+            guard.final_transaction_check()
             now = session.scalar(select(func.clock_timestamp()))
             if row.lease_expires_at is None or row.lease_expires_at <= now:
                 raise TrainingJobQueueError("claim_lost")

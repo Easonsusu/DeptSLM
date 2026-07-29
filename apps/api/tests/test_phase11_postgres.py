@@ -13,9 +13,11 @@ from uuid import uuid4
 import pytest
 from alembic.config import Config
 from sqlalchemy import inspect, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from alembic import command
+from app import training_job_maintenance
 from app.auth import AuthenticatedPrincipal
 from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.database import create_database_engine
@@ -27,7 +29,10 @@ from app.models import (
     SftDatasetBuild,
     SftSourceBundle,
     TrainingJob,
+    TrainingJobArtifactOperation,
+    TrainingJobArtifactOperationItem,
     TrainingJobAttempt,
+    TrainingJobPurgeReservation,
     UserIdentity,
 )
 from app.schemas import TrainingJobCreateRequest
@@ -324,6 +329,20 @@ def _publish_private_dataset(root: Path, department: Department, dataset: SftDat
         ).close()
 
 
+def _succeeded_training_job(factory, root: Path):
+    """Build the minimal real Phase 10/11 artifact path for purge tests."""
+
+    with factory.begin() as session:
+        department, identity, dataset = _approved_dataset(session)
+        _publish_private_dataset(root, department, dataset)
+        job = _enqueue(session, department, identity, dataset)
+        values = department.id, identity.issuer, identity.subject, job.id
+    claim = claim_next(factory, uuid4(), 30, "a" * 40)
+    assert claim is not None and claim.id == values[3]
+    process_training_job(factory, root, claim, lease_seconds=30, operation_seconds=20)
+    return values
+
+
 def test_phase11_approved_dataset_claims_with_exact_live_lease(engine) -> None:
     factory = sessionmaker(engine)
     with factory.begin() as session:
@@ -499,44 +518,28 @@ def test_phase11_source_bundle_snapshot_drift_fails_before_artifact_open(engine)
         _load_eligible_dataset(factory, claim, lambda: None)  # type: ignore[arg-type]
 
 
-def test_phase11_active_purge_reservation_fences_review_and_archive(engine) -> None:
+def test_phase11_active_purge_reservation_fences_review_and_archive(engine, tmp_path: Path) -> None:
     factory = sessionmaker(engine)
+    root = tmp_path / "runtime"
     with factory.begin() as session:
         department, identity, dataset = _approved_dataset(session)
+        _publish_private_dataset(root, department, dataset)
         job = _enqueue(session, department, identity, dataset)
-        now = datetime.now(UTC)
-        job.status = "succeeded"
-        job.review_status = "rejected"
-        job.finished_at = now
-        job.reviewed_at = now - timedelta(days=31)
-        job.train_example_count = job.validation_example_count = 1
-        job.result_manifest_sha256 = "1" * 64
-        job.training_config_sha256 = "2" * 64
-        job.training_config_byte_size = 1
-        job.dataset_info_sha256 = "3" * 64
-        job.dataset_info_byte_size = 1
-        job.train_sha256 = "4" * 64
-        job.train_byte_size = 1
-        job.validation_sha256 = "5" * 64
-        job.validation_byte_size = 1
-        session.add(
-            TrainingJobAttempt(
-                department_id=department.id,
-                training_job_id=job.id,
-                attempt_number=1,
-                publication_attempt_id=uuid4(),
-                code_revision=job.code_revision,
-                status="succeeded",
-                published_at=now,
-                finished_at=now,
-            )
-        )
         department_id, issuer, subject, job_id = (
             department.id,
             identity.issuer,
             identity.subject,
             job.id,
         )
+    claim = claim_next(factory, uuid4(), 30, "a" * 40)
+    assert claim is not None and claim.id == job_id
+    process_training_job(factory, root, claim, lease_seconds=30, operation_seconds=20)
+    with factory.begin() as session:
+        job = session.get(TrainingJob, job_id)
+        assert job is not None and job.status == "succeeded"
+        job.review_status = "rejected"
+        job.reviewed_at = datetime.now(UTC) - timedelta(days=31)
+        job.version += 1
     operation_id, _candidates = _register_candidates(
         factory,
         department_id=department_id,
@@ -571,6 +574,75 @@ def test_phase11_active_purge_reservation_fences_review_and_archive(engine) -> N
             actor_subject=subject,
             apply=True,
         )
+
+
+def test_phase11_empty_purge_is_a_repeatable_successful_noop(engine, tmp_path: Path) -> None:
+    factory = sessionmaker(engine)
+    with factory.begin() as session:
+        department, identity, _dataset = _approved_dataset(session)
+        department_id, issuer, subject = department.id, identity.issuer, identity.subject
+    root = tmp_path / "runtime"
+    (root / "training_datasets").mkdir(parents=True, mode=0o700)
+    for _ in range(2):
+        result = purge_training_job_artifacts(
+            factory,
+            data_dir=root,
+            department_id=department_id,
+            actor_issuer=issuer,
+            actor_subject=subject,
+            retention_days=30,
+            limit=1,
+            apply=True,
+        )
+        assert (result.eligible_count, result.applied_count, result.blocked_count) == (0, 0, 0)
+    with factory() as session:
+        assert (
+            session.query(TrainingJobArtifactOperation)
+            .filter(
+                TrainingJobArtifactOperation.department_id == department_id,
+                TrainingJobArtifactOperation.operation_type == "purge",
+            )
+            .count()
+            == 0
+        )
+
+
+def test_phase11_legacy_empty_registered_purge_operation_cannot_wedge_maintenance(
+    engine, tmp_path: Path
+) -> None:
+    """A legacy empty operation closes safely before a fresh purge is considered."""
+
+    factory = sessionmaker(engine)
+    root = tmp_path / "runtime"
+    with factory.begin() as session:
+        department, identity, _dataset = _approved_dataset(session)
+        operation = TrainingJobArtifactOperation(
+            department_id=department.id,
+            requested_by_user_id=identity.id,
+            limit_value=1,
+            retention_days=30,
+            operation_type="purge",
+            status="registered",
+        )
+        session.add(operation)
+        session.flush()
+        operation_id = operation.id
+        department_id, issuer, subject = department.id, identity.issuer, identity.subject
+    (root / "training_datasets").mkdir(parents=True, mode=0o700)
+    result = purge_training_job_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department_id,
+        actor_issuer=issuer,
+        actor_subject=subject,
+        retention_days=30,
+        limit=1,
+        apply=True,
+    )
+    assert (result.eligible_count, result.applied_count, result.blocked_count) == (0, 0, 0)
+    with factory() as session:
+        operation = session.get(TrainingJobArtifactOperation, operation_id)
+        assert operation is not None and operation.status == "completed"
 
 
 def test_phase11_stage_only_reconciliation_confirms_exact_attempt(engine, tmp_path: Path) -> None:
@@ -626,55 +698,62 @@ def test_phase11_stage_only_reconciliation_confirms_exact_attempt(engine, tmp_pa
         )
 
 
-def test_phase11_purge_selects_one_job_and_all_of_its_terminal_attempts(
+def test_phase11_blocked_historical_stage_leaves_authoritative_final_intact(
     engine, tmp_path: Path
 ) -> None:
-    """The purge limit applies to jobs, never an arbitrary attempt subset."""
-
     factory = sessionmaker(engine)
+    root = tmp_path / "runtime"
     with factory.begin() as session:
         department, identity, dataset = _approved_dataset(session)
+        _publish_private_dataset(root, department, dataset)
         job = _enqueue(session, department, identity, dataset)
-        now = datetime.now(UTC)
-        job.status = "succeeded"
-        job.review_status = "rejected"
-        job.finished_at = now
-        job.reviewed_at = now - timedelta(days=31)
-        job.train_example_count = 1
-        job.validation_example_count = 1
-        job.result_manifest_sha256 = "1" * 64
-        job.training_config_sha256 = "2" * 64
-        job.training_config_byte_size = 1
-        job.dataset_info_sha256 = "3" * 64
-        job.dataset_info_byte_size = 1
-        job.train_sha256 = "4" * 64
-        job.train_byte_size = 1
-        job.validation_sha256 = "5" * 64
-        job.validation_byte_size = 1
-        job.worker_id = job.claim_token = job.lease_expires_at = None
-        attempts = []
-        for number in (1, 2):
-            attempts.append(
-                TrainingJobAttempt(
-                    department_id=department.id,
-                    training_job_id=job.id,
-                    attempt_number=number,
-                    publication_attempt_id=uuid4(),
-                    code_revision=job.code_revision,
-                    status="succeeded",
-                    published_at=now,
-                    finished_at=now,
-                )
-            )
-        session.add_all(attempts)
         department_id, issuer, subject, job_id = (
             department.id,
             identity.issuer,
             identity.subject,
             job.id,
         )
-    root = tmp_path / "runtime"
-    (root / "training_datasets").mkdir(parents=True, mode=0o700)
+    claim = claim_next(factory, uuid4(), 30, "a" * 40)
+    assert claim is not None and claim.id == job_id
+    process_training_job(factory, root, claim, lease_seconds=30, operation_seconds=20)
+    historical_attempt_id = uuid4()
+    with factory.begin() as session:
+        job = session.get(TrainingJob, job_id)
+        assert job is not None and isinstance(job.publication_manifest, dict)
+        historical_manifest = dict(job.publication_manifest)
+        historical_manifest["publication_attempt_id"] = str(historical_attempt_id)
+        historical_manifest["attempt_number"] = 2
+        session.add(
+            TrainingJobAttempt(
+                department_id=department_id,
+                training_job_id=job_id,
+                attempt_number=2,
+                publication_attempt_id=historical_attempt_id,
+                code_revision=job.code_revision,
+                status="reclaimed",
+                ownership_manifest=historical_manifest,
+                finished_at=datetime.now(UTC),
+            )
+        )
+        job.review_status = "archived"
+        job.archived_at = datetime.now(UTC) - timedelta(days=31)
+        job.version += 1
+        expected = dict(job.publication_manifest)
+    with SftArtifactStore(root) as store:
+        stage = store.prepare_training_job_stage(
+            DepartmentScope(department_id), job_id, historical_attempt_id
+        )
+        stage.close()
+    stage_path = (
+        root
+        / "training_datasets"
+        / "staging"
+        / "jobs"
+        / str(department_id)
+        / str(job_id)
+        / str(historical_attempt_id)
+    )
+    os.symlink("unexpected", stage_path / "unsafe")
 
     result = purge_training_job_artifacts(
         factory,
@@ -686,7 +765,83 @@ def test_phase11_purge_selects_one_job_and_all_of_its_terminal_attempts(
         limit=1,
         apply=True,
     )
-    assert (result.eligible_count, result.applied_count, result.blocked_count) == (2, 2, 0)
+    assert result.blocked_count == 1
+    with SftArtifactStore(root) as store:
+        assert store.verify_training_job_final(
+            DepartmentScope(department_id), job_id, expected=expected
+        )
+    with factory() as session:
+        job = session.get(TrainingJob, job_id)
+        reservation = session.scalar(
+            select(TrainingJobPurgeReservation).where(
+                TrainingJobPurgeReservation.training_job_id == job_id
+            )
+        )
+        assert job is not None and job.review_status == "archived" and job.purged_at is None
+        assert reservation is not None and reservation.status == "terminalized"
+
+
+def test_phase11_purge_has_one_authoritative_final_and_historical_stage_only(
+    engine, tmp_path: Path
+) -> None:
+    """Historical manifests never authorize a second physical final deletion."""
+
+    factory = sessionmaker(engine)
+    root = tmp_path / "runtime"
+    with factory.begin() as session:
+        department, identity, dataset = _approved_dataset(session)
+        _publish_private_dataset(root, department, dataset)
+        job = _enqueue(session, department, identity, dataset)
+        department_id, issuer, subject, job_id = (
+            department.id,
+            identity.issuer,
+            identity.subject,
+            job.id,
+        )
+    claim = claim_next(factory, uuid4(), 30, "a" * 40)
+    assert claim is not None and claim.id == job_id
+    process_training_job(factory, root, claim, lease_seconds=30, operation_seconds=20)
+    historical_attempt_id = uuid4()
+    with factory.begin() as session:
+        job = session.get(TrainingJob, job_id)
+        assert job is not None and isinstance(job.publication_manifest, dict)
+        historical_manifest = dict(job.publication_manifest)
+        historical_manifest["publication_attempt_id"] = str(historical_attempt_id)
+        historical_manifest["attempt_number"] = 2
+        session.add(
+            TrainingJobAttempt(
+                department_id=department_id,
+                training_job_id=job_id,
+                attempt_number=2,
+                publication_attempt_id=historical_attempt_id,
+                code_revision=job.code_revision,
+                status="reclaimed",
+                ownership_manifest=historical_manifest,
+                finished_at=datetime.now(UTC),
+            )
+        )
+        job.review_status = "rejected"
+        job.reviewed_at = datetime.now(UTC) - timedelta(days=31)
+        job.version += 1
+        authoritative_attempt_id = job.publication_attempt_id
+        authoritative_manifest = dict(job.publication_manifest)
+    with SftArtifactStore(root) as store:
+        historical_stage = store.prepare_training_job_stage(
+            DepartmentScope(department_id), job_id, historical_attempt_id
+        )
+        historical_stage.close()
+
+    result = purge_training_job_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department_id,
+        actor_issuer=issuer,
+        actor_subject=subject,
+        retention_days=30,
+        limit=1,
+        apply=True,
+    )
+    assert (result.eligible_count, result.applied_count, result.blocked_count) == (3, 3, 0)
     with factory() as session:
         job = session.get(TrainingJob, job_id)
         attempts = session.scalars(
@@ -698,6 +853,15 @@ def test_phase11_purge_selects_one_job_and_all_of_its_terminal_attempts(
         assert len(attempts) == 2 and all(
             item.cleanup_confirmed_at is not None for item in attempts
         )
+        items = session.scalars(
+            select(TrainingJobArtifactOperationItem).where(
+                TrainingJobArtifactOperationItem.training_job_id == job_id,
+                TrainingJobArtifactOperationItem.resource_surface == "final",
+            )
+        ).all()
+        assert len(items) == 1
+        assert items[0].publication_attempt_id == authoritative_attempt_id
+        assert items[0].ownership_manifest == authoritative_manifest
         assert (
             session.query(PersistentAuditEvent)
             .filter(
@@ -707,3 +871,197 @@ def test_phase11_purge_selects_one_job_and_all_of_its_terminal_attempts(
             .count()
             == 1
         )
+
+
+def test_phase11_purge_recovers_after_final_deletion_before_database_commit(
+    engine, tmp_path: Path, monkeypatch
+) -> None:
+    """A committed authorization makes an absent final idempotent on retry."""
+
+    factory = sessionmaker(engine)
+    root = tmp_path / "runtime"
+    department_id, issuer, subject, job_id = _succeeded_training_job(factory, root)
+    with factory.begin() as session:
+        job = session.get(TrainingJob, job_id)
+        assert job is not None
+        job.review_status = "rejected"
+        job.reviewed_at = datetime.now(UTC) - timedelta(days=31)
+        job.version += 1
+
+    original = training_job_maintenance._persist_purge_final_outcomes
+
+    def database_finalization_failure(*_args, **_kwargs) -> None:
+        raise ServiceError(503, "Database unavailable")
+
+    monkeypatch.setattr(
+        training_job_maintenance,
+        "_persist_purge_final_outcomes",
+        database_finalization_failure,
+    )
+    with pytest.raises(ServiceError, match="Database unavailable"):
+        purge_training_job_artifacts(
+            factory,
+            data_dir=root,
+            department_id=department_id,
+            actor_issuer=issuer,
+            actor_subject=subject,
+            retention_days=30,
+            limit=1,
+            apply=True,
+        )
+    with factory() as session:
+        reservation = session.scalar(
+            select(TrainingJobPurgeReservation).where(
+                TrainingJobPurgeReservation.training_job_id == job_id
+            )
+        )
+        assert reservation is not None and reservation.status == "deletion_authorized"
+    monkeypatch.setattr(training_job_maintenance, "_persist_purge_final_outcomes", original)
+    result = purge_training_job_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department_id,
+        actor_issuer=issuer,
+        actor_subject=subject,
+        retention_days=30,
+        limit=1,
+        apply=True,
+    )
+    assert (result.eligible_count, result.applied_count, result.blocked_count) == (1, 1, 0)
+    with factory() as session:
+        job = session.get(TrainingJob, job_id)
+        assert job is not None and job.review_status == "purged" and job.purged_at is not None
+        assert (
+            session.query(PersistentAuditEvent)
+            .filter(
+                PersistentAuditEvent.department_id == department_id,
+                PersistentAuditEvent.action == "training.job.purge",
+            )
+            .count()
+            == 1
+        )
+
+
+def test_phase11_purge_never_deletes_final_before_stage_outcomes_are_committed(
+    engine, tmp_path: Path, monkeypatch
+) -> None:
+    """A failure before final authorization leaves the current final untouched."""
+
+    factory = sessionmaker(engine)
+    root = tmp_path / "runtime"
+    department_id, issuer, subject, job_id = _succeeded_training_job(factory, root)
+    with factory.begin() as session:
+        job = session.get(TrainingJob, job_id)
+        assert job is not None and isinstance(job.publication_manifest, dict)
+        expected = dict(job.publication_manifest)
+        job.review_status = "archived"
+        job.archived_at = datetime.now(UTC) - timedelta(days=31)
+        job.version += 1
+
+    original = training_job_maintenance._authorize_final_deletion
+
+    def authorization_failure(*_args, **_kwargs):
+        raise ServiceError(503, "Database unavailable")
+
+    monkeypatch.setattr(
+        training_job_maintenance, "_authorize_final_deletion", authorization_failure
+    )
+    with pytest.raises(ServiceError, match="Database unavailable"):
+        purge_training_job_artifacts(
+            factory,
+            data_dir=root,
+            department_id=department_id,
+            actor_issuer=issuer,
+            actor_subject=subject,
+            retention_days=30,
+            limit=1,
+            apply=True,
+        )
+    with SftArtifactStore(root) as store:
+        assert store.verify_training_job_final(
+            DepartmentScope(department_id), job_id, expected=expected
+        )
+    with factory() as session:
+        reservation = session.scalar(
+            select(TrainingJobPurgeReservation).where(
+                TrainingJobPurgeReservation.training_job_id == job_id
+            )
+        )
+        assert reservation is not None and reservation.status == "registered"
+    monkeypatch.setattr(training_job_maintenance, "_authorize_final_deletion", original)
+
+
+def test_phase11_authoritative_final_requires_exact_cross_row_owner_metadata(
+    engine, tmp_path: Path
+) -> None:
+    """Persistable cross-row ambiguity fails closed before any artifact mutation."""
+
+    factory = sessionmaker(engine)
+    root = tmp_path / "runtime"
+    department_id, issuer, subject, job_id = _succeeded_training_job(factory, root)
+    with factory.begin() as session:
+        job = session.get(TrainingJob, job_id)
+        assert job is not None and isinstance(job.publication_manifest, dict)
+        altered = dict(job.publication_manifest)
+        altered["attempt_number"] = 2
+        job.publication_manifest = altered
+        job.review_status = "rejected"
+        job.reviewed_at = datetime.now(UTC) - timedelta(days=31)
+        job.version += 1
+    with pytest.raises(ServiceError, match="purge authority changed"):
+        purge_training_job_artifacts(
+            factory,
+            data_dir=root,
+            department_id=department_id,
+            actor_issuer=issuer,
+            actor_subject=subject,
+            retention_days=30,
+            limit=1,
+            apply=True,
+        )
+    with factory() as session:
+        assert (
+            session.query(TrainingJobArtifactOperation)
+            .filter(
+                TrainingJobArtifactOperation.department_id == department_id,
+                TrainingJobArtifactOperation.operation_type == "purge",
+            )
+            .count()
+            == 0
+        )
+
+
+def test_phase11_succeeded_rows_reject_missing_owner_or_nonpositive_payload_metadata(
+    engine, tmp_path: Path
+) -> None:
+    """The migration check prevents incomplete success rows from becoming purgeable."""
+
+    factory = sessionmaker(engine)
+    root = tmp_path / "runtime"
+    _department_id, _issuer, _subject, job_id = _succeeded_training_job(factory, root)
+    with factory() as session:
+        job = session.get(TrainingJob, job_id)
+        assert job is not None
+        job.publication_manifest = None
+        with pytest.raises(IntegrityError):
+            session.flush()
+        session.rollback()
+    with factory() as session:
+        attempt = session.scalar(
+            select(TrainingJobAttempt).where(
+                TrainingJobAttempt.training_job_id == job_id,
+                TrainingJobAttempt.status == "succeeded",
+            )
+        )
+        assert attempt is not None
+        attempt.ownership_manifest = None
+        with pytest.raises(IntegrityError):
+            session.flush()
+        session.rollback()
+    with factory() as session:
+        job = session.get(TrainingJob, job_id)
+        assert job is not None
+        job.training_config_byte_size = 0
+        with pytest.raises(IntegrityError):
+            session.flush()
+        session.rollback()

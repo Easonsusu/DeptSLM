@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from hashlib import sha256
 from uuid import uuid4
 
 import pytest
 
+from app import training_job_queue
 from app.authorization import DepartmentScope
 from app.sft_artifacts import SftArtifactError, SftArtifactStore
 from app.training_job_child import _build as build_child_bundle
@@ -298,3 +300,26 @@ def test_child_streams_only_exact_retained_dataset_descriptors(tmp_path) -> None
     finally:
         for descriptor in fds.values():
             os.close(descriptor)
+
+
+def test_final_transaction_check_never_renews_an_elapsed_parent_lease(monkeypatch) -> None:
+    """Final checks are local-only so a locked final transaction cannot self-block."""
+
+    renewals: list[object] = []
+    monkeypatch.setattr(
+        training_job_queue,
+        "renew_lease",
+        lambda *_args: renewals.append(object()),
+    )
+    lease = training_job_queue._Lease(  # noqa: SLF001 - exercise the lease boundary.
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        lease_seconds=1,
+        operation_seconds=10,
+        should_stop=lambda: False,
+    )
+    lease.last_heartbeat = time.monotonic() - 10
+    lease.final_transaction_check()
+    assert not renewals
+    lease.renew_before_final_transaction()
+    assert len(renewals) == 1
