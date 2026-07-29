@@ -303,7 +303,7 @@ def test_phase11_stage_only_reconciliation_confirms_exact_attempt(engine, tmp_pa
     claim = claim_next(factory, uuid4(), 30, "a" * 40)
     assert claim is not None and claim.id == job_id
     root = tmp_path / "runtime"
-    (root / "training_datasets").mkdir(parents=True)
+    (root / "training_datasets").mkdir(parents=True, mode=0o700)
     with SftArtifactStore(root) as store:
         stage = store.prepare_training_job_stage(
             DepartmentScope(department_id), job_id, claim.publication_attempt_id
@@ -388,7 +388,7 @@ def test_phase11_purge_selects_one_job_and_all_of_its_terminal_attempts(
             job.id,
         )
     root = tmp_path / "runtime"
-    (root / "training_datasets").mkdir(parents=True)
+    (root / "training_datasets").mkdir(parents=True, mode=0o700)
 
     result = purge_training_job_artifacts(
         factory,
