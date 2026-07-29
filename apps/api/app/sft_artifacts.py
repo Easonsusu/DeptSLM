@@ -38,6 +38,7 @@ class SftArtifactError(RuntimeError):
                 "training_job_publication_failed",
                 "dataset_artifact_mismatch",
                 "artifact_ownership_mismatch",
+                "artifact_manifest_invalid",
                 "artifact_permissions_invalid",
                 "staging_path_unsafe",
             }
@@ -93,6 +94,8 @@ class SftFinalArtifactVerification:
     allowlist: frozenset[str]
     files: tuple[tuple[str, ArtifactDigest], ...]
     file_descriptors: tuple[tuple[str, int, os.stat_result], ...]
+    directory_metadata: os.stat_result
+    parent_metadata: os.stat_result
 
     def close(self) -> None:
         for _name, descriptor, _metadata in self.file_descriptors:
@@ -102,6 +105,14 @@ class SftFinalArtifactVerification:
                 pass
         self.file_descriptors = ()
         self.artifact.close()
+
+    def descriptor(self, name: str) -> tuple[int, os.stat_result]:
+        """Return one exact retained descriptor without reopening its pathname."""
+
+        for current, descriptor, metadata in self.file_descriptors:
+            if current == name:
+                return descriptor, metadata
+        raise SftArtifactError("artifact_ownership_mismatch")
 
     def recheck_identity(self) -> None:
         """Bind an earlier complete hash to the still-open final artifact.
@@ -116,6 +127,10 @@ class SftFinalArtifactVerification:
             raise SftArtifactError("artifact_ownership_mismatch")
         _require_private_directory(artifact.stage_fd, writable=True)
         _entry_matches(artifact.final_parent_fd, str(artifact.resource_id), artifact.stage_fd)
+        if not _same_directory(
+            self.directory_metadata, os.fstat(artifact.stage_fd)
+        ) or not _same_directory(self.parent_metadata, os.fstat(artifact.final_parent_fd)):
+            raise SftArtifactError("artifact_ownership_mismatch")
         if set(os.listdir(artifact.stage_fd)) != set(self.allowlist):
             raise SftArtifactError("artifact_ownership_mismatch")
         expected = dict(self.files)
@@ -491,6 +506,8 @@ class SftArtifactStore:
         check = checkpoint or _noop
         check()
         self._recheck_retained_files(verification, marker_allowed=False)
+        directory_metadata = os.fstat(artifact.stage_fd)
+        parent_metadata = os.fstat(artifact.final_parent_fd)
         files: dict[str, ArtifactDigest] = {}
         manifest_raw: bytes | None = None
         for name, descriptor, metadata in verification.file_descriptors:
@@ -516,7 +533,12 @@ class SftArtifactStore:
         descriptors = verification.file_descriptors
         verification.file_descriptors = ()
         return SftFinalArtifactVerification(
-            artifact, verification.allowlist, artifact.files, descriptors
+            artifact,
+            verification.allowlist,
+            artifact.files,
+            descriptors,
+            directory_metadata,
+            parent_metadata,
         )
 
     def _recheck_retained_files(
@@ -612,6 +634,8 @@ class SftArtifactStore:
             raise SftArtifactError("artifact_ownership_mismatch")
         descriptors: list[tuple[str, int, os.stat_result]] = []
         try:
+            directory_metadata = os.fstat(artifact.stage_fd)
+            parent_metadata = os.fstat(artifact.final_parent_fd)
             files: dict[str, ArtifactDigest] = {}
             manifest_raw: bytes | None = None
             for name in sorted(allowlist):
@@ -643,7 +667,12 @@ class SftArtifactStore:
             _require_exact_manifest(manifest, allowlist, files, expected)
             artifact.files = tuple(sorted(files.items()))
             return SftFinalArtifactVerification(
-                artifact, allowlist, artifact.files, tuple(descriptors)
+                artifact,
+                allowlist,
+                artifact.files,
+                tuple(descriptors),
+                directory_metadata,
+                parent_metadata,
             )
         except Exception:
             for _name, descriptor, _metadata in descriptors:
@@ -687,6 +716,7 @@ class SftArtifactStore:
         attempt_id: UUID,
         allowlist: frozenset[str],
         expected: dict[str, object],
+        checkpoint: _Checkpoint | None = None,
     ) -> SftFinalArtifactVerification:
         """Open an already-published final artifact without reopening at commit."""
 
@@ -712,7 +742,9 @@ class SftArtifactStore:
                 parent,
             )
             directory = parent = None
-            return self.verify_retained_final(artifact, allowlist=allowlist, expected=expected)
+            return self.verify_retained_final(
+                artifact, allowlist=allowlist, expected=expected, checkpoint=checkpoint
+            )
         finally:
             if directory is not None:
                 os.close(directory)
@@ -1356,13 +1388,13 @@ def _require_manifest_files(
     declared = manifest.get("files")
     payloads = allowlist - {"manifest.json"}
     if not isinstance(declared, dict) or set(declared) != payloads:
-        raise SftArtifactError("artifact_ownership_mismatch")
+        raise SftArtifactError("artifact_manifest_invalid")
     for name in payloads:
         if declared[name] != {
             "sha256": verified[name].sha256,
             "byte_size": verified[name].byte_size,
         }:
-            raise SftArtifactError("artifact_ownership_mismatch")
+            raise SftArtifactError("artifact_manifest_invalid")
 
 
 def _require_exact_manifest(
@@ -1443,21 +1475,21 @@ def _require_exact_manifest(
         else required_training_job
     )
     if set(manifest) != required:
-        raise SftArtifactError("artifact_ownership_mismatch")
+        raise SftArtifactError("artifact_manifest_invalid")
     _require_manifest_files(manifest, allowlist, verified)
     if set(expected) != required:
-        raise SftArtifactError("artifact_ownership_mismatch")
+        raise SftArtifactError("artifact_manifest_invalid")
     if any(manifest.get(key) != value for key, value in expected.items()):
-        raise SftArtifactError("artifact_ownership_mismatch")
+        raise SftArtifactError("artifact_manifest_invalid")
 
 
 def _parse_manifest(raw: bytes) -> dict[str, object]:
     try:
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_pairs)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-        raise SftArtifactError("artifact_ownership_mismatch") from error
+        raise SftArtifactError("artifact_manifest_invalid") from error
     if not isinstance(value, dict):
-        raise SftArtifactError("artifact_ownership_mismatch")
+        raise SftArtifactError("artifact_manifest_invalid")
     return value
 
 
@@ -1497,6 +1529,20 @@ def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
         and stat.S_IMODE(first.st_mode) == stat.S_IMODE(second.st_mode)
         and first.st_size == second.st_size
         and first.st_nlink == second.st_nlink == 1
+        and first.st_mtime_ns == second.st_mtime_ns
+        and first.st_ctime_ns == second.st_ctime_ns
+    )
+
+
+def _same_directory(first: os.stat_result, second: os.stat_result) -> bool:
+    """Detect directory-entry churn without applying regular-file constraints."""
+
+    return (
+        stat.S_ISDIR(second.st_mode)
+        and first.st_dev == second.st_dev
+        and first.st_ino == second.st_ino
+        and first.st_uid == second.st_uid
+        and stat.S_IMODE(first.st_mode) == stat.S_IMODE(second.st_mode)
         and first.st_mtime_ns == second.st_mtime_ns
         and first.st_ctime_ns == second.st_ctime_ns
     )

@@ -2407,6 +2407,11 @@ class TrainingJobArtifactOperation(Base):
             name="ck_training_job_operation_lifecycle",
         ),
         CheckConstraint("limit_value BETWEEN 1 AND 1000", name="ck_training_job_operation_limit"),
+        CheckConstraint(
+            "(operation_type = 'reconcile' AND retention_days IS NULL) OR "
+            "(operation_type = 'purge' AND retention_days BETWEEN 30 AND 730)",
+            name="ck_training_job_operation_retention",
+        ),
         Index("ix_training_job_operation_department", "department_id", "created_at"),
     )
 
@@ -2418,6 +2423,7 @@ class TrainingJobArtifactOperation(Base):
         ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
     )
     limit_value: Mapped[int] = mapped_column(Integer, nullable=False)
+    retention_days: Mapped[int | None] = mapped_column(Integer)
     operation_type: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="registered")
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

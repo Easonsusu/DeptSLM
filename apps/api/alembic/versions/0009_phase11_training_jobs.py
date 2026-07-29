@@ -261,6 +261,7 @@ def upgrade() -> None:
         sa.Column("department_id", sa.Uuid(), nullable=False),
         sa.Column("requested_by_user_id", sa.Uuid(), nullable=False),
         sa.Column("limit_value", sa.Integer(), nullable=False),
+        sa.Column("retention_days", sa.Integer()),
         sa.Column("operation_type", sa.String(16), nullable=False),
         sa.Column("status", sa.String(24), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True)),
@@ -281,6 +282,11 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "limit_value BETWEEN 1 AND 1000", name="ck_training_job_operation_limit"
+        ),
+        sa.CheckConstraint(
+            "(operation_type = 'reconcile' AND retention_days IS NULL) OR "
+            "(operation_type = 'purge' AND retention_days BETWEEN 30 AND 730)",
+            name="ck_training_job_operation_retention",
         ),
         sa.ForeignKeyConstraint(["department_id"], ["departments.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(

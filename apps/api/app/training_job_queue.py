@@ -339,6 +339,7 @@ def process_training_job(
                 attempt_id=dataset.publication_attempt_id,
                 allowlist=DATASET_FILES,
                 expected=_dataset_manifest(dataset),
+                checkpoint=source_guard,
             )
             source_guard()
             stage_guard = guard()
@@ -353,8 +354,14 @@ def process_training_job(
                 should_stop=should_stop,
                 heartbeat=child_guard,
                 error=TrainingJobQueueError,
-                request=_child_request(source.artifact.stage_fd, staged.stage_fd, job, dataset),
-                pass_fds=(source.artifact.stage_fd, staged.stage_fd),
+                request=_child_request(source, staged.stage_fd, job, dataset),
+                pass_fds=(
+                    source.descriptor("manifest.json")[0],
+                    source.descriptor("train.jsonl")[0],
+                    source.descriptor("validation.jsonl")[0],
+                    source.descriptor("provenance.jsonl")[0],
+                    staged.stage_fd,
+                ),
             )
             child_guard()
             manifest, train_count, validation_count = _validate_child_result(result, job, dataset)
@@ -436,7 +443,10 @@ def _load_eligible_dataset(
 
 
 def _child_request(
-    dataset_fd: int, stage_fd: int, job: ClaimedTrainingJob, dataset: SftDatasetBuild
+    source: SftFinalArtifactVerification,
+    stage_fd: int,
+    job: ClaimedTrainingJob,
+    dataset: SftDatasetBuild,
 ) -> dict[str, object]:
     if (
         dataset.train_sha256 is None
@@ -447,8 +457,21 @@ def _child_request(
         or dataset.provenance_byte_size is None
     ):
         raise TrainingJobQueueError("dataset_artifact_mismatch")
+    files = dict(source.files)
+    required = {"manifest.json", "train.jsonl", "validation.jsonl", "provenance.jsonl"}
+    if set(files) != required:
+        raise TrainingJobQueueError("dataset_artifact_mismatch")
+    manifest_fd, _manifest_identity = source.descriptor("manifest.json")
+    train_fd, _train_identity = source.descriptor("train.jsonl")
+    validation_fd, _validation_identity = source.descriptor("validation.jsonl")
+    provenance_fd, _provenance_identity = source.descriptor("provenance.jsonl")
+    if files["manifest.json"].sha256 != job.dataset_manifest_sha256:
+        raise TrainingJobQueueError("dataset_artifact_mismatch")
     return {
-        "dataset_fd": dataset_fd,
+        "manifest_fd": manifest_fd,
+        "train_fd": train_fd,
+        "validation_fd": validation_fd,
+        "provenance_fd": provenance_fd,
         "stage_fd": stage_fd,
         "department_id": str(job.department_id),
         "training_job_id": str(job.id),
@@ -466,6 +489,8 @@ def _child_request(
         "profile_id": job.profile_id,
         "dataset_rights_attested": job.dataset_rights_attested,
         "evaluation_contamination_reviewed": job.evaluation_contamination_reviewed,
+        "expected_manifest_sha256": files["manifest.json"].sha256,
+        "expected_manifest_byte_size": files["manifest.json"].byte_size,
         "expected_train_sha256": dataset.train_sha256,
         "expected_train_byte_size": dataset.train_byte_size,
         "expected_validation_sha256": dataset.validation_sha256,

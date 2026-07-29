@@ -56,6 +56,7 @@ _COMMON_PROFILE_VALUES: tuple[tuple[str, object], ...] = (
     ("enable_thinking", False),
     ("cutoff_len", 8192),
     ("packing", False),
+    ("neat_packing", False),
     ("preprocessing_num_workers", 1),
     ("dataloader_num_workers", 0),
     ("per_device_train_batch_size", 1),
@@ -81,7 +82,7 @@ _COMMON_PROFILE_VALUES: tuple[tuple[str, object], ...] = (
     ("trust_remote_code", False),
     ("flash_attn", "disabled"),
     ("use_unsloth", False),
-    ("use_liger_kernel", False),
+    ("enable_liger_kernel", False),
 )
 
 TRAINING_PROFILES = {
@@ -93,7 +94,8 @@ TRAINING_PROFILES = {
         _COMMON_PROFILE_VALUES
         + (
             ("quantization_bit", 4),
-            ("quantization_method", "bitsandbytes"),
+            # LlamaFactory 0.9.5 uses ``bnb`` for the bitsandbytes backend.
+            ("quantization_method", "bnb"),
             ("quantization_type", "nf4"),
             ("double_quantization", True),
         ),
@@ -116,8 +118,6 @@ class TrainingJobBundle:
     manifest: bytes
     training_yaml: bytes
     dataset_info: bytes
-    train: bytes
-    validation: bytes
     train_count: int
     validation_count: int
 
@@ -168,10 +168,14 @@ def build_bundle(
     profile_id: str,
     dataset_rights_attested: bool,
     evaluation_contamination_reviewed: bool,
-    train: bytes,
-    validation: bytes,
+    dataset: ValidatedDataset,
 ) -> TrainingJobBundle:
-    """Produce byte-stable config authority while preserving dataset bytes exactly."""
+    """Produce byte-stable configuration authority from content-free dataset metadata.
+
+    The fixed child streams and copies the exact approved dataset bytes directly
+    into the private stage.  Keeping those bytes out of this function prevents
+    configuration generation from materializing a potentially 512 MiB dataset.
+    """
 
     if (
         not isinstance(department_id, UUID)
@@ -202,8 +206,8 @@ def build_bundle(
     ):
         raise TrainingJobContractError()
     _sha256(dataset_manifest_sha256)
+    _validated_dataset(dataset)
     profile = training_profile(profile_id)
-    dataset = validate_phase10_records(train, validation)
     job_path = f"jobs/{department_id}/{training_job_id}"
     dataset_directory = f"/runtime/deptslm/training_datasets/{job_path}"
     output_directory = (
@@ -225,8 +229,10 @@ def build_bundle(
     files = {
         "training.yaml": _descriptor(training_yaml),
         "dataset_info.json": _descriptor(dataset_info),
-        "train.jsonl": _descriptor(train),
-        "validation.jsonl": _descriptor(validation),
+        "train.jsonl": _dataset_descriptor(dataset.train_sha256, dataset.train_byte_size),
+        "validation.jsonl": _dataset_descriptor(
+            dataset.validation_sha256, dataset.validation_byte_size
+        ),
     }
     manifest = {
         "artifact_contract_version": TRAINING_JOB_CONTRACT_VERSION,
@@ -264,8 +270,6 @@ def build_bundle(
         manifest=canonical_json_bytes(manifest) + b"\n",
         training_yaml=training_yaml,
         dataset_info=dataset_info,
-        train=train,
-        validation=validation,
         train_count=dataset.train_count,
         validation_count=dataset.validation_count,
     )
@@ -368,31 +372,37 @@ def _validate_records(raw: bytes) -> int:
         raise TrainingJobContractError("dataset_artifact_mismatch") from error
     count = 0
     for line in text.splitlines():
-        if not line:
-            raise TrainingJobContractError("dataset_artifact_mismatch")
-        value = _object(line.encode("utf-8"), "dataset_artifact_mismatch")
-        if set(value) != {"example_id", "messages"}:
-            raise TrainingJobContractError("dataset_artifact_mismatch")
-        _uuid(value.get("example_id"), "dataset_artifact_mismatch")
-        messages = value.get("messages")
-        if not isinstance(messages, list) or len(messages) != 2:
-            raise TrainingJobContractError("dataset_artifact_mismatch")
-        roles: list[str] = []
-        content_bytes = 0
-        for message in messages:
-            if not isinstance(message, dict) or set(message) != {"role", "content"}:
-                raise TrainingJobContractError("dataset_artifact_mismatch")
-            role, content = message.get("role"), message.get("content")
-            if not isinstance(role, str) or not isinstance(content, str) or not content:
-                raise TrainingJobContractError("dataset_artifact_mismatch")
-            if any(_unsafe(character) for character in content):
-                raise TrainingJobContractError("dataset_artifact_mismatch")
-            roles.append(role)
-            content_bytes += len(content.encode("utf-8"))
-        if roles != ["user", "assistant"] or content_bytes > MAX_RECORD_CONTENT_BYTES:
-            raise TrainingJobContractError("dataset_artifact_mismatch")
+        validate_phase10_record_line(line.encode("utf-8"))
         count += 1
     return count
+
+
+def validate_phase10_record_line(raw: bytes) -> None:
+    """Validate one exact Phase 10 JSONL record without normalizing it."""
+
+    if not raw or b"\r" in raw:
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    value = _object(raw, "dataset_artifact_mismatch")
+    if set(value) != {"example_id", "messages"}:
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    _uuid(value.get("example_id"), "dataset_artifact_mismatch")
+    messages = value.get("messages")
+    if not isinstance(messages, list) or len(messages) != 2:
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    roles: list[str] = []
+    content_bytes = 0
+    for message in messages:
+        if not isinstance(message, dict) or set(message) != {"role", "content"}:
+            raise TrainingJobContractError("dataset_artifact_mismatch")
+        role, content = message.get("role"), message.get("content")
+        if not isinstance(role, str) or not isinstance(content, str) or not content:
+            raise TrainingJobContractError("dataset_artifact_mismatch")
+        if any(_unsafe(character) for character in content):
+            raise TrainingJobContractError("dataset_artifact_mismatch")
+        roles.append(role)
+        content_bytes += len(content.encode("utf-8"))
+    if roles != ["user", "assistant"] or content_bytes > MAX_RECORD_CONTENT_BYTES:
+        raise TrainingJobContractError("dataset_artifact_mismatch")
 
 
 def _dataset_info() -> dict[str, object]:
@@ -437,6 +447,27 @@ def _descriptor(value: bytes) -> dict[str, object]:
     if not value:
         raise TrainingJobContractError()
     return {"sha256": hashlib.sha256(value).hexdigest(), "byte_size": len(value)}
+
+
+def _dataset_descriptor(sha256: str, byte_size: int) -> dict[str, object]:
+    _sha256(sha256)
+    if type(byte_size) is not int or byte_size < 1:
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    return {"sha256": sha256, "byte_size": byte_size}
+
+
+def _validated_dataset(value: object) -> ValidatedDataset:
+    if not isinstance(value, ValidatedDataset):
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    for count in (value.train_count, value.validation_count):
+        if type(count) is not int or count < 1:
+            raise TrainingJobContractError("dataset_artifact_mismatch")
+    for size in (value.train_byte_size, value.validation_byte_size):
+        if type(size) is not int or size < 1:
+            raise TrainingJobContractError("dataset_artifact_mismatch")
+    _sha256(value.train_sha256)
+    _sha256(value.validation_sha256)
+    return value
 
 
 def _object(raw: bytes, code: str = "artifact_manifest_invalid") -> dict[str, object]:

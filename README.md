@@ -20,8 +20,9 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 
 > **Phase 11 status:** Under review. It generates reviewable, department-scoped
 > LlamaFactory 0.9.5 LoRA or QLoRA job bundles from one approved Phase 10
-> dataset. It copies only verified dataset bytes into private external bundle
-> storage and publishes content-free metadata. It never installs or invokes
+> dataset. It streams only exact retained descriptor-bound dataset bytes into
+> private external bundle storage and publishes content-free metadata. It never
+> installs or invokes
 > LlamaFactory, loads a tokenizer or model, executes training, writes adapters,
 > or begins Phase 12.
 

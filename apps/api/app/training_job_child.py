@@ -1,8 +1,8 @@
 """Fixed exec child for Phase 11 contentful bundle construction.
 
-The child has no database, authentication, model, tokenizer, LlamaFactory, or
-runtime imports.  It receives only inherited dataset/stage descriptors and
-closed, content-free metadata.
+The child receives only exact inherited descriptors.  It never opens a Phase
+10 source by pathname, never receives a source directory descriptor, and
+streams the two dataset JSONL files into the exact private job stage.
 """
 
 from __future__ import annotations
@@ -12,21 +12,36 @@ import json
 import os
 import stat
 import struct
+from dataclasses import dataclass
 from uuid import UUID
 
 from app.sft_artifacts import STAGE_MARKER
 from app.training_job_domain import (
     TRAINING_JOB_FILES,
     TrainingJobContractError,
+    ValidatedDataset,
     build_bundle,
     canonical_json_bytes,
+    validate_phase10_record_line,
 )
 
 _ENVIRONMENT = {"PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1"}
 _MAX_REQUEST = 64 * 1024
 _MAX_RESPONSE = 32 * 1024
 _MAX_FILE = 512 * 1024 * 1024
-_PHASE10_FILES = frozenset({"manifest.json", "train.jsonl", "validation.jsonl", "provenance.jsonl"})
+_MAX_MANIFEST = 256 * 1024
+_COPY_BLOCK = 64 * 1024
+# A valid reviewed record is much smaller than this bound.  Retaining at most
+# one line makes memory independent of the complete external dataset size.
+_MAX_JSONL_LINE = 32 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _ExpectedFile:
+    descriptor: int
+    sha256: str
+    byte_size: int
+    maximum: int
 
 
 def main() -> int:
@@ -42,8 +57,7 @@ def main() -> int:
         payload = request.get("request")
         if not isinstance(payload, dict):
             raise TrainingJobContractError("training_job_publication_failed")
-        result = _build(payload)
-        _write_frame({"status": "ok", "result": result})
+        _write_frame({"status": "ok", "result": _build(payload)})
         return 0
     except BaseException as error:
         code = getattr(error, "code", "training_job_publication_failed")
@@ -58,7 +72,10 @@ def main() -> int:
 
 def _build(request: dict[str, object]) -> dict[str, object]:
     expected = {
-        "dataset_fd",
+        "manifest_fd",
+        "train_fd",
+        "validation_fd",
+        "provenance_fd",
         "stage_fd",
         "department_id",
         "training_job_id",
@@ -76,6 +93,8 @@ def _build(request: dict[str, object]) -> dict[str, object]:
         "profile_id",
         "dataset_rights_attested",
         "evaluation_contamination_reviewed",
+        "expected_manifest_sha256",
+        "expected_manifest_byte_size",
         "expected_train_sha256",
         "expected_train_byte_size",
         "expected_validation_sha256",
@@ -85,19 +104,28 @@ def _build(request: dict[str, object]) -> dict[str, object]:
     }
     if set(request) != expected:
         raise TrainingJobContractError("training_job_publication_failed")
-    dataset_fd = _fd(request["dataset_fd"])
     stage_fd = _fd(request["stage_fd"])
-    _directory(dataset_fd, writable=False)
     _directory(stage_fd, writable=True)
-    if set(os.listdir(dataset_fd)) != _PHASE10_FILES or set(os.listdir(stage_fd)) != {STAGE_MARKER}:
-        raise TrainingJobContractError("dataset_artifact_mismatch")
-    raw_manifest = _read(dataset_fd, "manifest.json", 256 * 1024)
-    train = _read(dataset_fd, "train.jsonl", _MAX_FILE)
-    validation = _read(dataset_fd, "validation.jsonl", _MAX_FILE)
-    provenance = _read(dataset_fd, "provenance.jsonl", _MAX_FILE)
-    if set(os.listdir(dataset_fd)) != _PHASE10_FILES:
-        raise TrainingJobContractError("dataset_artifact_mismatch")
-    _validate_phase10_manifest(raw_manifest, request, train, validation, provenance)
+    if set(os.listdir(stage_fd)) != {STAGE_MARKER}:
+        raise TrainingJobContractError("training_job_publication_failed")
+
+    manifest_file = _expected(request, "manifest", _MAX_MANIFEST)
+    train_file = _expected(request, "train", _MAX_FILE)
+    validation_file = _expected(request, "validation", _MAX_FILE)
+    provenance_file = _expected(request, "provenance", _MAX_FILE)
+    raw_manifest = _read_retained(manifest_file)
+    _validate_phase10_manifest(raw_manifest, request, train_file, validation_file, provenance_file)
+    train = _copy_and_validate_jsonl(train_file, stage_fd, "train.jsonl")
+    validation = _copy_and_validate_jsonl(validation_file, stage_fd, "validation.jsonl")
+    _verify_retained_digest(provenance_file)
+    dataset = ValidatedDataset(
+        train_count=train,
+        validation_count=validation,
+        train_sha256=train_file.sha256,
+        validation_sha256=validation_file.sha256,
+        train_byte_size=train_file.byte_size,
+        validation_byte_size=validation_file.byte_size,
+    )
     bundle = build_bundle(
         department_id=_uuid(request["department_id"]),
         training_job_id=_uuid(request["training_job_id"]),
@@ -115,13 +143,10 @@ def _build(request: dict[str, object]) -> dict[str, object]:
         profile_id=_string(request["profile_id"]),
         dataset_rights_attested=_true(request["dataset_rights_attested"]),
         evaluation_contamination_reviewed=_true(request["evaluation_contamination_reviewed"]),
-        train=train,
-        validation=validation,
+        dataset=dataset,
     )
     _write(stage_fd, "training.yaml", bundle.training_yaml)
     _write(stage_fd, "dataset_info.json", bundle.dataset_info)
-    _write(stage_fd, "train.jsonl", bundle.train)
-    _write(stage_fd, "validation.jsonl", bundle.validation)
     _write(stage_fd, "manifest.json", bundle.manifest)
     _fsync(stage_fd)
     if set(os.listdir(stage_fd)) != set(TRAINING_JOB_FILES) | {STAGE_MARKER}:
@@ -135,17 +160,36 @@ def _build(request: dict[str, object]) -> dict[str, object]:
                 ("manifest.json", bundle.manifest),
                 ("training.yaml", bundle.training_yaml),
                 ("dataset_info.json", bundle.dataset_info),
-                ("train.jsonl", bundle.train),
-                ("validation.jsonl", bundle.validation),
             )
+        }
+        | {
+            "train.jsonl": {"sha256": train_file.sha256, "byte_size": train_file.byte_size},
+            "validation.jsonl": {
+                "sha256": validation_file.sha256,
+                "byte_size": validation_file.byte_size,
+            },
         },
         "train_count": bundle.train_count,
         "validation_count": bundle.validation_count,
     }
 
 
+def _expected(request: dict[str, object], prefix: str, maximum: int) -> _ExpectedFile:
+    descriptor = _fd(request[f"{prefix}_fd"])
+    sha256 = _sha256(request[f"expected_{prefix}_sha256"])
+    byte_size = _size(request[f"expected_{prefix}_byte_size"], maximum)
+    details = _private_regular(descriptor, maximum)
+    if details.st_size != byte_size:
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    return _ExpectedFile(descriptor, sha256, byte_size, maximum)
+
+
 def _validate_phase10_manifest(
-    raw: bytes, request: dict[str, object], train: bytes, validation: bytes, provenance: bytes
+    raw: bytes,
+    request: dict[str, object],
+    train: _ExpectedFile,
+    validation: _ExpectedFile,
+    provenance: _ExpectedFile,
 ) -> None:
     manifest = _object(raw)
     expected = {
@@ -186,31 +230,122 @@ def _validate_phase10_manifest(
         "provenance.jsonl",
     }:
         raise TrainingJobContractError("dataset_artifact_mismatch")
-    for name, value, digest, size in (
-        (
-            "train.jsonl",
-            train,
-            request["expected_train_sha256"],
-            request["expected_train_byte_size"],
-        ),
-        (
-            "validation.jsonl",
-            validation,
-            request["expected_validation_sha256"],
-            request["expected_validation_byte_size"],
-        ),
-        (
-            "provenance.jsonl",
-            provenance,
-            request["expected_provenance_sha256"],
-            request["expected_provenance_byte_size"],
-        ),
+    for name, value in (
+        ("train.jsonl", train),
+        ("validation.jsonl", validation),
+        ("provenance.jsonl", provenance),
     ):
         descriptor = files.get(name)
-        if not isinstance(descriptor, dict) or descriptor != {"sha256": digest, "byte_size": size}:
+        if not isinstance(descriptor, dict) or descriptor != {
+            "sha256": value.sha256,
+            "byte_size": value.byte_size,
+        }:
             raise TrainingJobContractError("dataset_artifact_mismatch")
-        if _digest(value) != digest or len(value) != size:
+
+
+def _copy_and_validate_jsonl(source: _ExpectedFile, stage_fd: int, name: str) -> int:
+    before = _private_regular(source.descriptor, source.maximum)
+    if before.st_size != source.byte_size:
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    _seek_start(source.descriptor)
+    destination = os.open(
+        name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=stage_fd
+    )
+    source_hash = hashlib.sha256()
+    destination_hash = hashlib.sha256()
+    byte_size = 0
+    lines = bytearray()
+    count = 0
+    ended_with_newline = False
+    try:
+        while True:
+            block = os.read(source.descriptor, _COPY_BLOCK)
+            if not block:
+                break
+            byte_size += len(block)
+            if byte_size > source.byte_size:
+                raise TrainingJobContractError("dataset_artifact_mismatch")
+            source_hash.update(block)
+            _write_all(destination, block)
+            destination_hash.update(block)
+            for line in block.splitlines(keepends=True):
+                lines.extend(line)
+                if len(lines) > _MAX_JSONL_LINE:
+                    raise TrainingJobContractError("dataset_artifact_mismatch")
+                if lines.endswith(b"\n"):
+                    record = bytes(lines[:-1])
+                    validate_phase10_record_line(record)
+                    count += 1
+                    lines.clear()
+                    ended_with_newline = True
+                else:
+                    ended_with_newline = False
+        if byte_size != source.byte_size or not ended_with_newline or lines or count < 1:
             raise TrainingJobContractError("dataset_artifact_mismatch")
+        if (
+            source_hash.hexdigest() != source.sha256
+            or destination_hash.hexdigest() != source.sha256
+        ):
+            raise TrainingJobContractError("dataset_artifact_mismatch")
+        details = os.fstat(destination)
+        if details.st_size != byte_size or stat.S_IMODE(details.st_mode) != 0o600:
+            raise TrainingJobContractError("training_job_publication_failed")
+        os.fsync(destination)
+    finally:
+        os.close(destination)
+    after = os.fstat(source.descriptor)
+    if not _same_file(before, after) or after.st_size != source.byte_size:
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    return count
+
+
+def _read_retained(source: _ExpectedFile) -> bytes:
+    before = _private_regular(source.descriptor, source.maximum)
+    if before.st_size != source.byte_size:
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    _seek_start(source.descriptor)
+    value = bytearray()
+    digest = hashlib.sha256()
+    while True:
+        block = os.read(source.descriptor, _COPY_BLOCK)
+        if not block:
+            break
+        value.extend(block)
+        digest.update(block)
+        if len(value) > source.maximum:
+            raise TrainingJobContractError("dataset_artifact_mismatch")
+    after = os.fstat(source.descriptor)
+    if (
+        len(value) != source.byte_size
+        or digest.hexdigest() != source.sha256
+        or not _same_file(before, after)
+    ):
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    return bytes(value)
+
+
+def _verify_retained_digest(source: _ExpectedFile) -> None:
+    before = _private_regular(source.descriptor, source.maximum)
+    if before.st_size != source.byte_size:
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    _seek_start(source.descriptor)
+    digest = hashlib.sha256()
+    byte_size = 0
+    while True:
+        block = os.read(source.descriptor, _COPY_BLOCK)
+        if not block:
+            break
+        byte_size += len(block)
+        if byte_size > source.byte_size:
+            raise TrainingJobContractError("dataset_artifact_mismatch")
+        digest.update(block)
+    after = os.fstat(source.descriptor)
+    if (
+        byte_size != source.byte_size
+        or digest.hexdigest() != source.sha256
+        or not _same_file(before, after)
+    ):
+        raise TrainingJobContractError("dataset_artifact_mismatch")
 
 
 def _read_frame() -> dict[str, object]:
@@ -253,9 +388,9 @@ def _object(raw: bytes) -> dict[str, object]:
     try:
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=reject)
     except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
-        raise TrainingJobContractError("training_job_publication_failed") from error
+        raise TrainingJobContractError("dataset_artifact_mismatch") from error
     if not isinstance(value, dict):
-        raise TrainingJobContractError("training_job_publication_failed")
+        raise TrainingJobContractError("dataset_artifact_mismatch")
     return value
 
 
@@ -265,38 +400,34 @@ def _directory(descriptor: int, *, writable: bool) -> None:
         not stat.S_ISDIR(details.st_mode)
         or stat.S_IMODE(details.st_mode) != 0o700
         or details.st_nlink < 2
+        or (hasattr(os, "getuid") and details.st_uid != os.getuid())
     ):
-        raise TrainingJobContractError("dataset_artifact_mismatch")
-    if hasattr(os, "getuid") and details.st_uid != os.getuid():
         raise TrainingJobContractError("dataset_artifact_mismatch")
     if writable and not os.access(".", os.W_OK | os.X_OK, dir_fd=descriptor):
         raise TrainingJobContractError("training_job_publication_failed")
 
 
-def _read(directory: int, name: str, maximum: int) -> bytes:
-    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
-    try:
-        details = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(details.st_mode)
-            or details.st_nlink != 1
-            or stat.S_IMODE(details.st_mode) != 0o600
-            or not 1 <= details.st_size <= maximum
-        ):
-            raise TrainingJobContractError("dataset_artifact_mismatch")
-        value = bytearray()
-        while True:
-            block = os.read(descriptor, min(64 * 1024, maximum + 1 - len(value)))
-            if not block:
-                break
-            value.extend(block)
-            if len(value) > maximum:
-                raise TrainingJobContractError("dataset_artifact_mismatch")
-        if len(value) != details.st_size:
-            raise TrainingJobContractError("dataset_artifact_mismatch")
-        return bytes(value)
-    finally:
-        os.close(descriptor)
+def _private_regular(descriptor: int, maximum: int) -> os.stat_result:
+    details = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_nlink != 1
+        or stat.S_IMODE(details.st_mode) != 0o600
+        or not 1 <= details.st_size <= maximum
+        or (hasattr(os, "getuid") and details.st_uid != os.getuid())
+    ):
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    return details
+
+
+def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev == right.st_dev
+        and left.st_ino == right.st_ino
+        and left.st_size == right.st_size
+        and left.st_mtime_ns == right.st_mtime_ns
+        and left.st_ctime_ns == right.st_ctime_ns
+    )
 
 
 def _write(directory: int, name: str, value: bytes) -> None:
@@ -306,20 +437,40 @@ def _write(directory: int, name: str, value: bytes) -> None:
         name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory
     )
     try:
-        view = memoryview(value)
-        while view:
-            count = os.write(descriptor, view)
-            if count <= 0:
-                raise TrainingJobContractError("training_job_publication_failed")
-            view = view[count:]
+        _write_all(descriptor, value)
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
 
 
+def _write_all(descriptor: int, value: bytes) -> None:
+    view = memoryview(value)
+    while view:
+        count = os.write(descriptor, view)
+        if count <= 0:
+            raise TrainingJobContractError("training_job_publication_failed")
+        view = view[count:]
+
+
 def _fd(value: object) -> int:
     if type(value) is not int or value < 0:
         raise TrainingJobContractError("training_job_publication_failed")
+    return value
+
+
+def _size(value: object, maximum: int) -> int:
+    if type(value) is not int or not 1 <= value <= maximum:
+        raise TrainingJobContractError("dataset_artifact_mismatch")
+    return value
+
+
+def _sha256(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(item not in "0123456789abcdef" for item in value)
+    ):
+        raise TrainingJobContractError("dataset_artifact_mismatch")
     return value
 
 
@@ -367,6 +518,13 @@ def _digest(value: bytes) -> str:
 
 def _descriptor(value: bytes) -> dict[str, object]:
     return {"sha256": _digest(value), "byte_size": len(value)}
+
+
+def _seek_start(descriptor: int) -> None:
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+    except OSError as error:
+        raise TrainingJobContractError("dataset_artifact_mismatch") from error
 
 
 def _fsync(descriptor: int) -> None:
