@@ -2,7 +2,7 @@
 
 ## Document status
 
-This document describes the product direction and separates completed Phase 0–11 boundaries from the planned scope. Phase 12 is under review; Phase 12.0 is documentation and contract work only, and Phase 12.1 through 12.4 are not implemented. Unless a capability is explicitly labeled as completed, it is not implemented.
+This document describes the product direction and separates completed Phase 0–11 boundaries from the planned scope. Phase 12.0 is completed and Phase 12.1 is under review; Phase 12.1A adds only a model-free static adapter compatibility contract, while intake, registry, evaluation, promotion, runtime loading, and Phases 12.1B through 12.4 are not implemented. Unless a capability is explicitly labeled as completed, it is not implemented.
 
 ## Product summary
 

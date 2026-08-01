@@ -151,7 +151,7 @@ Phase 10 source bundles and final dataset artifacts live only under `DEPTSLM_DAT
 
 Phase 11 writes only private job bundles below `DEPTSLM_DATA_DIR/training_datasets/jobs/<department UUID>/<training job UUID>`. A final bundle contains exactly `manifest.json`, `training.yaml`, `dataset_info.json`, `train.jsonl`, and `validation.jsonl`; staging adds only the private marker. The API never mounts this directory. The isolated bundle worker verifies and copies an approved Phase 10 dataset through retained descriptors; it does not execute the configuration or mount `model_cache`, `adapters`, logs, or model outputs. The final directory is one job-level surface with one validated succeeded-attempt owner; historical attempts own only their exact stage directories. Purge deletes stages first, then may delete that descriptor-verified final only after PostgreSQL commits final-deletion authorization. The authorization reservation binds the owner attempt, closed content-free manifest, and UUID tombstone namespace below private `.deleting/jobs`; the final is fully verified before an atomic no-replace move and both parent directories are fsynced. Before any member is removed, a `tombstone_bound` reservation persists the exact private directory, parent, and fixed-file identities. Retries require each identity to match; only the one durably in-flight unlink may be absent. Tombstone deletion never parses partial bytes, and a substituted, parked, or partial unbound tombstone remains actively fenced. A pre-move failure leaves the final directory intact. Generated job bundles, like all runtime data, are never committed to Git.
 
-## Phase 12 adapter registry (planned; Phase 12.0 is documentation only)
+## Phase 12 adapter registry (under review; Phase 12.1A static contract only)
 
 The proposed private external registry layout is:
 
@@ -203,8 +203,8 @@ authority commit.
 The future adapter-registry worker mounts PostgreSQL, `adapters/imports`
 read-only, Phase 11 training-job bundles read-only, and adapter registry storage
 read-write. The API and browser have no adapter storage mount and no weight
-upload route. Phase 12.0 creates none of these directories and changes no setup
-script or Compose mount.
+upload route. Phase 12.0 and Phase 12.1A create none of these directories and
+change no setup script or Compose mount.
 
 Phase 12.0 does not change setup scripts, Compose, mounts, dependencies, or
 runtime directories. There is no fallback to the checkout, current directory,
@@ -242,10 +242,11 @@ deletion is not claimed.
 
 The registry manifest records verified governance lineage, a declared external
 training association, and verified artifact compatibility, not proven dataset
-use, trusted training execution, or certified adapter provenance. Phase 12.1
-must validate adapters with a reviewed model-free static schema. It must first
-pin compatible package versions, the closed configuration/tensor grammar, and
-numeric bounds; Phase 12.0 invents none and loads no model or tokenizer.
+use, trusted training execution, or certified adapter provenance. Phase 12.1A
+now fixes the model-free static schema: PEFT `0.18.1`, Transformers `4.55.0`,
+safetensors format `0.7.0`, the closed configuration/tensor grammar, and
+`1,048,576`-byte header and `44,040,192`-byte file bounds. It loads no model or
+tokenizer and does not implement intake or storage.
 
 A non-purged adapter record creates retention dependencies on the exact Phase 10
 dataset artifact and Phase 11 authoritative job bundle. Upstream Phase 10 and

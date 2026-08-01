@@ -64,8 +64,10 @@ This roadmap separates foundational safety work from product implementation. A l
 
 ## Phase 12 — LoRA adapter registry (under review)
 
-- Phase 12.0 is documentation and contract work only: threat model, immutable administrator-controlled source intake, server-generated manifest authority, separate import-source lifecycle and purge, complete registry/source byte-purge semantics, reversible rollback-retention transitions, closed artifact and metadata contracts, upstream retention, governance-lineage versus training-provenance limits, model-free static validation, and API, storage, lifecycle, evaluation, promotion, and rollback design.
-- Phase 12.1 (not started): immutable external adapter intake, validation, metadata-only registry, reconciliation, and purge foundations; no runtime loading.
+- Phase 12.0 (completed) defines the adapter-registry threat model, immutable administrator-controlled source boundary, closed artifact and metadata contracts, governance-lineage versus training-provenance limits, and future lifecycle, evaluation, promotion, rollback, reconciliation, and purge design.
+- Phase 12.1 (under review): immutable external adapter intake and metadata-only registry foundations; no runtime loading.
+- Phase 12.1A (implemented in this review): pure standard-library static compatibility validation for the pinned Qwen3-0.6B LoRA/QLoRA configuration, tensor-key and shape contract, and bounded safetensors metadata. It adds no intake, worker, registry, or storage implementation.
+- Phase 12.1B through 12.1E (not started): source import, publication, reconciliation, and purge implementation remain future reviewed work.
 - Phase 12.2 (not started): adapter-target evaluation, baseline/candidate evidence, and fixed numeric quality and safety gates; no automatic promotion.
 - Phase 12.3 (not started): review, approval, promotion, supersession, rollback, and deployment event history; no silent fallback.
 - Phase 12.4 (not started): department-bound runtime routing, immutable request snapshots, fail-closed loading, and explicit rollback-to-base.
