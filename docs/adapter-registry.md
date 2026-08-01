@@ -2,17 +2,21 @@
 
 This document is the reviewed Phase 12.0 design boundary. It describes future
 metadata, artifact, evaluation, review, deployment, and runtime contracts; it
-does not implement any of them.
+does not implement intake, registry, or runtime behavior. The separate
+Phase 12.1A static compatibility contract is documented in
+[adapter-static-contract.md](adapter-static-contract.md).
 
 ## Status
 
 - Phase 11 is completed. Its reviewed output is an immutable, department-scoped
   LlamaFactory job bundle; it does not execute training or create an adapter.
 - Phase 12 is under review.
-- Phase 12.0 defines contracts and a threat model only.
-- DeptSLM has not imported, validated, evaluated, approved, promoted, loaded, or
-  purged an adapter.
-- Phase 12.1, 12.2, 12.3, and 12.4 remain unimplemented.
+- Phase 12.0 is completed: it defines contracts and the threat model.
+- Phase 12.1 is under review. Phase 12.1A implements only the pure, model-free
+  static compatibility contract; no adapter has been imported, published,
+  evaluated, approved, promoted, loaded, or purged by DeptSLM.
+- Phase 12.1B through 12.1E and Phase 12.2, 12.3, and 12.4 remain
+  unimplemented.
 - Phase 13 has not started.
 
 No statement in this document is a claim that an adapter registry, adapter
@@ -36,15 +40,24 @@ the artifact is safe, compatible, or useful.
 
 ## Subphase plan
 
-### Phase 12.0 — contract and threat model (current; under review)
+### Phase 12.0 — contract and threat model (completed)
 
 - Correct project status and document the threat model.
 - Define closed adapter artifact and metadata contracts.
 - Design API, storage, lifecycle, evaluation, promotion, rollback,
   reconciliation, and purge boundaries.
-- Make no implementation, migration, dependency, service, or runtime change.
+- Phase 12.0 made no migration, dependency, service, or runtime change.
 
-### Phase 12.1 — immutable adapter intake (not started)
+### Phase 12.1 — immutable adapter intake (under review)
+
+#### Phase 12.1A — static compatibility contract (implemented in this review)
+
+- Freeze the reviewed Qwen3-0.6B architecture, PEFT configuration, tensor-key
+  grammar, exact shapes, dtypes, sizes, and bounded safetensors metadata parser.
+- Keep validation model-free, dependency-free, content-free, and separate from
+  intake, storage, publication, registry, reconciliation, and purge.
+
+#### Phase 12.1B through 12.1E (not started)
 
 - Validate an external adapter through the closed artifact contract.
 - Publish it to private external storage and register metadata only.
@@ -163,11 +176,9 @@ The contract explicitly prohibits pickle, `adapter_model.bin`, PyTorch `.pt` or
 state, checkpoints, training logs, shell or Python scripts, arbitrary README
 files, caches, temporary files, symbolic links, hard links, and unknown entries.
 
-Phase 12.1 must pin and review the compatible versions of PEFT, safetensors,
-and the transformers interfaces required for validation. Phase 12.0 does not
-invent package versions. Phase 12.1 must first define a closed
-`adapter_config.json` key and value contract; arbitrary PEFT configuration is
-not accepted.
+Phase 12.1A pins and documents the compatible PEFT, safetensors, and
+Transformers reference versions. It defines one closed `adapter_config.json`
+key/value contract; arbitrary PEFT configuration is not accepted.
 
 Validation must check the exact reviewed base-model contract, safetensors header,
 tensor names, shapes, ranks, dtypes, aggregate sizes, and adapter type. A file
@@ -177,21 +188,18 @@ not an adapter under this contract.
 ### Model-free static adapter validation
 
 The future intake worker has no `model_cache`, base-model weights, tokenizer,
-Transformers model object, or Hugging Face access. Phase 12.1 must therefore
-validate through a reviewed, content-free, source-controlled static adapter
-schema. Before implementation, that phase must pin compatible PEFT,
-`safetensors`, and any required Transformers interface versions, then review and
-version a closed `adapter_config.json` schema, allowed adapter type, target
-module names, tensor-key grammar, rank and shape relationships, allowed dtypes,
-maximum safetensors header bytes, maximum tensor count, maximum individual
-tensor bytes, maximum total adapter bytes, required and prohibited tensor
-groups, and rules distinguishing an adapter from full-model weights.
+Transformers model object, or Hugging Face access. Phase 12.1A therefore fixes
+the reviewed, content-free, source-controlled static adapter schema: PEFT
+`0.18.1`, Transformers `4.55.0`, safetensors format `0.7.0`, the closed
+`adapter_config.json` values, seven target modules, exact tensor-key grammar,
+rank and shape relationships, F16/BF16/F32 dtypes, a 1 MiB header bound, 392
+tensors, and a 44,040,192-byte file bound. See
+[adapter-static-contract.md](adapter-static-contract.md).
 
-The schema must require no model or tokenizer loading, network access, or model
-weights. It must reject unknown target modules, keys, shapes, ranks, and dtypes
-and fail closed when compatibility cannot be proven statically. Phase 12.0 does
-not invent package versions or numeric limits; Phase 12.1 cannot implement this
-validator until those values are reviewed and fixed.
+The schema requires no model or tokenizer loading, network access, or model
+weights. It rejects unknown target modules, keys, shapes, ranks, and dtypes and
+fails closed when compatibility cannot be proven statically. This static
+contract does not create a worker or make an external adapter trusted.
 
 ## Planned storage layout
 
@@ -591,7 +599,7 @@ adapters/.deleting/imports/<department_id>/<source_bundle_id>/<purge_operation_i
 adapters/.deleting/registry/<department_id>/<adapter_id>/<purge_operation_id>/
 ```
 
-Future Phase 12.1 must define explicit, bounded administrator maintenance for
+Future Phase 12.1B through 12.1E must define explicit, bounded administrator maintenance for
 abandoned import staging, committed-but-never-claimed sources, rejected sources,
 consumed sources, crashes between source publication and the PostgreSQL commit,
 and crashes during source deletion. It is dry-run by default. Before any
@@ -638,7 +646,7 @@ Phase 12 as a whole is complete only when tests prove that:
 - the manifest records verified governance lineage and declared external
   training association, not proven training provenance;
 - model-free static validation fails closed without loading a model or tokenizer
-  and cannot begin until its package versions and numeric limits are reviewed;
+  using the reviewed Phase 12.1A package references and numeric limits;
 - promotion and rollback are transactional at the metadata boundary, versioned,
   and auditable without claiming PostgreSQL/filesystem atomicity;
 - runtime routing cannot cross departments and never silently falls back;

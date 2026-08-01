@@ -40,12 +40,13 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > keeps the reservation active. Review changes are rejected while a reservation
 > is active. This is a reviewed boundary, not training execution.
 
-> **Phase 12 status:** Under review. Phase 12.0 is documentation and contract
-> work only for external adapter intake, an immutable department-scoped adapter
-> registry, evaluation evidence, explicit approval, promotion, rollback, and
-> eventual fail-closed runtime routing. No adapter has been imported, validated,
-> evaluated, approved, promoted, loaded, or purged by DeptSLM. Phase 12.1 through
-> Phase 12.4 remain unimplemented; no adapter registry or runtime routing exists.
+> **Phase 12 status:** Phase 12.0 is completed and Phase 12.1 is under review.
+> This PR implements Phase 12.1A's model-free static compatibility contract for
+> the reviewed Qwen3-0.6B LoRA/QLoRA artifact shape, configuration, key grammar,
+> and bounded safetensors metadata. It does not import, publish, evaluate,
+> approve, promote, load, or purge an adapter. Phase 12.1B through 12.1E and
+> Phase 12.2 through Phase 12.4 remain unimplemented; no adapter registry or
+> runtime routing exists.
 
 The planned intake begins with an administrator CLI that streams only
 `adapter_config.json` and `adapter_model.safetensors` into an immutable,
@@ -63,13 +64,12 @@ committed purged. Registry and source purge are separate, bounded,
 descriptor-relative, crash-resumable operations; artifact purge retains metadata
 and history and never deletes upstream artifacts.
 
-Phase 12.1 must validate adapters through a reviewed model-free static schema.
-Its compatible package versions, closed configuration and tensor grammar, and
-numeric limits must be fixed before implementation; Phase 12.0 does not invent
-them. The registry records verified governance lineage and declared external
-training association, not proven dataset use or trusted training execution.
-
-See [the Phase 12 adapter registry contract](docs/adapter-registry.md).
+Phase 12.1A fixes the compatible package references, closed configuration and
+tensor grammar, bounded header/file limits, and model-free validation rules in a
+pure standard-library contract. The registry records verified governance
+lineage and declared external training association, not proven dataset use or
+trusted training execution. See the [Phase 12.1A static adapter contract](docs/adapter-static-contract.md)
+and [Phase 12 adapter registry contract](docs/adapter-registry.md).
 
 Each evaluation publication has a server-generated attempt UUID and a positive run attempt number. Final suite/result manifests are closed schemas and removal requires descriptor-verified exact department, resource, ownership UUID, run attempt, code revision, payload digests, and sizes. Staging has a separate private UUID-path ownership contract so a supervised child killed during directory or payload creation can be removed without parsing partial content. The exact descriptor chain is opened once through deletion; a staging marker is housekeeping only, so missing, zero-byte, truncated, or partial marker states remain recoverable. Reconciliation registers a resumable content-free batch before deletion. Unsafe entries terminalize as fixed-code blocked items and cannot starve later valid items; completed batches write one audit only when deletion succeeded. It is dry-run by default, department-scoped, restricted to system or department administrators, and accepts a strict limit of 1 through 1000. PostgreSQL and external storage are not transactionally atomic: an orphaned external result after a crash is never retrieval or evaluation authority. Reconciliation does not delete backups or persistent audit history.
 
@@ -258,6 +258,8 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Vector indexing](docs/vector-indexing.md)
 - [Qdrant boundary](docs/qdrant-boundary.md)
 - [Embedding model](docs/embedding-model.md)
+- [Phase 12.1A static adapter contract](docs/adapter-static-contract.md)
+- [Phase 12 adapter registry contract](docs/adapter-registry.md)
 - [Grounded RAG answering](docs/rag-answering.md)
 - [Prompt-injection boundary](docs/prompt-injection-boundary.md)
 - [Citation model](docs/citation-model.md)
@@ -275,7 +277,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 
 Phase 9 does not implement LLM judging, semantic grading, public raw results, a frontend dashboard, feedback-derived cases, automatic threshold or RAG changes, training datasets, SFT, adapters, model promotion, cross-department benchmarking, production OAuth/OIDC/SSO, or production deployment.
 
-Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 does not implement adapter intake, registry, evaluation, approval, promotion, rollback, or runtime routing. Google Drive storage is an external development runtime location, not a production object store or backup.
+Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 remains contract and threat-model work, while Phase 12.1A adds only model-free static compatibility metadata validation; no adapter intake, registry, evaluation, approval, promotion, rollback, or runtime routing exists. Google Drive storage is an external development runtime location, not a production object store or backup.
 
 ## License
 
