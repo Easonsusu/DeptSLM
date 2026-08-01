@@ -165,7 +165,9 @@ adapters/
 │   ├── manifest.json
 │   ├── adapter_config.json
 │   └── adapter_model.safetensors
+├── .staging/imports/<department UUID>/<source bundle UUID>/<import attempt UUID>/
 ├── .staging/registry/<department UUID>/<adapter UUID>/<publication UUID>/
+├── .deleting/imports/<department UUID>/<source bundle UUID>/<purge UUID>/
 └── .deleting/registry/<department UUID>/<adapter UUID>/<purge UUID>/
 ```
 
@@ -185,10 +187,18 @@ The planned source-intake allowlist is exactly `intake_manifest.json`,
 `adapter_config.json`, and `adapter_model.safetensors`. An administrator CLI
 streams only the two externally supplied payload files into a private UUID-
 derived `.staging/imports/<department>/<source bundle>/<import attempt>/`
-directory. DeptSLM generates the intake manifest after descriptor verification;
-an external manifest, README, archive, directory tree, or unknown entry is
-rejected. The committed import bundle is immutable and read-only to the future
-worker. No user-supplied host path is reopened from PostgreSQL metadata.
+directory. DeptSLM generates a closed, content-free `intake_manifest.json`
+binding department ID, source-bundle ID, import publication-attempt ID, positive
+attempt number, safe internal uploader/request references, payload digests and
+positive sizes, intake contract version, and code revision. Original host paths,
+filenames, bytes, tensor values, arbitrary operator text, external manifests,
+and credentials never enter PostgreSQL, APIs, audits, or logs. An external
+manifest, README, archive, directory tree, or unknown entry is rejected. The
+committed import bundle is immutable and read-only to the future worker. No
+user-supplied host path is reopened from PostgreSQL metadata. Publication
+requires retained descriptors, complete allowlist verification, same-filesystem
+no-replace rename, parent fsync, post-rename rehash, and a final PostgreSQL
+authority commit.
 
 The future adapter-registry worker mounts PostgreSQL, `adapters/imports`
 read-only, Phase 11 training-job bundles read-only, and adapter registry storage
@@ -202,10 +212,40 @@ runtime directories. There is no fallback to the checkout, current directory,
 configuration bytes, tensor values, and sensitive content never enter
 PostgreSQL, APIs, audits, or logs. PostgreSQL and external storage are
 non-atomic; a database commit does not prove external publication or deletion.
-Future purge must be explicit, bounded, crash-resumable, operation-audited, and
-fenced against active deployment authority. It must preserve Phase 10 datasets,
-Phase 11 job bundles, lineage, and audit history and make no backup-deletion
-claim.
+
+Import-source state is separate from adapter state: `staging`, `committed`,
+`claimed`, `consumed`, `rejected`, `abandoned`, `purge_pending`, and `purged`.
+One committed source may be consumed by at most one exact adapter version;
+failed attempts and retries stay bound to that source. The immutable registry is
+authority after PostgreSQL success; an import source is never runtime,
+evaluation, promotion, or rollback authority.
+
+Future purge has separate source and registry operations. A rollback-retention
+reference may be removed through a reviewed pre-purge mutation; upstream Phase
+10/11 retention dependencies release only after no active deployment or
+rollback reference remains, all registry bytes and every bound source copy are
+confirmed purged through committed authorities, and the adapter state is
+`purged`. Registry-only deletion cannot mark an adapter purged while a source
+copy remains. A consumed source may be purged before the registry after registry
+publication is independently verified and no intake retry/reconciliation needs
+the source; the adapter may remain active because the registry is authority.
+
+Source reconciliation and purge are dry-run by default, strictly bounded,
+administrator-only, department-scoped, durable before mutation,
+descriptor-relative/no-follow, exact-attempt owned, tombstone-bound, and
+crash-resumable. They emit one operation-level success audit only after all
+items complete. They never delete a source still required by an active intake or
+retry, never delete registry artifacts through source cleanup, and never delete
+Phase 10/11 artifacts. Metadata, governance lineage, evaluations, reviews,
+deployment events, and audit history remain; backup or Google Drive history
+deletion is not claimed.
+
+The registry manifest records verified governance lineage, a declared external
+training association, and verified artifact compatibility, not proven dataset
+use, trusted training execution, or certified adapter provenance. Phase 12.1
+must validate adapters with a reviewed model-free static schema. It must first
+pin compatible package versions, the closed configuration/tensor grammar, and
+numeric bounds; Phase 12.0 invents none and loads no model or tokenizer.
 
 A non-purged adapter record creates retention dependencies on the exact Phase 10
 dataset artifact and Phase 11 authoritative job bundle. Upstream Phase 10 and
@@ -217,7 +257,7 @@ Historical metadata references do not retain bytes; active deployment and
 explicit rollback-retention references do. No purge claims deletion from
 backups or Google Drive history.
 
-Instructions, target responses, source chunk identifiers, paths, and manifests are contentful external data. PostgreSQL keeps no such content and public APIs do not disclose it. Reconciliation and purge are explicit, department-scoped, dry-run by default, bounded, and do not claim backup deletion. Google Drive remains external development storage, not a production object store or backup.
+Instructions, target responses, source chunk identifiers, paths, and manifests are contentful external data. PostgreSQL keeps no such content and public APIs do not disclose it. Google Drive remains external development storage, not a production object store or backup.
 
 ## Google Drive limitations
 

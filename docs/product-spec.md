@@ -67,15 +67,16 @@ Students may become an end-user group in a future deployment, but only after a d
 
 - Build reviewed department-specific training datasets.
 - Phase 11 generates immutable LoRA or QLoRA LlamaFactory job bundles; it does not execute training or create adapters.
-- A future Phase 12 intake may store externally produced adapters outside the repository and associate each with its department, exact base-model version, Phase 10 dataset, Phase 11 job, closed configuration, and evaluation evidence.
+- A future Phase 12 intake may store externally produced adapters outside the repository and record a department-scoped, verified governance association to one exact Phase 10 dataset and Phase 11 job, the reviewed base-model contract, closed configuration, and evaluation evidence.
 - Evaluation and explicit review approval are required before promotion or runtime use. Adaptation remains optional and must demonstrate value beyond the approved base/RAG behavior.
 
 ### Phase 12 governance boundary
 
 Phase 12.0 defines the external adapter threat model, immutable artifact and
-lineage contracts, metadata-only registry, evaluation evidence, review,
-promotion, rollback, and eventual fail-closed runtime routing. It does not add
-an adapter registry, API, migration, worker, model loading, or runtime routing.
+governance-lineage contracts, metadata-only registry, evaluation evidence,
+review, promotion, rollback, and eventual fail-closed runtime routing. It does
+not add an adapter registry, API, migration, worker, model loading, or runtime
+routing.
 An imported adapter is not approved, an approved adapter is not promoted, and
 promotion is not proof of safety or quality. Cross-department fallback and
 silent fallback to the base model are prohibited; rollback-to-base must be
@@ -83,11 +84,18 @@ explicit. See [adapter-registry.md](adapter-registry.md).
 
 The planned first intake is an administrator-controlled CLI, not a browser or
 public weight-upload route. It streams only the two payload files into a
-server-ID-derived immutable source bundle; DeptSLM generates the source
-manifest and never trusts an external manifest or host path. A non-purged
-adapter retains its exact Phase 10 and Phase 11 upstream artifacts. Historical
-deployment metadata may remain after byte purge, while active deployment and
-explicit rollback-retention references continue to fence artifact deletion.
+server-ID-derived immutable source bundle; DeptSLM generates a closed,
+content-free intake manifest and never trusts an external manifest or host path.
+Source state is separate from adapter state, and one committed source may be
+consumed by only one exact adapter version. A rollback-retention reference may
+be removed by a reviewed pre-purge mutation; upstream retention releases only
+after the registry and every bound source copy are committed purged. Registry
+and source purge remain separate, bounded, descriptor-relative, and
+crash-resumable. The registry records verified governance lineage and a
+declared external training association, not proven dataset use, trusted
+training execution, or certified adapter provenance. Phase 12.1 must use a
+reviewed model-free static schema, with package versions and numeric limits
+fixed before implementation.
 
 ### Evaluation and operations
 

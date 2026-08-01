@@ -218,14 +218,25 @@ The following metadata-only routes are conceptual and are not implemented:
 - `GET /departments/{department_id}/adapter-deployment`
 
 If a later reviewed phase implements them, they will expose safe metadata only
-and require exact same-department authorization, Phase 10/11 lineage, reviewed
-evaluation evidence, explicit approval, and optimistic version checks. There is
-no adapter weight upload or download, raw manifest or configuration download,
-host path, tensor disclosure, arbitrary model selector, or arbitrary adapter
-selector endpoint. The planned first intake is an administrator-controlled CLI
-that creates a committed immutable source bundle; it is not a browser or public
-weight-upload route. Cross-department fallback is prohibited; runtime loading
-must eventually fail closed and never silently fall back to the base model.
+and require exact same-department authorization, Phase 10/11 governance
+lineage, reviewed evaluation evidence, explicit approval, and optimistic version
+checks. There is no adapter weight upload or download, raw manifest or
+configuration download, host path, tensor disclosure, arbitrary model selector,
+or arbitrary adapter selector endpoint. The planned first intake is an
+administrator-controlled CLI that creates a committed immutable source bundle;
+it is not a browser or public weight-upload route. DeptSLM generates a closed,
+content-free intake manifest binding the exact source, import attempt, positive
+payload sizes/digests, contract version, and code revision; external manifests
+and attestations are never authority. One committed source may be consumed by
+only one exact adapter version, and a source is never runtime, evaluation,
+promotion, or rollback authority. Registry and source purge are separate and
+must release upstream retention only after both byte surfaces are committed
+purged. The registry records verified governance lineage and a declared external
+training association, not proven dataset use or trusted training execution.
+Cross-department fallback is prohibited; runtime loading must eventually fail
+closed and never silently fall back to the base model. Phase 12.1 static
+validation must be model-free and cannot begin until its package versions,
+closed schema, and numeric limits are reviewed and fixed.
 
 ### Evaluations and exports
 

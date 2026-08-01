@@ -113,8 +113,8 @@ route, worker, service, mount, dependency, adapter file, or runtime loading.
 The proposed final artifact allowlist is exactly `manifest.json`,
 `adapter_config.json`, and `adapter_model.safetensors`; adapters are untrusted
 until their exact safetensors, closed configuration, same-department Phase 10
-dataset lineage, and Phase 11 training-job lineage are validated. The reviewed
-base contract is `Qwen/Qwen3-0.6B` revision
+dataset governance lineage, and Phase 11 declared training association are
+validated. The reviewed base contract is `Qwen/Qwen3-0.6B` revision
 `c1899de289a04d12100db370d81485cdf75e47ca` with Apache-2.0 metadata and
 LlamaFactory `0.9.5`.
 
@@ -126,18 +126,27 @@ request snapshot, reject cross-department or base-revision mismatches, return a
 safe failure when a required adapter cannot load, and never silently fall back
 to the base model. Rollback-to-base must be explicit.
 
-The proposed registry, `.staging`, and `.deleting` surfaces live only beneath
-`DEPTSLM_DATA_DIR/adapters`, use private UUID-derived paths and descriptor-
-relative no-follow verification, and remain outside Git. PostgreSQL and
-external storage are non-atomic. Future reconciliation and purge must be
-crash-resumable, operation-audited, and fenced against active deployments; they
-must not delete Phase 10 datasets, Phase 11 job bundles, backups, or audit
-history. See [adapter-registry.md](adapter-registry.md) for the full contract.
+The proposed registry, import-source, `.staging`, and `.deleting` surfaces live
+only beneath `DEPTSLM_DATA_DIR/adapters`, use private UUID-derived paths and
+descriptor-relative no-follow verification, and remain outside Git. Import
+sources have separate `staging`, `committed`, `claimed`, `consumed`, `rejected`,
+`abandoned`, `purge_pending`, and `purged` states; one committed source can be
+consumed by only one exact adapter version. Registry and source-byte purge are
+separate, bounded, crash-resumable, operation-audited operations. PostgreSQL and
+external storage are non-atomic. Future reconciliation and purge must be fenced
+against active deployments and exact intake/retry ownership; they must not
+delete Phase 10 datasets, Phase 11 job bundles, backups, or audit history. See
+[adapter-registry.md](adapter-registry.md) for the full contract.
 
 The diagram separates an untrusted external training environment from the
 DeptSLM application. It may consume an administratively exported Phase 11 job
 bundle outside the Phase 12 implementation and produce untrusted adapter
-files; that output is not proof of origin, compatibility, safety, or quality.
+files. Phase 12 records only a verified governance lineage, a declared external
+training association, and verified artifact compatibility; it cannot prove exact
+bundle or dataset use, declared LlamaFactory execution, declared training steps,
+or unmodified weight production. Operator attestations remain untrusted, and
+stronger provenance would require a separately reviewed trusted-execution,
+signing, or remote-attestation design.
 The planned administrator source import creates a private immutable import
 bundle before the isolated intake/validation boundary. The final registry,
 evaluation evidence, review/approval, department deployment pointer, and
@@ -208,10 +217,19 @@ Phase 5 adds explicit failed-attempt retry, exact expired-claim staging recovery
 ### Adapter training and promotion
 
 1. An authorized operator creates or selects a reviewed department dataset.
-2. The training worker records the base-model revision and LLaMA-Factory configuration.
-3. LLaMA-Factory produces a department-bound adapter under external storage.
+2. The completed Phase 11 worker records the reviewed base-model revision and
+   LlamaFactory configuration in an immutable job bundle.
+3. An untrusted external training environment may consume the Phase 11 bundle and
+   submit adapter files through the future administrator-controlled intake.
 4. Automated and human evaluation compare the candidate with the current approved behavior.
-5. An authorized promotion action makes the adapter available to that department; rollback remains possible.
+5. An authorized promotion action may make a validated adapter available to that
+   department; rollback remains explicit and remains a future boundary.
+
+The import source is not runtime, evaluation, promotion, or rollback authority.
+The registry becomes adapter authority only after a successful PostgreSQL
+publication commit. Phase 12.1 must validate the adapter with a reviewed static
+schema without loading a model or tokenizer; package versions and numeric
+limits are intentionally not fixed in Phase 12.0.
 
 The exact training scheduler, GPU execution environment, registry schema, and approval workflow are future decisions.
 

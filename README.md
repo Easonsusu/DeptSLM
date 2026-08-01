@@ -49,11 +49,25 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 
 The planned intake begins with an administrator CLI that streams only
 `adapter_config.json` and `adapter_model.safetensors` into an immutable,
-department-scoped import bundle. DeptSLM generates the intake manifest; an
-external manifest, archive, directory, or arbitrary host path is never
-authority. Future adapter records retain exact Phase 10/11 upstream artifacts
-until active deployment and explicit rollback-retention dependencies are gone;
-artifact purge retains metadata and history.
+department-scoped import bundle. DeptSLM generates a closed, content-free
+`intake_manifest.json` binding the department, source bundle, import attempt,
+safe internal request reference, positive payload sizes, digests, contract
+version, and code revision; an external manifest, archive, directory, or
+arbitrary host path is never authority. Import sources have their own planned
+staging, committed, claimed, consumed, rejected, abandoned, purge-pending, and
+purged lifecycle. One committed source can be consumed by only one exact adapter
+version, and retries remain bound to that source. A reviewed mutation may remove
+a rollback-retention reference before byte purge; upstream Phase 10/11 retention
+dependencies release only after the registry and every bound source copy are
+committed purged. Registry and source purge are separate, bounded,
+descriptor-relative, crash-resumable operations; artifact purge retains metadata
+and history and never deletes upstream artifacts.
+
+Phase 12.1 must validate adapters through a reviewed model-free static schema.
+Its compatible package versions, closed configuration and tensor grammar, and
+numeric limits must be fixed before implementation; Phase 12.0 does not invent
+them. The registry records verified governance lineage and declared external
+training association, not proven dataset use or trusted training execution.
 
 See [the Phase 12 adapter registry contract](docs/adapter-registry.md).
 

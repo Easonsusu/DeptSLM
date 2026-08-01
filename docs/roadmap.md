@@ -64,7 +64,7 @@ This roadmap separates foundational safety work from product implementation. A l
 
 ## Phase 12 — LoRA adapter registry (under review)
 
-- Phase 12.0 is documentation and contract work only: status correction, threat model, immutable administrator-controlled source intake, server-generated manifest authority, closed artifact and metadata contracts, upstream retention, and API, storage, lifecycle, evaluation, promotion, and rollback design.
+- Phase 12.0 is documentation and contract work only: threat model, immutable administrator-controlled source intake, server-generated manifest authority, separate import-source lifecycle and purge, complete registry/source byte-purge semantics, reversible rollback-retention transitions, closed artifact and metadata contracts, upstream retention, governance-lineage versus training-provenance limits, model-free static validation, and API, storage, lifecycle, evaluation, promotion, and rollback design.
 - Phase 12.1 (not started): immutable external adapter intake, validation, metadata-only registry, reconciliation, and purge foundations; no runtime loading.
 - Phase 12.2 (not started): adapter-target evaluation, baseline/candidate evidence, and fixed numeric quality and safety gates; no automatic promotion.
 - Phase 12.3 (not started): review, approval, promotion, supersession, rollback, and deployment event history; no silent fallback.

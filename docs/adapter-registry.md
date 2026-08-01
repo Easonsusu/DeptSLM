@@ -22,11 +22,13 @@ evaluation, deployment pointer, runtime loading, or rollback exists today.
 
 Phase 12 is intended to provide controlled intake of externally produced LoRA
 or QLoRA adapter artifacts and an immutable, department-scoped adapter
-registry. The future registry must preserve exact lineage to a Phase 10 dataset
-and a Phase 11 training-job bundle, retain adapter evaluation evidence, require
-explicit review and approval, support controlled department promotion, and
-support rollback to a previous adapter or explicitly to the base model. A later
-reviewed subphase may add fail-closed runtime routing.
+registry. The future registry must preserve a verified governance association to
+one Phase 10 dataset and one Phase 11 training-job bundle, retain adapter
+evaluation evidence, require explicit review and approval, support controlled
+department promotion, and support rollback to a previous adapter or explicitly
+to the base model. A later reviewed subphase may add fail-closed runtime
+routing. This association does not prove dataset use or trusted external
+training execution.
 
 This boundary does not make external training trustworthy. An operator's claim
 about how an adapter was produced is an input to validate, not evidence that
@@ -105,10 +107,11 @@ adapter is not automatically promoted; and a promoted adapter is not proof of
 safety or quality. Google Drive is development storage, not an object store,
 locking service, or backup guarantee.
 
-## Required lineage
+## Required governance lineage (not training provenance)
 
 Every future adapter version must bind to one exact same-department Phase 11
-training job. Its content-free registry metadata must preserve:
+training job as its verified governance lineage. Its content-free registry
+metadata must preserve:
 
 - adapter ID and department ID;
 - Phase 11 training job ID and job version;
@@ -130,8 +133,20 @@ The reviewed base contract is:
 | License metadata | `Apache-2.0` |
 | Phase 11 LlamaFactory version | `0.9.5` |
 
-Phase 12.1 must fail closed if any lineage field changes between initial
+Phase 12.1 must fail closed if any governance-lineage field changes between initial
 authorization, validation, publication, or final commit.
+
+This association is not trusted training provenance. Phase 12 can verify the
+permitted Phase 11 job, the reviewed contract, and adapter compatibility, but it
+cannot prove that an untrusted external environment used the exact job bundle or
+Phase 10 dataset, executed the declared LlamaFactory configuration or steps, or
+produced the submitted weights without modification. The registry manifest
+records a **verified governance lineage**, a **declared external training
+association**, and **verified artifact compatibility** only. Operator
+attestations remain untrusted metadata. Stronger provenance would require a
+separately reviewed trusted-execution, signing, or remote-attestation design.
+Evaluation and approval remain mandatory, but they do not turn this association
+into proven training provenance.
 
 ## Planned adapter artifact contract
 
@@ -154,10 +169,29 @@ invent package versions. Phase 12.1 must first define a closed
 `adapter_config.json` key and value contract; arbitrary PEFT configuration is
 not accepted.
 
-Validation must check the exact reviewed base-model lineage, safetensors header,
+Validation must check the exact reviewed base-model contract, safetensors header,
 tensor names, shapes, ranks, dtypes, aggregate sizes, and adapter type. A file
 that contains full-model weights or an otherwise valid but unreviewed format is
 not an adapter under this contract.
+
+### Model-free static adapter validation
+
+The future intake worker has no `model_cache`, base-model weights, tokenizer,
+Transformers model object, or Hugging Face access. Phase 12.1 must therefore
+validate through a reviewed, content-free, source-controlled static adapter
+schema. Before implementation, that phase must pin compatible PEFT,
+`safetensors`, and any required Transformers interface versions, then review and
+version a closed `adapter_config.json` schema, allowed adapter type, target
+module names, tensor-key grammar, rank and shape relationships, allowed dtypes,
+maximum safetensors header bytes, maximum tensor count, maximum individual
+tensor bytes, maximum total adapter bytes, required and prohibited tensor
+groups, and rules distinguishing an adapter from full-model weights.
+
+The schema must require no model or tokenizer loading, network access, or model
+weights. It must reject unknown target modules, keys, shapes, ranks, and dtypes
+and fail closed when compatibility cannot be proven statically. Phase 12.0 does
+not invent package versions or numeric limits; Phase 12.1 cannot implement this
+validator until those values are reviewed and fixed.
 
 ## Planned storage layout
 
@@ -178,11 +212,19 @@ adapters/
         adapter_config.json
         adapter_model.safetensors
   .staging/
+    imports/
+      <department_id>/
+        <source_bundle_id>/
+          <import_attempt_id>/
     registry/
       <department_id>/
         <adapter_id>/
           <publication_attempt_id>/
   .deleting/
+    imports/
+      <department_id>/
+        <source_bundle_id>/
+          <purge_operation_id>/
     registry/
       <department_id>/
         <adapter_id>/
@@ -233,11 +275,24 @@ rejected. External manifests and operator attestations are untrusted input and
 never become authority.
 
 The import source bundle is immutable and is verified through retained
-descriptor-relative, no-follow handles. No source host path is stored in
-PostgreSQL, audit events, logs, public APIs, or a registry manifest. A queued
+descriptor-relative, no-follow handles. Its server-generated,
+closed/content-free `intake_manifest.json` binds the department ID, source-bundle
+ID, import publication-attempt ID, positive import-attempt number, safe internal
+uploader/request references, the positive sizes and SHA-256 digests of
+`adapter_config.json` and `adapter_model.safetensors`, the intake contract
+version, and the code revision. It never stores or exposes original host paths,
+original filenames, adapter bytes, configuration bytes, tensor values, arbitrary
+operator text, external manifests, or credentials. No source host path is stored
+in PostgreSQL, audit events, logs, public APIs, or a registry manifest. A queued
 adapter-registry worker may consume only an already committed immutable import
 source bundle; it must never reopen a user-supplied arbitrary host path from
 PostgreSQL metadata.
+
+Committed publication requires private attempt-scoped staging, retained
+no-follow descriptors, complete allowlist and identity verification,
+same-filesystem no-replace rename, parent fsync, post-rename rehash, and a final
+PostgreSQL authority commit. External manifests or attestations remain untrusted
+and never authorize ownership.
 
 The external source allowlist is exactly:
 
@@ -257,9 +312,43 @@ adapter_model.safetensors
 
 The final `manifest.json` is generated by DeptSLM after complete validation. It
 binds the exact department, source bundle, adapter, intake attempt, Phase 10
-lineage, Phase 11 lineage, base model, contracts, payload digests, and positive
-sizes. It is never copied from the external source package and is reverified
-after publication before PostgreSQL records success.
+governance lineage, declared Phase 11 training association, base model,
+contracts, payload digests, and positive sizes. It is never copied from the
+external source package and is reverified after publication before PostgreSQL
+records success.
+
+## Planned import-source lifecycle
+
+Import-source state is separate from adapter state. The conceptual states are:
+
+```text
+staging -> committed -> claimed -> consumed
+    |          |          |
+    +------> rejected   abandoned
+                         |
+                  purge_pending -> purged
+```
+
+The exact implementation may represent terminal outcomes with separate
+operation fields, but it must preserve these meanings:
+
+- one committed source bundle may be consumed by at most one exact adapter
+  version; it cannot be reused to create sibling adapters;
+- claiming binds the exact source bundle, adapter ID, intake attempt, department,
+  and Phase 11 authority snapshot;
+- a failed attempt never transfers the source bundle to another adapter; retry
+  remains bound to the same adapter and exact source bundle;
+- successful registry publication and PostgreSQL authority transition the source
+  to `consumed`; and
+- the immutable registry, not the import source, becomes adapter authority after
+  that success. The source is never runtime, evaluation, promotion, or rollback
+  authority.
+
+`rejected` covers a source that fails closed validation, `abandoned` covers an
+interrupted or explicitly abandoned attempt before commitment, and
+`purge_pending`/`purged` are reserved for an authorized source-byte purge. A
+source still required by an active intake, retry, or reconciliation operation
+cannot be purged.
 
 ## Planned intake boundary
 
@@ -387,17 +476,44 @@ no active purge or conflicting deployment operation. A historical event that
 references a purged adapter remains readable as metadata but cannot be a
 rollback target.
 
-Removing a rollback-retention dependency requires no active deployment, no
-in-progress evaluation, review, promotion, rollback, reconciliation, or purge
-operation, no explicit rollback-retention requirement, and completed adapter
-artifact purge. PostgreSQL lineage and immutable audit/deployment history may
-remain afterward.
+### Separate rollback-reference and upstream-release transitions
 
-Future adapter purge may remove private adapter artifact bytes after every
-required fence and retention check and mark the artifact state `purged`. It
-retains the metadata row, lineage, evaluations, reviews, deployment events,
-timestamps, and audits. Metadata-row deletion is not required adapter purge
-behavior.
+Removing a rollback-retention reference is a reviewed mutation that may occur
+before byte purge. It requires the exact adapter in the authorized department,
+the adapter not to be the active deployment, no active promotion, rollback,
+evaluation, review, reconciliation, or purge operation, exact expected-reference
+and adapter-version matches, and current same-department `system_admin` or
+`department_admin` authorization. It records an immutable mutation audit and a
+deployment-governance event. The removal makes the adapter ineligible as an
+explicit rollback target; it does not purge bytes, erase deployment history, or
+release the Phase 10/11 upstream dependencies.
+
+Upstream Phase 10 and Phase 11 retention dependencies may be released only
+after no active deployment or rollback-retention reference remains, no intake,
+evaluation, review, promotion, rollback, reconciliation, or purge operation is
+active, every registry artifact byte is confirmed purged through committed
+registry-purge authority, every bound import-source byte is confirmed purged
+through committed source-purge authority, and the adapter artifact state is
+committed as `purged`. Historical metadata, lineage, evaluations, reviews,
+deployment events, timestamps, and audits remain.
+
+### Complete adapter-byte purge semantics
+
+Registry purge removes the authoritative registry artifact; source purge removes
+the exact bound immutable import source. A registry-only deletion must not mark
+an adapter `purged` while any bound import copy remains. An adapter may enter
+`purged` only after the registry final is absent through committed purge
+authority, every bound source bundle is absent through committed source-purge
+authority, no active deployment or rollback-retention reference exists, and no
+conflicting operation remains.
+
+A consumed source may be purged before the registry artifact when registry
+publication and PostgreSQL success are complete, no intake retry or
+reconciliation requires it, the final registry has been independently verified,
+and source-purge authority is committed. The adapter may remain active after
+that source purge because the immutable registry is runtime authority. Purge
+retains the metadata row and history; it does not delete Phase 10 or Phase 11
+artifacts and does not claim deletion from backups or synchronized history.
 
 ## Planned evaluation contract
 
@@ -467,6 +583,31 @@ purge must not delete Phase 10 datasets or Phase 11 training-job bundles, and it
 must not claim deletion from backups, Google Drive history, or other retained
 copies. PostgreSQL and external storage remain non-atomic throughout recovery.
 
+Import-source reconciliation is a separate surface from registry-artifact
+reconciliation. The planned external layout includes:
+
+```text
+adapters/.deleting/imports/<department_id>/<source_bundle_id>/<purge_operation_id>/
+adapters/.deleting/registry/<department_id>/<adapter_id>/<purge_operation_id>/
+```
+
+Future Phase 12.1 must define explicit, bounded administrator maintenance for
+abandoned import staging, committed-but-never-claimed sources, rejected sources,
+consumed sources, crashes between source publication and the PostgreSQL commit,
+and crashes during source deletion. It is dry-run by default. Before any
+mutation it durably registers the operation and exact source-bundle/attempt
+item, proves ownership through descriptor-relative no-follow handles, binds
+exact tombstone identities before unlink, and remains crash-resumable. It emits
+one operation-level exactly-once success audit only after every active item is
+complete.
+
+Source cleanup must not delete a source still required by an active intake,
+retry, or reconciliation operation; must never delete registry artifacts through
+a source-cleanup operation; and must never delete Phase 10 or Phase 11
+artifacts. A failed or incomplete marker is not ownership authority: only exact
+metadata plus the private UUID-derived source path and descriptor identity can
+authorize cleanup. Unsafe or foreign paths remain blocked without deletion.
+
 ## Acceptance criteria for Phase 12
 
 Phase 12 as a whole is complete only when tests prove that:
@@ -476,7 +617,8 @@ Phase 12 as a whole is complete only when tests prove that:
 - intake is eligible only for the exact approved, succeeded, unpurged Phase 11
   job and its complete immutable Phase 10/11 authority snapshot;
 - external adapter artifacts are validated through a closed immutable contract;
-- exact Phase 10 and Phase 11 lineage is preserved;
+- exact Phase 10 and Phase 11 governance lineage is preserved without claiming
+  trusted training provenance;
 - publication is private, descriptor-bound, immutable, and recoverable;
 - invalid, foreign, malformed, substituted, oversized, or full-model artifacts
   fail closed;
@@ -484,8 +626,19 @@ Phase 12 as a whole is complete only when tests prove that:
 - unapproved adapters cannot be promoted;
 - each department has at most one active deployment;
 - upstream Phase 10/11 purge is fenced by adapter retention dependencies;
+- rollback-retention references can be removed through a reviewed pre-purge
+  mutation, while upstream dependencies release only after registry and source
+  bytes are both committed purged;
+- import-source lifecycle, exact one-source/one-adapter consumption, and
+  source-only reconciliation/purge are separate from adapter lifecycle;
 - historical metadata references survive artifact purge without retaining bytes,
   while active and rollback-retention references fence deletion;
+- a registry-only deletion cannot mark an adapter purged while any bound import
+  source remains;
+- the manifest records verified governance lineage and declared external
+  training association, not proven training provenance;
+- model-free static validation fails closed without loading a model or tokenizer
+  and cannot begin until its package versions and numeric limits are reviewed;
 - promotion and rollback are transactional at the metadata boundary, versioned,
   and auditable without claiming PostgreSQL/filesystem atomicity;
 - runtime routing cannot cross departments and never silently falls back;

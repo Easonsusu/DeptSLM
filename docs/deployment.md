@@ -4,16 +4,24 @@
 
 DeptSLM is not a production deployment. Phase 9 completed the internal evaluation runner with external immutable suites, content-free result artifacts, and PostgreSQL-backed leases. It reuses the completed Phase 7 grounded-answer boundary; it is not a public evaluation API. Phase 10 completed an isolated dataset-builder worker that writes only private external SFT dataset artifacts. Phase 11 completed a separate worker that generates immutable LlamaFactory configuration bundles only; it does not install or execute LlamaFactory, train models, or create adapters. Phase 12 is under review, and Phase 12.0 adds documentation and contract design only. It adds no service, mount, dependency, environment variable, port, or operational command. Public vector search, conversations, history, streaming, reranking, scheduled evaluation, scheduled purge, malware scanning, OCR, training, adapter intake, runtime adapter routing, production identity/storage, secrets management, backups, clustering, and production operations remain deferred.
 
-Phase 12.1 through 12.4 are not started. Do not provide a runnable adapter upload, download, loading, promotion, or rollback command from this document. Future adapter runtime design requires a separate reviewed deployment model with exact lineage, validation, evaluation, approval, department promotion, explicit rollback-to-base, and fail-closed loading. PostgreSQL and external storage remain non-atomic.
+Phase 12.1 through 12.4 are not started. Do not provide a runnable adapter upload, download, loading, promotion, or rollback command from this document. Future adapter runtime design requires a separate reviewed deployment model with verified governance lineage, static validation, evaluation, approval, department promotion, explicit rollback-to-base, and fail-closed loading. PostgreSQL and external storage remain non-atomic.
 
 The planned intake begins with an administrator-controlled CLI that creates an
-immutable server-ID-derived import bundle from only the two payload files. A
-future adapter-registry worker would mount PostgreSQL, adapter imports
-read-only, Phase 11 training-job bundles read-only, and registry storage
-read-write. The API and browser would receive no adapter storage mount or weight
-upload route. Active deployment and explicit rollback-retention references
-would fence adapter artifact purge; historical metadata would remain without
-retaining artifact bytes.
+immutable server-ID-derived import bundle from only the two payload files.
+DeptSLM generates a closed, content-free intake manifest binding exact source,
+attempt, department, safe internal request reference, payload digests and sizes,
+contract version, and code revision; external manifests and host paths are never
+authority. Import sources have separate staging, committed, claimed, consumed,
+rejected, abandoned, purge-pending, and purged states, and one committed source
+may be consumed by only one exact adapter version. A future adapter-registry
+worker would mount PostgreSQL, adapter imports read-only, Phase 11 training-job
+bundles read-only, and registry storage read-write. The API and browser would
+receive no adapter storage mount or weight-upload route. A rollback-retention
+reference may be removed by a reviewed pre-purge mutation. Registry and source
+purge are separate, bounded, descriptor-relative, crash-resumable operations;
+upstream retention dependencies release only after both byte surfaces are
+committed purged. The registry manifest records governance lineage and a
+declared external training association, not proven training provenance.
 
 ## Planned local services
 
@@ -31,7 +39,7 @@ retaining artifact bytes.
 | `training-worker` | Phase 10 SFT dataset builder | PostgreSQL plus `training_datasets` only; no model, Qdrant, RAG, or adapter stack. |
 | `training-job-worker` | Phase 11 immutable job-bundle generator | PostgreSQL plus `training_datasets` only; no model, tokenizer, LlamaFactory package, Qdrant, RAG, or adapter stack. |
 
-Phase 6 pins `Qwen/Qwen3-Embedding-0.6B` at immutable revision `d23109d65ca9fdf61eef614209744716f337f50f`; Phase 7 pins `Qwen/Qwen3-0.6B` at revision `c1899de289a04d12100db370d81485cdf75e47ca`. Explicit administration downloads them outside Git while normal processes stay offline. LlamaIndex and adapter runtime loading remain future components. Phase 11 does not execute LLaMA-Factory; model inference dependencies remain outside API/extraction/indexing images.
+Phase 6 pins `Qwen/Qwen3-Embedding-0.6B` at immutable revision `d23109d65ca9fdf61eef614209744716f337f50f`; Phase 7 pins `Qwen/Qwen3-0.6B` at revision `c1899de289a04d12100db370d81485cdf75e47ca`. Explicit administration downloads them outside Git while normal processes stay offline. LlamaIndex and adapter runtime loading remain future components. Phase 11 does not execute LLaMA-Factory; model inference dependencies remain outside API/extraction/indexing images. Phase 12.1 adapter intake must use a reviewed model-free static schema and cannot load a model or tokenizer; its package versions and numeric limits remain to be fixed in that phase.
 
 ## Prerequisites
 
