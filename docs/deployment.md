@@ -6,6 +6,15 @@ DeptSLM is not a production deployment. Phase 9 completed the internal evaluatio
 
 Phase 12.1 through 12.4 are not started. Do not provide a runnable adapter upload, download, loading, promotion, or rollback command from this document. Future adapter runtime design requires a separate reviewed deployment model with exact lineage, validation, evaluation, approval, department promotion, explicit rollback-to-base, and fail-closed loading. PostgreSQL and external storage remain non-atomic.
 
+The planned intake begins with an administrator-controlled CLI that creates an
+immutable server-ID-derived import bundle from only the two payload files. A
+future adapter-registry worker would mount PostgreSQL, adapter imports
+read-only, Phase 11 training-job bundles read-only, and registry storage
+read-write. The API and browser would receive no adapter storage mount or weight
+upload route. Active deployment and explicit rollback-retention references
+would fence adapter artifact purge; historical metadata would remain without
+retaining artifact bytes.
+
 ## Planned local services
 
 | Service | Role | Current expectation |

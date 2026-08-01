@@ -157,6 +157,10 @@ The proposed private external registry layout is:
 
 ```text
 adapters/
+├── imports/<department UUID>/<source bundle UUID>/
+│   ├── intake_manifest.json
+│   ├── adapter_config.json
+│   └── adapter_model.safetensors
 ├── registry/<department UUID>/<adapter UUID>/
 │   ├── manifest.json
 │   ├── adapter_config.json
@@ -177,6 +181,21 @@ publication, file and directory fsync, post-rename rehash, and retained
 descriptor identity through the final PostgreSQL commit. Descriptor-relative
 no-follow operations must reject path replacement and links.
 
+The planned source-intake allowlist is exactly `intake_manifest.json`,
+`adapter_config.json`, and `adapter_model.safetensors`. An administrator CLI
+streams only the two externally supplied payload files into a private UUID-
+derived `.staging/imports/<department>/<source bundle>/<import attempt>/`
+directory. DeptSLM generates the intake manifest after descriptor verification;
+an external manifest, README, archive, directory tree, or unknown entry is
+rejected. The committed import bundle is immutable and read-only to the future
+worker. No user-supplied host path is reopened from PostgreSQL metadata.
+
+The future adapter-registry worker mounts PostgreSQL, `adapters/imports`
+read-only, Phase 11 training-job bundles read-only, and adapter registry storage
+read-write. The API and browser have no adapter storage mount and no weight
+upload route. Phase 12.0 creates none of these directories and changes no setup
+script or Compose mount.
+
 Phase 12.0 does not change setup scripts, Compose, mounts, dependencies, or
 runtime directories. There is no fallback to the checkout, current directory,
 `/tmp`, home, cache, logs, exports, or `model_cache`. Host paths, adapter bytes,
@@ -187,6 +206,16 @@ Future purge must be explicit, bounded, crash-resumable, operation-audited, and
 fenced against active deployment authority. It must preserve Phase 10 datasets,
 Phase 11 job bundles, lineage, and audit history and make no backup-deletion
 claim.
+
+A non-purged adapter record creates retention dependencies on the exact Phase 10
+dataset artifact and Phase 11 authoritative job bundle. Upstream Phase 10 and
+Phase 11 purge must fail closed while those dependencies exist. Adapter purge
+removes only private adapter bytes after active-deployment and explicit
+rollback-retention fences, then marks artifact state purged while retaining
+metadata, lineage, evaluations, reviews, deployment events, and audit history.
+Historical metadata references do not retain bytes; active deployment and
+explicit rollback-retention references do. No purge claims deletion from
+backups or Google Drive history.
 
 Instructions, target responses, source chunk identifiers, paths, and manifests are contentful external data. PostgreSQL keeps no such content and public APIs do not disclose it. Reconciliation and purge are explicit, department-scoped, dry-run by default, bounded, and do not claim backup deletion. Google Drive remains external development storage, not a production object store or backup.
 

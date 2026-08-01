@@ -222,7 +222,9 @@ and require exact same-department authorization, Phase 10/11 lineage, reviewed
 evaluation evidence, explicit approval, and optimistic version checks. There is
 no adapter weight upload or download, raw manifest or configuration download,
 host path, tensor disclosure, arbitrary model selector, or arbitrary adapter
-selector endpoint. Cross-department fallback is prohibited; runtime loading
+selector endpoint. The planned first intake is an administrator-controlled CLI
+that creates a committed immutable source bundle; it is not a browser or public
+weight-upload route. Cross-department fallback is prohibited; runtime loading
 must eventually fail closed and never silently fall back to the base model.
 
 ### Evaluations and exports

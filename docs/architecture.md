@@ -19,7 +19,7 @@ flowchart TB
         API["FastAPI API"]
         RAG["RAG worker (extraction)"]
         Index["Indexing worker (embedding and Qdrant)"]
-        Train["Training worker (planned)"]
+        Train["Phase 11 training-job worker"]
     end
 
     subgraph Data["State services"]
@@ -33,9 +33,21 @@ flowchart TB
         Runtime["Private Qwen3 runtime"]
     end
 
-    subgraph TrainingStack["Adapter training (planned)"]
-        Factory["LLaMA-Factory"]
-        Adapter["Department LoRA / QLoRA adapter"]
+    subgraph ExternalTraining["Untrusted external training environment (planned; outside DeptSLM)"]
+        JobBundle["Phase 11 job bundle\n(administratively supplied)"]
+        Factory["External LLaMA-Factory environment"]
+        ExternalAdapter["Untrusted adapter files"]
+    end
+
+    subgraph AdapterBoundary["Phase 12 adapter governance (planned; not implemented)"]
+        SourceImport["Administrator source import"]
+        ImportBundle["Immutable external adapter source bundle"]
+        Intake["Isolated adapter intake and validation"]
+        Registry["Immutable adapter registry"]
+        Evidence["Adapter evaluation evidence"]
+        Review["Review and approval"]
+        Deployment["Department deployment pointer"]
+        Load["Fail-closed runtime adapter loading"]
     end
 
     Drive[("External runtime storage\nDEPTSLM_DATA_DIR on Google Drive")]
@@ -52,12 +64,22 @@ flowchart TB
     Index -->|"offline document embeddings"| Embed
     Index -->|"scoped staged upserts"| QD
     Runtime -->|"strict JSON answer contract"| API
-    Train --> Factory
-    Factory -->|"produces"| Adapter
-    Adapter -.->|"approved adapter only"| Runtime
+    Train -->|"generates bundle only"| JobBundle
+    JobBundle -.->|"may be supplied outside Phase 12"| Factory
+    Factory -.->|"produces untrusted files"| ExternalAdapter
+    ExternalAdapter -.->|"administrator-controlled import"| SourceImport
+    SourceImport -.-> ImportBundle
+    ImportBundle -.-> Intake
+    Intake -.-> Registry
+    Registry -.-> Evidence
+    Evidence -.-> Review
+    Review -.-> Deployment
+    Deployment -.-> Load
+    Load -.->|"exact approved adapter only"| Runtime
+    API -.->|"future metadata boundary"| Deployment
     RAG -->|"documents, extracted text, snapshots"| Drive
     Index -->|"read-only chunks and model cache"| Drive
-    Train -->|"datasets, adapters, evaluations, logs"| Drive
+    Train -->|"Phase 11 job bundle only"| Drive
     Runtime -->|"model cache"| Drive
 ```
 
@@ -111,6 +133,17 @@ external storage are non-atomic. Future reconciliation and purge must be
 crash-resumable, operation-audited, and fenced against active deployments; they
 must not delete Phase 10 datasets, Phase 11 job bundles, backups, or audit
 history. See [adapter-registry.md](adapter-registry.md) for the full contract.
+
+The diagram separates an untrusted external training environment from the
+DeptSLM application. It may consume an administratively exported Phase 11 job
+bundle outside the Phase 12 implementation and produce untrusted adapter
+files; that output is not proof of origin, compatibility, safety, or quality.
+The planned administrator source import creates a private immutable import
+bundle before the isolated intake/validation boundary. The final registry,
+evaluation evidence, review/approval, department deployment pointer, and
+fail-closed runtime loading are separate planned boundaries. Phase 11's actual
+worker remains separate and generates a job bundle only; it does not launch
+LlamaFactory.
 
 ### FastAPI backend
 

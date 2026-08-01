@@ -47,6 +47,14 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > evaluated, approved, promoted, loaded, or purged by DeptSLM. Phase 12.1 through
 > Phase 12.4 remain unimplemented; no adapter registry or runtime routing exists.
 
+The planned intake begins with an administrator CLI that streams only
+`adapter_config.json` and `adapter_model.safetensors` into an immutable,
+department-scoped import bundle. DeptSLM generates the intake manifest; an
+external manifest, archive, directory, or arbitrary host path is never
+authority. Future adapter records retain exact Phase 10/11 upstream artifacts
+until active deployment and explicit rollback-retention dependencies are gone;
+artifact purge retains metadata and history.
+
 See [the Phase 12 adapter registry contract](docs/adapter-registry.md).
 
 Each evaluation publication has a server-generated attempt UUID and a positive run attempt number. Final suite/result manifests are closed schemas and removal requires descriptor-verified exact department, resource, ownership UUID, run attempt, code revision, payload digests, and sizes. Staging has a separate private UUID-path ownership contract so a supervised child killed during directory or payload creation can be removed without parsing partial content. The exact descriptor chain is opened once through deletion; a staging marker is housekeeping only, so missing, zero-byte, truncated, or partial marker states remain recoverable. Reconciliation registers a resumable content-free batch before deletion. Unsafe entries terminalize as fixed-code blocked items and cannot starve later valid items; completed batches write one audit only when deletion succeeded. It is dry-run by default, department-scoped, restricted to system or department administrators, and accepts a strict limit of 1 through 1000. PostgreSQL and external storage are not transactionally atomic: an orphaned external result after a crash is never retrieval or evaluation authority. Reconciliation does not delete backups or persistent audit history.

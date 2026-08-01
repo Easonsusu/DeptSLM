@@ -81,6 +81,14 @@ promotion is not proof of safety or quality. Cross-department fallback and
 silent fallback to the base model are prohibited; rollback-to-base must be
 explicit. See [adapter-registry.md](adapter-registry.md).
 
+The planned first intake is an administrator-controlled CLI, not a browser or
+public weight-upload route. It streams only the two payload files into a
+server-ID-derived immutable source bundle; DeptSLM generates the source
+manifest and never trusts an external manifest or host path. A non-purged
+adapter retains its exact Phase 10 and Phase 11 upstream artifacts. Historical
+deployment metadata may remain after byte purge, while active deployment and
+explicit rollback-retention references continue to fence artifact deletion.
+
 ### Evaluation and operations
 
 - Maintain versioned evaluation sets and results.
