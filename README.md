@@ -18,13 +18,13 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > marker transition, rename/durability, post-rename verification, and final
 > metadata commit.
 
-> **Phase 11 status:** Under review. It generates reviewable, department-scoped
+> **Phase 11 status:** Completed. It generates reviewed, department-scoped
 > LlamaFactory 0.9.5 LoRA or QLoRA job bundles from one approved Phase 10
 > dataset. It streams only exact retained descriptor-bound dataset bytes into
 > private external bundle storage and publishes content-free metadata. It never
 > installs or invokes
 > LlamaFactory, loads a tokenizer or model, executes training, writes adapters,
-> or begins Phase 12.
+> or implements an adapter registry.
 
 > **Phase 11 hardening:** A job captures a complete, content-free approved
 > Phase 10 authority snapshot. Each succeeded job has one validated
@@ -38,7 +38,16 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > paths or files; a single purge operation emits at most one success audit.
 > Blocked pre-move cleanup leaves the final intact, while post-move interruption
 > keeps the reservation active. Review changes are rejected while a reservation
-> is active. This remains a draft review boundary, not training execution.
+> is active. This is a reviewed boundary, not training execution.
+
+> **Phase 12 status:** Under review. Phase 12.0 is documentation and contract
+> work only for external adapter intake, an immutable department-scoped adapter
+> registry, evaluation evidence, explicit approval, promotion, rollback, and
+> eventual fail-closed runtime routing. No adapter has been imported, validated,
+> evaluated, approved, promoted, loaded, or purged by DeptSLM. Phase 12.1 through
+> Phase 12.4 remain unimplemented; no adapter registry or runtime routing exists.
+
+See [the Phase 12 adapter registry contract](docs/adapter-registry.md).
 
 Each evaluation publication has a server-generated attempt UUID and a positive run attempt number. Final suite/result manifests are closed schemas and removal requires descriptor-verified exact department, resource, ownership UUID, run attempt, code revision, payload digests, and sizes. Staging has a separate private UUID-path ownership contract so a supervised child killed during directory or payload creation can be removed without parsing partial content. The exact descriptor chain is opened once through deletion; a staging marker is housekeeping only, so missing, zero-byte, truncated, or partial marker states remain recoverable. Reconciliation registers a resumable content-free batch before deletion. Unsafe entries terminalize as fixed-code blocked items and cannot starve later valid items; completed batches write one audit only when deletion succeeded. It is dry-run by default, department-scoped, restricted to system or department administrators, and accepts a strict limit of 1 through 1000. PostgreSQL and external storage are not transactionally atomic: an orphaned external result after a crash is never retrieval or evaluation authority. Reconciliation does not delete backups or persistent audit history.
 
@@ -244,7 +253,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 
 Phase 9 does not implement LLM judging, semantic grading, public raw results, a frontend dashboard, feedback-derived cases, automatic threshold or RAG changes, training datasets, SFT, adapters, model promotion, cross-department benchmarking, production OAuth/OIDC/SSO, or production deployment.
 
-Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Google Drive storage is an external development runtime location, not a production object store or backup.
+Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 does not implement adapter intake, registry, evaluation, approval, promotion, rollback, or runtime routing. Google Drive storage is an external development runtime location, not a production object store or backup.
 
 ## License
 

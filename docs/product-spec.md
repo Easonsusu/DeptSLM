@@ -2,7 +2,7 @@
 
 ## Document status
 
-This document describes the product direction and separates the Phase 0 repository skeleton from the planned MVP and longer-term scope. Unless a capability is explicitly labeled **Phase 0**, it is not yet implemented.
+This document describes the product direction and separates completed Phase 0–11 boundaries from the planned scope. Phase 12 is under review; Phase 12.0 is documentation and contract work only, and Phase 12.1 through 12.4 are not implemented. Unless a capability is explicitly labeled as completed, it is not implemented.
 
 ## Product summary
 
@@ -66,9 +66,20 @@ Students may become an end-user group in a future deployment, but only after a d
 ### Fine-tuning and adapters
 
 - Build reviewed department-specific training datasets.
-- Launch and monitor LoRA or QLoRA jobs through LLaMA-Factory.
-- Store adapters outside the repository and associate each with its department, base-model version, dataset, configuration, and evaluation results.
-- Evaluate and approve an adapter before making it available for inference.
+- Phase 11 generates immutable LoRA or QLoRA LlamaFactory job bundles; it does not execute training or create adapters.
+- A future Phase 12 intake may store externally produced adapters outside the repository and associate each with its department, exact base-model version, Phase 10 dataset, Phase 11 job, closed configuration, and evaluation evidence.
+- Evaluation and explicit review approval are required before promotion or runtime use. Adaptation remains optional and must demonstrate value beyond the approved base/RAG behavior.
+
+### Phase 12 governance boundary
+
+Phase 12.0 defines the external adapter threat model, immutable artifact and
+lineage contracts, metadata-only registry, evaluation evidence, review,
+promotion, rollback, and eventual fail-closed runtime routing. It does not add
+an adapter registry, API, migration, worker, model loading, or runtime routing.
+An imported adapter is not approved, an approved adapter is not promoted, and
+promotion is not proof of safety or quality. Cross-department fallback and
+silent fallback to the base model are prohibited; rollback-to-base must be
+explicit. See [adapter-registry.md](adapter-registry.md).
 
 ### Evaluation and operations
 
@@ -135,7 +146,7 @@ These are roadmap candidates, not Phase 0 commitments.
 - Running LLaMA-Factory or producing adapters
 - Building a production authentication or authorization system
 - Handling real university, personal, confidential, or regulated data
-- Claiming that the placeholder Compose stack is production ready
+- Treating the placeholder Compose stack as a production deployment
 
 ## High-level success criteria
 

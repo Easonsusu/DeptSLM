@@ -2,7 +2,7 @@
 
 ## Status
 
-The Phase 8 API preserves the completed grounded-answer boundary and adds structured feedback submission and review metadata. Feedback routes use PostgreSQL only and expose no content or identity IDs. There is no public vector search, query-vector API, conversation history, streaming, reranking, evaluation, training, or production identity integration.
+The Phase 8 API preserves the completed grounded-answer boundary and adds structured feedback submission and review metadata. Phase 11 exposes metadata for completed immutable training-job bundles only; it never executes LlamaFactory or creates adapters. Phase 12 is under review and Phase 12.0 is documentation-only contract work. Feedback routes use PostgreSQL only and expose no content or identity IDs. There is no public vector search, query-vector API, conversation history, streaming, reranking, adapter registry, adapter runtime routing, or production identity integration.
 
 For the default local configuration, the base URL is:
 
@@ -205,14 +205,25 @@ Retrieved passages are untrusted content. The server must keep them separated fr
 
 Long-running work should return a job resource rather than hold an HTTP request open.
 
-### Adapters
+### Phase 12 adapter registry (conceptual; not implemented in Phase 12.0)
 
-- department-scoped adapter registry
-- evaluation status
-- controlled promotion and rollback
-- exact base-model and dataset provenance
+The following metadata-only routes are conceptual and are not implemented:
 
-An adapter may be selected only for the department that owns it. Cross-department fallback is prohibited.
+- `GET /departments/{department_id}/adapters`
+- `GET /departments/{department_id}/adapters/{adapter_id}`
+- `POST /departments/{department_id}/adapters/{adapter_id}/evaluations`
+- `PATCH /departments/{department_id}/adapters/{adapter_id}/review`
+- `POST /departments/{department_id}/adapters/{adapter_id}/promote`
+- `POST /departments/{department_id}/adapters/rollback`
+- `GET /departments/{department_id}/adapter-deployment`
+
+If a later reviewed phase implements them, they will expose safe metadata only
+and require exact same-department authorization, Phase 10/11 lineage, reviewed
+evaluation evidence, explicit approval, and optimistic version checks. There is
+no adapter weight upload or download, raw manifest or configuration download,
+host path, tensor disclosure, arbitrary model selector, or arbitrary adapter
+selector endpoint. Cross-department fallback is prohibited; runtime loading
+must eventually fail closed and never silently fall back to the base model.
 
 ### Evaluations and exports
 

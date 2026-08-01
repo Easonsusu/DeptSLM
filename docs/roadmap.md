@@ -58,14 +58,18 @@ This roadmap separates foundational safety work from product implementation. A l
 
 - Phase 10 merged reviewed, traceable, department-scoped supervised fine-tuning dataset generation from immutable human-authored external source bundles. It has no training, adapter, or model execution.
 
-## Phase 11 — LLaMA-Factory training job generation (current; not completed)
+## Phase 11 — LLaMA-Factory training job generation (completed)
 
-- Under review: generate controlled, immutable LoRA or QLoRA job bundles from one approved Phase 10 dataset, without invoking LlamaFactory, training a model, creating adapters, or placing datasets, logs, or weights in Git.
+- Phase 11 merged its reviewed, immutable department-scoped LoRA and QLoRA job-bundle boundary from one approved Phase 10 dataset. It does not invoke LlamaFactory, train a model, create adapters, or place datasets, logs, or weights in Git.
 
-## Phase 12 — LoRA adapter registry
+## Phase 12 — LoRA adapter registry (under review)
 
-- Add department-bound adapter metadata, evaluation state, approval, promotion, and rollback.
+- Phase 12.0 is documentation and contract work only: status correction, threat model, closed artifact and metadata contracts, and API, storage, lifecycle, evaluation, promotion, and rollback design.
+- Phase 12.1 (not started): immutable external adapter intake, validation, metadata-only registry, reconciliation, and purge foundations; no runtime loading.
+- Phase 12.2 (not started): adapter-target evaluation, baseline/candidate evidence, and fixed numeric quality and safety gates; no automatic promotion.
+- Phase 12.3 (not started): review, approval, promotion, supersession, rollback, and deployment event history; no silent fallback.
+- Phase 12.4 (not started): department-bound runtime routing, immutable request snapshots, fail-closed loading, and explicit rollback-to-base.
 
-## Phase 13 — Security hardening, Docker demo, and final documentation
+## Phase 13 — Security hardening, Docker demo, and final documentation (not started)
 
 - Complete threat modeling, abuse and isolation tests, operational safeguards, a reviewed local Docker demonstration, and final setup and recovery documentation.
