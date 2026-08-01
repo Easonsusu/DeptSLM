@@ -1,9 +1,9 @@
 # Phase 12 adapter registry contract
 
-This document is the reviewed Phase 12.0 design boundary. It describes future
-metadata, artifact, evaluation, review, deployment, and runtime contracts; it
-does not implement intake, registry, or runtime behavior. The separate
-Phase 12.1A static compatibility contract is documented in
+This document is the reviewed Phase 12 governance boundary. It describes the
+completed contract work, the reviewed Phase 12.1B source-intake implementation,
+and future metadata, evaluation, review, deployment, and runtime contracts. The
+separate Phase 12.1A static compatibility contract is documented in
 [adapter-static-contract.md](adapter-static-contract.md).
 
 ## Status
@@ -12,10 +12,12 @@ Phase 12.1A static compatibility contract is documented in
   LlamaFactory job bundle; it does not execute training or create an adapter.
 - Phase 12 is under review.
 - Phase 12.0 is completed: it defines contracts and the threat model.
-- Phase 12.1 is under review. Phase 12.1A implements only the pure, model-free
-  static compatibility contract; no adapter has been imported, published,
-  evaluated, approved, promoted, loaded, or purged by DeptSLM.
-- Phase 12.1B through 12.1E and Phase 12.2, 12.3, and 12.4 remain
+- Phase 12.1 is under review. Phase 12.1A is completed and Phase 12.1B adds
+  administrator-only immutable source intake: exactly two external files are
+  validated, streamed to private `adapters/imports` storage, and recorded only
+  through content-free source/attempt metadata. No adapter has been evaluated,
+  approved, promoted, loaded, or purged by DeptSLM.
+- Phase 12.1C through 12.1E and Phase 12.2, 12.3, and 12.4 remain
   unimplemented.
 - Phase 13 has not started.
 
@@ -57,11 +59,20 @@ the artifact is safe, compatible, or useful.
 - Keep validation model-free, dependency-free, content-free, and separate from
   intake, storage, publication, registry, reconciliation, and purge.
 
-#### Phase 12.1B through 12.1E (not started)
+#### Phase 12.1B — immutable source intake (under review)
 
-- Validate an external adapter through the closed artifact contract.
-- Publish it to private external storage and register metadata only.
-- Add reconciliation and purge foundations.
+- Administrator CLI only, dry-run by default, with exactly
+  `adapter_config.json` and `adapter_model.safetensors`.
+- Validate through the Phase 12.1A model-free child, stream bytes through
+  retained descriptors, generate `intake_manifest.json`, and publish one
+  immutable private import bundle.
+- Commit only department-scoped source and attempt authority metadata. No
+  adapter registry row, Phase 11 binding, evaluation, review, approval,
+  promotion, runtime loading, reconciliation, or purge is included.
+
+#### Phase 12.1C through 12.1E (not started)
+
+- Add reviewed registry consumption, reconciliation, and purge foundations.
 - Do not load an adapter at runtime.
 
 ### Phase 12.2 — adapter-target evaluation (not started)
@@ -206,7 +217,8 @@ contract does not create a worker or make an external adapter trusted.
 
 ## Planned storage layout
 
-All paths are future external runtime paths below `DEPTSLM_DATA_DIR`:
+Phase 12.1B uses only the following external runtime paths below
+`DEPTSLM_DATA_DIR`; registry and deletion surfaces remain future design:
 
 ```text
 adapters/
@@ -216,7 +228,7 @@ adapters/
         intake_manifest.json
         adapter_config.json
         adapter_model.safetensors
-  registry/
+  registry/                 # not created in Phase 12.1B
     <department_id>/
       <adapter_id>/
         manifest.json
@@ -361,11 +373,11 @@ interrupted or explicitly abandoned attempt before commitment, and
 source still required by an active intake, retry, or reconciliation operation
 cannot be purged.
 
-## Planned intake boundary
+## Phase 12.1B intake boundary and future worker
 
-Phase 12.1 should begin with an administrator-controlled CLI and an isolated
-adapter-registry worker. It must not begin with a browser or public weight-upload
-API.
+Phase 12.1B provides an administrator-controlled CLI and an isolated static
+validation child. It does not provide a browser or public weight-upload API.
+The registry worker described below remains future work.
 
 The future worker receives only:
 
@@ -385,6 +397,15 @@ descriptors, exact private staging descriptors, closed content-free metadata, a
 secret-free environment, `close_fds`, bounded framed content-free IPC, and
 cancellation, shutdown, deadline, and lease supervision. Adapter bytes must not
 cross IPC; the parent must never parse or materialize the complete adapter.
+
+The Phase 12.1B implementation binds one exact validated-byte authority across
+the pre-child and post-child digest passes, descriptor-relative copy, post-
+rename publication verification, and the final PostgreSQL commit. Every
+transition compares a complete frozen authority snapshot and both row versions;
+static contract errors are distinct from the fixed descriptor/operational
+codes. Migration `0010_phase12_adapter_sources` is self-contained and freezes
+the SQL contract literals, while CI validates that head and the private
+temporary adapters root before running the full suite.
 
 ## Planned PostgreSQL boundary
 
@@ -602,15 +623,16 @@ adapters/.deleting/imports/<department_id>/<source_bundle_id>/<purge_operation_i
 adapters/.deleting/registry/<department_id>/<adapter_id>/<purge_operation_id>/
 ```
 
-Future Phase 12.1B through 12.1E must define explicit, bounded administrator maintenance for
-abandoned import staging, committed-but-never-claimed sources, rejected sources,
-consumed sources, crashes between source publication and the PostgreSQL commit,
-and crashes during source deletion. It is dry-run by default. Before any
-mutation it durably registers the operation and exact source-bundle/attempt
-item, proves ownership through descriptor-relative no-follow handles, binds
-exact tombstone identities before unlink, and remains crash-resumable. It emits
-one operation-level exactly-once success audit only after every active item is
-complete.
+Future Phase 12.1C through 12.1E must define explicit, bounded administrator
+maintenance for abandoned import staging, committed-but-never-claimed sources,
+rejected sources, consumed sources, crashes between source publication and the
+PostgreSQL commit, and crashes during source deletion. Phase 12.1B does not
+implement reconciliation or purge. Those future commands are dry-run by
+default; before any mutation they must durably register the operation and exact
+source-bundle/attempt item, prove ownership through descriptor-relative
+no-follow handles, bind exact tombstone identities before unlink, and remain
+crash-resumable. They must emit one operation-level exactly-once success audit
+only after every active item is complete.
 
 Source cleanup must not delete a source still required by an active intake,
 retry, or reconciliation operation; must never delete registry artifacts through

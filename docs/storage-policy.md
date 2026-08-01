@@ -151,7 +151,7 @@ Phase 10 source bundles and final dataset artifacts live only under `DEPTSLM_DAT
 
 Phase 11 writes only private job bundles below `DEPTSLM_DATA_DIR/training_datasets/jobs/<department UUID>/<training job UUID>`. A final bundle contains exactly `manifest.json`, `training.yaml`, `dataset_info.json`, `train.jsonl`, and `validation.jsonl`; staging adds only the private marker. The API never mounts this directory. The isolated bundle worker verifies and copies an approved Phase 10 dataset through retained descriptors; it does not execute the configuration or mount `model_cache`, `adapters`, logs, or model outputs. The final directory is one job-level surface with one validated succeeded-attempt owner; historical attempts own only their exact stage directories. Purge deletes stages first, then may delete that descriptor-verified final only after PostgreSQL commits final-deletion authorization. The authorization reservation binds the owner attempt, closed content-free manifest, and UUID tombstone namespace below private `.deleting/jobs`; the final is fully verified before an atomic no-replace move and both parent directories are fsynced. Before any member is removed, a `tombstone_bound` reservation persists the exact private directory, parent, and fixed-file identities. Retries require each identity to match; only the one durably in-flight unlink may be absent. Tombstone deletion never parses partial bytes, and a substituted, parked, or partial unbound tombstone remains actively fenced. A pre-move failure leaves the final directory intact. Generated job bundles, like all runtime data, are never committed to Git.
 
-## Phase 12 adapter registry (under review; Phase 12.1A static contract only)
+## Phase 12 adapter source and registry (under review)
 
 The proposed private external registry layout is:
 
@@ -180,8 +180,11 @@ entry is permitted. Components derive only from `DEPTSLM_DATA_DIR`; the
 server-owned paths, real private `0700` directories, private `0600` files,
 current service UID, exclusive creation, no overwrite, same-filesystem atomic
 publication, file and directory fsync, post-rename rehash, and retained
-descriptor identity through the final PostgreSQL commit. Descriptor-relative
-no-follow operations must reject path replacement and links.
+descriptor identity through the final PostgreSQL commit. Final file and
+directory mtime/ctime nanoseconds are part of that retained authority.
+Descriptor-relative no-follow operations must reject path replacement and links;
+an unexpected private stage marker fails closed before rename even though the
+marker is not an ownership authority.
 
 The planned source-intake allowlist is exactly `intake_manifest.json`,
 `adapter_config.json`, and `adapter_model.safetensors`. An administrator CLI
@@ -196,15 +199,19 @@ and credentials never enter PostgreSQL, APIs, audits, or logs. An external
 manifest, README, archive, directory tree, or unknown entry is rejected. The
 committed import bundle is immutable and read-only to the future worker. No
 user-supplied host path is reopened from PostgreSQL metadata. Publication
-requires retained descriptors, complete allowlist verification, same-filesystem
-no-replace rename, parent fsync, post-rename rehash, and a final PostgreSQL
-authority commit.
+requires an exact marker, retained descriptors, complete allowlist verification,
+same-filesystem no-replace rename, parent fsync, post-rename rehash,
+entry-to-descriptor binding, file/directory mtime/ctime capture, and a final
+PostgreSQL authority commit that repeats those checks without hashing.
 
-The future adapter-registry worker mounts PostgreSQL, `adapters/imports`
-read-only, Phase 11 training-job bundles read-only, and adapter registry storage
-read-write. The API and browser have no adapter storage mount and no weight
-upload route. Phase 12.0 and Phase 12.1A create none of these directories and
-change no setup script or Compose mount.
+Phase 12.1B creates only the private `adapters/imports` and
+`.staging/imports` source-intake surfaces through the administrator CLI. It
+requires the pre-existing `adapters` root and uses no registry or `.deleting`
+surface. The CLI is dry-run by default, accepts exactly the two external files,
+and streams them through retained descriptors; it never reopens a persisted
+host path. The API and browser have no adapter storage mount and no weight
+upload route. Future registry workers may mount imports read-only, but that
+worker is not part of Phase 12.1B.
 
 Phase 12.0 does not change setup scripts, Compose, mounts, dependencies, or
 runtime directories. There is no fallback to the checkout, current directory,
@@ -213,12 +220,12 @@ configuration bytes, tensor values, and sensitive content never enter
 PostgreSQL, APIs, audits, or logs. PostgreSQL and external storage are
 non-atomic; a database commit does not prove external publication or deletion.
 
-Import-source state is separate from adapter state: `staging`, `committed`,
-`claimed`, `consumed`, `rejected`, `abandoned`, `purge_pending`, and `purged`.
-One committed source may be consumed by at most one exact adapter version;
-failed attempts and retries stay bound to that source. The immutable registry is
-authority after PostgreSQL success; an import source is never runtime,
-evaluation, promotion, or rollback authority.
+Phase 12.1B implements only import-source state, separate from adapter state:
+`staging`, `committed`, `rejected`, and `abandoned`. The schema reserves
+`claimed`, `consumed`, `purge_pending`, and `purged` for later reviewed
+subphases; no Phase 12.1B transition implies registry publication. Failed
+attempts and future retries remain bound to their exact source. An import source
+is never runtime, evaluation, promotion, or rollback authority.
 
 Future purge has separate source and registry operations. A rollback-retention
 reference may be removed through a reviewed pre-purge mutation; upstream Phase

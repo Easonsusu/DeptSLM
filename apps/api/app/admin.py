@@ -12,6 +12,11 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from app.adapter_source_services import (
+    AdapterSourceImportConfigurationError,
+    AdapterSourceImportSettings,
+    import_adapter_source,
+)
 from app.database import create_database_engine, create_session_factory
 from app.feedback_purge import (
     FeedbackPurgeConfigurationError,
@@ -134,6 +139,13 @@ def _parser() -> argparse.ArgumentParser:
     sft_import.add_argument("--actor-subject", required=True)
     sft_import.add_argument("--source-dir", required=True)
     sft_import.add_argument("--apply", action="store_true")
+    adapter_import = commands.add_parser("import-adapter-source")
+    adapter_import.add_argument("--department-id", required=True, type=_nonzero_uuid)
+    adapter_import.add_argument("--actor-issuer", required=True)
+    adapter_import.add_argument("--actor-subject", required=True)
+    adapter_import.add_argument("--adapter-config", required=True, type=Path)
+    adapter_import.add_argument("--adapter-model", required=True, type=Path)
+    adapter_import.add_argument("--apply", action="store_true")
     sft_archive = commands.add_parser("archive-sft-source")
     sft_archive.add_argument("--department-id", required=True, type=_nonzero_uuid)
     sft_archive.add_argument("--source-bundle-id", required=True, type=_nonzero_uuid)
@@ -227,6 +239,29 @@ def main(argv: list[str] | None = None) -> int:
                 f"{verb} SFT source {result.source_bundle_id}: "
                 f"{result.example_count} examples in {result.group_count} groups."
             )
+            return 0
+        if args.command == "import-adapter-source":
+            result = import_adapter_source(
+                AdapterSourceImportSettings.from_environment(),
+                department_id=args.department_id,
+                actor_issuer=args.actor_issuer,
+                actor_subject=args.actor_subject,
+                adapter_config=args.adapter_config,
+                adapter_model=args.adapter_model,
+                apply=args.apply,
+            )
+            if result.applied:
+                print(
+                    f"Imported adapter source {result.source_bundle_id} "
+                    f"for department {result.department_id}."
+                )
+                print("Status: committed")
+            else:
+                print("Adapter source validation succeeded.")
+                print(f"Base model: {result.base_model_display_id}")
+                print(f"Dtype: {result.tensor_dtype}")
+                print(f"Tensor count: {result.tensor_count}")
+                print(f"Aggregate tensor bytes: {result.tensor_payload_byte_size}")
             return 0
         if args.command in {"archive-sft-source", "reconcile-sft-artifacts", "purge-sft-artifacts"}:
             settings = SftMaintenanceSettings.from_environment()
@@ -336,6 +371,7 @@ def main(argv: list[str] | None = None) -> int:
     except (
         BootstrapError,
         ConfigurationError,
+        AdapterSourceImportConfigurationError,
         FeedbackPurgeConfigurationError,
         SftImportConfigurationError,
         SftMaintenanceConfigurationError,

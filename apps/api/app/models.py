@@ -24,6 +24,20 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from app.adapter_contract import (
+    ADAPTER_CONFIG_CONTRACT_VERSION,
+    ADAPTER_INTAKE_CONTRACT_VERSION,
+    ADAPTER_SOURCE_CONTRACT_VERSION,
+    ADAPTER_TENSOR_CONTRACT_VERSION,
+    BASE_MODEL_ID,
+    BASE_MODEL_LICENSE,
+    BASE_MODEL_REVISION,
+    EXPECTED_TENSOR_BYTES,
+    EXPECTED_TENSOR_COUNT,
+    EXPECTED_TENSOR_ELEMENTS,
+    PEFT_FORMAT_REFERENCE_VERSION,
+    SAFETENSORS_FORMAT_REFERENCE_VERSION,
+)
 from app.auth import DepartmentRole, MembershipStatus
 
 USER_STATUSES = ("active", "suspended", "revoked")
@@ -169,6 +183,45 @@ SFT_BUILD_ERROR_CODES = (
     "claim_lost",
     "cancelled",
     "worker_shutdown",
+    "database_unavailable",
+)
+ADAPTER_IMPORT_SOURCE_STATUSES = (
+    "staging",
+    "committed",
+    "claimed",
+    "consumed",
+    "rejected",
+    "abandoned",
+    "purge_pending",
+    "purged",
+)
+ADAPTER_IMPORT_ATTEMPT_STATUSES = (
+    "registered",
+    "validated",
+    "staged",
+    "published",
+    "committed",
+    "failed",
+    "abandoned",
+)
+ADAPTER_IMPORT_ERROR_CODES = (
+    "adapter_config_invalid",
+    "adapter_config_unsupported",
+    "adapter_header_invalid",
+    "adapter_header_too_large",
+    "adapter_file_too_large",
+    "adapter_tensor_set_invalid",
+    "adapter_tensor_shape_invalid",
+    "adapter_tensor_dtype_invalid",
+    "adapter_tensor_offsets_invalid",
+    "adapter_tensor_size_invalid",
+    "adapter_input_invalid",
+    "adapter_input_unsafe",
+    "adapter_source_changed",
+    "adapter_source_publication_failed",
+    "adapter_source_authority_changed",
+    "department_unavailable",
+    "requester_unauthorized",
     "database_unavailable",
 )
 
@@ -2166,6 +2219,278 @@ class SftArtifactReconciliationOperationItem(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = utc_timestamp()
+
+
+class AdapterImportSource(Base):
+    """Content-free authority for one immutable externally produced adapter source."""
+
+    __tablename__ = "adapter_import_sources"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["authoritative_attempt_id", "department_id", "id"],
+            [
+                "adapter_import_attempts.id",
+                "adapter_import_attempts.department_id",
+                "adapter_import_attempts.source_bundle_id",
+            ],
+            name="fk_adapter_import_source_authoritative_attempt_scope",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("id", "department_id", name="uq_adapter_import_source_department"),
+        CheckConstraint(
+            "status IN ('staging','committed','claimed','consumed','rejected','abandoned',"
+            "'purge_pending','purged')",
+            name="ck_adapter_import_source_status",
+        ),
+        CheckConstraint("version > 0", name="ck_adapter_import_source_version"),
+        CheckConstraint(
+            "code_revision ~ '^[0-9a-f]{40}$'",
+            name="ck_adapter_import_source_code_revision",
+        ),
+        CheckConstraint(
+            "(adapter_config_sha256 IS NULL OR adapter_config_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(adapter_model_sha256 IS NULL OR adapter_model_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(intake_manifest_sha256 IS NULL OR intake_manifest_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_adapter_import_source_hashes",
+        ),
+        CheckConstraint(
+            "(adapter_config_byte_size IS NULL OR adapter_config_byte_size > 0) AND "
+            "(adapter_model_byte_size IS NULL OR adapter_model_byte_size > 0) AND "
+            "(tensor_payload_byte_size IS NULL OR tensor_payload_byte_size > 0)",
+            name="ck_adapter_import_source_sizes",
+        ),
+        CheckConstraint(
+            "tensor_count IS NULL OR tensor_count = " + str(EXPECTED_TENSOR_COUNT),
+            name="ck_adapter_import_source_tensor_count",
+        ),
+        CheckConstraint(
+            "tensor_element_count IS NULL OR tensor_element_count = "
+            + str(EXPECTED_TENSOR_ELEMENTS),
+            name="ck_adapter_import_source_tensor_elements",
+        ),
+        CheckConstraint(
+            "tensor_dtype IS NULL OR "
+            "(tensor_dtype = 'F16' AND tensor_payload_byte_size = "
+            + str(EXPECTED_TENSOR_BYTES["F16"])
+            + ") OR (tensor_dtype = 'BF16' AND tensor_payload_byte_size = "
+            + str(EXPECTED_TENSOR_BYTES["BF16"])
+            + ") OR (tensor_dtype = 'F32' AND tensor_payload_byte_size = "
+            + str(EXPECTED_TENSOR_BYTES["F32"])
+            + ")",
+            name="ck_adapter_import_source_tensor_contract",
+        ),
+        CheckConstraint(
+            "source_contract_version = '" + ADAPTER_SOURCE_CONTRACT_VERSION + "' AND "
+            "intake_contract_version = '" + ADAPTER_INTAKE_CONTRACT_VERSION + "' AND "
+            "config_contract_version = '" + ADAPTER_CONFIG_CONTRACT_VERSION + "' AND "
+            "tensor_contract_version = '" + ADAPTER_TENSOR_CONTRACT_VERSION + "' AND "
+            "base_model_id = '" + BASE_MODEL_ID + "' AND "
+            "base_model_revision = '" + BASE_MODEL_REVISION + "' AND "
+            "base_model_license = '" + BASE_MODEL_LICENSE + "' AND "
+            "peft_version = '" + PEFT_FORMAT_REFERENCE_VERSION + "' AND "
+            "safetensors_format = '" + SAFETENSORS_FORMAT_REFERENCE_VERSION + "'",
+            name="ck_adapter_import_source_contract",
+        ),
+        CheckConstraint(
+            "(status = 'staging' AND authoritative_attempt_id IS NULL AND "
+            "committed_at IS NULL AND rejected_at IS NULL AND abandoned_at IS NULL "
+            "AND purged_at IS NULL AND error_code IS NULL) OR "
+            "(status = 'committed' AND authoritative_attempt_id IS NOT NULL AND "
+            "adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND "
+            "adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND "
+            "intake_manifest_sha256 IS NOT NULL AND tensor_dtype IS NOT NULL AND "
+            "tensor_count = "
+            + str(EXPECTED_TENSOR_COUNT)
+            + " AND tensor_element_count = "
+            + str(EXPECTED_TENSOR_ELEMENTS)
+            + " AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND "
+            "rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL AND "
+            "error_code IS NULL) OR "
+            "(status = 'rejected' AND rejected_at IS NOT NULL AND committed_at IS NULL "
+            "AND abandoned_at IS NULL AND purged_at IS NULL AND "
+            "authoritative_attempt_id IS NULL AND error_code IN ('adapter_config_invalid',"
+            "'adapter_config_unsupported','adapter_header_invalid','adapter_header_too_large',"
+            "'adapter_file_too_large','adapter_tensor_set_invalid','adapter_tensor_shape_invalid',"
+            "'adapter_tensor_dtype_invalid','adapter_tensor_offsets_invalid',"
+            "'adapter_tensor_size_invalid','adapter_input_invalid','adapter_input_unsafe')) OR "
+            "(status = 'abandoned' AND abandoned_at IS NOT NULL AND rejected_at IS NULL "
+            "AND committed_at IS NULL AND purged_at IS NULL AND "
+            "authoritative_attempt_id IS NULL AND error_code IN ('adapter_source_changed',"
+            "'adapter_source_publication_failed','adapter_source_authority_changed',"
+            "'department_unavailable','requester_unauthorized','database_unavailable')) OR "
+            "(status IN ('claimed','consumed','purge_pending') AND "
+            "authoritative_attempt_id IS NOT NULL AND "
+            "adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND "
+            "adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND "
+            "intake_manifest_sha256 IS NOT NULL AND tensor_dtype IS NOT NULL AND "
+            "tensor_count = "
+            + str(EXPECTED_TENSOR_COUNT)
+            + " AND tensor_element_count = "
+            + str(EXPECTED_TENSOR_ELEMENTS)
+            + " AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND "
+            "rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL AND "
+            "error_code IS NULL) OR "
+            "(status = 'purged' AND authoritative_attempt_id IS NOT NULL AND "
+            "adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND "
+            "adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND "
+            "intake_manifest_sha256 IS NOT NULL AND tensor_dtype IS NOT NULL AND "
+            "tensor_count = "
+            + str(EXPECTED_TENSOR_COUNT)
+            + " AND tensor_element_count = "
+            + str(EXPECTED_TENSOR_ELEMENTS)
+            + " AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND "
+            "purged_at IS NOT NULL AND rejected_at IS NULL AND abandoned_at IS NULL AND "
+            "error_code IS NULL)",
+            name="ck_adapter_import_source_lifecycle",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            + ",".join("'" + code + "'" for code in ADAPTER_IMPORT_ERROR_CODES)
+            + ")",
+            name="ck_adapter_import_source_error_code",
+        ),
+        Index(
+            "ix_adapter_import_source_department_status_created",
+            "department_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(
+        ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False
+    )
+    imported_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="staging")
+    authoritative_attempt_id: Mapped[UUID | None] = mapped_column()
+    source_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    intake_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    config_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    tensor_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    base_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    base_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    base_model_license: Mapped[str] = mapped_column(String(40), nullable=False)
+    peft_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    safetensors_format: Mapped[str] = mapped_column(String(32), nullable=False)
+    adapter_config_sha256: Mapped[str | None] = mapped_column(String(64))
+    adapter_config_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    adapter_model_sha256: Mapped[str | None] = mapped_column(String(64))
+    adapter_model_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    intake_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    tensor_dtype: Mapped[str | None] = mapped_column(String(8))
+    tensor_count: Mapped[int | None] = mapped_column(Integer)
+    tensor_element_count: Mapped[int | None] = mapped_column(BigInteger)
+    tensor_payload_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    abandoned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class AdapterImportAttempt(Base):
+    """Content-free ownership for every Phase 12.1B publication attempt."""
+
+    __tablename__ = "adapter_import_attempts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_bundle_id", "department_id"],
+            ["adapter_import_sources.id", "adapter_import_sources.department_id"],
+            name="fk_adapter_import_attempt_source_scope",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "id", "department_id", "source_bundle_id", name="uq_adapter_import_attempt_scope"
+        ),
+        UniqueConstraint(
+            "source_bundle_id", "attempt_number", name="uq_adapter_import_attempt_number"
+        ),
+        UniqueConstraint("publication_attempt_id", name="uq_adapter_import_publication_attempt"),
+        CheckConstraint(
+            "status IN ('registered','validated','staged','published','committed','failed',"
+            "'abandoned')",
+            name="ck_adapter_import_attempt_status",
+        ),
+        CheckConstraint(
+            "attempt_number > 0 AND version > 0",
+            name="ck_adapter_import_attempt_versions",
+        ),
+        CheckConstraint(
+            "ownership_manifest IS NULL OR json_typeof(ownership_manifest) = 'object'",
+            name="ck_adapter_import_attempt_manifest_object",
+        ),
+        CheckConstraint(
+            "(status = 'registered' AND validated_at IS NULL AND staged_at IS NULL AND "
+            "published_at IS NULL AND committed_at IS NULL AND finished_at IS NULL AND "
+            "cleanup_confirmed_at IS NULL AND ownership_manifest IS NULL AND "
+            "error_code IS NULL) OR "
+            "(status = 'validated' AND validated_at IS NOT NULL AND staged_at IS NULL AND "
+            "published_at IS NULL AND committed_at IS NULL AND finished_at IS NULL AND "
+            "cleanup_confirmed_at IS NULL AND error_code IS NULL) OR "
+            "(status = 'staged' AND validated_at IS NOT NULL AND staged_at IS NOT NULL AND "
+            "ownership_manifest IS NOT NULL AND published_at IS NULL AND committed_at IS NULL "
+            "AND finished_at IS NULL AND cleanup_confirmed_at IS NULL AND error_code IS NULL) OR "
+            "(status = 'published' AND validated_at IS NOT NULL AND staged_at IS NOT NULL AND "
+            "published_at IS NOT NULL AND ownership_manifest IS NOT NULL AND committed_at IS NULL "
+            "AND finished_at IS NULL AND cleanup_confirmed_at IS NULL AND error_code IS NULL) OR "
+            "(status = 'committed' AND validated_at IS NOT NULL AND staged_at IS NOT NULL AND "
+            "published_at IS NOT NULL AND committed_at IS NOT NULL AND finished_at IS NOT NULL "
+            "AND ownership_manifest IS NOT NULL AND cleanup_confirmed_at IS NULL "
+            "AND error_code IS NULL) OR "
+            "(status IN ('failed','abandoned') AND finished_at IS NOT NULL AND "
+            "committed_at IS NULL AND cleanup_confirmed_at IS NULL AND error_code IS NOT NULL)",
+            name="ck_adapter_import_attempt_lifecycle",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            + ",".join("'" + code + "'" for code in ADAPTER_IMPORT_ERROR_CODES)
+            + ")",
+            name="ck_adapter_import_attempt_error_code",
+        ),
+        Index(
+            "ix_adapter_import_attempt_department_status_created",
+            "department_id",
+            "status",
+            "created_at",
+        ),
+        Index(
+            "uq_adapter_import_attempt_active",
+            "source_bundle_id",
+            unique=True,
+            postgresql_where=text("status IN ('registered','validated','staged','published')"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_bundle_id: Mapped[UUID] = mapped_column(nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="registered")
+    ownership_manifest: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    registered_at: Mapped[datetime] = utc_timestamp()
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    staged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleanup_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
 
 
 class TrainingJob(Base):

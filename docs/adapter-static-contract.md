@@ -4,15 +4,18 @@
 
 Phase 12.0 (adapter-registry contract and threat model) is complete. Phase 12.1
 is under review; this document and `apps/api/app/adapter_contract.py` implement
-Phase 12.1A, the model-free static compatibility contract only. Phase 12.1B
-through 12.1E, Phases 12.2 through 12.4, and Phase 13 are not started.
+Phase 12.1A, the model-free static compatibility contract. Phase 12.1B now
+uses this contract from its isolated source-validation child; this document
+does not describe storage or import authority. Phase 12.1C through 12.1E,
+Phases 12.2 through 12.4, and Phase 13 are not started.
 
-This change adds no intake command, database model, migration, API route, queue,
-worker, registry, storage directory, reconciliation, purge, Docker change,
-dependency, model/tokenizer loading, adapter loading, or training execution.
-It validates metadata that a future isolated intake worker may use. It does not
-prove that an external environment used the declared dataset, job bundle, or
-training configuration.
+The static-contract change itself adds no intake command, database model,
+migration, API route, queue, worker, registry, storage directory,
+reconciliation, purge, Docker change, dependency, model/tokenizer loading,
+adapter loading, or training execution. Phase 12.1B adds a separate
+administrator-only source-intake boundary that calls this validator without
+changing its semantics. Static acceptance does not prove that an external
+environment used the declared dataset, job bundle, or training configuration.
 
 ## Immutable compatibility evidence
 
