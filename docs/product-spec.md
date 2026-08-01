@@ -2,7 +2,7 @@
 
 ## Document status
 
-This document describes the product direction and separates the Phase 0 repository skeleton from the planned MVP and longer-term scope. Unless a capability is explicitly labeled **Phase 0**, it is not yet implemented.
+This document describes the product direction and separates completed Phase 0–11 boundaries from the planned scope. Phase 12 is under review; Phase 12.0 is documentation and contract work only, and Phase 12.1 through 12.4 are not implemented. Unless a capability is explicitly labeled as completed, it is not implemented.
 
 ## Product summary
 
@@ -66,9 +66,36 @@ Students may become an end-user group in a future deployment, but only after a d
 ### Fine-tuning and adapters
 
 - Build reviewed department-specific training datasets.
-- Launch and monitor LoRA or QLoRA jobs through LLaMA-Factory.
-- Store adapters outside the repository and associate each with its department, base-model version, dataset, configuration, and evaluation results.
-- Evaluate and approve an adapter before making it available for inference.
+- Phase 11 generates immutable LoRA or QLoRA LlamaFactory job bundles; it does not execute training or create adapters.
+- A future Phase 12 intake may store externally produced adapters outside the repository and record a department-scoped, verified governance association to one exact Phase 10 dataset and Phase 11 job, the reviewed base-model contract, closed configuration, and evaluation evidence.
+- Evaluation and explicit review approval are required before promotion or runtime use. Adaptation remains optional and must demonstrate value beyond the approved base/RAG behavior.
+
+### Phase 12 governance boundary
+
+Phase 12.0 defines the external adapter threat model, immutable artifact and
+governance-lineage contracts, metadata-only registry, evaluation evidence,
+review, promotion, rollback, and eventual fail-closed runtime routing. It does
+not add an adapter registry, API, migration, worker, model loading, or runtime
+routing.
+An imported adapter is not approved, an approved adapter is not promoted, and
+promotion is not proof of safety or quality. Cross-department fallback and
+silent fallback to the base model are prohibited; rollback-to-base must be
+explicit. See [adapter-registry.md](adapter-registry.md).
+
+The planned first intake is an administrator-controlled CLI, not a browser or
+public weight-upload route. It streams only the two payload files into a
+server-ID-derived immutable source bundle; DeptSLM generates a closed,
+content-free intake manifest and never trusts an external manifest or host path.
+Source state is separate from adapter state, and one committed source may be
+consumed by only one exact adapter version. A rollback-retention reference may
+be removed by a reviewed pre-purge mutation; upstream retention releases only
+after the registry and every bound source copy are committed purged. Registry
+and source purge remain separate, bounded, descriptor-relative, and
+crash-resumable. The registry records verified governance lineage and a
+declared external training association, not proven dataset use, trusted
+training execution, or certified adapter provenance. Phase 12.1 must use a
+reviewed model-free static schema, with package versions and numeric limits
+fixed before implementation.
 
 ### Evaluation and operations
 
@@ -135,7 +162,7 @@ These are roadmap candidates, not Phase 0 commitments.
 - Running LLaMA-Factory or producing adapters
 - Building a production authentication or authorization system
 - Handling real university, personal, confidential, or regulated data
-- Claiming that the placeholder Compose stack is production ready
+- Treating the placeholder Compose stack as a production deployment
 
 ## High-level success criteria
 

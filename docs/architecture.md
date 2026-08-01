@@ -2,7 +2,7 @@
 
 ## Status and boundaries
 
-Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 completed the internal department-scoped evaluation runner; Phase 10 completed the metadata-only builder for human-authored supervised fine-tuning dataset artifacts. Phase 11 is under review with an isolated LlamaFactory job-bundle generator that never executes training. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or the private runtime. Public vector search, conversations, streaming, reranking, training, and adapter flows remain unimplemented.
+Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 completed the internal department-scoped evaluation runner; Phase 10 completed the metadata-only builder for human-authored supervised fine-tuning dataset artifacts; Phase 11 completed the isolated LlamaFactory job-bundle generator that never executes training. Phase 12 is under review with documentation-only Phase 12.0 adapter registry contracts. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or the private runtime. Public vector search, conversations, streaming, reranking, training, adapter intake, and runtime adapter routing remain unimplemented.
 
 Phase 9 publication is deliberately non-atomic across PostgreSQL and external storage. A server-generated publication UUID and exact positive run attempt number bind each staged and final result manifest to the department, suite, run, and code revision. Result staging and publication run in killable leased children; PostgreSQL writes the succeeded state only after descriptor-relative no-follow final-artifact verification. Reclaim and the administrator-only `reconcile-artifacts` command delete only an exact manifest-proven, non-succeeded attempt. Reconciliation records a durable content-free batch before filesystem mutation and terminalizes the owned run or suite metadata with one batch audit, so a later authorized invocation can resume a crash window. They never delete unknown, mismatched, succeeded, or committed artifacts. A crash after an external rename can therefore leave an untrusted orphan, but never an authoritative result.
 
@@ -19,7 +19,7 @@ flowchart TB
         API["FastAPI API"]
         RAG["RAG worker (extraction)"]
         Index["Indexing worker (embedding and Qdrant)"]
-        Train["Training worker (planned)"]
+        Train["Phase 11 training-job worker"]
     end
 
     subgraph Data["State services"]
@@ -33,9 +33,21 @@ flowchart TB
         Runtime["Private Qwen3 runtime"]
     end
 
-    subgraph TrainingStack["Adapter training (planned)"]
-        Factory["LLaMA-Factory"]
-        Adapter["Department LoRA / QLoRA adapter"]
+    subgraph ExternalTraining["Untrusted external training environment (planned; outside DeptSLM)"]
+        JobBundle["Phase 11 job bundle\n(administratively supplied)"]
+        Factory["External LLaMA-Factory environment"]
+        ExternalAdapter["Untrusted adapter files"]
+    end
+
+    subgraph AdapterBoundary["Phase 12 adapter governance (planned; not implemented)"]
+        SourceImport["Administrator source import"]
+        ImportBundle["Immutable external adapter source bundle"]
+        Intake["Isolated adapter intake and validation"]
+        Registry["Immutable adapter registry"]
+        Evidence["Adapter evaluation evidence"]
+        Review["Review and approval"]
+        Deployment["Department deployment pointer"]
+        Load["Fail-closed runtime adapter loading"]
     end
 
     Drive[("External runtime storage\nDEPTSLM_DATA_DIR on Google Drive")]
@@ -52,12 +64,22 @@ flowchart TB
     Index -->|"offline document embeddings"| Embed
     Index -->|"scoped staged upserts"| QD
     Runtime -->|"strict JSON answer contract"| API
-    Train --> Factory
-    Factory -->|"produces"| Adapter
-    Adapter -.->|"approved adapter only"| Runtime
+    Train -->|"generates bundle only"| JobBundle
+    JobBundle -.->|"may be supplied outside Phase 12"| Factory
+    Factory -.->|"produces untrusted files"| ExternalAdapter
+    ExternalAdapter -.->|"administrator-controlled import"| SourceImport
+    SourceImport -.-> ImportBundle
+    ImportBundle -.-> Intake
+    Intake -.-> Registry
+    Registry -.-> Evidence
+    Evidence -.-> Review
+    Review -.-> Deployment
+    Deployment -.-> Load
+    Load -.->|"exact approved adapter only"| Runtime
+    API -.->|"future metadata boundary"| Deployment
     RAG -->|"documents, extracted text, snapshots"| Drive
     Index -->|"read-only chunks and model cache"| Drive
-    Train -->|"datasets, adapters, evaluations, logs"| Drive
+    Train -->|"Phase 11 job bundle only"| Drive
     Runtime -->|"model cache"| Drive
 ```
 
@@ -77,11 +99,60 @@ The builder has only PostgreSQL and `training_datasets` access. Its contentful s
 
 Each source-import authority scan uses a repeatable-read PostgreSQL snapshot and bounded locked batches. Every long parent filesystem and authority operation has its own deadline, heartbeat, cancellation, shutdown, and claim-loss checkpoint. Filesystem publication and PostgreSQL success cannot be atomic: final artifacts are fully hashed before locks, then their exact directory and file descriptors stay open through the success transaction for identity-only rechecks. Each active or claim-time terminal build has one metadata-only build-attempt record; reclaim preserves every prior attempt for exact-attempt cleanup. Every incomplete lifecycle registers its stage plus any manifest-proven final surface for reconciliation, keyed by resource and attempt UUID; a blocked final artifact keeps that exact attempt cleanup unconfirmed. An orphaned artifact is never Phase 11 authority.
 
-## Phase 11 training-job boundary
+## Phase 11 training-job boundary (completed)
 
 Phase 11 consumes exactly one succeeded, approved, unpurged Phase 10 dataset in the same department. Enqueue freezes a complete content-free snapshot of its identity, version, publication attempt, contracts, digests, sizes, and counts; worker startup and final locked authority both compare every field. The separate `training-job-worker` leases a PostgreSQL-backed job, verifies the retained dataset through descriptor-relative no-follow handles, and starts a fixed child with only the dataset and fresh staging descriptors. The child validates the closed Phase 10 records, preserves train and validation bytes exactly, and writes a deterministic LlamaFactory 0.9.5 `training.yaml`, `dataset_info.json`, data copies, and closed manifest. No source content, dataset bytes, configuration bytes, paths, hashes, execution token, or model/adaptor output enters PostgreSQL, logs, audit rows, public APIs, or frontend state.
 
 The worker receives only PostgreSQL and `training_datasets`; it has no model, tokenizer, LlamaFactory package, Hugging Face token, Qdrant, RAG runtime, upload, extraction, evaluation, adapter, or cloud configuration. It never runs the generated configuration. Stale cleanup, authority loading, descriptor hashing, stage preparation, child execution, publication steps, and final source reauthorization retain independent parent lease checkpoints. The parent renews a fresh lease guard before, never inside, the final locked transaction; that transaction uses PostgreSQL server time for the final ownership check. Purge uses a durable review-fencing reservation binding the exact succeeded attempt, content-free manifest, and UUID tombstone namespace. Stages must complete before final-deletion authorization; the verified final moves without replacement to private tombstone storage, then a separate committed `tombstone_bound` state records exact parent, directory, and fixed-file identities before cleanup. Retries reject any replacement or unbound partial tombstone; only a durably in-flight exact unlink may be absent. A purge operation records per-job progress and emits at most one success audit after its active reservations close. A pre-move ownership failure leaves the final intact; a post-move cleanup failure leaves the reservation active. PostgreSQL and external storage remain non-atomic: an artifact without committed succeeded PostgreSQL authority is not eligible for review or future adapter use.
+
+## Phase 12 adapter registry boundary (under review; contract only)
+
+Phase 12.0 defines a future external adapter intake and immutable,
+department-scoped registry. It does not add a database model, migration, API
+route, worker, service, mount, dependency, adapter file, or runtime loading.
+The proposed final artifact allowlist is exactly `manifest.json`,
+`adapter_config.json`, and `adapter_model.safetensors`; adapters are untrusted
+until their exact safetensors, closed configuration, same-department Phase 10
+dataset governance lineage, and Phase 11 declared training association are
+validated. The reviewed base contract is `Qwen/Qwen3-0.6B` revision
+`c1899de289a04d12100db370d81485cdf75e47ca` with Apache-2.0 metadata and
+LlamaFactory `0.9.5`.
+
+Future intake, evaluation evidence, review, approval, promotion, supersession,
+rollback, and deployment events remain separate metadata boundaries. A
+deployment will point to one exact immutable adapter version, and a department
+will have at most one active deployment. Runtime routing must use one immutable
+request snapshot, reject cross-department or base-revision mismatches, return a
+safe failure when a required adapter cannot load, and never silently fall back
+to the base model. Rollback-to-base must be explicit.
+
+The proposed registry, import-source, `.staging`, and `.deleting` surfaces live
+only beneath `DEPTSLM_DATA_DIR/adapters`, use private UUID-derived paths and
+descriptor-relative no-follow verification, and remain outside Git. Import
+sources have separate `staging`, `committed`, `claimed`, `consumed`, `rejected`,
+`abandoned`, `purge_pending`, and `purged` states; one committed source can be
+consumed by only one exact adapter version. Registry and source-byte purge are
+separate, bounded, crash-resumable, operation-audited operations. PostgreSQL and
+external storage are non-atomic. Future reconciliation and purge must be fenced
+against active deployments and exact intake/retry ownership; they must not
+delete Phase 10 datasets, Phase 11 job bundles, backups, or audit history. See
+[adapter-registry.md](adapter-registry.md) for the full contract.
+
+The diagram separates an untrusted external training environment from the
+DeptSLM application. It may consume an administratively exported Phase 11 job
+bundle outside the Phase 12 implementation and produce untrusted adapter
+files. Phase 12 records only a verified governance lineage, a declared external
+training association, and verified artifact compatibility; it cannot prove exact
+bundle or dataset use, declared LlamaFactory execution, declared training steps,
+or unmodified weight production. Operator attestations remain untrusted, and
+stronger provenance would require a separately reviewed trusted-execution,
+signing, or remote-attestation design.
+The planned administrator source import creates a private immutable import
+bundle before the isolated intake/validation boundary. The final registry,
+evaluation evidence, review/approval, department deployment pointer, and
+fail-closed runtime loading are separate planned boundaries. Phase 11's actual
+worker remains separate and generates a job bundle only; it does not launch
+LlamaFactory.
 
 ### FastAPI backend
 
@@ -109,7 +180,12 @@ Phase 6 fixes `Qwen/Qwen3-Embedding-0.6B` revision `d23109d65ca9fdf61eef61420974
 
 ### LLaMA-Factory and the training worker
 
-The training worker is planned to launch controlled LoRA or QLoRA jobs through LLaMA-Factory. Training data, outputs, logs, and adapters will live under `DEPTSLM_DATA_DIR`. Every dataset, job, evaluation, and adapter will be bound to a `department_id` and an exact base-model revision. Adapters should be evaluated and explicitly promoted before use; no cross-department adapter fallback is permitted.
+Phase 11's training-job worker generates immutable bundles but does not launch
+LLaMA-Factory. A future Phase 12 implementation may consume one exact approved
+bundle through a separately reviewed external adapter intake. Training data,
+outputs, logs, and adapters remain under `DEPTSLM_DATA_DIR`; every dataset,
+job, evaluation, and adapter is department-scoped and bound to an exact
+base-model revision. No cross-department adapter fallback is permitted.
 
 ### Shared package
 
@@ -141,10 +217,19 @@ Phase 5 adds explicit failed-attempt retry, exact expired-claim staging recovery
 ### Adapter training and promotion
 
 1. An authorized operator creates or selects a reviewed department dataset.
-2. The training worker records the base-model revision and LLaMA-Factory configuration.
-3. LLaMA-Factory produces a department-bound adapter under external storage.
+2. The completed Phase 11 worker records the reviewed base-model revision and
+   LlamaFactory configuration in an immutable job bundle.
+3. An untrusted external training environment may consume the Phase 11 bundle and
+   submit adapter files through the future administrator-controlled intake.
 4. Automated and human evaluation compare the candidate with the current approved behavior.
-5. An authorized promotion action makes the adapter available to that department; rollback remains possible.
+5. An authorized promotion action may make a validated adapter available to that
+   department; rollback remains explicit and remains a future boundary.
+
+The import source is not runtime, evaluation, promotion, or rollback authority.
+The registry becomes adapter authority only after a successful PostgreSQL
+publication commit. Phase 12.1 must validate the adapter with a reviewed static
+schema without loading a model or tokenizer; package versions and numeric
+limits are intentionally not fixed in Phase 12.0.
 
 The exact training scheduler, GPU execution environment, registry schema, and approval workflow are future decisions.
 
@@ -174,5 +259,5 @@ PostgreSQL claims, Qdrant retrieval, Phase 5 artifacts, result publication, and 
 - Production extraction sandbox, malware controls, and additional reviewed formats
 - Hybrid retrieval, reranking, and relevance thresholds beyond the Phase 5 character chunker
 - Production retention, physical purge, reconciliation, and tamper-resistant audit requirements
-- Adapter evaluation gates and promotion workflow
+- Phase 12.1 through 12.4 adapter implementation and runtime deployment
 - Production topology, secrets, observability, backup, and disaster recovery
