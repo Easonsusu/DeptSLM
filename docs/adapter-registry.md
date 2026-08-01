@@ -190,10 +190,13 @@ not an adapter under this contract.
 The future intake worker has no `model_cache`, base-model weights, tokenizer,
 Transformers model object, or Hugging Face access. Phase 12.1A therefore fixes
 the reviewed, content-free, source-controlled static adapter schema: PEFT
-`0.18.1`, Transformers `4.55.0`, safetensors format `0.7.0`, the closed
-`adapter_config.json` values, seven target modules, exact tensor-key grammar,
-rank and shape relationships, F16/BF16/F32 dtypes, a 1 MiB header bound, 392
-tensors, and a 44,040,192-byte file bound. See
+`0.18.1`, Transformers `4.55.0`, safetensors format `0.7.0`, the saved
+`adapter_config.json` values including `inference_mode=true`,
+`auto_mapping=null`, and `peft_version="0.18.1"`, the exact safetensors
+`{"format":"pt"}` metadata object, seven target modules, exact tensor-key
+grammar, rank and shape relationships, F16/BF16/F32 dtypes, a 1 MiB header
+bound, 392 tensors, and a 44,040,192-byte file bound. `__metadata__` is the
+only accepted safetensors metadata and is not a tensor. See
 [adapter-static-contract.md](adapter-static-contract.md).
 
 The schema requires no model or tokenizer loading, network access, or model

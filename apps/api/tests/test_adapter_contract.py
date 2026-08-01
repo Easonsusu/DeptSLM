@@ -18,7 +18,9 @@ def _external_config() -> dict[str, object]:
         "revision": None,
         "peft_type": "LORA",
         "task_type": "CAUSAL_LM",
-        "inference_mode": False,
+        "inference_mode": True,
+        "auto_mapping": None,
+        "peft_version": "0.18.1",
         "r": 16,
         "target_modules": list(contract.TARGET_MODULES),
         "exclude_modules": None,
@@ -77,6 +79,7 @@ def _header_entries(dtype: str = "F16") -> dict[str, object]:
         size = shape[0] * shape[1] * contract.TENSOR_DTYPE_BYTES[dtype]
         entries[name] = {"dtype": dtype, "shape": shape, "data_offsets": [offset, offset + size]}
         offset += size
+    entries["__metadata__"] = {"format": "pt"}
     return entries
 
 
@@ -168,6 +171,29 @@ def test_external_config_accepts_reviewed_lora_profile() -> None:
     assert summary.r == 16
     assert summary.lora_alpha == 32
     assert summary.lora_dropout == 0.05
+    assert summary.inference_mode is True
+    assert summary.auto_mapping is None
+    assert summary.peft_version == "0.18.1"
+
+
+def test_peft_0181_saved_artifact_contract() -> None:
+    config_raw = json.dumps(_external_config(), sort_keys=True).encode("utf-8")
+    summary = contract.parse_external_adapter_config(config_raw)
+    canonical = contract.canonicalize_external_adapter_config(config_raw)
+    reader, file_size, header = _reader_for(_header_entries())
+    tensor_summary = contract.validate_safetensors_metadata(reader, file_size)
+    canonical_object = json.loads(canonical)
+
+    assert summary.inference_mode is True
+    assert summary.auto_mapping is None
+    assert summary.peft_version == "0.18.1"
+    assert canonical_object["inference_mode"] is True
+    assert canonical_object["auto_mapping"] is None
+    assert canonical_object["peft_version"] == "0.18.1"
+    assert contract.parse_canonical_adapter_config(canonical) == summary
+    assert contract.canonicalize_external_adapter_config(canonical) == canonical
+    assert tensor_summary.tensor_count == 392
+    assert reader._offset == 8 + len(header)
 
 
 def test_external_config_accepts_reviewed_qlora_profile_same_artifact_contract() -> None:
@@ -207,7 +233,10 @@ def test_canonical_config_is_sorted_compact_and_round_trips_byte_identically() -
         ("revision", "wrong-revision"),
         ("peft_type", "ADALORA"),
         ("task_type", "SEQ_CLS"),
-        ("inference_mode", True),
+        ("inference_mode", False),
+        ("auto_mapping", {"base_model": "not-accepted"}),
+        ("peft_version", "0.18.0"),
+        ("peft_version", "0.18.1.dev0"),
         ("r", 8),
         ("lora_alpha", 8),
         ("lora_dropout", 0.1),
@@ -248,11 +277,29 @@ def test_external_config_rejects_missing_and_unknown_keys() -> None:
         lambda: contract.parse_external_adapter_config(json.dumps(missing).encode()),
         "adapter_config_invalid",
     )
-    unknown = _external_config()
-    unknown["operator_note"] = "not accepted"
+    for field in ("operator_note", "runtime_config"):
+        unknown = _external_config()
+        unknown[field] = "not accepted"
+        _assert_code(
+            lambda unknown=unknown: contract.parse_external_adapter_config(
+                json.dumps(unknown).encode()
+            ),
+            "adapter_config_invalid",
+        )
+    for field in ("auto_mapping", "peft_version"):
+        missing_field = _external_config()
+        missing_field.pop(field)
+        _assert_code(
+            lambda missing_field=missing_field: contract.parse_external_adapter_config(
+                json.dumps(missing_field).encode()
+            ),
+            "adapter_config_invalid",
+        )
+    null_version = _external_config()
+    null_version["peft_version"] = None
     _assert_code(
-        lambda: contract.parse_external_adapter_config(json.dumps(unknown).encode()),
-        "adapter_config_invalid",
+        lambda: contract.parse_external_adapter_config(json.dumps(null_version).encode()),
+        "adapter_config_unsupported",
     )
 
 
@@ -310,6 +357,51 @@ def test_header_reader_never_reads_declared_payload_even_when_simulated_file_is_
     reader, file_size, header = _reader_for(entries, dtype="F32")
     contract.validate_safetensors_metadata(reader, file_size)
     assert reader._offset == 8 + len(header)
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    "metadata_value",
+    [
+        _MISSING,
+        {},
+        {"format": "torch"},
+        {"format": "PT"},
+        {"format": 1},
+        {"format": None},
+        {"format": "pt", "operator_note": "not accepted"},
+        [],
+        "pt",
+    ],
+)
+def test_header_requires_exact_peft_safetensors_metadata(metadata_value: object) -> None:
+    entries = _header_entries()
+    if metadata_value is _MISSING:
+        entries.pop("__metadata__")
+    else:
+        entries["__metadata__"] = metadata_value
+    reader, file_size, _ = _reader_for(entries)
+    _assert_code(
+        lambda: contract.validate_safetensors_metadata(reader, file_size),
+        "adapter_tensor_set_invalid",
+    )
+
+
+def test_header_rejects_duplicate_metadata_key() -> None:
+    entries = _header_entries()
+    entries.pop("__metadata__")
+    raw = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    duplicate = raw[:-1] + b',"__metadata__":{"format":"pt"},"__metadata__":{"format":"pt"}}'
+    duplicate += b" " * ((8 - (len(duplicate) % 8)) % 8)
+    reader = _RecordingReader(len(duplicate).to_bytes(8, "little") + duplicate)
+    _assert_code(
+        lambda: contract.validate_safetensors_metadata(
+            reader, 8 + len(duplicate) + contract.EXPECTED_TENSOR_BYTES["F16"]
+        ),
+        "adapter_header_invalid",
+    )
 
 
 @pytest.mark.parametrize(
@@ -399,7 +491,7 @@ def test_header_rejects_prefix_length_and_file_bounds() -> None:
 @pytest.mark.parametrize("mutation", ["overlap", "gap", "reversed", "wrong_size", "trailing"])
 def test_header_rejects_offset_integrity_failures(mutation: str) -> None:
     entries = _header_entries()
-    names = list(entries)
+    names = list(contract.EXPECTED_TENSOR_NAMES)
     if mutation == "overlap":
         entries[names[1]]["data_offsets"] = [1, 65_537]  # type: ignore[index]
     elif mutation == "gap":

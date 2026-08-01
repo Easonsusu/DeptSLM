@@ -123,6 +123,8 @@ class AdapterConfigSummary:
     peft_type: str
     task_type: str
     inference_mode: bool
+    auto_mapping: None
+    peft_version: str
     r: int
     target_modules: tuple[str, ...]
     lora_alpha: int
@@ -155,7 +157,7 @@ class SafetensorsSummary:
 
 
 # This is the exact dataclass serialization field set of PEFT 0.18.1's
-# LoraConfig.to_dict() after its runtime_config field is intentionally removed.
+# PeftConfig/LoraConfig save_pretrained output after runtime_config is removed.
 EXTERNAL_CONFIG_KEYS = frozenset(
     {
         "base_model_name_or_path",
@@ -163,6 +165,8 @@ EXTERNAL_CONFIG_KEYS = frozenset(
         "peft_type",
         "task_type",
         "inference_mode",
+        "auto_mapping",
+        "peft_version",
         "r",
         "target_modules",
         "exclude_modules",
@@ -311,7 +315,14 @@ def _validate_config_values(value: dict[str, object]) -> AdapterConfigSummary:
         _fail("adapter_config_unsupported")
     if value["peft_type"] != PEFT_TYPE or value["task_type"] != TASK_TYPE:
         _fail("adapter_config_unsupported")
-    if not _is_exact_bool(value["inference_mode"]) or value["inference_mode"]:
+    if not _is_exact_bool(value["inference_mode"]) or value["inference_mode"] is not True:
+        _fail("adapter_config_unsupported")
+    if value["auto_mapping"] is not None:
+        _fail("adapter_config_unsupported")
+    if (
+        type(value["peft_version"]) is not str
+        or value["peft_version"] != PEFT_FORMAT_REFERENCE_VERSION
+    ):
         _fail("adapter_config_unsupported")
     if not _is_exact_int(value["r"]) or value["r"] != LORA_RANK:
         _fail("adapter_config_unsupported")
@@ -372,7 +383,9 @@ def _validate_config_values(value: dict[str, object]) -> AdapterConfigSummary:
         revision=None,
         peft_type=PEFT_TYPE,
         task_type=TASK_TYPE,
-        inference_mode=False,
+        inference_mode=True,
+        auto_mapping=None,
+        peft_version=PEFT_FORMAT_REFERENCE_VERSION,
         r=LORA_RANK,
         target_modules=tuple(sorted(target_modules)),  # type: ignore[arg-type]
         lora_alpha=LORA_ALPHA,
@@ -395,12 +408,13 @@ def validate_adapter_config(raw: bytes | bytearray | memoryview | str) -> Adapte
 
 
 def _canonical_config_object() -> dict[str, object]:
-    # Keep this object byte-compatible with PEFT 0.18.1's closed LoraConfig
+    # Keep this object byte-compatible with PEFT 0.18.1's saved LoraConfig
     # serialization while removing the operator-controlled model-cache path.
     return {
         "alpha_pattern": {},
         "alora_invocation_tokens": None,
         "arrow_config": None,
+        "auto_mapping": None,
         "base_model_name_or_path": BASE_MODEL_ID,
         "bias": LORA_BIAS,
         "corda_config": None,
@@ -408,7 +422,7 @@ def _canonical_config_object() -> dict[str, object]:
         "exclude_modules": None,
         "eva_config": None,
         "fan_in_fan_out": False,
-        "inference_mode": False,
+        "inference_mode": True,
         "init_lora_weights": True,
         "layer_replication": None,
         "layers_pattern": None,
@@ -420,6 +434,7 @@ def _canonical_config_object() -> dict[str, object]:
         "megatron_core": "megatron.core",
         "modules_to_save": None,
         "peft_type": PEFT_TYPE,
+        "peft_version": PEFT_FORMAT_REFERENCE_VERSION,
         "qalora_group_size": 16,
         "rank_pattern": {},
         "r": LORA_RANK,
@@ -577,9 +592,16 @@ def validate_safetensors_metadata(reader: BinaryIO, file_size: int) -> Safetenso
         _fail("adapter_header_invalid")
     header = _read_exact(reader, header_length)
     metadata = _parse_header(header)
-    if "__metadata__" in metadata:
+    expected_top_level_keys = set(EXPECTED_TENSOR_NAMES) | {"__metadata__"}
+    if set(metadata) != expected_top_level_keys:
         _fail("adapter_tensor_set_invalid")
-    if set(metadata) != set(EXPECTED_TENSOR_NAMES):
+    safetensors_metadata = metadata.get("__metadata__")
+    if (
+        not isinstance(safetensors_metadata, dict)
+        or set(safetensors_metadata) != {"format"}
+        or type(safetensors_metadata["format"]) is not str
+        or safetensors_metadata["format"] != "pt"
+    ):
         _fail("adapter_tensor_set_invalid")
 
     ranges: list[tuple[int, int]] = []

@@ -87,16 +87,21 @@ bias, full-model, or quantized-base tensor.
 
 ## External and canonical configuration
 
-The parser accepts only the complete PEFT 0.18.1 `LoraConfig.to_dict()` field
-set after PEFT removes its runtime-only `runtime_config`. Every field must have
-the reviewed value: `peft_type=LORA`, `task_type=CAUSAL_LM`, `r=16`,
-`lora_alpha=32`, `lora_dropout=0.05`, `bias=none`, `inference_mode=false`,
-the exact seven target modules, `modules_to_save=null`, `use_rslora=false`,
-`use_dora=false`, empty rank/alpha patterns, `target_parameters=null`,
-`revision=null`, `megatron_core=megatron.core`, empty `loftq_config`, and all
-other advanced fields at their reviewed disabled/default values. The external
-base value is either `Qwen/Qwen3-0.6B` or the exact Phase 11 runtime cache path;
-no other identifier or path is accepted.
+The parser accepts only the complete PEFT 0.18.1 saved configuration field set
+after PEFT removes its runtime-only `runtime_config`. This is the completed
+artifact written by `PeftModel.save_pretrained`, not the in-memory training
+configuration: PEFT temporarily writes `inference_mode=true`,
+`auto_mapping=null` for this non-null `CAUSAL_LM` task type, and
+`peft_version="0.18.1"`. Every field must have the reviewed value:
+`peft_type=LORA`, `task_type=CAUSAL_LM`, `r=16`, `lora_alpha=32`,
+`lora_dropout=0.05`, `bias=none`, the exact seven target modules,
+`modules_to_save=null`, `use_rslora=false`, `use_dora=false`, empty rank/alpha
+patterns, `target_parameters=null`, `revision=null`,
+`megatron_core=megatron.core`, empty `loftq_config`, and all other advanced
+fields at their reviewed disabled/default values. Unknown keys, including
+`runtime_config`, remain rejected. The external base value is either
+`Qwen/Qwen3-0.6B` or the exact Phase 11 runtime cache path; no other identifier
+or path is accepted.
 
 `canonicalize_external_adapter_config` emits a generated UTF-8 JSON object with
 sorted keys, compact separators, one trailing LF, the same closed PEFT field
@@ -118,15 +123,19 @@ length and at most the declared UTF-8 JSON header, bounded to `1,048,576`
 bytes. It never reads tensor payload bytes and never allocates a complete
 adapter. The maximum accepted file size is `44,040,192` bytes.
 
-The header must be an object containing exactly the 392 expected tensor names;
-`__metadata__`, unknown entries, duplicate keys, malformed descriptors, mixed
-or unsupported dtypes, zero/negative/boolean dimensions, wrong shapes, invalid
+The header must be an object containing exactly the 392 expected tensor names
+plus `__metadata__`. PEFT 0.18.1 writes the exact metadata object
+`{"format":"pt"}`; no other metadata, operator text, or arbitrary extension is
+accepted. `__metadata__` is not a tensor and does not count toward the 392
+tensor total. Missing, duplicate, empty, non-object, or differently shaped
+metadata, unknown entries, duplicate keys, malformed descriptors, mixed or
+unsupported dtypes, zero/negative/boolean dimensions, wrong shapes, invalid
 offsets, overlaps, reversals, duplicate ranges, gaps, overruns, underruns,
-trailing bytes, and full-model groups fail closed. Each descriptor contains
-only `dtype`, `shape`, and `data_offsets`; all ranges are contiguous from zero,
-end at the exact dtype-specific payload total, and make the complete file size
-exactly `8 + header_length + payload_bytes`. Only F16, BF16, and F32 are
-accepted, one uniform dtype per file.
+trailing bytes, and full-model groups fail closed. Each tensor descriptor
+contains only `dtype`, `shape`, and `data_offsets`; all ranges are contiguous
+from zero, end at the exact dtype-specific payload total, and make the complete
+file size exactly `8 + header_length + payload_bytes`. Only F16, BF16, and F32
+are accepted, one uniform dtype per file.
 
 The returned `SafetensorsSummary` contains only contract version, layer/module
 counts, tensor count, dtype, element count, and byte count. Tests use an

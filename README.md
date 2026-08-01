@@ -48,6 +48,12 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > Phase 12.2 through Phase 12.4 remain unimplemented; no adapter registry or
 > runtime routing exists.
 
+The static contract models the completed PEFT 0.18.1 artifact: saved
+`inference_mode=true`, `auto_mapping=null`, `peft_version="0.18.1"`, and the
+exact safetensors metadata `{"format":"pt"}`. That metadata is closed and
+content-free; `__metadata__` is not a tensor, and acceptance does not prove
+training provenance.
+
 The planned intake begins with an administrator CLI that streams only
 `adapter_config.json` and `adapter_model.safetensors` into an immutable,
 department-scoped import bundle. DeptSLM generates a closed, content-free
