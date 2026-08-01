@@ -233,7 +233,7 @@ def test_same_department_admin_can_apply_source_import(
         ("viewer", "active", "active"),
         ("department_admin", "suspended", "active"),
         ("department_admin", "revoked", "active"),
-        ("department_admin", "active", "inactive"),
+        ("department_admin", "active", "suspended"),
     ],
 )
 def test_non_admin_or_inactive_actor_cannot_apply_source_import(

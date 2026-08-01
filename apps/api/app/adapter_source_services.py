@@ -550,7 +550,13 @@ def _register(factory, principal, scope, code_revision):
             code_revision=code_revision,
             version=1,
         )
-        session.add_all((source, attempt))
+        # Flush the parent before the composite child insert.  SQLAlchemy's
+        # unit-of-work ordering does not reliably infer this dependency from
+        # the content-free composite foreign key when no ORM relationship is
+        # declared, and PostgreSQL must see the exact department/source pair.
+        session.add(source)
+        session.flush()
+        session.add(attempt)
         session.flush()
         return (
             source_id,
