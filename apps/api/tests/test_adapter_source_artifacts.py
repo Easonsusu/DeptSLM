@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import pytest
 
+from app import adapter_source_artifacts as artifacts
 from app.adapter_contract import (
     ADAPTER_CONFIG_CONTRACT_VERSION,
     ADAPTER_INTAKE_CONTRACT_VERSION,
@@ -173,6 +174,48 @@ def test_existing_final_source_is_never_replaced(tmp_path: Path) -> None:
         second.close()
         config_input.close()
         model_input.close()
+
+
+def test_source_mutation_during_copy_never_publishes_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "adapters").mkdir(mode=0o700)
+    config, model = _files(tmp_path)
+    department_id, source_id, attempt_id, publication_id = (uuid4() for _ in range(4))
+    original_pread = os.pread
+    mutator_fd = os.open(config, os.O_RDWR)
+    mutated = False
+
+    def mutate_after_first_read(fd: int, size: int, offset: int) -> bytes:
+        nonlocal mutated
+        block = original_pread(fd, size, offset)
+        if fd == config_fd and not mutated:
+            mutated = True
+            os.pwrite(mutator_fd, b"X", 0)
+        return block
+
+    with AdapterSourceArtifactStore(tmp_path) as store:
+        config_input, model_input = store.open_external_inputs(config, model)
+        config_fd = config_input.descriptor
+        monkeypatch.setattr(artifacts.os, "pread", mutate_after_first_read)
+        try:
+            with pytest.raises(AdapterSourceArtifactError) as error:
+                store.stage(
+                    DepartmentScope(department_id),
+                    source_id,
+                    attempt_id,
+                    publication_id,
+                    1,
+                    config_input,
+                    model_input,
+                    _manifest(department_id, source_id, attempt_id, publication_id, config, model),
+                )
+            assert error.value.code == "adapter_source_changed"
+        finally:
+            config_input.close()
+            model_input.close()
+    assert not (tmp_path / "adapters" / "imports" / str(department_id) / str(source_id)).exists()
+    os.close(mutator_fd)
 
 
 def stat_mode(descriptor: int) -> int:

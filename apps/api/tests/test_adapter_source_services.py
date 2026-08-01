@@ -10,7 +10,11 @@ from uuid import uuid4
 import pytest
 
 from app import adapter_source_services as services
-from app.adapter_source_artifacts import AdapterArtifactDigest
+from app.adapter_source_artifacts import (
+    AdapterArtifactDigest,
+    AdapterSourceArtifactError,
+    AdapterSourceArtifactStore,
+)
 from app.admin import _parser
 
 
@@ -180,3 +184,41 @@ def test_cli_accepts_only_exact_adapter_source_arguments() -> None:
     assert args.command == "import-adapter-source"
     assert args.apply is False
     assert not hasattr(args, "source_dir")
+
+
+def test_same_size_source_mutation_after_child_validation_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _settings(tmp_path)
+    config, model = _write_inputs(tmp_path)
+    mutator_fd = os.open(config, os.O_RDWR)
+    with AdapterSourceArtifactStore(tmp_path) as store:
+        config_input, model_input = store.open_external_inputs(config, model)
+        try:
+            original = config.read_bytes()
+
+            def validate_then_mutate(**_kwargs):
+                os.pwrite(mutator_fd, b"X", 0)
+                return {
+                    "source_contract_version": "phase12-adapter-source-v1",
+                    "config_contract_version": "phase12-adapter-config-v1",
+                    "tensor_contract_version": "phase12-adapter-tensors-v1",
+                    "base_model_id": "Qwen/Qwen3-0.6B",
+                    "base_model_display_id": "Qwen/Qwen3-0.6B",
+                    "peft_version": "0.18.1",
+                    "safetensors_format": "0.7.0",
+                    "tensor_dtype": "F16",
+                    "tensor_count": 392,
+                    "tensor_element_count": 10_092_544,
+                    "tensor_payload_byte_size": 20_185_088,
+                }
+
+            monkeypatch.setattr(services, "run_adapter_source_validation", validate_then_mutate)
+            with pytest.raises(AdapterSourceArtifactError) as error:
+                services._validate_and_hash(config_input, model_input)
+            assert error.value.code == "adapter_source_changed"
+            assert config.read_bytes() != original
+        finally:
+            config_input.close()
+            model_input.close()
+            os.close(mutator_fd)

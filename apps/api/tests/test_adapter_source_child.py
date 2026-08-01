@@ -6,13 +6,16 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from app.adapter_contract import (
     EXPECTED_TENSOR_NAMES,
     EXPECTED_TENSOR_SHAPES,
     canonical_adapter_config_bytes,
 )
-from app.adapter_source_child import validate_descriptors
-from app.adapter_source_supervision import run_adapter_source_validation
+from app.adapter_source_artifacts import AdapterSourceArtifactError
+from app.adapter_source_child import AdapterSourceChildError, validate_descriptors
+from app.adapter_source_supervision import _validate_success_result, run_adapter_source_validation
 
 
 def _adapter_files(tmp_path: Path) -> tuple[Path, Path, int]:
@@ -107,3 +110,44 @@ def test_supervised_child_returns_content_free_summary(tmp_path: Path) -> None:
     assert result["tensor_payload_byte_size"] == 20_185_088
     assert "adapter_config.json" not in json.dumps(result)
     assert str(tmp_path) not in json.dumps(result)
+
+
+def test_child_preserves_descriptor_error_codes(tmp_path: Path) -> None:
+    config = tmp_path / "adapter_config.json"
+    model = tmp_path / "adapter_model.safetensors"
+    config.write_bytes(b"{}")
+    model.write_bytes(b"not-a-safetensors")
+    os.chmod(config, 0o600)
+    os.chmod(model, 0o600)
+    config_fd = os.open(config, os.O_RDONLY)
+    model_fd = os.open(model, os.O_RDONLY)
+    try:
+        with pytest.raises(AdapterSourceChildError) as error:
+            validate_descriptors(
+                _request(config_fd, model_fd, config.stat().st_size, model.stat().st_size)
+            )
+    finally:
+        os.close(config_fd)
+        os.close(model_fd)
+    assert error.value.code == "adapter_config_invalid"
+
+
+def test_parent_accepts_only_the_exact_child_success_schema(tmp_path: Path) -> None:
+    config, model, _payload_size = _adapter_files(tmp_path)
+    config_fd = os.open(config, os.O_RDONLY)
+    model_fd = os.open(model, os.O_RDONLY)
+    try:
+        result = run_adapter_source_validation(
+            config_fd=config_fd,
+            model_fd=model_fd,
+            config_size=config.stat().st_size,
+            model_size=model.stat().st_size,
+        )
+    finally:
+        os.close(config_fd)
+        os.close(model_fd)
+    assert _validate_success_result(result) == result
+    with pytest.raises(AdapterSourceArtifactError):
+        _validate_success_result({**result, "extra": "rejected"})
+    with pytest.raises(AdapterSourceArtifactError):
+        _validate_success_result({**result, "tensor_count": True})

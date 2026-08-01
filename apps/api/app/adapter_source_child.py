@@ -22,6 +22,31 @@ from app.adapter_contract import (
 
 MAX_REQUEST_FRAME_BYTES = 64 * 1024
 MAX_RESPONSE_FRAME_BYTES = 16 * 1024
+CHILD_ERROR_CODES = frozenset(
+    {
+        "adapter_config_invalid",
+        "adapter_config_unsupported",
+        "adapter_header_invalid",
+        "adapter_header_too_large",
+        "adapter_file_too_large",
+        "adapter_tensor_set_invalid",
+        "adapter_tensor_shape_invalid",
+        "adapter_tensor_dtype_invalid",
+        "adapter_tensor_offsets_invalid",
+        "adapter_tensor_size_invalid",
+        "adapter_input_invalid",
+        "adapter_input_unsafe",
+        "adapter_source_changed",
+    }
+)
+
+
+class AdapterSourceChildError(RuntimeError):
+    """Fixed child-local error boundary for contract and descriptor failures."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code if code in CHILD_ERROR_CODES else "adapter_input_invalid"
+        super().__init__(self.code)
 
 
 class _PreadReader:
@@ -57,19 +82,19 @@ def validate_descriptors(request: dict[str, object]) -> dict[str, object]:
         "tensor_contract_version",
     }
     if set(request) != expected:
-        raise AdapterContractError("adapter_config_invalid")
+        raise AdapterSourceChildError("adapter_config_invalid")
     descriptors = (request["config_fd"], request["model_fd"])
     sizes = (request["config_size"], request["model_size"])
     if any(type(value) is not int or value < 0 for value in descriptors):
-        raise AdapterContractError("adapter_input_invalid")
+        raise AdapterSourceChildError("adapter_input_invalid")
     if any(type(value) is not int or value <= 0 for value in sizes):
-        raise AdapterContractError("adapter_input_invalid")
+        raise AdapterSourceChildError("adapter_input_invalid")
     if request["source_contract_version"] != ADAPTER_SOURCE_CONTRACT_VERSION:
-        raise AdapterContractError("adapter_config_unsupported")
+        raise AdapterSourceChildError("adapter_config_unsupported")
     if request["config_contract_version"] != ADAPTER_CONFIG_CONTRACT_VERSION:
-        raise AdapterContractError("adapter_config_unsupported")
+        raise AdapterSourceChildError("adapter_config_unsupported")
     if request["tensor_contract_version"] != ADAPTER_TENSOR_CONTRACT_VERSION:
-        raise AdapterContractError("adapter_config_unsupported")
+        raise AdapterSourceChildError("adapter_config_unsupported")
     config_fd, model_fd = descriptors
     config_size, model_size = sizes
     config_metadata = os.fstat(config_fd)
@@ -86,14 +111,17 @@ def validate_descriptors(request: dict[str, object]) -> dict[str, object]:
         or config_metadata.st_mode & 0o077
         or model_metadata.st_mode & 0o077
     ):
-        raise AdapterContractError("adapter_input_unsafe")
+        raise AdapterSourceChildError("adapter_input_unsafe")
     config_raw = _read_bounded(config_fd, config_size)
-    parse_external_adapter_config(config_raw)
-    model_summary = validate_safetensors_metadata(
-        _PreadReader(model_fd, min(model_size, 8 + 1_048_576)), model_size
-    )
+    try:
+        parse_external_adapter_config(config_raw)
+        model_summary = validate_safetensors_metadata(
+            _PreadReader(model_fd, min(model_size, 8 + 1_048_576)), model_size
+        )
+    except AdapterContractError as error:
+        raise AdapterSourceChildError(error.code) from error
     if os.fstat(config_fd).st_size != config_size or os.fstat(model_fd).st_size != model_size:
-        raise AdapterContractError("adapter_source_changed")
+        raise AdapterSourceChildError("adapter_source_changed")
     return {
         "source_contract_version": ADAPTER_SOURCE_CONTRACT_VERSION,
         "config_contract_version": ADAPTER_CONFIG_CONTRACT_VERSION,
@@ -111,13 +139,13 @@ def validate_descriptors(request: dict[str, object]) -> dict[str, object]:
 
 def _read_bounded(descriptor: int, size: int) -> bytes:
     if size <= 0:
-        raise AdapterContractError("adapter_input_invalid")
+        raise AdapterSourceChildError("adapter_input_invalid")
     blocks: list[bytes] = []
     offset = 0
     while offset < size:
         block = os.pread(descriptor, min(64 * 1024, size - offset), offset)
         if not block:
-            raise AdapterContractError("adapter_source_changed")
+            raise AdapterSourceChildError("adapter_source_changed")
         blocks.append(block)
         offset += len(block)
     return b"".join(blocks)
@@ -150,7 +178,7 @@ def _read_stdin(size: int) -> bytes:
 def _write_frame(value: dict[str, object]) -> None:
     raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     if not 1 <= len(raw) <= MAX_RESPONSE_FRAME_BYTES:
-        raw = b'{"status":"error","code":"adapter_source_publication_failed"}'
+        raw = b'{"status":"error","code":"adapter_input_invalid"}'
     sys.stdout.buffer.write(struct.pack("!I", len(raw)) + raw)
     sys.stdout.buffer.flush()
 
@@ -158,7 +186,7 @@ def _write_frame(value: dict[str, object]) -> None:
 def main() -> int:
     try:
         result = validate_descriptors(_read_frame())
-    except AdapterContractError as error:
+    except AdapterSourceChildError as error:
         _write_frame({"status": "error", "code": error.code})
         return 1
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
@@ -172,4 +200,11 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["MAX_REQUEST_FRAME_BYTES", "MAX_RESPONSE_FRAME_BYTES", "validate_descriptors", "main"]
+__all__ = [
+    "MAX_REQUEST_FRAME_BYTES",
+    "MAX_RESPONSE_FRAME_BYTES",
+    "CHILD_ERROR_CODES",
+    "AdapterSourceChildError",
+    "validate_descriptors",
+    "main",
+]

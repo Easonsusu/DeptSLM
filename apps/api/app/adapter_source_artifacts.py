@@ -98,6 +98,9 @@ class ExternalAdapterInput:
     device: int
     inode: int
     name: str
+    mode: int
+    uid: int
+    nlink: int
 
     def close(self) -> None:
         try:
@@ -112,6 +115,31 @@ class AdapterArtifactDigest:
     byte_size: int
 
 
+@dataclass(frozen=True, slots=True)
+class DescriptorAuthority:
+    """Retained, content-free identity for one published descriptor."""
+
+    name: str
+    device: int
+    inode: int
+    mode: int
+    uid: int
+    nlink: int
+    byte_size: int
+    sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class PublishedAdapterAuthority:
+    """Post-rename authority retained without reopening final pathnames."""
+
+    directory_device: int
+    directory_inode: int
+    directory_mode: int
+    directory_uid: int
+    entries: tuple[DescriptorAuthority, ...]
+
+
 @dataclass(slots=True)
 class StagedAdapterSource:
     department: DepartmentScope
@@ -124,6 +152,7 @@ class StagedAdapterSource:
     final_parent_fd: int
     file_descriptors: tuple[tuple[str, int, os.stat_result], ...]
     digests: tuple[tuple[str, AdapterArtifactDigest], ...]
+    published_authority: PublishedAdapterAuthority | None = None
     renamed: bool = False
 
     def close(self) -> None:
@@ -160,10 +189,41 @@ class StagedAdapterSource:
             if expected[name].byte_size != after.st_size:
                 raise AdapterSourceArtifactError("adapter_source_authority_changed")
 
+    def recheck_retained_authority(self) -> None:
+        """Recheck retained post-rename descriptor identities without hashing."""
+
+        authority = self.published_authority
+        if authority is None or not self.renamed:
+            raise AdapterSourceArtifactError("adapter_source_authority_changed")
+        directory = _require_private_directory(self.stage_fd, writable=True)
+        if (
+            directory.st_dev != authority.directory_device
+            or directory.st_ino != authority.directory_inode
+            or stat.S_IMODE(directory.st_mode) != authority.directory_mode
+            or directory.st_uid != authority.directory_uid
+        ):
+            raise AdapterSourceArtifactError("adapter_source_authority_changed")
+        _entry_matches(self.final_parent_fd, str(self.source_bundle_id), self.stage_fd)
+        for entry in authority.entries:
+            descriptor = next(
+                (fd for name, fd, _metadata in self.file_descriptors if name == entry.name),
+                None,
+            )
+            expected = self.digest_map.get(entry.name)
+            if (
+                descriptor is None
+                or expected is None
+                or expected.sha256 != entry.sha256
+                or expected.byte_size != entry.byte_size
+                or not _descriptor_matches(entry, os.fstat(descriptor))
+            ):
+                raise AdapterSourceArtifactError("adapter_source_authority_changed")
+
     def verify_published_digests(self) -> None:
         """Hash the retained final descriptors once after the no-replace rename."""
 
         expected = self.digest_map
+        entries: list[DescriptorAuthority] = []
         for name, descriptor, before in self.file_descriptors:
             digest = hashlib.sha256()
             offset = 0
@@ -180,6 +240,26 @@ class StagedAdapterSource:
                 or digest.hexdigest() != expected[name].sha256
             ):
                 raise AdapterSourceArtifactError("adapter_source_authority_changed")
+            entries.append(
+                DescriptorAuthority(
+                    name=name,
+                    device=current.st_dev,
+                    inode=current.st_ino,
+                    mode=stat.S_IMODE(current.st_mode),
+                    uid=current.st_uid,
+                    nlink=current.st_nlink,
+                    byte_size=current.st_size,
+                    sha256=digest.hexdigest(),
+                )
+            )
+        directory = _require_private_directory(self.stage_fd, writable=True)
+        self.published_authority = PublishedAdapterAuthority(
+            directory_device=directory.st_dev,
+            directory_inode=directory.st_ino,
+            directory_mode=stat.S_IMODE(directory.st_mode),
+            directory_uid=directory.st_uid,
+            entries=tuple(sorted(entries, key=lambda item: item.name)),
+        )
 
 
 class AdapterSourceArtifactStore:
@@ -262,6 +342,9 @@ class AdapterSourceArtifactStore:
             device=metadata.st_dev,
             inode=metadata.st_ino,
             name=expected_name,
+            mode=stat.S_IMODE(metadata.st_mode),
+            uid=metadata.st_uid,
+            nlink=metadata.st_nlink,
         )
 
     def stage(
@@ -274,6 +357,8 @@ class AdapterSourceArtifactStore:
         config: ExternalAdapterInput,
         model: ExternalAdapterInput,
         manifest: dict[str, object],
+        expected_config: AdapterArtifactDigest | None = None,
+        expected_model: AdapterArtifactDigest | None = None,
     ) -> StagedAdapterSource:
         """Copy the two retained descriptors into an exclusive private stage."""
 
@@ -299,9 +384,6 @@ class AdapterSourceArtifactStore:
                 if descriptor != final_parent:
                     os.close(descriptor)
 
-            _write_exact(stage_fd, STAGE_MARKER, _MARKER_BYTES)
-            config_digest = _copy_external(config, stage_fd, "adapter_config.json")
-            model_digest = _copy_external(model, stage_fd, "adapter_model.safetensors")
             _validate_manifest(manifest)
             if (
                 manifest["department_id"] != str(department.value)
@@ -317,6 +399,19 @@ class AdapterSourceArtifactStore:
                 "adapter_model.safetensors",
             }:
                 raise AdapterSourceArtifactError("adapter_source_publication_failed")
+            manifest_config = _manifest_digest(expected_files, "adapter_config.json")
+            manifest_model = _manifest_digest(expected_files, "adapter_model.safetensors")
+            expected_config = expected_config or manifest_config
+            expected_model = expected_model or manifest_model
+            if expected_config != manifest_config or expected_model != manifest_model:
+                raise AdapterSourceArtifactError("adapter_source_authority_changed")
+            _write_exact(stage_fd, STAGE_MARKER, _MARKER_BYTES)
+            config_digest = _copy_external(
+                config, stage_fd, "adapter_config.json", expected=expected_config
+            )
+            model_digest = _copy_external(
+                model, stage_fd, "adapter_model.safetensors", expected=expected_model
+            )
             if not _manifest_digest_matches(expected_files, "adapter_config.json", config_digest):
                 raise AdapterSourceArtifactError("adapter_source_changed")
             if not _manifest_digest_matches(
@@ -586,8 +681,24 @@ def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
     )
 
 
+def _descriptor_matches(expected: DescriptorAuthority, metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_dev == expected.device
+        and metadata.st_ino == expected.inode
+        and stat.S_IMODE(metadata.st_mode) == expected.mode
+        and metadata.st_uid == expected.uid
+        and metadata.st_nlink == expected.nlink
+        and metadata.st_size == expected.byte_size
+    )
+
+
 def _copy_external(
-    source: ExternalAdapterInput, directory_fd: int, name: str
+    source: ExternalAdapterInput,
+    directory_fd: int,
+    name: str,
+    *,
+    expected: AdapterArtifactDigest,
 ) -> AdapterArtifactDigest:
     try:
         destination = os.open(
@@ -620,13 +731,17 @@ def _copy_external(
                     raise AdapterSourceArtifactError("adapter_source_publication_failed")
                 written += count
         after = os.fstat(source.descriptor)
-        if total != source.size or not _source_identity(source, after):
+        result = AdapterArtifactDigest(digest.hexdigest(), total)
+        if total != source.size or not _source_identity(source, after) or result != expected:
             raise AdapterSourceArtifactError("adapter_source_changed")
         os.fsync(destination)
         current = os.fstat(destination)
         if current.st_size != source.size:
             raise AdapterSourceArtifactError("adapter_source_publication_failed")
-        return AdapterArtifactDigest(digest.hexdigest(), total)
+        source_digest = _digest_source(source)
+        if source_digest != expected:
+            raise AdapterSourceArtifactError("adapter_source_changed")
+        return result
     except OSError as error:
         raise AdapterSourceArtifactError("adapter_source_publication_failed") from error
     finally:
@@ -642,8 +757,24 @@ def _source_identity(source: ExternalAdapterInput, metadata: os.stat_result) -> 
         and metadata.st_dev == source.device
         and metadata.st_ino == source.inode
         and metadata.st_size == source.size
-        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) == source.mode
+        and metadata.st_uid == source.uid
+        and metadata.st_nlink == source.nlink == 1
     )
+
+
+def _digest_source(source: ExternalAdapterInput) -> AdapterArtifactDigest:
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < source.size:
+        block = os.pread(source.descriptor, min(_CHUNK_BYTES, source.size - offset), offset)
+        if not block:
+            raise AdapterSourceArtifactError("adapter_source_changed")
+        digest.update(block)
+        offset += len(block)
+    if not _source_identity(source, os.fstat(source.descriptor)):
+        raise AdapterSourceArtifactError("adapter_source_changed")
+    return AdapterArtifactDigest(digest.hexdigest(), offset)
 
 
 def _manifest_digest_matches(
@@ -656,6 +787,20 @@ def _manifest_digest_matches(
         and value.get("sha256") == digest.sha256
         and value.get("byte_size") == digest.byte_size
     )
+
+
+def _manifest_digest(files: dict[str, object], name: str) -> AdapterArtifactDigest:
+    value = files.get(name)
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"sha256", "byte_size"}
+        or not isinstance(value.get("sha256"), str)
+        or len(value["sha256"]) != 64
+        or type(value.get("byte_size")) is not int
+        or value["byte_size"] <= 0
+    ):
+        raise AdapterSourceArtifactError("adapter_source_publication_failed")
+    return AdapterArtifactDigest(value["sha256"], value["byte_size"])
 
 
 def _write_exact(directory_fd: int, name: str, value: bytes) -> AdapterArtifactDigest:
@@ -748,6 +893,8 @@ __all__ = [
     "AdapterSourceArtifactError",
     "ExternalAdapterInput",
     "AdapterArtifactDigest",
+    "DescriptorAuthority",
+    "PublishedAdapterAuthority",
     "StagedAdapterSource",
     "AdapterSourceArtifactStore",
 ]

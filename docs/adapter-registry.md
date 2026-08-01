@@ -398,6 +398,15 @@ secret-free environment, `close_fds`, bounded framed content-free IPC, and
 cancellation, shutdown, deadline, and lease supervision. Adapter bytes must not
 cross IPC; the parent must never parse or materialize the complete adapter.
 
+The Phase 12.1B implementation binds one exact validated-byte authority across
+the pre-child and post-child digest passes, descriptor-relative copy, post-
+rename publication verification, and the final PostgreSQL commit. Every
+transition compares a complete frozen authority snapshot and both row versions;
+static contract errors are distinct from the fixed descriptor/operational
+codes. Migration `0010_phase12_adapter_sources` is self-contained and freezes
+the SQL contract literals, while CI validates that head and the private
+temporary adapters root before running the full suite.
+
 ## Planned PostgreSQL boundary
 
 These are conceptual entities only; names and decomposition may change during

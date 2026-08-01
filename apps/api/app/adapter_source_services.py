@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -134,6 +135,43 @@ class AdapterSourceImportResult:
         return self.tensor_payload_byte_size
 
 
+@dataclass(frozen=True, slots=True)
+class AdapterAuthoritySnapshot:
+    """Frozen optimistic authority for one source and its exact attempt."""
+
+    department_id: UUID
+    source_bundle_id: UUID
+    import_attempt_id: UUID
+    publication_attempt_id: UUID
+    attempt_number: int
+    imported_by_user_id: UUID
+    source_version: int
+    attempt_version: int
+    source_status: str
+    attempt_status: str
+    source_code_revision: str
+    attempt_code_revision: str
+    source_contract_version: str
+    intake_contract_version: str
+    config_contract_version: str
+    tensor_contract_version: str
+    base_model_id: str
+    base_model_revision: str
+    base_model_license: str
+    peft_version: str
+    safetensors_format: str
+    adapter_config_sha256: str | None
+    adapter_config_byte_size: int | None
+    adapter_model_sha256: str | None
+    adapter_model_byte_size: int | None
+    intake_manifest_sha256: str | None
+    tensor_dtype: str | None
+    tensor_count: int | None
+    tensor_element_count: int | None
+    tensor_payload_byte_size: int | None
+    ownership_manifest: str | None
+
+
 def import_adapter_source(
     settings: AdapterSourceImportSettings,
     *,
@@ -164,6 +202,7 @@ def import_adapter_source(
     staged: StagedAdapterSource | None = None
     source_id: UUID | None = None
     attempt_id: UUID | None = None
+    authority: AdapterAuthoritySnapshot | None = None
     principal = AuthenticatedPrincipal(subject=actor_subject, issuer=actor_issuer)
     scope = DepartmentRequestScope(DepartmentScope(department_id))
     try:
@@ -199,16 +238,21 @@ def import_adapter_source(
                     tensor_payload_byte_size=int(summary["tensor_payload_byte_size"]),
                 )
 
-            source_id, attempt_id, publication_attempt_id, attempt_number, actor_id = _register(
+            (
+                source_id,
+                attempt_id,
+                publication_attempt_id,
+                attempt_number,
+                actor_id,
+                authority,
+            ) = _register(
                 factory,
                 principal,
                 scope,
                 settings.code_revision,
             )
             try:
-                summary, config_digest, model_digest = _validate_and_hash(
-                    config_input, model_input, include_digests=True
-                )
+                summary, config_digest, model_digest = _validate_and_hash(config_input, model_input)
             except AdapterSourceArtifactError as error:
                 if error.code in _VALIDATION_FAILURES:
                     _reject_registered(
@@ -218,6 +262,7 @@ def import_adapter_source(
                         source_id,
                         attempt_id,
                         error.code,
+                        expected=authority,
                     )
                 else:
                     _abandon_registered(
@@ -227,12 +272,13 @@ def import_adapter_source(
                         source_id,
                         attempt_id,
                         error.code,
+                        expected=authority,
                     )
                 raise AdapterSourceImportConfigurationError(
                     "Adapter source validation failed.", error.code
                 ) from error
 
-            _mark_validated(
+            authority = _mark_validated(
                 factory,
                 principal,
                 scope,
@@ -241,6 +287,7 @@ def import_adapter_source(
                 summary,
                 config_digest,
                 model_digest,
+                expected=authority,
             )
             manifest = _intake_manifest(
                 department_id=department_id,
@@ -263,11 +310,17 @@ def import_adapter_source(
                 config_input,
                 model_input,
                 manifest,
+                expected_config=config_digest,
+                expected_model=model_digest,
             )
-            _mark_staged(factory, principal, scope, source_id, attempt_id, manifest)
+            authority = _mark_staged(
+                factory, principal, scope, source_id, attempt_id, manifest, expected=authority
+            )
             store.publish(staged)
-            _mark_published(factory, principal, scope, source_id, attempt_id, manifest)
-            _commit_published(
+            authority = _mark_published(
+                factory, principal, scope, source_id, attempt_id, manifest, expected=authority
+            )
+            authority = _commit_published(
                 factory,
                 principal,
                 scope,
@@ -275,9 +328,7 @@ def import_adapter_source(
                 attempt_id,
                 manifest,
                 staged,
-                summary,
-                config_digest,
-                model_digest,
+                expected=authority,
             )
             staged = None
             return AdapterSourceImportResult(
@@ -295,7 +346,15 @@ def import_adapter_source(
         raise
     except AdapterSourceArtifactError as error:
         if source_id is not None and attempt_id is not None:
-            _abandon_registered(factory, principal, scope, source_id, attempt_id, error.code)
+            _abandon_registered(
+                factory,
+                principal,
+                scope,
+                source_id,
+                attempt_id,
+                error.code,
+                expected=authority,
+            )
         raise AdapterSourceImportConfigurationError(
             "Adapter source import failed.", error.code
         ) from error
@@ -321,6 +380,7 @@ def import_adapter_source(
                 "database_unavailable"
                 if isinstance(error, SQLAlchemyError)
                 else "adapter_input_invalid",
+                expected=authority,
             )
         raise AdapterSourceImportConfigurationError("Adapter source import failed.") from error
     finally:
@@ -337,20 +397,25 @@ def import_adapter_source(
 def _validate_and_hash(
     config: ExternalAdapterInput,
     model: ExternalAdapterInput,
-    *,
-    include_digests: bool = False,
-) -> tuple[dict[str, object], AdapterArtifactDigest | None, AdapterArtifactDigest | None]:
+) -> tuple[dict[str, object], AdapterArtifactDigest, AdapterArtifactDigest]:
+    # The first complete digest pass binds the retained descriptors before the
+    # isolated child is allowed to inspect them.
+    config_before = _digest_external(config)
+    model_before = _digest_external(model)
     summary = run_adapter_source_validation(
         config_fd=config.descriptor,
         model_fd=model.descriptor,
         config_size=config.size,
         model_size=model.size,
     )
-    # Dry-run and apply both hash the retained descriptors; apply persists the
-    # resulting digests only after the validation-authority transaction.
-    config_digest = _digest_external(config)
-    model_digest = _digest_external(model)
-    return summary, config_digest, model_digest
+    # A second complete pass immediately after child validation binds the
+    # validated bytes.  Same-inode, same-size in-place changes are detected by
+    # digest comparison even though descriptor identity is unchanged.
+    config_after = _digest_external(config)
+    model_after = _digest_external(model)
+    if config_before != config_after or model_before != model_after:
+        raise AdapterSourceArtifactError("adapter_source_changed")
+    return summary, config_after, model_after
 
 
 def _digest_external(source: ExternalAdapterInput) -> AdapterArtifactDigest:
@@ -382,8 +447,67 @@ def _same_identity(source: ExternalAdapterInput, metadata: os.stat_result) -> bo
         and metadata.st_dev == source.device
         and metadata.st_ino == source.inode
         and metadata.st_size == source.size
-        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) == source.mode
+        and metadata.st_uid == source.uid
+        and metadata.st_nlink == source.nlink == 1
     )
+
+
+def _manifest_fingerprint(value: dict[str, object] | None) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _snapshot(
+    source: AdapterImportSource, attempt: AdapterImportAttempt
+) -> AdapterAuthoritySnapshot:
+    if source.id != attempt.source_bundle_id or source.department_id != attempt.department_id:
+        raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
+    return AdapterAuthoritySnapshot(
+        department_id=source.department_id,
+        source_bundle_id=source.id,
+        import_attempt_id=attempt.id,
+        publication_attempt_id=attempt.publication_attempt_id,
+        attempt_number=attempt.attempt_number,
+        imported_by_user_id=source.imported_by_user_id,
+        source_version=source.version,
+        attempt_version=attempt.version,
+        source_status=source.status,
+        attempt_status=attempt.status,
+        source_code_revision=source.code_revision,
+        attempt_code_revision=attempt.code_revision,
+        source_contract_version=source.source_contract_version,
+        intake_contract_version=source.intake_contract_version,
+        config_contract_version=source.config_contract_version,
+        tensor_contract_version=source.tensor_contract_version,
+        base_model_id=source.base_model_id,
+        base_model_revision=source.base_model_revision,
+        base_model_license=source.base_model_license,
+        peft_version=source.peft_version,
+        safetensors_format=source.safetensors_format,
+        adapter_config_sha256=source.adapter_config_sha256,
+        adapter_config_byte_size=source.adapter_config_byte_size,
+        adapter_model_sha256=source.adapter_model_sha256,
+        adapter_model_byte_size=source.adapter_model_byte_size,
+        intake_manifest_sha256=source.intake_manifest_sha256,
+        tensor_dtype=source.tensor_dtype,
+        tensor_count=source.tensor_count,
+        tensor_element_count=source.tensor_element_count,
+        tensor_payload_byte_size=source.tensor_payload_byte_size,
+        ownership_manifest=_manifest_fingerprint(attempt.ownership_manifest),
+    )
+
+
+def _require_snapshot(
+    source: AdapterImportSource,
+    attempt: AdapterImportAttempt,
+    expected: AdapterAuthoritySnapshot | None,
+) -> AdapterAuthoritySnapshot:
+    actual = _snapshot(source, attempt)
+    if expected is not None and actual != expected:
+        raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
+    return actual
 
 
 def _register(factory, principal, scope, code_revision):
@@ -428,10 +552,26 @@ def _register(factory, principal, scope, code_revision):
         )
         session.add_all((source, attempt))
         session.flush()
-        return source_id, attempt_id, publication_attempt_id, 1, authorization.identity.id
+        return (
+            source_id,
+            attempt_id,
+            publication_attempt_id,
+            1,
+            authorization.identity.id,
+            _snapshot(source, attempt),
+        )
 
 
-def _validate_source_attempt(session, principal, scope, source_id, attempt_id, status):
+def _validate_source_attempt(
+    session,
+    principal,
+    scope,
+    source_id,
+    attempt_id,
+    status,
+    *,
+    expected: AdapterAuthoritySnapshot | None = None,
+):
     authorize_transaction(
         session,
         principal,
@@ -461,15 +601,31 @@ def _validate_source_attempt(session, principal, scope, source_id, attempt_id, s
     ).scalar_one_or_none()
     if source is None or attempt is None:
         raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
+    _require_snapshot(source, attempt, expected)
     return source, attempt
 
 
 def _mark_validated(
-    factory, principal, scope, source_id, attempt_id, summary, config_digest, model_digest
+    factory,
+    principal,
+    scope,
+    source_id,
+    attempt_id,
+    summary,
+    config_digest,
+    model_digest,
+    *,
+    expected: AdapterAuthoritySnapshot | None = None,
 ):
     with factory.begin() as session:
         source, attempt = _validate_source_attempt(
-            session, principal, scope, source_id, attempt_id, "registered"
+            session,
+            principal,
+            scope,
+            source_id,
+            attempt_id,
+            "registered",
+            expected=expected,
         )
         source.adapter_config_sha256 = config_digest.sha256
         source.adapter_config_byte_size = config_digest.byte_size
@@ -484,6 +640,7 @@ def _mark_validated(
         source.version += 1
         attempt.version += 1
         session.flush()
+        return _snapshot(source, attempt)
 
 
 def _intake_manifest(
@@ -533,10 +690,16 @@ def _intake_manifest(
     }
 
 
-def _mark_staged(factory, principal, scope, source_id, attempt_id, manifest):
+def _mark_staged(factory, principal, scope, source_id, attempt_id, manifest, *, expected=None):
     with factory.begin() as session:
         source, attempt = _validate_source_attempt(
-            session, principal, scope, source_id, attempt_id, "validated"
+            session,
+            principal,
+            scope,
+            source_id,
+            attempt_id,
+            "validated",
+            expected=expected,
         )
         attempt.ownership_manifest = manifest
         attempt.status = "staged"
@@ -544,12 +707,19 @@ def _mark_staged(factory, principal, scope, source_id, attempt_id, manifest):
         source.version += 1
         attempt.version += 1
         session.flush()
+        return _snapshot(source, attempt)
 
 
-def _mark_published(factory, principal, scope, source_id, attempt_id, manifest):
+def _mark_published(factory, principal, scope, source_id, attempt_id, manifest, *, expected=None):
     with factory.begin() as session:
         source, attempt = _validate_source_attempt(
-            session, principal, scope, source_id, attempt_id, "staged"
+            session,
+            principal,
+            scope,
+            source_id,
+            attempt_id,
+            "staged",
+            expected=expected,
         )
         if attempt.ownership_manifest != manifest:
             raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
@@ -558,6 +728,27 @@ def _mark_published(factory, principal, scope, source_id, attempt_id, manifest):
         source.version += 1
         attempt.version += 1
         session.flush()
+        return _snapshot(source, attempt)
+
+
+def _manifest_uuid(value: object) -> UUID | None:
+    try:
+        if not isinstance(value, str):
+            return None
+        parsed = UUID(value)
+        return parsed if str(parsed) == value and parsed.int else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _manifest_file_digest(value: object) -> AdapterArtifactDigest | None:
+    if not isinstance(value, dict):
+        return None
+    digest = value.get("sha256")
+    size = value.get("byte_size")
+    if type(digest) is not str or len(digest) != 64 or type(size) is not int or size <= 0:
+        return None
+    return AdapterArtifactDigest(digest, size)
 
 
 def _commit_published(
@@ -568,9 +759,8 @@ def _commit_published(
     attempt_id,
     manifest,
     staged,
-    summary,
-    config_digest,
-    model_digest,
+    *,
+    expected: AdapterAuthoritySnapshot | None = None,
 ):
     with factory.begin() as session:
         authorization = authorize_transaction(
@@ -600,10 +790,60 @@ def _commit_published(
             )
             .with_for_update()
         ).scalar_one_or_none()
-        if source is None or attempt is None or attempt.ownership_manifest != manifest:
+        if source is None or attempt is None:
             raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
-        staged.recheck_identity()
+        _require_snapshot(source, attempt, expected)
+        if attempt.ownership_manifest != manifest:
+            raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
+        staged.recheck_retained_authority()
         manifest_digest = hashlib.sha256(_manifest_bytes(manifest)).hexdigest()
+        digest_map = staged.digest_map
+        files = manifest.get("files")
+        config_file = files.get("adapter_config.json") if isinstance(files, dict) else None
+        model_file = files.get("adapter_model.safetensors") if isinstance(files, dict) else None
+        manifest_contract_matches = all(
+            getattr(source, field) == manifest.get(key)
+            for field, key in (
+                ("source_contract_version", "source_contract_version"),
+                ("intake_contract_version", "intake_contract_version"),
+                ("config_contract_version", "config_contract_version"),
+                ("tensor_contract_version", "tensor_contract_version"),
+                ("base_model_id", "base_model_id"),
+                ("base_model_revision", "base_model_revision"),
+                ("base_model_license", "base_model_license"),
+                ("peft_version", "peft_version"),
+                ("safetensors_format", "safetensors_format"),
+            )
+        )
+        if (
+            not isinstance(config_file, dict)
+            or not isinstance(model_file, dict)
+            or not manifest_contract_matches
+            or _manifest_uuid(manifest.get("department_id")) != source.department_id
+            or _manifest_uuid(manifest.get("source_bundle_id")) != source.id
+            or _manifest_uuid(manifest.get("import_attempt_id")) != attempt.id
+            or _manifest_uuid(manifest.get("publication_attempt_id"))
+            != attempt.publication_attempt_id
+            or type(manifest.get("attempt_number")) is not int
+            or manifest.get("attempt_number") != attempt.attempt_number
+            or _manifest_uuid(manifest.get("imported_by_user_id")) != source.imported_by_user_id
+            or source.adapter_config_sha256 != config_file.get("sha256")
+            or source.adapter_config_byte_size != config_file.get("byte_size")
+            or source.adapter_model_sha256 != model_file.get("sha256")
+            or source.adapter_model_byte_size != model_file.get("byte_size")
+            or digest_map.get("adapter_config.json") != _manifest_file_digest(config_file)
+            or digest_map.get("adapter_model.safetensors") != _manifest_file_digest(model_file)
+            or digest_map.get("intake_manifest.json")
+            != AdapterArtifactDigest(manifest_digest, len(_manifest_bytes(manifest)))
+            or source.tensor_dtype != manifest.get("tensor_dtype")
+            or source.tensor_count != manifest.get("tensor_count")
+            or source.tensor_element_count != manifest.get("tensor_element_count")
+            or source.tensor_payload_byte_size != manifest.get("tensor_payload_byte_size")
+            or source.code_revision != manifest.get("code_revision")
+            or attempt.code_revision != manifest.get("code_revision")
+            or source.intake_manifest_sha256 not in (None, manifest_digest)
+        ):
+            raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
         source.status = "committed"
         source.authoritative_attempt_id = attempt.id
         source.intake_manifest_sha256 = manifest_digest
@@ -625,6 +865,7 @@ def _commit_published(
             resource_id=source.id,
         )
         session.flush()
+        return _snapshot(source, attempt)
 
 
 def _manifest_bytes(manifest: dict[str, object]) -> bytes:
@@ -638,7 +879,7 @@ def _manifest_bytes(manifest: dict[str, object]) -> bytes:
     )
 
 
-def _reject_registered(factory, principal, scope, source_id, attempt_id, code):
+def _reject_registered(factory, principal, scope, source_id, attempt_id, code, *, expected=None):
     code = code if code in _VALIDATION_FAILURES else "adapter_input_invalid"
     with factory.begin() as session:
         authorization = authorize_transaction(
@@ -670,6 +911,7 @@ def _reject_registered(factory, principal, scope, source_id, attempt_id, code):
         ).scalar_one_or_none()
         if source is None or attempt is None:
             raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
+        _require_snapshot(source, attempt, expected)
         now = _server_now(session)
         source.status = "rejected"
         source.error_code = code
@@ -691,7 +933,7 @@ def _reject_registered(factory, principal, scope, source_id, attempt_id, code):
         session.flush()
 
 
-def _abandon_registered(factory, principal, scope, source_id, attempt_id, code):
+def _abandon_registered(factory, principal, scope, source_id, attempt_id, code, *, expected=None):
     if factory is None:
         return
     code = code if code not in _VALIDATION_FAILURES else "adapter_source_changed"
@@ -726,6 +968,7 @@ def _abandon_registered(factory, principal, scope, source_id, attempt_id, code):
             ).scalar_one_or_none()
             if source is None or attempt is None:
                 return
+            _require_snapshot(source, attempt, expected)
             now = _server_now(session)
             source.status = "abandoned"
             source.error_code = code
@@ -763,5 +1006,6 @@ __all__ = [
     "AdapterSourceImportConfigurationError",
     "AdapterSourceImportSettings",
     "AdapterSourceImportResult",
+    "AdapterAuthoritySnapshot",
     "import_adapter_source",
 ]

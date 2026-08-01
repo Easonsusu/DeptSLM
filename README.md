@@ -67,6 +67,13 @@ the child reads no tensor payload; the parent streams payload bytes only to
 hash and copy them. The immutable source bundle is separate from any future
 adapter registry and is not approved, evaluated, promoted, runtime-usable, or
 bound to a Phase 11 job. Reconciliation and purge are not implemented here.
+The validated-byte authority is bound by complete digest passes before and
+after child validation, digest-checked descriptor-relative staging, and
+post-rename identity verification. Every PostgreSQL transition compares a
+complete frozen authority snapshot and both row versions; static contract
+errors remain distinct from fixed descriptor/operational errors. Migration
+0010 is self-contained and CI validates that head with a private temporary
+adapters root; CI downloads no model weights.
 
 Phase 12.1A fixes the compatible package references, closed configuration and
 tensor grammar, bounded header/file limits, and model-free validation rules in a

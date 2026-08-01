@@ -61,6 +61,16 @@ incomplete-stage housekeeping; metadata, the UUID path, and retained
 descriptor identity are the ownership boundary. Missing or incomplete marker
 bytes do not make an otherwise exact private stage authoritative or trusted.
 
+The exact validated-byte authority is two complete digest passes around child
+validation, with positive size, regular-file, owner, mode, link-count, and
+descriptor identity checks. Each stage copy verifies the destination digest and
+size against that authority, rechecks the retained source descriptor, and
+performs a final source digest pass. Post-rename descriptors are hashed and
+retained by identity; the final PostgreSQL transaction compares that retained
+authority, the closed manifest, and every content-free source field. A same-
+size in-place source mutation therefore fails as `adapter_source_changed` and
+cannot publish a committed source.
+
 ## PostgreSQL authority and crash boundaries
 
 Migration `0010_phase12_adapter_sources` creates only
@@ -72,6 +82,16 @@ successful final transaction reauthorizes the exact department, locks both
 rows, checks the retained post-rename directory and file identities, marks the
 source `committed`, points it to the exact attempt, and appends one safe
 mutation-success audit.
+
+Every transition captures a frozen authority snapshot containing the complete
+department/source/attempt IDs, versions, statuses, actor, code revision,
+contract/model/package values, digest and size fields, tensor summary, and
+ownership manifest. Later transitions reauthorize, lock the same rows in a
+deterministic order, compare the complete expected snapshot, increment both
+versions exactly once, and return the next snapshot. Static contract failures
+remain the fixed Phase 12.1A codes; descriptor and operational failures use
+the separate `adapter_input_invalid`, `adapter_input_unsafe`, and
+`adapter_source_changed` boundary.
 
 PostgreSQL and external storage are not atomic. A failure after registration or
 publication leaves exact metadata and an exact stage/final surface for the
@@ -86,3 +106,8 @@ registry table, Phase 11 binding or retention dependency, evaluation, review,
 approval, promotion, deployment, runtime loading, purge, or reconciliation.
 It adds no PEFT, Transformers, PyTorch, safetensors, or LlamaFactory dependency,
 does not download a model, and does not load or materialize tensor values.
+Migration `0010_phase12_adapter_sources` freezes its reviewed SQL literals and
+does not import mutable application contract code. CI upgrades to that head,
+creates a private temporary adapters root, and runs the complete PostgreSQL,
+Qdrant, worker, storage, frontend, artifact-policy, and infrastructure checks;
+normal CI downloads no model weights.

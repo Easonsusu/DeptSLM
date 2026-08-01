@@ -17,13 +17,38 @@ from app.adapter_contract import (
     ADAPTER_CONFIG_CONTRACT_VERSION,
     ADAPTER_SOURCE_CONTRACT_VERSION,
     ADAPTER_TENSOR_CONTRACT_VERSION,
+    BASE_MODEL_ID,
+    EXPECTED_TENSOR_BYTES,
+    EXPECTED_TENSOR_COUNT,
+    EXPECTED_TENSOR_ELEMENTS,
+    PEFT_FORMAT_REFERENCE_VERSION,
+    SAFETENSORS_FORMAT_REFERENCE_VERSION,
 )
 from app.adapter_source_artifacts import AdapterSourceArtifactError
+from app.adapter_source_child import CHILD_ERROR_CODES
 
 MAX_REQUEST_FRAME_BYTES = 64 * 1024
 MAX_RESPONSE_FRAME_BYTES = 16 * 1024
 DEFAULT_TIMEOUT_SECONDS = 30
 _POLL_SECONDS = 0.1
+_SUCCESS_KEYS = frozenset(
+    {
+        "source_contract_version",
+        "config_contract_version",
+        "tensor_contract_version",
+        "base_model_id",
+        "base_model_display_id",
+        "peft_version",
+        "safetensors_format",
+        "tensor_dtype",
+        "tensor_count",
+        "tensor_element_count",
+        "tensor_payload_byte_size",
+    }
+)
+_INTEGER_RESULT_KEYS = frozenset(
+    {"tensor_count", "tensor_element_count", "tensor_payload_byte_size"}
+)
 
 
 def run_adapter_source_validation(
@@ -125,17 +150,20 @@ def run_adapter_source_validation(
                         value = json.loads(received[4:].decode("utf-8"))
                         if not isinstance(value, dict):
                             raise AdapterSourceArtifactError("adapter_source_publication_failed")
-                        if value.get("status") != "ok":
+                        if value.get("status") == "error":
+                            if set(value) != {"status", "code"}:
+                                raise AdapterSourceArtifactError(
+                                    "adapter_source_publication_failed"
+                                )
                             code = value.get("code")
-                            raise AdapterSourceArtifactError(
-                                code
-                                if isinstance(code, str)
-                                else "adapter_source_publication_failed"
-                            )
-                        result = value.get("result")
-                        if not isinstance(result, dict):
+                            if not isinstance(code, str) or code not in CHILD_ERROR_CODES:
+                                raise AdapterSourceArtifactError(
+                                    "adapter_source_publication_failed"
+                                )
+                            raise AdapterSourceArtifactError(code)
+                        if set(value) != {"status", "result"} or value.get("status") != "ok":
                             raise AdapterSourceArtifactError("adapter_source_publication_failed")
-                        return result
+                        return _validate_success_result(value.get("result"))
                 elif child.poll() is not None:
                     raise AdapterSourceArtifactError("adapter_source_publication_failed")
             if child.poll() is not None and expected is None:
@@ -175,9 +203,45 @@ def _terminate(child: subprocess.Popen[bytes]) -> None:
         pass
 
 
+def _validate_success_result(result: object) -> dict[str, object]:
+    """Accept only the complete fixed content-free child success schema."""
+
+    if not isinstance(result, dict) or set(result) != _SUCCESS_KEYS:
+        raise AdapterSourceArtifactError("adapter_source_publication_failed")
+    expected_strings = {
+        "source_contract_version": ADAPTER_SOURCE_CONTRACT_VERSION,
+        "config_contract_version": ADAPTER_CONFIG_CONTRACT_VERSION,
+        "tensor_contract_version": ADAPTER_TENSOR_CONTRACT_VERSION,
+        "base_model_id": BASE_MODEL_ID,
+        "base_model_display_id": BASE_MODEL_ID,
+        "peft_version": PEFT_FORMAT_REFERENCE_VERSION,
+        "safetensors_format": SAFETENSORS_FORMAT_REFERENCE_VERSION,
+    }
+    for key, expected in expected_strings.items():
+        if type(result.get(key)) is not str or result[key] != expected:
+            raise AdapterSourceArtifactError("adapter_source_publication_failed")
+    if type(result.get("tensor_dtype")) is not str or result["tensor_dtype"] not in {
+        "F16",
+        "BF16",
+        "F32",
+    }:
+        raise AdapterSourceArtifactError("adapter_source_publication_failed")
+    for key in _INTEGER_RESULT_KEYS:
+        if type(result.get(key)) is not int or result[key] <= 0:
+            raise AdapterSourceArtifactError("adapter_source_publication_failed")
+    if result["tensor_count"] != EXPECTED_TENSOR_COUNT:
+        raise AdapterSourceArtifactError("adapter_source_publication_failed")
+    if result["tensor_element_count"] != EXPECTED_TENSOR_ELEMENTS:
+        raise AdapterSourceArtifactError("adapter_source_publication_failed")
+    if result["tensor_payload_byte_size"] != EXPECTED_TENSOR_BYTES[result["tensor_dtype"]]:
+        raise AdapterSourceArtifactError("adapter_source_publication_failed")
+    return dict(result)
+
+
 __all__ = [
     "MAX_REQUEST_FRAME_BYTES",
     "MAX_RESPONSE_FRAME_BYTES",
     "DEFAULT_TIMEOUT_SECONDS",
+    "_validate_success_result",
     "run_adapter_source_validation",
 ]

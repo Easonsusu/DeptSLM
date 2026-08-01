@@ -2294,7 +2294,7 @@ class AdapterImportSource(Base):
         CheckConstraint(
             "(status = 'staging' AND authoritative_attempt_id IS NULL AND "
             "committed_at IS NULL AND rejected_at IS NULL AND abandoned_at IS NULL "
-            "AND purged_at IS NULL) OR "
+            "AND purged_at IS NULL AND error_code IS NULL) OR "
             "(status = 'committed' AND authoritative_attempt_id IS NOT NULL AND "
             "adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND "
             "adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND "
@@ -2306,17 +2306,41 @@ class AdapterImportSource(Base):
             + " AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND "
             "rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL AND "
             "error_code IS NULL) OR "
-            "(status = 'rejected' AND rejected_at IS NOT NULL AND "
+            "(status = 'rejected' AND rejected_at IS NOT NULL AND committed_at IS NULL "
+            "AND abandoned_at IS NULL AND purged_at IS NULL AND "
             "authoritative_attempt_id IS NULL AND error_code IN ('adapter_config_invalid',"
             "'adapter_config_unsupported','adapter_header_invalid','adapter_header_too_large',"
             "'adapter_file_too_large','adapter_tensor_set_invalid','adapter_tensor_shape_invalid',"
             "'adapter_tensor_dtype_invalid','adapter_tensor_offsets_invalid',"
             "'adapter_tensor_size_invalid','adapter_input_invalid','adapter_input_unsafe')) OR "
-            "(status = 'abandoned' AND abandoned_at IS NOT NULL AND "
+            "(status = 'abandoned' AND abandoned_at IS NOT NULL AND rejected_at IS NULL "
+            "AND committed_at IS NULL AND purged_at IS NULL AND "
             "authoritative_attempt_id IS NULL AND error_code IN ('adapter_source_changed',"
             "'adapter_source_publication_failed','adapter_source_authority_changed',"
             "'department_unavailable','requester_unauthorized','database_unavailable')) OR "
-            "status IN ('claimed','consumed','purge_pending','purged')",
+            "(status IN ('claimed','consumed','purge_pending') AND "
+            "authoritative_attempt_id IS NOT NULL AND "
+            "adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND "
+            "adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND "
+            "intake_manifest_sha256 IS NOT NULL AND tensor_dtype IS NOT NULL AND "
+            "tensor_count = "
+            + str(EXPECTED_TENSOR_COUNT)
+            + " AND tensor_element_count = "
+            + str(EXPECTED_TENSOR_ELEMENTS)
+            + " AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND "
+            "rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL AND "
+            "error_code IS NULL) OR "
+            "(status = 'purged' AND authoritative_attempt_id IS NOT NULL AND "
+            "adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND "
+            "adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND "
+            "intake_manifest_sha256 IS NOT NULL AND tensor_dtype IS NOT NULL AND "
+            "tensor_count = "
+            + str(EXPECTED_TENSOR_COUNT)
+            + " AND tensor_element_count = "
+            + str(EXPECTED_TENSOR_ELEMENTS)
+            + " AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND "
+            "purged_at IS NOT NULL AND rejected_at IS NULL AND abandoned_at IS NULL AND "
+            "error_code IS NULL)",
             name="ck_adapter_import_source_lifecycle",
         ),
         CheckConstraint(
@@ -2411,18 +2435,19 @@ class AdapterImportAttempt(Base):
             "error_code IS NULL) OR "
             "(status = 'validated' AND validated_at IS NOT NULL AND staged_at IS NULL AND "
             "published_at IS NULL AND committed_at IS NULL AND finished_at IS NULL AND "
-            "error_code IS NULL) OR "
+            "cleanup_confirmed_at IS NULL AND error_code IS NULL) OR "
             "(status = 'staged' AND validated_at IS NOT NULL AND staged_at IS NOT NULL AND "
             "ownership_manifest IS NOT NULL AND published_at IS NULL AND committed_at IS NULL "
-            "AND finished_at IS NULL AND error_code IS NULL) OR "
+            "AND finished_at IS NULL AND cleanup_confirmed_at IS NULL AND error_code IS NULL) OR "
             "(status = 'published' AND validated_at IS NOT NULL AND staged_at IS NOT NULL AND "
             "published_at IS NOT NULL AND ownership_manifest IS NOT NULL AND committed_at IS NULL "
-            "AND finished_at IS NULL AND error_code IS NULL) OR "
+            "AND finished_at IS NULL AND cleanup_confirmed_at IS NULL AND error_code IS NULL) OR "
             "(status = 'committed' AND validated_at IS NOT NULL AND staged_at IS NOT NULL AND "
             "published_at IS NOT NULL AND committed_at IS NOT NULL AND finished_at IS NOT NULL "
-            "AND ownership_manifest IS NOT NULL AND error_code IS NULL) OR "
+            "AND ownership_manifest IS NOT NULL AND cleanup_confirmed_at IS NULL "
+            "AND error_code IS NULL) OR "
             "(status IN ('failed','abandoned') AND finished_at IS NOT NULL AND "
-            "error_code IS NOT NULL)",
+            "committed_at IS NULL AND cleanup_confirmed_at IS NULL AND error_code IS NOT NULL)",
             name="ck_adapter_import_attempt_lifecycle",
         ),
         CheckConstraint(

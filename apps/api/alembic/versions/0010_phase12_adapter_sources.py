@@ -9,20 +9,23 @@ from __future__ import annotations
 import sqlalchemy as sa
 
 from alembic import op
-from app.adapter_contract import (
-    ADAPTER_CONFIG_CONTRACT_VERSION,
-    ADAPTER_INTAKE_CONTRACT_VERSION,
-    ADAPTER_SOURCE_CONTRACT_VERSION,
-    ADAPTER_TENSOR_CONTRACT_VERSION,
-    BASE_MODEL_ID,
-    BASE_MODEL_LICENSE,
-    BASE_MODEL_REVISION,
-    EXPECTED_TENSOR_BYTES,
-    EXPECTED_TENSOR_COUNT,
-    EXPECTED_TENSOR_ELEMENTS,
-    PEFT_FORMAT_REFERENCE_VERSION,
-    SAFETENSORS_FORMAT_REFERENCE_VERSION,
-)
+
+_ADAPTER_CONFIG_CONTRACT_VERSION = "phase12-adapter-config-v1"
+_ADAPTER_INTAKE_CONTRACT_VERSION = "phase12-adapter-intake-v1"
+_ADAPTER_SOURCE_CONTRACT_VERSION = "phase12-adapter-source-v1"
+_ADAPTER_TENSOR_CONTRACT_VERSION = "phase12-adapter-tensors-v1"
+_BASE_MODEL_ID = "Qwen/Qwen3-0.6B"
+_BASE_MODEL_REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
+_BASE_MODEL_LICENSE = "Apache-2.0"
+_PEFT_FORMAT_REFERENCE_VERSION = "0.18.1"
+_SAFETENSORS_FORMAT_REFERENCE_VERSION = "0.7.0"
+_EXPECTED_TENSOR_COUNT = 392
+_EXPECTED_TENSOR_ELEMENTS = 10_092_544
+_EXPECTED_TENSOR_BYTES = {
+    "F16": 20_185_088,
+    "BF16": 20_185_088,
+    "F32": 40_370_176,
+}
 
 revision = "0010_phase12_adapter_sources"
 down_revision = "0009_phase11_training_jobs"
@@ -119,53 +122,75 @@ def upgrade() -> None:
             name="ck_adapter_import_source_sizes",
         ),
         sa.CheckConstraint(
-            f"tensor_count IS NULL OR tensor_count = {EXPECTED_TENSOR_COUNT}",
+            f"tensor_count IS NULL OR tensor_count = {_EXPECTED_TENSOR_COUNT}",
             name="ck_adapter_import_source_tensor_count",
         ),
         sa.CheckConstraint(
-            f"tensor_element_count IS NULL OR tensor_element_count = {EXPECTED_TENSOR_ELEMENTS}",
+            f"tensor_element_count IS NULL OR tensor_element_count = {_EXPECTED_TENSOR_ELEMENTS}",
             name="ck_adapter_import_source_tensor_elements",
         ),
         sa.CheckConstraint(
             "tensor_dtype IS NULL OR "
-            f"(tensor_dtype = 'F16' AND tensor_payload_byte_size = {EXPECTED_TENSOR_BYTES['F16']}) "
+            f"(tensor_dtype = 'F16' AND tensor_payload_byte_size = "
+            f"{_EXPECTED_TENSOR_BYTES['F16']}) "
             "OR "
             f"(tensor_dtype = 'BF16' AND tensor_payload_byte_size = "
-            f"{EXPECTED_TENSOR_BYTES['BF16']}) "
+            f"{_EXPECTED_TENSOR_BYTES['BF16']}) "
             "OR "
-            f"(tensor_dtype = 'F32' AND tensor_payload_byte_size = {EXPECTED_TENSOR_BYTES['F32']})",
+            f"(tensor_dtype = 'F32' AND tensor_payload_byte_size = "
+            f"{_EXPECTED_TENSOR_BYTES['F32']})",
             name="ck_adapter_import_source_tensor_contract",
         ),
         sa.CheckConstraint(
-            f"source_contract_version = '{ADAPTER_SOURCE_CONTRACT_VERSION}' AND "
-            f"intake_contract_version = '{ADAPTER_INTAKE_CONTRACT_VERSION}' AND "
-            f"config_contract_version = '{ADAPTER_CONFIG_CONTRACT_VERSION}' AND "
-            f"tensor_contract_version = '{ADAPTER_TENSOR_CONTRACT_VERSION}' AND "
-            f"base_model_id = '{BASE_MODEL_ID}' AND "
-            f"base_model_revision = '{BASE_MODEL_REVISION}' AND "
-            f"base_model_license = '{BASE_MODEL_LICENSE}' AND "
-            f"peft_version = '{PEFT_FORMAT_REFERENCE_VERSION}' AND "
-            f"safetensors_format = '{SAFETENSORS_FORMAT_REFERENCE_VERSION}'",
+            f"source_contract_version = '{_ADAPTER_SOURCE_CONTRACT_VERSION}' AND "
+            f"intake_contract_version = '{_ADAPTER_INTAKE_CONTRACT_VERSION}' AND "
+            f"config_contract_version = '{_ADAPTER_CONFIG_CONTRACT_VERSION}' AND "
+            f"tensor_contract_version = '{_ADAPTER_TENSOR_CONTRACT_VERSION}' AND "
+            f"base_model_id = '{_BASE_MODEL_ID}' AND "
+            f"base_model_revision = '{_BASE_MODEL_REVISION}' AND "
+            f"base_model_license = '{_BASE_MODEL_LICENSE}' AND "
+            f"peft_version = '{_PEFT_FORMAT_REFERENCE_VERSION}' AND "
+            f"safetensors_format = '{_SAFETENSORS_FORMAT_REFERENCE_VERSION}'",
             name="ck_adapter_import_source_contract",
         ),
         sa.CheckConstraint(
             "(status = 'staging' AND authoritative_attempt_id IS NULL AND committed_at IS NULL "
-            "AND rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL) OR "
+            "AND rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL "
+            "AND error_code IS NULL) OR "
             "(status = 'committed' AND authoritative_attempt_id IS NOT NULL "
             "AND adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 "
             "AND adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 "
             "AND intake_manifest_sha256 IS NOT NULL AND tensor_dtype IS NOT NULL "
-            f"AND tensor_count = {EXPECTED_TENSOR_COUNT} "
-            f"AND tensor_element_count = {EXPECTED_TENSOR_ELEMENTS} "
+            f"AND tensor_count = {_EXPECTED_TENSOR_COUNT} "
+            f"AND tensor_element_count = {_EXPECTED_TENSOR_ELEMENTS} "
             "AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL "
             "AND rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL "
             "AND error_code IS NULL) OR "
-            "(status = 'rejected' AND rejected_at IS NOT NULL AND authoritative_attempt_id IS NULL "
+            "(status = 'rejected' AND rejected_at IS NOT NULL AND committed_at IS NULL "
+            "AND abandoned_at IS NULL AND purged_at IS NULL AND authoritative_attempt_id IS NULL "
             f"AND error_code IN ({_quoted(_VALIDATION_ERRORS)})) OR "
-            "(status = 'abandoned' AND abandoned_at IS NOT NULL AND "
-            "authoritative_attempt_id IS NULL "
+            "(status = 'abandoned' AND abandoned_at IS NOT NULL AND rejected_at IS NULL "
+            "AND committed_at IS NULL AND purged_at IS NULL AND authoritative_attempt_id IS NULL "
             f"AND error_code IN ({_quoted(_OPERATIONAL_ERRORS)})) OR "
-            "status IN ('claimed','consumed','purge_pending','purged')",
+            "(status IN ('claimed','consumed','purge_pending') AND "
+            "authoritative_attempt_id IS NOT NULL AND "
+            "adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND "
+            "adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND "
+            "intake_manifest_sha256 IS NOT NULL AND tensor_dtype IS NOT NULL AND "
+            f"tensor_count = {_EXPECTED_TENSOR_COUNT} AND "
+            f"tensor_element_count = {_EXPECTED_TENSOR_ELEMENTS} AND "
+            "tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND "
+            "rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL AND "
+            "error_code IS NULL) OR "
+            "(status = 'purged' AND authoritative_attempt_id IS NOT NULL AND "
+            "adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND "
+            "adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND "
+            "intake_manifest_sha256 IS NOT NULL AND tensor_dtype IS NOT NULL AND "
+            f"tensor_count = {_EXPECTED_TENSOR_COUNT} AND "
+            f"tensor_element_count = {_EXPECTED_TENSOR_ELEMENTS} AND "
+            "tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND "
+            "purged_at IS NOT NULL AND rejected_at IS NULL AND abandoned_at IS NULL AND "
+            "error_code IS NULL)",
             name="ck_adapter_import_source_lifecycle",
         ),
         sa.CheckConstraint(
@@ -235,19 +260,20 @@ def upgrade() -> None:
             "error_code IS NULL) OR "
             "(status = 'validated' AND validated_at IS NOT NULL AND staged_at IS NULL "
             "AND published_at IS NULL AND committed_at IS NULL AND finished_at IS NULL "
-            "AND error_code IS NULL) OR "
+            "AND cleanup_confirmed_at IS NULL AND error_code IS NULL) OR "
             "(status = 'staged' AND validated_at IS NOT NULL AND staged_at IS NOT NULL "
             "AND ownership_manifest IS NOT NULL AND published_at IS NULL AND committed_at IS NULL "
-            "AND finished_at IS NULL AND error_code IS NULL) OR "
+            "AND finished_at IS NULL AND cleanup_confirmed_at IS NULL AND error_code IS NULL) OR "
             "(status = 'published' AND validated_at IS NOT NULL AND staged_at IS NOT NULL "
             "AND published_at IS NOT NULL AND ownership_manifest IS NOT NULL AND "
             "committed_at IS NULL "
-            "AND finished_at IS NULL AND error_code IS NULL) OR "
+            "AND finished_at IS NULL AND cleanup_confirmed_at IS NULL AND error_code IS NULL) OR "
             "(status = 'committed' AND validated_at IS NOT NULL AND staged_at IS NOT NULL "
             "AND published_at IS NOT NULL AND committed_at IS NOT NULL AND finished_at IS NOT NULL "
-            "AND ownership_manifest IS NOT NULL AND error_code IS NULL) OR "
+            "AND ownership_manifest IS NOT NULL AND cleanup_confirmed_at IS NULL "
+            "AND error_code IS NULL) OR "
             "(status IN ('failed','abandoned') AND finished_at IS NOT NULL AND "
-            "error_code IS NOT NULL)",
+            "committed_at IS NULL AND cleanup_confirmed_at IS NULL AND error_code IS NOT NULL)",
             name="ck_adapter_import_attempt_lifecycle",
         ),
         sa.CheckConstraint(
