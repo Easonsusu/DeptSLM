@@ -57,19 +57,29 @@ Incomplete work is staged below the exact UUID-derived `.staging/imports`
 surface. Directories are `0700`, files are `0600`, all operations are
 descriptor-relative and no-follow, publication is same-filesystem no-replace,
 and written files and parent directories are fsynced. A fixed marker is only
-incomplete-stage housekeeping; metadata, the UUID path, and retained
-descriptor identity are the ownership boundary. Missing or incomplete marker
-bytes do not make an otherwise exact private stage authoritative or trusted.
+incomplete-stage housekeeping and is never stored in PostgreSQL, the manifest,
+audits, or the published authority. It is nevertheless required to be the
+exact private `0600` one-link service-owned marker before publication; missing,
+substituted, symlinked, hard-linked, wrongly permissioned, or extra-entry
+stages fail closed without rename. Metadata, the UUID path, and retained
+descriptor identity remain the ownership boundary for incomplete-stage
+cleanup.
 
 The exact validated-byte authority is two complete digest passes around child
 validation, with positive size, regular-file, owner, mode, link-count, and
 descriptor identity checks. Each stage copy verifies the destination digest and
 size against that authority, rechecks the retained source descriptor, and
-performs a final source digest pass. Post-rename descriptors are hashed and
-retained by identity; the final PostgreSQL transaction compares that retained
-authority, the closed manifest, and every content-free source field. A same-
-size in-place source mutation therefore fails as `adapter_source_changed` and
-cannot publish a committed source.
+performs a final source digest pass. Before rename, the exact marker and the
+three-file allowlist are checked; the marker is unlinked and the stage is
+fsynced. After rename, each retained descriptor is fully hashed once, and every
+final directory entry is checked descriptor-relatively against that descriptor.
+The retained file authority includes device, inode, mode, UID, link count, size,
+mtime nanoseconds, ctime nanoseconds, and digest; the final directory authority
+also includes its identity, permissions, link count, mtime, and ctime. The final
+PostgreSQL transaction repeats the entry allowlist, retained-descriptor, and
+file/directory timestamp checks without hashing. A same-inode, same-size
+post-hash mutation therefore fails as `adapter_source_authority_changed` and
+cannot publish a committed source or success audit.
 
 ## PostgreSQL authority and crash boundaries
 
@@ -79,9 +89,12 @@ rows are registered before filesystem mutation, transition through the reviewed
 staging/validation/publication states, and commit only content-free contracts,
 digests, sizes, tensor summary, UUID ownership, and server timestamps. A
 successful final transaction reauthorizes the exact department, locks both
-rows, checks the retained post-rename directory and file identities, marks the
-source `committed`, points it to the exact attempt, and appends one safe
-mutation-success audit.
+rows, checks the retained post-rename directory entries and file descriptors,
+including mtime/ctime authority, marks the source `committed`, points it to the
+exact attempt, and appends one safe mutation-success audit. Any entry addition,
+removal, rename, exchange, substitution, hard link, or timestamp drift leaves
+the source and attempt uncommitted; uncertain final bytes are retained for
+future reviewed reconciliation.
 
 Every transition captures a frozen authority snapshot containing the complete
 department/source/attempt IDs, versions, statuses, actor, code revision,

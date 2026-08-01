@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session
 
 from alembic import command
@@ -18,6 +18,7 @@ from app.adapter_contract import (
     EXPECTED_TENSOR_SHAPES,
     canonical_adapter_config_bytes,
 )
+from app.adapter_source_artifacts import AdapterSourceArtifactStore
 from app.adapter_source_services import (
     AdapterSourceImportConfigurationError,
     AdapterSourceImportSettings,
@@ -270,3 +271,90 @@ def test_non_admin_or_inactive_actor_cannot_apply_source_import(
             apply=True,
         )
     assert error.value.code == "requester_unauthorized"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["unknown", "rename", "replace", "exchange", "same_size", "directory_time", "file_time"],
+)
+def test_final_authority_mutation_refuses_commit_and_success_audit(
+    engine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    issuer, subject, department_id = _seed_actor(engine)
+    (tmp_path / "adapters").mkdir(mode=0o700)
+    config, model = _adapter_files(tmp_path)
+    monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
+    settings = AdapterSourceImportSettings(
+        database_url=_database_url(), data_dir=tmp_path, code_revision="a" * 40
+    )
+    original_publish = AdapterSourceArtifactStore.publish
+
+    def publish_then_mutate(store, staged):
+        result = original_publish(store, staged)
+        final_path = (
+            tmp_path / "adapters" / "imports" / str(department_id) / str(staged.source_bundle_id)
+        )
+        if mutation == "unknown":
+            (final_path / "unexpected").write_bytes(b"x")
+        elif mutation == "rename":
+            os.rename(final_path / "adapter_config.json", final_path / "renamed")
+        elif mutation == "replace":
+            os.rename(final_path / "adapter_config.json", final_path / "moved")
+            replacement = final_path / "adapter_config.json"
+            replacement.write_bytes(b"replacement")
+            os.chmod(replacement, 0o600)
+        elif mutation == "exchange":
+            os.rename(final_path / "adapter_config.json", final_path / "exchange")
+            os.rename(final_path / "adapter_model.safetensors", final_path / "adapter_config.json")
+            os.rename(final_path / "exchange", final_path / "adapter_model.safetensors")
+        elif mutation == "same_size":
+            descriptor = os.open(final_path / "adapter_config.json", os.O_RDWR)
+            try:
+                os.pwrite(descriptor, b"X", 0)
+            finally:
+                os.close(descriptor)
+        elif mutation == "directory_time":
+            temporary = final_path / "temporary"
+            temporary.write_bytes(b"x")
+            temporary.unlink()
+        else:
+            target = final_path / "adapter_config.json"
+            metadata = target.stat()
+            os.utime(target, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1))
+        return result
+
+    monkeypatch.setattr(AdapterSourceArtifactStore, "publish", publish_then_mutate)
+    with pytest.raises(AdapterSourceImportConfigurationError) as error:
+        import_adapter_source(
+            settings,
+            department_id=department_id,
+            actor_issuer=issuer,
+            actor_subject=subject,
+            adapter_config=config,
+            adapter_model=model,
+            apply=True,
+        )
+    assert error.value.code == "adapter_source_authority_changed"
+    with Session(engine) as session:
+        source = session.execute(
+            select(AdapterImportSource).where(AdapterImportSource.department_id == department_id)
+        ).scalar_one()
+        attempt = session.execute(
+            select(AdapterImportAttempt).where(AdapterImportAttempt.department_id == department_id)
+        ).scalar_one()
+        assert source.status != "committed"
+        assert attempt.status != "committed"
+        assert (
+            session.scalar(
+                text(
+                    "SELECT count(*) FROM audit_events "
+                    "WHERE action = 'adapter.source.import' AND resource_id = :resource_id"
+                ),
+                {"resource_id": str(source.id)},
+            )
+            == 0
+        )
+    assert (tmp_path / "adapters" / "imports" / str(department_id) / str(source.id)).exists()

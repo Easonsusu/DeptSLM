@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
 from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
@@ -93,6 +94,40 @@ def _manifest(
             },
         },
     }
+
+
+@contextmanager
+def _staged_surface(tmp_path: Path):
+    (tmp_path / "adapters").mkdir(mode=0o700)
+    config, model = _files(tmp_path)
+    department_id, source_id, attempt_id, publication_id = (uuid4() for _ in range(4))
+    store = AdapterSourceArtifactStore(tmp_path)
+    config_input, model_input = store.open_external_inputs(config, model)
+    staged = store.stage(
+        DepartmentScope(department_id),
+        source_id,
+        attempt_id,
+        publication_id,
+        1,
+        config_input,
+        model_input,
+        _manifest(department_id, source_id, attempt_id, publication_id, config, model),
+    )
+    try:
+        yield store, staged, config_input, model_input, department_id, source_id, attempt_id
+    finally:
+        staged.close()
+        config_input.close()
+        model_input.close()
+        store.close()
+
+
+@contextmanager
+def _published_surface(tmp_path: Path):
+    with _staged_surface(tmp_path) as values:
+        store, staged, config_input, model_input, department_id, source_id, attempt_id = values
+        store.publish(staged)
+        yield values
 
 
 def test_publish_has_exact_private_allowlist_and_uuid_layout(tmp_path: Path) -> None:
@@ -216,6 +251,132 @@ def test_source_mutation_during_copy_never_publishes_manifest(
             model_input.close()
     assert not (tmp_path / "adapters" / "imports" / str(department_id) / str(source_id)).exists()
     os.close(mutator_fd)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "content", "symlink", "hardlink", "mode"])
+def test_marker_must_be_exact_before_publication(tmp_path: Path, mutation: str) -> None:
+    with _staged_surface(tmp_path) as (
+        store,
+        staged,
+        _config_input,
+        _model_input,
+        department_id,
+        source_id,
+        attempt_id,
+    ):
+        stage_path = (
+            tmp_path
+            / "adapters"
+            / ".staging"
+            / "imports"
+            / str(department_id)
+            / str(source_id)
+            / str(attempt_id)
+        )
+        marker_path = stage_path / artifacts.STAGE_MARKER
+        if mutation == "missing":
+            marker_path.unlink()
+        elif mutation == "content":
+            with marker_path.open("r+b") as handle:
+                handle.write(b"deptslm-adapter-stage-x1\n")
+        elif mutation == "symlink":
+            marker_path.unlink()
+            marker_path.symlink_to(tmp_path / "outside-marker")
+            (tmp_path / "outside-marker").write_bytes(artifacts._MARKER_BYTES)
+        elif mutation == "hardlink":
+            marker_path.unlink()
+            outside = tmp_path / "outside-marker"
+            outside.write_bytes(artifacts._MARKER_BYTES)
+            os.chmod(outside, 0o600)
+            os.link(outside, marker_path)
+        else:
+            marker_path.chmod(0o640)
+        with pytest.raises(AdapterSourceArtifactError) as error:
+            store.publish(staged)
+        assert error.value.code == "adapter_source_publication_failed"
+        assert not (
+            tmp_path / "adapters" / "imports" / str(department_id) / str(source_id)
+        ).exists()
+
+
+def test_final_allowlist_binds_entries_to_retained_descriptors(tmp_path: Path) -> None:
+    with _published_surface(tmp_path) as (store, staged, *_rest):
+        final_path = (
+            tmp_path
+            / "adapters"
+            / "imports"
+            / str(staged.department.value)
+            / str(staged.source_bundle_id)
+        )
+        (final_path / "unexpected").write_bytes(b"x")
+        with pytest.raises(AdapterSourceArtifactError) as error:
+            staged.recheck_retained_authority()
+        assert error.value.code == "adapter_source_authority_changed"
+
+
+@pytest.mark.parametrize("mutation", ["rename", "replace", "exchange"])
+def test_final_name_substitution_fails_closed(tmp_path: Path, mutation: str) -> None:
+    with _published_surface(tmp_path) as (store, staged, *_rest):
+        config_name = "adapter_config.json"
+        model_name = "adapter_model.safetensors"
+        stage_fd = staged.stage_fd
+        if mutation == "rename":
+            os.rename(config_name, "renamed", src_dir_fd=stage_fd, dst_dir_fd=stage_fd)
+        elif mutation == "replace":
+            os.rename(config_name, "moved", src_dir_fd=stage_fd, dst_dir_fd=stage_fd)
+            replacement = os.open(
+                config_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=stage_fd,
+            )
+            os.write(replacement, b"replacement")
+            os.close(replacement)
+        else:
+            os.rename(config_name, "exchange", src_dir_fd=stage_fd, dst_dir_fd=stage_fd)
+            os.rename(model_name, config_name, src_dir_fd=stage_fd, dst_dir_fd=stage_fd)
+            os.rename("exchange", model_name, src_dir_fd=stage_fd, dst_dir_fd=stage_fd)
+        with pytest.raises(AdapterSourceArtifactError) as error:
+            staged.recheck_retained_authority()
+        assert error.value.code == "adapter_source_authority_changed"
+
+
+def test_same_inode_same_size_post_hash_mutation_fails_closed(tmp_path: Path) -> None:
+    with _published_surface(tmp_path) as (_store, staged, *_rest):
+        config_fd = os.open("adapter_config.json", os.O_RDWR, dir_fd=staged.stage_fd)
+        try:
+            os.pwrite(config_fd, b"X", 0)
+        finally:
+            os.close(config_fd)
+        with pytest.raises(AdapterSourceArtifactError) as error:
+            staged.recheck_retained_authority()
+        assert error.value.code == "adapter_source_authority_changed"
+
+
+def test_final_directory_timestamp_drift_fails_closed(tmp_path: Path) -> None:
+    with _published_surface(tmp_path) as (_store, staged, *_rest):
+        temporary = os.open(
+            "temporary", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=staged.stage_fd
+        )
+        os.close(temporary)
+        os.unlink("temporary", dir_fd=staged.stage_fd)
+        with pytest.raises(AdapterSourceArtifactError) as error:
+            staged.recheck_retained_authority()
+        assert error.value.code == "adapter_source_authority_changed"
+
+
+def test_final_file_timestamp_drift_fails_closed(tmp_path: Path) -> None:
+    with _published_surface(tmp_path) as (_store, staged, *_rest):
+        metadata = os.stat("adapter_config.json", dir_fd=staged.stage_fd, follow_symlinks=False)
+        os.utime(
+            "adapter_config.json",
+            ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1),
+            dir_fd=staged.stage_fd,
+            follow_symlinks=False,
+        )
+        with pytest.raises(AdapterSourceArtifactError) as error:
+            staged.recheck_retained_authority()
+        assert error.value.code == "adapter_source_authority_changed"
 
 
 def stat_mode(descriptor: int) -> int:

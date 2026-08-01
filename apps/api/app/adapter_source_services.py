@@ -463,7 +463,9 @@ def _snapshot(
     source: AdapterImportSource, attempt: AdapterImportAttempt
 ) -> AdapterAuthoritySnapshot:
     if source.id != attempt.source_bundle_id or source.department_id != attempt.department_id:
-        raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
+        raise AdapterSourceImportConfigurationError(
+            "Adapter source authority changed.", "adapter_source_authority_changed"
+        )
     return AdapterAuthoritySnapshot(
         department_id=source.department_id,
         source_bundle_id=source.id,
@@ -506,7 +508,9 @@ def _require_snapshot(
 ) -> AdapterAuthoritySnapshot:
     actual = _snapshot(source, attempt)
     if expected is not None and actual != expected:
-        raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
+        raise AdapterSourceImportConfigurationError(
+            "Adapter source authority changed.", "adapter_source_authority_changed"
+        )
     return actual
 
 
@@ -606,7 +610,9 @@ def _validate_source_attempt(
         .with_for_update()
     ).scalar_one_or_none()
     if source is None or attempt is None:
-        raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
+        raise AdapterSourceImportConfigurationError(
+            "Adapter source authority changed.", "adapter_source_authority_changed"
+        )
     _require_snapshot(source, attempt, expected)
     return source, attempt
 
@@ -728,7 +734,9 @@ def _mark_published(factory, principal, scope, source_id, attempt_id, manifest, 
             expected=expected,
         )
         if attempt.ownership_manifest != manifest:
-            raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
+            raise AdapterSourceImportConfigurationError(
+                "Adapter source authority changed.", "adapter_source_authority_changed"
+            )
         attempt.status = "published"
         attempt.published_at = _server_now(session)
         source.version += 1
@@ -797,10 +805,14 @@ def _commit_published(
             .with_for_update()
         ).scalar_one_or_none()
         if source is None or attempt is None:
-            raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
+            raise AdapterSourceImportConfigurationError(
+                "Adapter source authority changed.", "adapter_source_authority_changed"
+            )
         _require_snapshot(source, attempt, expected)
         if attempt.ownership_manifest != manifest:
-            raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
+            raise AdapterSourceImportConfigurationError(
+                "Adapter source authority changed.", "adapter_source_authority_changed"
+            )
         staged.recheck_retained_authority()
         manifest_digest = hashlib.sha256(_manifest_bytes(manifest)).hexdigest()
         digest_map = staged.digest_map
@@ -849,7 +861,9 @@ def _commit_published(
             or attempt.code_revision != manifest.get("code_revision")
             or source.intake_manifest_sha256 not in (None, manifest_digest)
         ):
-            raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
+            raise AdapterSourceImportConfigurationError(
+                "Adapter source authority changed.", "adapter_source_authority_changed"
+            )
         source.status = "committed"
         source.authoritative_attempt_id = attempt.id
         source.intake_manifest_sha256 = manifest_digest
@@ -916,7 +930,9 @@ def _reject_registered(factory, principal, scope, source_id, attempt_id, code, *
             .with_for_update()
         ).scalar_one_or_none()
         if source is None or attempt is None:
-            raise AdapterSourceImportConfigurationError("Adapter source authority changed.")
+            raise AdapterSourceImportConfigurationError(
+                "Adapter source authority changed.", "adapter_source_authority_changed"
+            )
         _require_snapshot(source, attempt, expected)
         now = _server_now(session)
         source.status = "rejected"

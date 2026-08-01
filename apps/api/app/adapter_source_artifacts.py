@@ -126,6 +126,8 @@ class DescriptorAuthority:
     uid: int
     nlink: int
     byte_size: int
+    mtime_ns: int
+    ctime_ns: int
     sha256: str
 
 
@@ -137,6 +139,9 @@ class PublishedAdapterAuthority:
     directory_inode: int
     directory_mode: int
     directory_uid: int
+    directory_nlink: int
+    directory_mtime_ns: int
+    directory_ctime_ns: int
     entries: tuple[DescriptorAuthority, ...]
 
 
@@ -201,22 +206,33 @@ class StagedAdapterSource:
             or directory.st_ino != authority.directory_inode
             or stat.S_IMODE(directory.st_mode) != authority.directory_mode
             or directory.st_uid != authority.directory_uid
+            or directory.st_nlink != authority.directory_nlink
+            or directory.st_mtime_ns != authority.directory_mtime_ns
+            or directory.st_ctime_ns != authority.directory_ctime_ns
         ):
             raise AdapterSourceArtifactError("adapter_source_authority_changed")
         _entry_matches(self.final_parent_fd, str(self.source_bundle_id), self.stage_fd)
+        names = set(os.listdir(self.stage_fd))
+        if names != set(FINAL_FILES) or {entry.name for entry in authority.entries} != set(
+            FINAL_FILES
+        ):
+            raise AdapterSourceArtifactError("adapter_source_authority_changed")
+        descriptors = {name: descriptor for name, descriptor, _metadata in self.file_descriptors}
+        digests = self.digest_map
+        if set(descriptors) != set(FINAL_FILES) or set(digests) != set(FINAL_FILES):
+            raise AdapterSourceArtifactError("adapter_source_authority_changed")
         for entry in authority.entries:
-            descriptor = next(
-                (fd for name, fd, _metadata in self.file_descriptors if name == entry.name),
-                None,
-            )
-            expected = self.digest_map.get(entry.name)
+            descriptor = descriptors.get(entry.name)
+            expected = digests.get(entry.name)
             if (
                 descriptor is None
                 or expected is None
-                or expected.sha256 != entry.sha256
-                or expected.byte_size != entry.byte_size
-                or not _descriptor_matches(entry, os.fstat(descriptor))
+                or expected != AdapterArtifactDigest(entry.sha256, entry.byte_size)
             ):
+                raise AdapterSourceArtifactError("adapter_source_authority_changed")
+            retained = os.fstat(descriptor)
+            named = os.stat(entry.name, dir_fd=self.stage_fd, follow_symlinks=False)
+            if not _descriptor_matches(entry, retained) or not _descriptor_matches(entry, named):
                 raise AdapterSourceArtifactError("adapter_source_authority_changed")
 
     def verify_published_digests(self) -> None:
@@ -249,15 +265,42 @@ class StagedAdapterSource:
                     uid=current.st_uid,
                     nlink=current.st_nlink,
                     byte_size=current.st_size,
+                    mtime_ns=current.st_mtime_ns,
+                    ctime_ns=current.st_ctime_ns,
                     sha256=digest.hexdigest(),
                 )
             )
+        self.published_authority = self._capture_published_authority(entries)
+
+    def _capture_published_authority(
+        self, entries: list[DescriptorAuthority]
+    ) -> PublishedAdapterAuthority:
+        """Bind every final directory entry to its retained descriptor."""
+
+        _entry_matches(self.final_parent_fd, str(self.source_bundle_id), self.stage_fd)
+        names = set(os.listdir(self.stage_fd))
+        if names != set(FINAL_FILES) or {entry.name for entry in entries} != set(FINAL_FILES):
+            raise AdapterSourceArtifactError("adapter_source_authority_changed")
+        descriptors = {name: descriptor for name, descriptor, _metadata in self.file_descriptors}
+        if set(descriptors) != set(FINAL_FILES):
+            raise AdapterSourceArtifactError("adapter_source_authority_changed")
+        for entry in entries:
+            descriptor = descriptors.get(entry.name)
+            if descriptor is None:
+                raise AdapterSourceArtifactError("adapter_source_authority_changed")
+            retained = os.fstat(descriptor)
+            named = os.stat(entry.name, dir_fd=self.stage_fd, follow_symlinks=False)
+            if not _descriptor_matches(entry, retained) or not _descriptor_matches(entry, named):
+                raise AdapterSourceArtifactError("adapter_source_authority_changed")
         directory = _require_private_directory(self.stage_fd, writable=True)
-        self.published_authority = PublishedAdapterAuthority(
+        return PublishedAdapterAuthority(
             directory_device=directory.st_dev,
             directory_inode=directory.st_ino,
             directory_mode=stat.S_IMODE(directory.st_mode),
             directory_uid=directory.st_uid,
+            directory_nlink=directory.st_nlink,
+            directory_mtime_ns=directory.st_mtime_ns,
+            directory_ctime_ns=directory.st_ctime_ns,
             entries=tuple(sorted(entries, key=lambda item: item.name)),
         )
 
@@ -460,14 +503,11 @@ class AdapterSourceArtifactStore:
         """Publish one stage by an atomic no-replace directory rename."""
 
         try:
-            names = set(os.listdir(staged.stage_fd))
-            if not FINAL_FILES.issubset(names) or names - set(FINAL_FILES) - {STAGE_MARKER}:
-                raise AdapterSourceArtifactError("adapter_source_publication_failed")
-            try:
-                os.unlink(STAGE_MARKER, dir_fd=staged.stage_fd)
-            except FileNotFoundError:
-                pass
+            _verify_stage_marker(staged.stage_fd)
+            os.unlink(STAGE_MARKER, dir_fd=staged.stage_fd)
             _fsync(staged.stage_fd)
+            if set(os.listdir(staged.stage_fd)) != set(FINAL_FILES):
+                raise AdapterSourceArtifactError("adapter_source_publication_failed")
             _rename_no_replace(
                 staged.stage_parent_fd,
                 str(staged.import_attempt_id),
@@ -478,7 +518,6 @@ class AdapterSourceArtifactStore:
             _fsync(staged.stage_parent_fd)
             _fsync(staged.final_parent_fd)
             staged.verify_published_digests()
-            staged.recheck_identity()
             return staged
         except AdapterSourceArtifactError:
             raise
@@ -609,6 +648,39 @@ def _require_private_file(descriptor: int) -> os.stat_result:
     return metadata
 
 
+def _verify_stage_marker(stage_fd: int) -> None:
+    """Require the exact private housekeeping marker before publication."""
+
+    if set(os.listdir(stage_fd)) != set(FINAL_FILES) | {STAGE_MARKER}:
+        raise AdapterSourceArtifactError("adapter_source_publication_failed")
+    try:
+        descriptor = os.open(
+            STAGE_MARKER,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=stage_fd,
+        )
+    except OSError as error:
+        raise AdapterSourceArtifactError("adapter_source_publication_failed") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size != len(_MARKER_BYTES)
+            or os.pread(descriptor, len(_MARKER_BYTES), 0) != _MARKER_BYTES
+        ):
+            raise AdapterSourceArtifactError("adapter_source_publication_failed")
+    except OSError as error:
+        raise AdapterSourceArtifactError("adapter_source_publication_failed") from error
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
 def _safe_name(name: str) -> None:
     if not name or "/" in name or name in {".", ".."}:
         raise AdapterSourceArtifactError("adapter_source_publication_failed")
@@ -690,6 +762,8 @@ def _descriptor_matches(expected: DescriptorAuthority, metadata: os.stat_result)
         and metadata.st_uid == expected.uid
         and metadata.st_nlink == expected.nlink
         and metadata.st_size == expected.byte_size
+        and metadata.st_mtime_ns == expected.mtime_ns
+        and metadata.st_ctime_ns == expected.ctime_ns
     )
 
 

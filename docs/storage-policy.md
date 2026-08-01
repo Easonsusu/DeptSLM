@@ -180,8 +180,11 @@ entry is permitted. Components derive only from `DEPTSLM_DATA_DIR`; the
 server-owned paths, real private `0700` directories, private `0600` files,
 current service UID, exclusive creation, no overwrite, same-filesystem atomic
 publication, file and directory fsync, post-rename rehash, and retained
-descriptor identity through the final PostgreSQL commit. Descriptor-relative
-no-follow operations must reject path replacement and links.
+descriptor identity through the final PostgreSQL commit. Final file and
+directory mtime/ctime nanoseconds are part of that retained authority.
+Descriptor-relative no-follow operations must reject path replacement and links;
+an unexpected private stage marker fails closed before rename even though the
+marker is not an ownership authority.
 
 The planned source-intake allowlist is exactly `intake_manifest.json`,
 `adapter_config.json`, and `adapter_model.safetensors`. An administrator CLI
@@ -196,9 +199,10 @@ and credentials never enter PostgreSQL, APIs, audits, or logs. An external
 manifest, README, archive, directory tree, or unknown entry is rejected. The
 committed import bundle is immutable and read-only to the future worker. No
 user-supplied host path is reopened from PostgreSQL metadata. Publication
-requires retained descriptors, complete allowlist verification, same-filesystem
-no-replace rename, parent fsync, post-rename rehash, and a final PostgreSQL
-authority commit.
+requires an exact marker, retained descriptors, complete allowlist verification,
+same-filesystem no-replace rename, parent fsync, post-rename rehash,
+entry-to-descriptor binding, file/directory mtime/ctime capture, and a final
+PostgreSQL authority commit that repeats those checks without hashing.
 
 Phase 12.1B creates only the private `adapters/imports` and
 `.staging/imports` source-intake surfaces through the administrator CLI. It
