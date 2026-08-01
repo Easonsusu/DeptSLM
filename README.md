@@ -41,12 +41,15 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > is active. This is a reviewed boundary, not training execution.
 
 > **Phase 12 status:** Phase 12.0 is completed and Phase 12.1 is under review.
-> This PR implements Phase 12.1A's model-free static compatibility contract for
-> the reviewed Qwen3-0.6B LoRA/QLoRA artifact shape, configuration, key grammar,
-> and bounded safetensors metadata. It does not import, publish, evaluate,
-> approve, promote, load, or purge an adapter. Phase 12.1B through 12.1E and
-> Phase 12.2 through Phase 12.4 remain unimplemented; no adapter registry or
-> runtime routing exists.
+> Phase 12.1A is completed, and this review implements Phase 12.1B's
+> administrator-only immutable source intake. It accepts exactly
+> `adapter_config.json` and `adapter_model.safetensors`, validates their
+> model-free Phase 12.1A contract in an isolated descriptor child, streams the
+> bytes into private external storage, and commits only content-free source and
+> attempt authority metadata. It does not create an adapter registry record,
+> bind a Phase 11 job, evaluate, approve, promote, load, or purge an adapter.
+> Phase 12.1C through 12.1E and Phase 12.2 through Phase 12.4 remain
+> unimplemented; no runtime routing exists.
 
 The static contract models the completed PEFT 0.18.1 artifact: saved
 `inference_mode=true`, `auto_mapping=null`, `peft_version="0.18.1"`, and the
@@ -54,21 +57,16 @@ exact safetensors metadata `{"format":"pt"}`. That metadata is closed and
 content-free; `__metadata__` is not a tensor, and acceptance does not prove
 training provenance.
 
-The planned intake begins with an administrator CLI that streams only
-`adapter_config.json` and `adapter_model.safetensors` into an immutable,
-department-scoped import bundle. DeptSLM generates a closed, content-free
-`intake_manifest.json` binding the department, source bundle, import attempt,
-safe internal request reference, positive payload sizes, digests, contract
-version, and code revision; an external manifest, archive, directory, or
-arbitrary host path is never authority. Import sources have their own planned
-staging, committed, claimed, consumed, rejected, abandoned, purge-pending, and
-purged lifecycle. One committed source can be consumed by only one exact adapter
-version, and retries remain bound to that source. A reviewed mutation may remove
-a rollback-retention reference before byte purge; upstream Phase 10/11 retention
-dependencies release only after the registry and every bound source copy are
-committed purged. Registry and source purge are separate, bounded,
-descriptor-relative, crash-resumable operations; artifact purge retains metadata
-and history and never deletes upstream artifacts.
+Source intake is an administrator CLI and dry-run is the default. It accepts
+only the two exact external files and generates a closed, content-free
+`intake_manifest.json` binding the department, server-generated source and
+attempt IDs, safe internal request reference, positive payload sizes, digests,
+contract versions, and code revision. An external manifest, archive, directory,
+or arbitrary host path is never authority. Static validation is model-free and
+the child reads no tensor payload; the parent streams payload bytes only to
+hash and copy them. The immutable source bundle is separate from any future
+adapter registry and is not approved, evaluated, promoted, runtime-usable, or
+bound to a Phase 11 job. Reconciliation and purge are not implemented here.
 
 Phase 12.1A fixes the compatible package references, closed configuration and
 tensor grammar, bounded header/file limits, and model-free validation rules in a
@@ -265,6 +263,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Qdrant boundary](docs/qdrant-boundary.md)
 - [Embedding model](docs/embedding-model.md)
 - [Phase 12.1A static adapter contract](docs/adapter-static-contract.md)
+- [Phase 12.1B adapter source intake](docs/adapter-source-intake.md)
 - [Phase 12 adapter registry contract](docs/adapter-registry.md)
 - [Grounded RAG answering](docs/rag-answering.md)
 - [Prompt-injection boundary](docs/prompt-injection-boundary.md)
@@ -283,7 +282,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 
 Phase 9 does not implement LLM judging, semantic grading, public raw results, a frontend dashboard, feedback-derived cases, automatic threshold or RAG changes, training datasets, SFT, adapters, model promotion, cross-department benchmarking, production OAuth/OIDC/SSO, or production deployment.
 
-Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 remains contract and threat-model work, while Phase 12.1A adds only model-free static compatibility metadata validation; no adapter intake, registry, evaluation, approval, promotion, rollback, or runtime routing exists. Google Drive storage is an external development runtime location, not a production object store or backup.
+Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 remains contract and threat-model work. Phase 12.1A is complete, and Phase 12.1B adds only administrator-controlled immutable source intake with no registry, evaluation, approval, promotion, rollback, or runtime routing. Google Drive storage is an external development runtime location, not a production object store or backup.
 
 ## License
 

@@ -1,4 +1,4 @@
-# Database Model Through Phase 8
+# Database Model Through Phase 12.1B
 
 DeptSLM uses PostgreSQL 16, SQLAlchemy 2, psycopg 3, and Alembic. Revision `0006_phase8_rag_feedback` follows `0005_phase7_rag_answers`. Alembic is the only schema-creation mechanism; runtime never calls `metadata.create_all`.
 
@@ -36,6 +36,26 @@ erDiagram
 `training_jobs`, `training_job_attempts`, bounded artifact-operation rows, and job-level purge reservations record department scope, the complete exact Phase 10 dataset snapshot, fixed LlamaFactory/model/profile contracts, lifecycle, review state, execution ownership, content-free file digests and counts, and retention cleanup state. A succeeded job requires a non-null publication attempt, closed object manifest, positive train/validation counts, result manifest digest, and positive digest/size metadata for all four payloads. Staged, published, and succeeded attempts require their closed ownership manifest and lifecycle timestamps. Application authority additionally requires the job's manifest to exactly equal the one matching succeeded attempt manifest and every closed manifest field to match the job row.
 
 A purge reservation captures the expected job version, review status, server-time anchor, retention period, and durable registered/deletion-authorized/terminalized lifecycle before any external deletion. Each job operation contains unresolved attempt-stage items plus exactly one final item for the authoritative succeeded owner; historical manifests never create duplicate final ownership. They contain no dataset records, configuration bytes, source chunk identifiers, artifact paths, model outputs, adapters, logs, tokens, or credentials. Composite department constraints keep attempts and cleanup operations scoped to the same job department.
+
+## Phase 12.1B adapter source metadata
+
+Revision `0010_phase12_adapter_sources` adds only `adapter_import_sources` and
+`adapter_import_attempts`. A source row is a department-scoped, server-generated
+content-free authority record for exactly one immutable external source bundle.
+An attempt row records the registered, validated, staged, published, committed,
+failed, or abandoned lifecycle and a closed ownership manifest. Composite
+department/source foreign keys, a globally unique publication-attempt UUID, and
+a partial unique active-attempt index prevent cross-department or concurrent
+source ownership. The source status supports later `claimed`, `consumed`,
+`purge_pending`, and `purged` states, but Phase 12.1B creates none of those
+transitions.
+
+The tables retain contract identifiers, fixed model revision, dtype/count/size
+summary, lowercase SHA-256 digests, positive sizes, versions, and safe error
+codes only. They contain no adapter bytes, configuration JSON, tensor names or
+values, host paths, filenames, manifests supplied by an operator, credentials,
+or training provenance. PostgreSQL and external storage publication are not
+atomic; later reconciliation and purge phases are not implemented here.
 - `documents`: department-owned source metadata with an internal uploader relation, normalized filename, canonical media type, positive size, SHA-256 digest, lifecycle state, version, and timestamps. It stores no body or path, and public document schemas do not expose internal identity IDs; see [document-model.md](document-model.md).
 - `document_extractions`: immutable attempt history and PostgreSQL queue state, including source/pipeline identity, claim lease, safe result metadata, and an allowlisted error code. It stores no content, path, filename, stderr, or exception.
 - `document_chunks`: department/document/extraction-scoped offsets, byte size, internal digest, and mutually exclusive page/line provenance. Chunk text remains external.
