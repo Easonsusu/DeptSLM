@@ -88,11 +88,16 @@ if [[ "${1:-}" == "--require-compose-layout" ]]; then
     extracted_text
     vector_snapshots
     training_datasets
+    training_datasets/jobs
     adapters
     model_cache
     eval_results
     logs
     exports
+    adapters/imports
+    adapters/registry
+    adapters/.staging/imports
+    adapters/.staging/registry
     service_state/postgres
     service_state/qdrant
   )

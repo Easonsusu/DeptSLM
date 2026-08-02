@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.auth import AuthenticatedPrincipal
 from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.models import (
+    AdapterUpstreamDependency,
     TrainingJob,
     TrainingJobArtifactOperation,
     TrainingJobArtifactOperationItem,
@@ -315,6 +316,13 @@ def _register_candidates(
                         TrainingJob.review_status.in_(("rejected", "archived")),
                         TrainingJob.purged_at.is_(None),
                         retained_at <= cutoff,
+                        ~select(AdapterUpstreamDependency.id)
+                        .where(
+                            AdapterUpstreamDependency.department_id == department_id,
+                            AdapterUpstreamDependency.training_job_id == TrainingJob.id,
+                            AdapterUpstreamDependency.status == "active",
+                        )
+                        .exists(),
                     )
                     .order_by(retained_at, TrainingJob.id)
                     .with_for_update(skip_locked=True)
@@ -1122,6 +1130,9 @@ def _authorize_purge_prerequisites(
             if not reservations:
                 raise ServiceError(409, "Training-job purge reservation is unavailable")
             for reservation in reservations:
+                _reject_active_adapter_dependency(
+                    session, department_id, reservation.training_job_id
+                )
                 _assert_purge_authority(session, department_id, reservation, now)
     except ServiceError:
         raise
@@ -1194,6 +1205,9 @@ def _authorize_final_deletion(
             now = session.scalar(select(func.clock_timestamp()))
             result: list[_Candidate] = []
             for reservation in _active_reservations(session, operation_id, department_id):
+                _reject_active_adapter_dependency(
+                    session, department_id, reservation.training_job_id
+                )
                 job, _attempts, items, owner = _assert_purge_authority(
                     session, department_id, reservation, now
                 )
@@ -1277,6 +1291,7 @@ def _persist_purge_final_outcomes(
                 job, attempts, items, owner = _assert_purge_authority(
                     session, department_id, reservation, now
                 )
+                _reject_active_adapter_dependency(session, department_id, job.id)
                 if owner.attempt.publication_attempt_id != attempt_id:
                     raise ServiceError(409, "Training-job purge authority changed")
                 item = _locked_item(session, operation_id, department_id, *key)
@@ -1597,6 +1612,36 @@ def _close_purge_operation_if_terminal(
         )
         operation.success_audited_at = now
         operation.version += 1
+
+
+def _has_active_adapter_dependency(
+    session: Session, department_id: UUID, training_job_id: UUID
+) -> bool:
+    return bool(
+        session.scalar(
+            select(func.count(AdapterUpstreamDependency.id)).where(
+                AdapterUpstreamDependency.department_id == department_id,
+                AdapterUpstreamDependency.training_job_id == training_job_id,
+                AdapterUpstreamDependency.status == "active",
+            )
+        )
+    )
+
+
+def _reject_active_adapter_dependency(
+    session: Session, department_id: UUID, training_job_id: UUID
+) -> None:
+    dependency = session.execute(
+        select(AdapterUpstreamDependency)
+        .where(
+            AdapterUpstreamDependency.department_id == department_id,
+            AdapterUpstreamDependency.training_job_id == training_job_id,
+            AdapterUpstreamDependency.status == "active",
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if dependency is not None:
+        raise ServiceError(409, "Training job is retained by an adapter registry dependency")
 
 
 def _purge_reservation_matches(

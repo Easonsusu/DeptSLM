@@ -2,7 +2,8 @@
 
 This document is the reviewed Phase 12 governance boundary. It describes the
 completed contract work, the reviewed Phase 12.1B source-intake implementation,
-and future metadata, evaluation, review, deployment, and runtime contracts. The
+and the reviewed Phase 12.1C immutable registry-publication implementation.
+It also records future metadata, evaluation, review, deployment, and runtime contracts. The
 separate Phase 12.1A static compatibility contract is documented in
 [adapter-static-contract.md](adapter-static-contract.md).
 
@@ -12,17 +13,20 @@ separate Phase 12.1A static compatibility contract is documented in
   LlamaFactory job bundle; it does not execute training or create an adapter.
 - Phase 12 is under review.
 - Phase 12.0 is completed: it defines contracts and the threat model.
-- Phase 12.1 is under review. Phase 12.1A is completed and Phase 12.1B adds
-  administrator-only immutable source intake: exactly two external files are
-  validated, streamed to private `adapters/imports` storage, and recorded only
-  through content-free source/attempt metadata. No adapter has been evaluated,
-  approved, promoted, loaded, or purged by DeptSLM.
-- Phase 12.1C through 12.1E and Phase 12.2, 12.3, and 12.4 remain
+- Phase 12.1 is under review. Phase 12.1A and Phase 12.1B are completed. Phase
+  12.1C binds one exact committed source to one approved succeeded Phase 11
+  job and captured Phase 10 authority, then publishes an immutable private
+  registry bundle through a leased descriptor-bound worker. It records only
+  content-free authority and never evaluates, approves, promotes, loads,
+  routes, reconciles, or purges an adapter.
+- Phase 12.1D through 12.1E and Phase 12.2, 12.3, and 12.4 remain
   unimplemented.
 - Phase 13 has not started.
 
-No statement in this document is a claim that an adapter registry, adapter
-evaluation, deployment pointer, runtime loading, or rollback exists today.
+No statement in this document is a claim that public adapter metadata routes,
+adapter evaluation, deployment pointers, runtime loading, or rollback exist
+today. The Phase 12.1C internal worker does publish immutable registry files
+and content-free PostgreSQL authority only.
 
 ## Phase 12 objective
 
@@ -59,7 +63,7 @@ the artifact is safe, compatible, or useful.
 - Keep validation model-free, dependency-free, content-free, and separate from
   intake, storage, publication, registry, reconciliation, and purge.
 
-#### Phase 12.1B — immutable source intake (under review)
+#### Phase 12.1B — immutable source intake (completed)
 
 - Administrator CLI only, dry-run by default, with exactly
   `adapter_config.json` and `adapter_model.safetensors`.
@@ -70,7 +74,22 @@ the artifact is safe, compatible, or useful.
   adapter registry row, Phase 11 binding, evaluation, review, approval,
   promotion, runtime loading, reconciliation, or purge is included.
 
-#### Phase 12.1C through 12.1E (not started)
+#### Phase 12.1C — immutable registry publication (implemented in this review)
+
+- Bind one same-department committed source to one approved succeeded Phase 11
+  bundle and the exact Phase 10 authority snapshot captured by that job.
+- Claim and lease PostgreSQL metadata with `SKIP LOCKED`; require live claim
+  checks before every filesystem or child-owned mutation.
+- Build and publish only the exact private `manifest.json`,
+  `adapter_config.json`, and `adapter_model.safetensors` registry files.
+- Keep declared external training association explicit while leaving training
+  provenance unverified. Record source consumption, upstream retention, and a
+  transactional success audit only after complete descriptor verification.
+- The worker never loads a model or invokes LlamaFactory, and no public API,
+  evaluation, approval, promotion, runtime routing, reconciliation, or purge
+  is added.
+
+#### Phase 12.1D through 12.1E (not started)
 
 - Add reviewed registry consumption, reconciliation, and purge foundations.
 - Do not load an adapter at runtime.
@@ -198,7 +217,8 @@ not an adapter under this contract.
 
 ### Model-free static adapter validation
 
-The future intake worker has no `model_cache`, base-model weights, tokenizer,
+The Phase 12.1B validation child and Phase 12.1C registry worker have no
+`model_cache`, base-model weights, tokenizer,
 Transformers model object, or Hugging Face access. Phase 12.1A therefore fixes
 the reviewed, content-free, source-controlled static adapter schema: PEFT
 `0.18.1`, Transformers `4.55.0`, safetensors format `0.7.0`, the saved
@@ -215,10 +235,11 @@ weights. It rejects unknown target modules, keys, shapes, ranks, and dtypes and
 fails closed when compatibility cannot be proven statically. This static
 contract does not create a worker or make an external adapter trusted.
 
-## Planned storage layout
+## External storage layout
 
-Phase 12.1B uses only the following external runtime paths below
-`DEPTSLM_DATA_DIR`; registry and deletion surfaces remain future design:
+Phase 12.1B uses the private import paths below. Phase 12.1C additionally
+creates the private registry and registry-staging paths; deletion surfaces
+remain future design:
 
 ```text
 adapters/
@@ -228,7 +249,7 @@ adapters/
         intake_manifest.json
         adapter_config.json
         adapter_model.safetensors
-  registry/                 # not created in Phase 12.1B
+  registry/                 # Phase 12.1C final publication
     <department_id>/
       <adapter_id>/
         manifest.json
@@ -254,7 +275,7 @@ adapters/
           <purge_operation_id>/
 ```
 
-The future implementation must require a pre-existing `adapters` root, UUID-
+The implemented 12.1B/12.1C workers require a pre-existing `adapters` root, UUID-
 only server-owned path components, real directories, private `0700`
 directories, private `0600` files, current service UID ownership, no-follow
 descriptor-relative access, no symlinks, no hard links, exclusive creation,
@@ -268,10 +289,10 @@ enter PostgreSQL, API responses, audits, or logs. PostgreSQL and external
 storage are non-atomic; a successful database transaction cannot claim that an
 external rename or fsync happened atomically with it.
 
-## Planned immutable source-intake boundary
+## Immutable source-intake boundary
 
 The source of an adapter is a private, immutable, department-scoped import
-bundle. The planned source layout is:
+bundle. The source layout is:
 
 ```text
 adapters/
@@ -288,8 +309,7 @@ adapters/
           <import_attempt_id>/
 ```
 
-This layout is planned only and is not created in Phase 12.0. An
-administrator-controlled CLI will stream only the two externally supplied
+Phase 12.1B's administrator-controlled CLI streams only the two externally supplied
 payload files, `adapter_config.json` and `adapter_model.safetensors`, into a
 private server-ID-derived stage. DeptSLM then generates `intake_manifest.json`
 after basic descriptor verification. An externally supplied `manifest.json`,
@@ -373,13 +393,13 @@ interrupted or explicitly abandoned attempt before commitment, and
 source still required by an active intake, retry, or reconciliation operation
 cannot be purged.
 
-## Phase 12.1B intake boundary and future worker
+## Phase 12.1B intake and Phase 12.1C publication boundary
 
 Phase 12.1B provides an administrator-controlled CLI and an isolated static
-validation child. It does not provide a browser or public weight-upload API.
-The registry worker described below remains future work.
+validation child. Phase 12.1C adds the separate leased registry worker; neither
+phase provides a browser or public weight-upload API.
 
-The future worker receives only:
+The Phase 12.1C worker receives only:
 
 - PostgreSQL;
 - read-only adapter imports;
@@ -398,14 +418,16 @@ secret-free environment, `close_fds`, bounded framed content-free IPC, and
 cancellation, shutdown, deadline, and lease supervision. Adapter bytes must not
 cross IPC; the parent must never parse or materialize the complete adapter.
 
-The Phase 12.1B implementation binds one exact validated-byte authority across
+The Phase 12.1B and 12.1C implementations bind exact validated-byte authority across
 the pre-child and post-child digest passes, descriptor-relative copy, post-
 rename publication verification, and the final PostgreSQL commit. Every
 transition compares a complete frozen authority snapshot and both row versions;
 static contract errors are distinct from the fixed descriptor/operational
 codes. Migration `0010_phase12_adapter_sources` is self-contained and freezes
-the SQL contract literals, while CI validates that head and the private
-temporary adapters root before running the full suite.
+the source SQL contract literals. Migration `0011_phase12_adapter_registry`
+adds the adapter, attempt, dependency, and source-claim schema without
+importing application code. CI validates the head and private temporary
+adapter roots before running the full suite.
 
 ## Planned PostgreSQL boundary
 
@@ -623,10 +645,10 @@ adapters/.deleting/imports/<department_id>/<source_bundle_id>/<purge_operation_i
 adapters/.deleting/registry/<department_id>/<adapter_id>/<purge_operation_id>/
 ```
 
-Future Phase 12.1C through 12.1E must define explicit, bounded administrator
+Future Phase 12.1D through 12.1E must define explicit, bounded administrator
 maintenance for abandoned import staging, committed-but-never-claimed sources,
 rejected sources, consumed sources, crashes between source publication and the
-PostgreSQL commit, and crashes during source deletion. Phase 12.1B does not
+PostgreSQL commit, and crashes during source deletion. Phase 12.1B and 12.1C do not
 implement reconciliation or purge. Those future commands are dry-run by
 default; before any mutation they must durably register the operation and exact
 source-bundle/attempt item, prove ownership through descriptor-relative

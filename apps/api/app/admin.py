@@ -12,11 +12,14 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from app.adapter_registry_services import enqueue_adapter_registry
 from app.adapter_source_services import (
     AdapterSourceImportConfigurationError,
     AdapterSourceImportSettings,
     import_adapter_source,
 )
+from app.auth import AuthenticatedPrincipal
+from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.database import create_database_engine, create_session_factory
 from app.feedback_purge import (
     FeedbackPurgeConfigurationError,
@@ -146,6 +149,16 @@ def _parser() -> argparse.ArgumentParser:
     adapter_import.add_argument("--adapter-config", required=True, type=Path)
     adapter_import.add_argument("--adapter-model", required=True, type=Path)
     adapter_import.add_argument("--apply", action="store_true")
+    adapter_registry = commands.add_parser("enqueue-adapter-registry")
+    adapter_registry.add_argument("--department-id", required=True, type=_nonzero_uuid)
+    adapter_registry.add_argument("--actor-issuer", required=True)
+    adapter_registry.add_argument("--actor-subject", required=True)
+    adapter_registry.add_argument("--source-bundle-id", required=True, type=_nonzero_uuid)
+    adapter_registry.add_argument("--training-job-id", required=True, type=_nonzero_uuid)
+    adapter_registry.add_argument("--expected-source-version", required=True, type=int)
+    adapter_registry.add_argument("--expected-training-job-version", required=True, type=int)
+    adapter_registry.add_argument("--confirm-declared-training-association", action="store_true")
+    adapter_registry.add_argument("--apply", action="store_true")
     sft_archive = commands.add_parser("archive-sft-source")
     sft_archive.add_argument("--department-id", required=True, type=_nonzero_uuid)
     sft_archive.add_argument("--source-bundle-id", required=True, type=_nonzero_uuid)
@@ -259,6 +272,46 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print("Adapter source validation succeeded.")
                 print(f"Base model: {result.base_model_display_id}")
+                print(f"Dtype: {result.tensor_dtype}")
+                print(f"Tensor count: {result.tensor_count}")
+                print(f"Aggregate tensor bytes: {result.tensor_payload_byte_size}")
+            return 0
+        if args.command == "enqueue-adapter-registry":
+            database_url = os.getenv("DATABASE_URL", "").strip()
+            code_revision = os.getenv("DEPTSLM_ADAPTER_REGISTRY_CODE_REVISION", "").strip()
+            if not database_url:
+                print("Database unavailable.", file=sys.stderr)
+                return 1
+            engine = create_database_engine(database_url)
+            factory = create_session_factory(engine)
+            try:
+                principal = AuthenticatedPrincipal(
+                    issuer=args.actor_issuer, subject=args.actor_subject
+                )
+                request_scope = DepartmentRequestScope(DepartmentScope(args.department_id))
+                with factory.begin() as session:
+                    result = enqueue_adapter_registry(
+                        session,
+                        principal,
+                        request_scope,
+                        source_bundle_id=args.source_bundle_id,
+                        training_job_id=args.training_job_id,
+                        expected_source_version=args.expected_source_version,
+                        expected_training_job_version=args.expected_training_job_version,
+                        confirm_declared_training_association=(
+                            args.confirm_declared_training_association
+                        ),
+                        apply=args.apply,
+                        code_revision=code_revision,
+                    )
+            finally:
+                engine.dispose()
+            if result.applied:
+                print(f"Queued adapter registry publication {result.adapter_id}.")
+            else:
+                print(f"Eligible department: {result.department_id}")
+                print(f"Profile: {result.profile_id}")
+                print(f"Base model: {result.base_model_id}")
                 print(f"Dtype: {result.tensor_dtype}")
                 print(f"Tensor count: {result.tensor_count}")
                 print(f"Aggregate tensor bytes: {result.tensor_payload_byte_size}")

@@ -378,6 +378,50 @@ services:
       postgres:
         condition: service_healthy
 
+  adapter-registry-worker:
+    build:
+      context: .
+      dockerfile: services/adapter-registry-worker/Dockerfile
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      DEPTSLM_ADAPTER_REGISTRY_WORKER_ID: "${DEPTSLM_ADAPTER_REGISTRY_WORKER_ID:-00000000-0000-0000-0000-000000000012}"
+      DEPTSLM_ADAPTER_REGISTRY_POLL_SECONDS: "${DEPTSLM_ADAPTER_REGISTRY_POLL_SECONDS:-5}"
+      DEPTSLM_ADAPTER_REGISTRY_LEASE_SECONDS: "${DEPTSLM_ADAPTER_REGISTRY_LEASE_SECONDS:-300}"
+      DEPTSLM_ADAPTER_REGISTRY_OPERATION_SECONDS: "${DEPTSLM_ADAPTER_REGISTRY_OPERATION_SECONDS:-600}"
+      DEPTSLM_ADAPTER_REGISTRY_CODE_REVISION: "${DEPTSLM_ADAPTER_REGISTRY_CODE_REVISION:?Set the exact lowercase 40-character code revision}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/adapters/imports"
+        target: /runtime/deptslm/adapters/imports
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/training_datasets"
+        target: /runtime/deptslm/training_datasets
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/adapters/registry"
+        target: /runtime/deptslm/adapters/registry
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/adapters/.staging/registry"
+        target: /runtime/deptslm/adapters/.staging/registry
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 networks:
   rag-internal:
     internal: true

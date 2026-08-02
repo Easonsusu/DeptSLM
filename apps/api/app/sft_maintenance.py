@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.auth import AuthenticatedPrincipal
 from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.models import (
+    AdapterUpstreamDependency,
     SftArtifactReconciliationOperation,
     SftArtifactReconciliationOperationItem,
     SftDatasetBuild,
@@ -334,6 +335,13 @@ def _register_or_resume_purge(
                     SftDatasetBuild.status == "succeeded",
                     SftDatasetBuild.review_status.in_(("rejected", "archived")),
                     SftDatasetBuild.reviewed_at <= cutoff,
+                    ~select(AdapterUpstreamDependency.id)
+                    .where(
+                        AdapterUpstreamDependency.department_id == department_id,
+                        AdapterUpstreamDependency.dataset_build_id == SftDatasetBuild.id,
+                        AdapterUpstreamDependency.status == "active",
+                    )
+                    .exists(),
                 )
                 .order_by(SftDatasetBuild.reviewed_at, SftDatasetBuild.id)
                 .with_for_update(skip_locked=True)
@@ -350,6 +358,20 @@ def _register_or_resume_purge(
                         SftDatasetBuild.department_id == department_id,
                         SftDatasetBuild.source_bundle_id == SftSourceBundle.id,
                         SftDatasetBuild.review_status != "purged",
+                    )
+                    .exists(),
+                    ~select(AdapterUpstreamDependency.id)
+                    .join(
+                        SftDatasetBuild,
+                        (SftDatasetBuild.id == AdapterUpstreamDependency.dataset_build_id)
+                        & (
+                            SftDatasetBuild.department_id == AdapterUpstreamDependency.department_id
+                        ),
+                    )
+                    .where(
+                        AdapterUpstreamDependency.department_id == department_id,
+                        AdapterUpstreamDependency.status == "active",
+                        SftDatasetBuild.source_bundle_id == SftSourceBundle.id,
                     )
                     .exists(),
                 )
@@ -706,6 +728,8 @@ def _finalize_purge_resource(
     now,
 ) -> bool:
     if item.resource_type == "dataset_final":
+        if _has_active_dataset_dependency(session, department_id, item.resource_id):
+            return False
         build = session.execute(
             select(SftDatasetBuild)
             .where(
@@ -724,6 +748,8 @@ def _finalize_purge_resource(
         build.version += 1
         return True
     if item.resource_type == "source_final":
+        if _has_active_source_dependency(session, department_id, item.resource_id):
+            return False
         source = session.execute(
             select(SftSourceBundle)
             .where(
@@ -740,6 +766,40 @@ def _finalize_purge_resource(
         source.version += 1
         return True
     return False
+
+
+def _has_active_dataset_dependency(
+    session: Session, department_id: UUID, dataset_build_id: UUID
+) -> bool:
+    return bool(
+        session.scalar(
+            select(func.count(AdapterUpstreamDependency.id)).where(
+                AdapterUpstreamDependency.department_id == department_id,
+                AdapterUpstreamDependency.dataset_build_id == dataset_build_id,
+                AdapterUpstreamDependency.status == "active",
+            )
+        )
+    )
+
+
+def _has_active_source_dependency(
+    session: Session, department_id: UUID, source_bundle_id: UUID
+) -> bool:
+    return bool(
+        session.scalar(
+            select(func.count(AdapterUpstreamDependency.id))
+            .join(
+                SftDatasetBuild,
+                (SftDatasetBuild.id == AdapterUpstreamDependency.dataset_build_id)
+                & (SftDatasetBuild.department_id == AdapterUpstreamDependency.department_id),
+            )
+            .where(
+                AdapterUpstreamDependency.department_id == department_id,
+                AdapterUpstreamDependency.status == "active",
+                SftDatasetBuild.source_bundle_id == source_bundle_id,
+            )
+        )
+    )
 
 
 def _finalize_reconciliation_resource(

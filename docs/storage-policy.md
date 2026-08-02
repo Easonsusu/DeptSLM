@@ -171,22 +171,23 @@ adapters/
 └── .deleting/registry/<department UUID>/<adapter UUID>/<purge UUID>/
 ```
 
-The final allowlist is exactly `manifest.json`, `adapter_config.json`, and
+Phase 12.1C now creates the private registry surface through its isolated
+worker. The final allowlist is exactly `manifest.json`, `adapter_config.json`, and
 `adapter_model.safetensors`. No pickle, `.bin`, `.pt`, `.pth`, GGUF, base-model
 weights, tokenizer, optimizer, scheduler, trainer state, checkpoint, log,
 script, arbitrary README, cache, temporary file, symlink, hard link, or unknown
 entry is permitted. Components derive only from `DEPTSLM_DATA_DIR`; the
-`adapters` root must preexist. Future implementation requires UUID-only
+`adapters` root must preexist. The implemented Phase 12.1C worker requires UUID-only
 server-owned paths, real private `0700` directories, private `0600` files,
 current service UID, exclusive creation, no overwrite, same-filesystem atomic
 publication, file and directory fsync, post-rename rehash, and retained
 descriptor identity through the final PostgreSQL commit. Final file and
 directory mtime/ctime nanoseconds are part of that retained authority.
 Descriptor-relative no-follow operations must reject path replacement and links;
-an unexpected private stage marker fails closed before rename even though the
-marker is not an ownership authority.
+an incomplete marker is not ownership authority; exact PostgreSQL metadata and
+the private UUID stage path are the cleanup boundary.
 
-The planned source-intake allowlist is exactly `intake_manifest.json`,
+The source-intake allowlist is exactly `intake_manifest.json`,
 `adapter_config.json`, and `adapter_model.safetensors`. An administrator CLI
 streams only the two externally supplied payload files into a private UUID-
 derived `.staging/imports/<department>/<source bundle>/<import attempt>/`
@@ -197,7 +198,7 @@ positive sizes, intake contract version, and code revision. Original host paths,
 filenames, bytes, tensor values, arbitrary operator text, external manifests,
 and credentials never enter PostgreSQL, APIs, audits, or logs. An external
 manifest, README, archive, directory tree, or unknown entry is rejected. The
-committed import bundle is immutable and read-only to the future worker. No
+committed import bundle is immutable and read-only to the registry worker. No
 user-supplied host path is reopened from PostgreSQL metadata. Publication
 requires an exact marker, retained descriptors, complete allowlist verification,
 same-filesystem no-replace rename, parent fsync, post-rename rehash,
@@ -205,27 +206,27 @@ entry-to-descriptor binding, file/directory mtime/ctime capture, and a final
 PostgreSQL authority commit that repeats those checks without hashing.
 
 Phase 12.1B creates only the private `adapters/imports` and
-`.staging/imports` source-intake surfaces through the administrator CLI. It
-requires the pre-existing `adapters` root and uses no registry or `.deleting`
-surface. The CLI is dry-run by default, accepts exactly the two external files,
-and streams them through retained descriptors; it never reopens a persisted
-host path. The API and browser have no adapter storage mount and no weight
-upload route. Future registry workers may mount imports read-only, but that
-worker is not part of Phase 12.1B.
+`.staging/imports` source-intake surfaces through the administrator CLI. Phase
+12.1C additionally mounts imports and Phase 11 bundles read-only and registry
+staging/final paths read-write for its isolated worker. The CLI is dry-run by
+default, accepts exactly the two external files, and streams them through
+retained descriptors; it never reopens a persisted host path. The API and
+browser have no adapter storage mount and no weight-upload route.
 
-Phase 12.0 does not change setup scripts, Compose, mounts, dependencies, or
-runtime directories. There is no fallback to the checkout, current directory,
+Phase 12.1C updates setup and Compose only to create and mount the private
+registry worker surfaces. There is no fallback to the checkout, current directory,
 `/tmp`, home, cache, logs, exports, or `model_cache`. Host paths, adapter bytes,
 configuration bytes, tensor values, and sensitive content never enter
 PostgreSQL, APIs, audits, or logs. PostgreSQL and external storage are
 non-atomic; a database commit does not prove external publication or deletion.
 
-Phase 12.1B implements only import-source state, separate from adapter state:
-`staging`, `committed`, `rejected`, and `abandoned`. The schema reserves
-`claimed`, `consumed`, `purge_pending`, and `purged` for later reviewed
-subphases; no Phase 12.1B transition implies registry publication. Failed
-attempts and future retries remain bound to their exact source. An import source
-is never runtime, evaluation, promotion, or rollback authority.
+Phase 12.1B implements import-source state, separate from adapter state. Phase
+12.1C adds `claimed` and `consumed` source transitions, `adapters`, registry
+attempts, and an active upstream retention dependency. The registry worker
+records declared external training association and verified governance and
+artifact compatibility, but `training_provenance_verified` remains false. Failed
+attempts remain bound to their exact source; the source and registry are never
+runtime, evaluation, promotion, or rollback authority.
 
 Future purge has separate source and registry operations. A rollback-retention
 reference may be removed through a reviewed pre-purge mutation; upstream Phase
@@ -253,7 +254,8 @@ use, trusted training execution, or certified adapter provenance. Phase 12.1A
 now fixes the model-free static schema: PEFT `0.18.1`, Transformers `4.55.0`,
 safetensors format `0.7.0`, the closed configuration/tensor grammar, and
 `1,048,576`-byte header and `44,040,192`-byte file bounds. It loads no model or
-tokenizer and does not implement intake or storage.
+tokenizer and does not implement evaluation, approval, promotion, runtime
+loading, reconciliation, or purge.
 
 A non-purged adapter record creates retention dependencies on the exact Phase 10
 dataset artifact and Phase 11 authoritative job bundle. Upstream Phase 10 and

@@ -2,7 +2,7 @@
 
 ## Status and boundaries
 
-Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 completed the internal department-scoped evaluation runner; Phase 10 completed the metadata-only builder for human-authored supervised fine-tuning dataset artifacts; Phase 11 completed the isolated LlamaFactory job-bundle generator that never executes training. Phase 12.0 is completed and Phase 12.1 is under review. Phase 12.1A adds only a pure standard-library static adapter compatibility contract; adapter intake, registry, and runtime routing remain unimplemented. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or the private runtime. Public vector search, conversations, streaming, reranking, training, and adapter loading remain unimplemented.
+Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 completed the internal department-scoped evaluation runner; Phase 10 completed the metadata-only builder for human-authored supervised fine-tuning dataset artifacts; Phase 11 completed the isolated LlamaFactory job-bundle generator that never executes training. Phase 12.0 is completed and Phase 12.1 is under review. Phase 12.1A and Phase 12.1B are completed; Phase 12.1C adds a private leased worker for department-scoped immutable registry publication. Runtime routing remains unimplemented. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or the private runtime. Public vector search, conversations, streaming, reranking, training, and adapter loading remain unimplemented.
 
 Phase 9 publication is deliberately non-atomic across PostgreSQL and external storage. A server-generated publication UUID and exact positive run attempt number bind each staged and final result manifest to the department, suite, run, and code revision. Result staging and publication run in killable leased children; PostgreSQL writes the succeeded state only after descriptor-relative no-follow final-artifact verification. Reclaim and the administrator-only `reconcile-artifacts` command delete only an exact manifest-proven, non-succeeded attempt. Reconciliation records a durable content-free batch before filesystem mutation and terminalizes the owned run or suite metadata with one batch audit, so a later authorized invocation can resume a crash window. They never delete unknown, mismatched, succeeded, or committed artifacts. A crash after an external rename can therefore leave an untrusted orphan, but never an authoritative result.
 
@@ -39,7 +39,7 @@ flowchart TB
         ExternalAdapter["Untrusted adapter files"]
     end
 
-    subgraph AdapterBoundary["Phase 12 adapter governance (planned; not implemented)"]
+    subgraph AdapterBoundary["Phase 12 adapter governance (under review)"]
         SourceImport["Administrator source import"]
         ImportBundle["Immutable external adapter source bundle"]
         Intake["Isolated adapter intake and validation"]
@@ -105,13 +105,13 @@ Phase 11 consumes exactly one succeeded, approved, unpurged Phase 10 dataset in 
 
 The worker receives only PostgreSQL and `training_datasets`; it has no model, tokenizer, LlamaFactory package, Hugging Face token, Qdrant, RAG runtime, upload, extraction, evaluation, adapter, or cloud configuration. It never runs the generated configuration. Stale cleanup, authority loading, descriptor hashing, stage preparation, child execution, publication steps, and final source reauthorization retain independent parent lease checkpoints. The parent renews a fresh lease guard before, never inside, the final locked transaction; that transaction uses PostgreSQL server time for the final ownership check. Purge uses a durable review-fencing reservation binding the exact succeeded attempt, content-free manifest, and UUID tombstone namespace. Stages must complete before final-deletion authorization; the verified final moves without replacement to private tombstone storage, then a separate committed `tombstone_bound` state records exact parent, directory, and fixed-file identities before cleanup. Retries reject any replacement or unbound partial tombstone; only a durably in-flight exact unlink may be absent. A purge operation records per-job progress and emits at most one success audit after its active reservations close. A pre-move ownership failure leaves the final intact; a post-move cleanup failure leaves the reservation active. PostgreSQL and external storage remain non-atomic: an artifact without committed succeeded PostgreSQL authority is not eligible for review or future adapter use.
 
-## Phase 12 adapter registry boundary (under review; static contract only)
+## Phase 12 adapter registry boundary (under review)
 
-Phase 12.0 defines a future external adapter intake and immutable,
-department-scoped registry. Phase 12.1A adds only the source-controlled,
-model-free static compatibility contract in `app.adapter_contract`; it does not
-add a database model, migration, API route, worker, service, mount, dependency,
-adapter file, or runtime loading.
+Phase 12.0 defines the external adapter threat model. Phase 12.1A adds the
+source-controlled, model-free static compatibility contract in
+`app.adapter_contract`; Phase 12.1B adds immutable source intake; and Phase
+12.1C adds the department-scoped registry publication worker. No public API,
+frontend, adapter loading, or runtime routing is added.
 The proposed final artifact allowlist is exactly `manifest.json`,
 `adapter_config.json`, and `adapter_model.safetensors`; adapters are untrusted
 until their exact safetensors, closed configuration, same-department Phase 10
@@ -128,7 +128,7 @@ request snapshot, reject cross-department or base-revision mismatches, return a
 safe failure when a required adapter cannot load, and never silently fall back
 to the base model. Rollback-to-base must be explicit.
 
-The proposed registry, import-source, `.staging`, and `.deleting` surfaces live
+The registry, import-source, and `.staging` surfaces live
 only beneath `DEPTSLM_DATA_DIR/adapters`, use private UUID-derived paths and
 descriptor-relative no-follow verification, and remain outside Git. Import
 sources have separate `staging`, `committed`, `claimed`, `consumed`, `rejected`,
@@ -143,21 +143,18 @@ delete Phase 10 datasets, Phase 11 job bundles, backups, or audit history. See
 The static contract fixes the Qwen3-0.6B/PEFT/safetensors compatibility metadata
 and bounded header validation without loading a model, tokenizer, adapter, or
 tensor payload. It records no training provenance and does not make an external
-artifact trusted. The diagram separates an untrusted external training environment from the
-DeptSLM application. It may consume an administratively exported Phase 11 job
-bundle outside the Phase 12 implementation and produce untrusted adapter
-files. Phase 12 records only a verified governance lineage, a declared external
-training association, and verified artifact compatibility; it cannot prove exact
-bundle or dataset use, declared LlamaFactory execution, declared training steps,
-or unmodified weight production. Operator attestations remain untrusted, and
-stronger provenance would require a separately reviewed trusted-execution,
-signing, or remote-attestation design.
-The planned administrator source import creates a private immutable import
-bundle before the isolated intake/validation boundary. The final registry,
-evaluation evidence, review/approval, department deployment pointer, and
-fail-closed runtime loading are separate planned boundaries. Phase 11's actual
-worker remains separate and generates a job bundle only; it does not launch
-LlamaFactory.
+artifact trusted. The diagram separates an untrusted external training
+environment from the DeptSLM application. The Phase 12.1C worker consumes one
+exact approved Phase 11 bundle and captured Phase 10 authority, then produces
+untrusted immutable registry files. Phase 12 records only a verified governance
+lineage, a declared external training association, and verified artifact
+compatibility; it cannot prove exact bundle or dataset use, declared
+LlamaFactory execution, declared training steps, or unmodified weight
+production. Operator attestations remain untrusted, and stronger provenance
+would require a separately reviewed trusted-execution, signing, or
+remote-attestation design. Evaluation evidence, review/approval, department
+deployment, fail-closed runtime loading, reconciliation, and purge remain
+separate future boundaries.
 
 ### FastAPI backend
 
@@ -233,9 +230,9 @@ Phase 5 adds explicit failed-attempt retry, exact expired-claim staging recovery
 The import source is not runtime, evaluation, promotion, or rollback authority.
 The registry becomes adapter authority only after a successful PostgreSQL
 publication commit. Phase 12.1A validates adapter metadata with the reviewed
-static schema without loading a model or tokenizer; intake, publication,
-evaluation, approval, promotion, rollback, reconciliation, and purge remain
-future reviewed phases.
+static schema without loading a model or tokenizer; Phase 12.1C publishes only
+the exact content-free registry bundle. Evaluation, approval, promotion,
+rollback, reconciliation, and purge remain future reviewed phases.
 
 The exact training scheduler, GPU execution environment, registry schema, and approval workflow are future decisions.
 
@@ -265,5 +262,6 @@ PostgreSQL claims, Qdrant retrieval, Phase 5 artifacts, result publication, and 
 - Production extraction sandbox, malware controls, and additional reviewed formats
 - Hybrid retrieval, reranking, and relevance thresholds beyond the Phase 5 character chunker
 - Production retention, physical purge, reconciliation, and tamper-resistant audit requirements
-- Phase 12.1B through 12.4 adapter intake, registry, evaluation, and runtime deployment
+- Phase 12.1D through 12.4 adapter reconciliation, evaluation, registry
+  lifecycle, and runtime deployment
 - Production topology, secrets, observability, backup, and disaster recovery

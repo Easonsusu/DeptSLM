@@ -2,7 +2,7 @@
 
 ## Document status
 
-This document describes the product direction and separates completed Phase 0–11 boundaries from the planned scope. Phase 12.0 is completed and Phase 12.1 is under review; Phase 12.1A adds only a model-free static adapter compatibility contract, while intake, registry, evaluation, promotion, runtime loading, and Phases 12.1B through 12.4 are not implemented. Unless a capability is explicitly labeled as completed, it is not implemented.
+This document describes the product direction and separates completed Phase 0–11 boundaries from the planned scope. Phase 12.0 is completed and Phase 12.1 is under review; Phase 12.1A and Phase 12.1B are completed, while Phase 12.1C adds only an internal administrator-enqueued immutable registry publication worker. Evaluation, promotion, runtime loading, and Phases 12.1D through 12.4 remain unimplemented. Unless a capability is explicitly labeled as completed, it is not implemented.
 
 ## Product summary
 
@@ -67,23 +67,24 @@ Students may become an end-user group in a future deployment, but only after a d
 
 - Build reviewed department-specific training datasets.
 - Phase 11 generates immutable LoRA or QLoRA LlamaFactory job bundles; it does not execute training or create adapters.
-- A future Phase 12 intake may store externally produced adapters outside the repository and record a department-scoped, verified governance association to one exact Phase 10 dataset and Phase 11 job, the reviewed base-model contract, closed configuration, and evaluation evidence.
+- Phase 12.1B stores externally produced adapters outside the repository, and Phase 12.1C records a department-scoped, verified governance association to one exact Phase 10 dataset and Phase 11 job plus the reviewed base-model and closed artifact contracts. Evaluation evidence, approval, promotion, and runtime loading remain future work.
 - Evaluation and explicit review approval are required before promotion or runtime use. Adaptation remains optional and must demonstrate value beyond the approved base/RAG behavior.
 
 ### Phase 12 governance boundary
 
 Phase 12.0 defines the external adapter threat model, immutable artifact and
 governance-lineage contracts, metadata-only registry, evaluation evidence,
-review, promotion, rollback, and eventual fail-closed runtime routing. It does
-not add an adapter registry, API, migration, worker, model loading, or runtime
-routing.
+review, promotion, rollback, and eventual fail-closed runtime routing. Phase
+12.1C adds only the internal migration and administrator-enqueued worker for
+immutable registry publication; it adds no public adapter route, model loading,
+or runtime routing.
 An imported adapter is not approved, an approved adapter is not promoted, and
 promotion is not proof of safety or quality. Cross-department fallback and
 silent fallback to the base model are prohibited; rollback-to-base must be
 explicit. See [adapter-registry.md](adapter-registry.md).
 
-The planned first intake is an administrator-controlled CLI, not a browser or
-public weight-upload route. It streams only the two payload files into a
+The first intake is an administrator-controlled CLI, not a browser or public
+weight-upload route. It streams only the two payload files into a
 server-ID-derived immutable source bundle; DeptSLM generates a closed,
 content-free intake manifest and never trusts an external manifest or host path.
 Source state is separate from adapter state, and one committed source may be

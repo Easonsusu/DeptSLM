@@ -1,4 +1,4 @@
-# Database Model Through Phase 12.1B
+# Database Model Through Phase 12.1C
 
 DeptSLM uses PostgreSQL 16, SQLAlchemy 2, psycopg 3, and Alembic. Revision `0006_phase8_rag_feedback` follows `0005_phase7_rag_answers`. Alembic is the only schema-creation mechanism; runtime never calls `metadata.create_all`.
 
@@ -24,6 +24,12 @@ erDiagram
     RAG_ANSWER_FEEDBACK ||--o{ RAG_ANSWER_FEEDBACK_REASONS : classifies
     RAG_ANSWER_FEEDBACK ||--o{ RAG_ANSWER_FEEDBACK_SOURCE_TARGETS : targets
     RAG_ANSWER_CITATIONS ||--o{ RAG_ANSWER_FEEDBACK_SOURCE_TARGETS : references
+    DEPARTMENTS ||--o{ ADAPTERS : owns
+    ADAPTER_IMPORT_SOURCES ||--o{ ADAPTERS : supplies
+    TRAINING_JOBS ||--o{ ADAPTERS : governs
+    SFT_DATASET_BUILDS ||--o{ ADAPTERS : governs
+    ADAPTERS ||--o{ ADAPTER_REGISTRY_ATTEMPTS : attempts
+    ADAPTERS ||--o{ ADAPTER_UPSTREAM_DEPENDENCIES : retains
 ```
 
 - `user_identities`: UUID identity keyed uniquely by the exact opaque `(issuer, subject)`. Subjects are not lowercased or interpreted as email addresses. Status is `active`, `suspended`, or `revoked`.
@@ -56,6 +62,29 @@ codes only. They contain no adapter bytes, configuration JSON, tensor names or
 values, host paths, filenames, manifests supplied by an operator, credentials,
 or training provenance. PostgreSQL and external storage publication are not
 atomic; later reconciliation and purge phases are not implemented here.
+
+## Phase 12.1C adapter registry metadata
+
+Revision `0011_phase12_adapter_registry` adds the `adapters`,
+`adapter_registry_attempts`, and `adapter_upstream_dependencies` tables and
+adds source claim/consumption fields plus the exact claimed-adapter foreign
+key. Composite department foreign keys are restrictive; no database cascade
+can cross a tenant boundary or delete upstream artifacts. A queued adapter
+captures the complete content-free source, succeeded Phase 11, and Phase 10
+authority snapshots, including immutable publication IDs, versions, code
+revisions, contract versions, digests, sizes,
+counts, and governance booleans.
+
+The registry lifecycle is `queued` → `running` → `validated` (or a fixed
+failure state), while each publication attempt records staged, published,
+succeeded, failed, validation-failed, or reclaimed metadata. `active` upstream
+dependencies fence the exact Phase 11 job and Phase 10 dataset from purge until
+a later reviewed lifecycle releases them. The registry stores only UUIDs,
+states, contracts, aggregate tensor metadata, positive sizes, SHA-256 values,
+timestamps, and safe error codes; it stores no adapter bytes, tensor values,
+dataset records, prompts, model output, paths, credentials, or runtime settings.
+The worker's final success audit and source `consumed` transition occur in one
+short PostgreSQL transaction after descriptor-bound final artifact verification.
 - `documents`: department-owned source metadata with an internal uploader relation, normalized filename, canonical media type, positive size, SHA-256 digest, lifecycle state, version, and timestamps. It stores no body or path, and public document schemas do not expose internal identity IDs; see [document-model.md](document-model.md).
 - `document_extractions`: immutable attempt history and PostgreSQL queue state, including source/pipeline identity, claim lease, safe result metadata, and an allowlisted error code. It stores no content, path, filename, stderr, or exception.
 - `document_chunks`: department/document/extraction-scoped offsets, byte size, internal digest, and mutually exclusive page/line provenance. Chunk text remains external.

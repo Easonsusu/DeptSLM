@@ -90,11 +90,16 @@ runtime_subdirectories=(
   extracted_text
   vector_snapshots
   training_datasets
+  training_datasets/jobs
   adapters
   model_cache
   eval_results
   logs
   exports
+  adapters/imports
+  adapters/registry
+  adapters/.staging/imports
+  adapters/.staging/registry
   service_state/postgres
   service_state/qdrant
 )
@@ -122,7 +127,10 @@ fi
 mkdir -p "${data_dir}"
 for runtime_subdirectory in "${runtime_subdirectories[@]}"; do
   mkdir -p "${data_dir}/${runtime_subdirectory}"
+  chmod 700 "${data_dir}/${runtime_subdirectory}"
 done
+
+chmod 700 "${data_dir}"
 
 # Escape the small set of characters that are significant inside a quoted
 # dotenv or shell value.
