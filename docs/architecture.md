@@ -2,7 +2,7 @@
 
 ## Status and boundaries
 
-Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 completed the internal department-scoped evaluation runner; Phase 10 completed the metadata-only builder for human-authored supervised fine-tuning dataset artifacts; Phase 11 completed the isolated LlamaFactory job-bundle generator that never executes training. Phase 12.0 is completed and Phase 12.1 is under review. Phase 12.1A and Phase 12.1B are completed; Phase 12.1C adds a private leased worker for department-scoped immutable registry publication. Runtime routing remains unimplemented. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or the private runtime. Public vector search, conversations, streaming, reranking, training, and adapter loading remain unimplemented.
+Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 completed the internal department-scoped evaluation runner; Phase 10 completed the metadata-only builder for human-authored supervised fine-tuning dataset artifacts; Phase 11 completed the isolated LlamaFactory job-bundle generator that never executes training. Phase 12.0 is completed and Phase 12.1 is under review. Phase 12.1A, Phase 12.1B, and Phase 12.1C are completed; Phase 12.1D adds only PostgreSQL-backed, metadata-only department-scoped adapter list/detail reads with closed projections. Runtime routing remains unimplemented. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or the private runtime. Public vector search, conversations, streaming, reranking, training, and adapter loading remain unimplemented.
 
 Phase 9 publication is deliberately non-atomic across PostgreSQL and external storage. A server-generated publication UUID and exact positive run attempt number bind each staged and final result manifest to the department, suite, run, and code revision. Result staging and publication run in killable leased children; PostgreSQL writes the succeeded state only after descriptor-relative no-follow final-artifact verification. Reclaim and the administrator-only `reconcile-artifacts` command delete only an exact manifest-proven, non-succeeded attempt. Reconciliation records a durable content-free batch before filesystem mutation and terminalizes the owned run or suite metadata with one batch audit, so a later authorized invocation can resume a crash window. They never delete unknown, mismatched, succeeded, or committed artifacts. A crash after an external rename can therefore leave an untrusted orphan, but never an authoritative result.
 
@@ -109,9 +109,11 @@ The worker receives only PostgreSQL and `training_datasets`; it has no model, to
 
 Phase 12.0 defines the external adapter threat model. Phase 12.1A adds the
 source-controlled, model-free static compatibility contract in
-`app.adapter_contract`; Phase 12.1B adds immutable source intake; and Phase
-12.1C adds the department-scoped registry publication worker. No public API,
-frontend, adapter loading, or runtime routing is added.
+`app.adapter_contract`; Phase 12.1B adds immutable source intake; Phase 12.1C
+adds the department-scoped registry publication worker; and Phase 12.1D adds
+only two PostgreSQL-backed metadata list/detail reads. The read API has no
+adapter storage mount, never opens registry artifacts, and has no mutation,
+frontend, adapter loading, or runtime routing surface.
 The proposed final artifact allowlist is exactly `manifest.json`,
 `adapter_config.json`, and `adapter_model.safetensors`; adapters are untrusted
 until their exact safetensors, closed configuration, same-department Phase 10
@@ -154,7 +156,10 @@ production. Operator attestations remain untrusted, and stronger provenance
 would require a separately reviewed trusted-execution, signing, or
 remote-attestation design. Evaluation evidence, review/approval, department
 deployment, fail-closed runtime loading, reconciliation, and purge remain
-separate future boundaries.
+separate future boundaries. Phase 12.1D returns only the closed PostgreSQL
+projection documented in
+[adapter-registry-metadata.md](adapter-registry-metadata.md); it does not alter
+those storage or trust boundaries.
 
 ### FastAPI backend
 
@@ -274,6 +279,6 @@ PostgreSQL claims, Qdrant retrieval, Phase 5 artifacts, result publication, and 
 - Production extraction sandbox, malware controls, and additional reviewed formats
 - Hybrid retrieval, reranking, and relevance thresholds beyond the Phase 5 character chunker
 - Production retention, physical purge, reconciliation, and tamper-resistant audit requirements
-- Phase 12.1D through 12.4 adapter reconciliation, evaluation, registry
+- Phase 12.1E through 12.4 adapter reconciliation, evaluation, registry
   lifecycle, and runtime deployment
 - Production topology, secrets, observability, backup, and disaster recovery

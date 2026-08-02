@@ -7,8 +7,9 @@ is under review; this document and `apps/api/app/adapter_contract.py` implement
 Phase 12.1A, the model-free static compatibility contract. Phase 12.1B now
 uses this contract from its isolated source-validation child, and Phase 12.1C
 reuses the same model-free checks in its registry publication child; this
-document does not describe storage or import authority. Phase 12.1D through
-12.1E, Phases 12.2 through 12.4, and Phase 13 are not started.
+document does not describe storage or import authority. Phase 12.1D adds only a
+separate PostgreSQL metadata-read boundary; Phase 12.1E, Phases 12.2 through
+12.4, and Phase 13 are not started.
 
 The static-contract implementation itself adds no intake command, database model,
 migration, API route, queue, worker, registry, storage directory,

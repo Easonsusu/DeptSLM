@@ -2,7 +2,7 @@
 
 ## Document status
 
-This document describes the product direction and separates completed Phase 0–11 boundaries from the planned scope. Phase 12.0 is completed and Phase 12.1 is under review; Phase 12.1A and Phase 12.1B are completed, while Phase 12.1C adds only an internal administrator-enqueued immutable registry publication worker. Evaluation, promotion, runtime loading, and Phases 12.1D through 12.4 remain unimplemented. Unless a capability is explicitly labeled as completed, it is not implemented.
+This document describes the product direction and separates completed Phase 0–11 boundaries from the planned scope. Phase 12.0 is completed and Phase 12.1 is under review; Phase 12.1A, Phase 12.1B, and Phase 12.1C are completed, while Phase 12.1D adds only department-scoped, metadata-only PostgreSQL registry list/detail reads. Evaluation, promotion, runtime loading, and Phases 12.1E through 12.4 remain unimplemented. Unless a capability is explicitly labeled as completed, it is not implemented.
 
 ## Product summary
 
@@ -76,8 +76,8 @@ Phase 12.0 defines the external adapter threat model, immutable artifact and
 governance-lineage contracts, metadata-only registry, evaluation evidence,
 review, promotion, rollback, and eventual fail-closed runtime routing. Phase
 12.1C adds only the internal migration and administrator-enqueued worker for
-immutable registry publication; it adds no public adapter route, model loading,
-or runtime routing.
+immutable registry publication. Phase 12.1D adds only the two department-scoped
+metadata GETs; it adds no artifact mutation, model loading, or runtime routing.
 An imported adapter is not approved, an approved adapter is not promoted, and
 promotion is not proof of safety or quality. Cross-department fallback and
 silent fallback to the base model are prohibited; rollback-to-base must be

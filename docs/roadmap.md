@@ -74,14 +74,19 @@ This roadmap separates foundational safety work from product implementation. A l
   only content-free source/attempt authority metadata. It creates no registry
   record, Phase 11 binding, evaluation, approval, promotion, runtime loading,
   reconciliation, or purge.
-- Phase 12.1C (implemented in this review; under review): binds one exact
+- Phase 12.1C (completed): binds one exact
   same-department committed Phase 12.1B source to one approved succeeded
   Phase 11 job and its captured Phase 10 authority, then publishes an
   immutable, content-free registry bundle through a leased, descriptor-bound
   worker. It preserves declared external training association while leaving
   training provenance unverified. It does not evaluate, approve, promote,
   load, route, reconcile, purge, or execute training.
-- Phase 12.1D–12.1E (not started): registry reconciliation, purge, and later
+- Phase 12.1D (under review in this branch): adds only department-scoped,
+  metadata-only registry list/detail reads backed by PostgreSQL authority.
+  The closed projection exposes lineage, contract, verification, lifecycle,
+  and retention metadata; it exposes no artifact bytes, paths, hashes, tensor
+  data, identities, or runtime settings, and it performs no mutation or audit.
+- Phase 12.1E (not started): registry reconciliation, purge, and later
   lifecycle hardening remain future reviewed work.
 - Phase 12.2 (not started): adapter-target evaluation, baseline/candidate evidence, and fixed numeric quality and safety gates; no automatic promotion.
 - Phase 12.3 (not started): review, approval, promotion, supersession, rollback, and deployment event history; no silent fallback.

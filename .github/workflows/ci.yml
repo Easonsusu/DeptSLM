@@ -515,7 +515,7 @@ jobs:
       - name: Check Phase 12.1C adapter registry isolation
         run: |
           ! grep -R -E '^(from|import) (torch|transformers|sentence_transformers|huggingface_hub|qdrant|app\.evaluation|app\.rag_feedback)' apps/api/app/adapter_registry_*.py
-          ! grep -E '@router\.(get|post).*adapter|/adapter' apps/api/app/routes.py
+          ! grep -n -A6 -E '@router\.(post|put|patch|delete)' apps/api/app/routes.py | grep -E '/departments/\{department_id\}/adapters'
           registry_compose="$(sed -n '/^  adapter-registry-worker:/,/^  [a-z][a-z-]*:/p' docker-compose.yml)"
           grep -F '/adapters/imports' <<<"$registry_compose" >/dev/null
           grep -F '/training_datasets' <<<"$registry_compose" >/dev/null
@@ -524,6 +524,15 @@ jobs:
           ! grep -E 'uploads|extracted_text|eval_results|model_cache|vector_snapshots|exports|rag-internal|DEPTSLM_QDRANT|DEPTSLM_RAG|DEPTSLM_AUTH|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|PROXY' <<<"$registry_compose"
           grep -F 'AdapterRegistryArtifactStore' apps/api/app/adapter_registry_queue.py >/dev/null
           grep -F 'training_provenance_verified = False' apps/api/app/adapter_registry_queue.py >/dev/null
+      - name: Check Phase 12.1D metadata-read isolation
+        run: |
+          grep -F 'from app.adapter_registry_read_services import list_adapters, read_adapter' apps/api/app/routes.py >/dev/null
+          ! grep -E '^(from|import) (adapter_registry_artifacts|adapter_source_artifacts|torch|transformers|sentence_transformers|huggingface_hub|qdrant|safetensors|peft|llamafactory)' apps/api/app/adapter_registry_read_services.py
+          api_compose="$(sed -n '/^  api:/,/^  postgres:/p' docker-compose.yml)"
+          ! grep -E '/adapters|adapters/' <<<"$api_compose"
+          ! grep -E '@router\.(post|put|patch|delete)' apps/api/app/routes.py | grep -E '/departments/\{department_id\}/adapters'
+          grep -F 'AdapterMetadataListResponse' apps/api/app/routes.py >/dev/null
+          grep -F 'AdapterMetadataResponse' apps/api/app/routes.py >/dev/null
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then

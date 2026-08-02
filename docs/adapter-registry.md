@@ -2,7 +2,8 @@
 
 This document is the reviewed Phase 12 governance boundary. It describes the
 completed contract work, the reviewed Phase 12.1B source-intake implementation,
-and the reviewed Phase 12.1C immutable registry-publication implementation.
+the completed Phase 12.1C immutable registry-publication implementation, and
+the Phase 12.1D metadata-only registry read boundary under review.
 It also records future metadata, evaluation, review, deployment, and runtime contracts. The
 separate Phase 12.1A static compatibility contract is documented in
 [adapter-static-contract.md](adapter-static-contract.md).
@@ -13,20 +14,23 @@ separate Phase 12.1A static compatibility contract is documented in
   LlamaFactory job bundle; it does not execute training or create an adapter.
 - Phase 12 is under review.
 - Phase 12.0 is completed: it defines contracts and the threat model.
-- Phase 12.1 is under review. Phase 12.1A and Phase 12.1B are completed. Phase
-  12.1C binds one exact committed source to one approved succeeded Phase 11
+- Phase 12.1 is under review. Phase 12.1A, Phase 12.1B, and Phase 12.1C are
+  completed. Phase 12.1C binds one exact committed source to one approved succeeded Phase 11
   job and captured Phase 10 authority, then publishes an immutable private
   registry bundle through a leased descriptor-bound worker. It records only
   content-free authority and never evaluates, approves, promotes, loads,
   routes, reconciles, or purges an adapter.
-- Phase 12.1D through 12.1E and Phase 12.2, 12.3, and 12.4 remain
-  unimplemented.
+- Phase 12.1D is under review in this branch and adds only department-scoped
+  PostgreSQL metadata list/detail reads through closed projections. It performs
+  no mutation, artifact access, or audit. Phase 12.1E and Phase 12.2, 12.3,
+  and 12.4 remain unimplemented.
 - Phase 13 has not started.
 
-No statement in this document is a claim that public adapter metadata routes,
-adapter evaluation, deployment pointers, runtime loading, or rollback exist
-today. The Phase 12.1C internal worker does publish immutable registry files
-and content-free PostgreSQL authority only.
+The Phase 12.1D read routes are the only public adapter metadata surface today:
+they return a closed PostgreSQL projection and never access registry files.
+There is still no adapter upload/download, evaluation, deployment pointer,
+runtime loading, or rollback route. The Phase 12.1C internal worker publishes
+immutable registry files and content-free PostgreSQL authority only.
 
 ## Phase 12 objective
 
@@ -74,7 +78,7 @@ the artifact is safe, compatible, or useful.
   adapter registry row, Phase 11 binding, evaluation, review, approval,
   promotion, runtime loading, reconciliation, or purge is included.
 
-#### Phase 12.1C — immutable registry publication (implemented in this review)
+#### Phase 12.1C — immutable registry publication (completed)
 
 - Bind one same-department committed source to one approved succeeded Phase 11
   bundle and the exact Phase 10 authority snapshot captured by that job.
@@ -85,13 +89,32 @@ the artifact is safe, compatible, or useful.
 - Keep declared external training association explicit while leaving training
   provenance unverified. Record source consumption, upstream retention, and a
   transactional success audit only after complete descriptor verification.
-- The worker never loads a model or invokes LlamaFactory, and no public API,
+- The worker never loads a model or invokes LlamaFactory, and no additional public API,
   evaluation, approval, promotion, runtime routing, reconciliation, or purge
   is added.
 
-#### Phase 12.1D through 12.1E (not started)
+#### Phase 12.1D — metadata-only registry reads (under review)
 
-- Add reviewed registry consumption, reconciliation, and purge foundations.
+- `GET /departments/{department_id}/adapters` lists department-scoped adapter
+  metadata with integer `limit` 1–100, non-negative integer `offset`, and
+  deterministic `created_at DESC, id ASC` ordering.
+- `GET /departments/{department_id}/adapters/{adapter_id}` reads one exact
+  department-scoped adapter or returns a safe `404`.
+- Same-department `system_admin`, `department_admin`, and `instructor` roles
+  may read. `student`, `viewer`, inactive memberships, expired memberships,
+  archived departments, and cross-department selectors are denied.
+- Each response is a closed content-free projection of PostgreSQL authority:
+  lineage, fixed contracts, verification booleans, lifecycle timestamps,
+  source/dependency retention state, and optimistic version. It contains no
+  artifact bytes, paths, hashes, tensor names or values, identities, secrets,
+  or runtime settings. Reads append no audit and perform no mutation.
+- The source association and active/released upstream dependency must match the
+  exact adapter and department. Inconsistent or missing authority fails closed
+  without revealing resource details. PostgreSQL is the only read authority.
+
+#### Phase 12.1E (not started)
+
+- Add reviewed registry reconciliation, purge, and later lifecycle hardening.
 - Do not load an adapter at runtime.
 
 ### Phase 12.2 — adapter-target evaluation (not started)
@@ -606,11 +629,11 @@ adapter ID, adapter version, and base revision.
 
 ## Planned metadata-only API boundary
 
-The following endpoint shapes are conceptual and **not implemented in Phase
-12.0**:
+The following endpoint shapes are implemented only where noted and otherwise
+remain conceptual:
 
-- `GET /departments/{department_id}/adapters`
-- `GET /departments/{department_id}/adapters/{adapter_id}`
+- `GET /departments/{department_id}/adapters` (Phase 12.1D metadata only)
+- `GET /departments/{department_id}/adapters/{adapter_id}` (Phase 12.1D metadata only)
 - `POST /departments/{department_id}/adapters/{adapter_id}/evaluations`
 - `PATCH /departments/{department_id}/adapters/{adapter_id}/review`
 - `POST /departments/{department_id}/adapters/{adapter_id}/promote`
@@ -645,7 +668,7 @@ adapters/.deleting/imports/<department_id>/<source_bundle_id>/<purge_operation_i
 adapters/.deleting/registry/<department_id>/<adapter_id>/<purge_operation_id>/
 ```
 
-Future Phase 12.1D through 12.1E must define explicit, bounded administrator
+Future Phase 12.1E must define explicit, bounded administrator
 maintenance for abandoned import staging, committed-but-never-claimed sources,
 rejected sources, consumed sources, crashes between source publication and the
 PostgreSQL commit, and crashes during source deletion. Phase 12.1B and 12.1C do not

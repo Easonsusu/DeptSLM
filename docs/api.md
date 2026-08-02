@@ -2,7 +2,7 @@
 
 ## Status
 
-The Phase 8 API preserves the completed grounded-answer boundary and adds structured feedback submission and review metadata. Phase 11 exposes metadata for completed immutable training-job bundles only; it never executes LlamaFactory or creates adapters. Phase 12 is under review: Phase 12.1C adds an internal administrator-enqueued registry worker, but no public adapter registry route or adapter runtime route. Feedback routes use PostgreSQL only and expose no content or identity IDs. There is no public vector search, query-vector API, conversation history, streaming, reranking, adapter upload/download, or production identity integration.
+The Phase 8 API preserves the completed grounded-answer boundary and adds structured feedback submission and review metadata. Phase 11 exposes metadata for completed immutable training-job bundles only; it never executes LlamaFactory or creates adapters. Phase 12 is under review: Phase 12.1C adds an internal administrator-enqueued registry worker, and Phase 12.1D adds only department-scoped PostgreSQL metadata list/detail GETs. Feedback routes use PostgreSQL only and expose no content or identity IDs. There is no public vector search, query-vector API, conversation history, streaming, reranking, adapter upload/download, or production identity integration.
 
 For the default local configuration, the base URL is:
 
@@ -205,12 +205,17 @@ Retrieved passages are untrusted content. The server must keep them separated fr
 
 Long-running work should return a job resource rather than hold an HTTP request open.
 
-### Phase 12 adapter registry (internal publication; no public API)
+### Phase 12 adapter registry (metadata-only reads)
 
-The following metadata-only routes remain conceptual and are not implemented:
+Phase 12.1D implements only these two department-scoped, PostgreSQL-backed
+metadata reads:
 
 - `GET /departments/{department_id}/adapters`
 - `GET /departments/{department_id}/adapters/{adapter_id}`
+
+They return a closed content-free projection and never access adapter storage.
+The following mutation, artifact, evaluation, and deployment routes remain
+conceptual and are not implemented:
 - `POST /departments/{department_id}/adapters/{adapter_id}/evaluations`
 - `PATCH /departments/{department_id}/adapters/{adapter_id}/review`
 - `POST /departments/{department_id}/adapters/{adapter_id}/promote`
@@ -236,7 +241,7 @@ training association, not proven dataset use or trusted training execution.
 Cross-department fallback is prohibited; runtime loading must eventually fail
 closed and never silently fall back to the base model. Phase 12.1A static
 validation is model-free with fixed package references, closed schema, and
-numeric limits. Phase 12.1C adds no public route.
+numeric limits. Phase 12.1C adds no mutation or artifact route; Phase 12.1D adds only the metadata-only GET routes documented above.
 
 ### Evaluations and exports
 

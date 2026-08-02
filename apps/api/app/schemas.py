@@ -568,3 +568,86 @@ class TrainingJobReviewRequest(BaseModel):
         if value not in {"approve", "reject", "archive"}:
             raise ValueError("action is invalid")
         return value
+
+
+class AdapterLineageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_bundle_id: UUID
+    training_job_id: UUID
+    training_job_version: int
+    training_job_profile_id: str
+    dataset_build_id: UUID
+    dataset_build_version: int
+    base_model_id: str
+    base_model_revision: str
+    base_model_license: str
+    llamafactory_version: str
+
+
+class AdapterContractResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_contract_version: str
+    intake_contract_version: str
+    adapter_config_contract_version: str
+    adapter_tensor_contract_version: str
+    adapter_artifact_contract_version: str
+    registry_manifest_contract_version: str
+    training_job_artifact_contract_version: str
+    training_job_manifest_contract_version: str
+    dataset_artifact_contract_version: str
+    dataset_example_contract_version: str
+    dataset_normalization_version: str
+    dataset_split_version: str
+    peft_version: str
+    safetensors_format: str
+
+
+class AdapterVerificationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    declared_external_training_association: bool
+    verified_governance_lineage: bool
+    verified_artifact_compatibility: bool
+    training_provenance_verified: bool
+
+
+class AdapterRetentionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source_status: str
+    source_consumed_at: datetime | None
+    source_purged_at: datetime | None
+    upstream_dependency_status: str
+    upstream_dependency_created_at: datetime
+    upstream_dependency_released_at: datetime | None
+
+
+class AdapterMetadataResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    department_id: UUID
+    status: str
+    error_code: str | None
+    lineage: AdapterLineageResponse
+    contracts: AdapterContractResponse
+    verification: AdapterVerificationResponse
+    retention: AdapterRetentionResponse
+    queued_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    validated_at: datetime | None
+    purged_at: datetime | None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdapterMetadataListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[AdapterMetadataResponse]
+    limit: int
+    offset: int

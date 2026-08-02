@@ -1,4 +1,4 @@
-# Database Model Through Phase 12.1C
+# Database Model Through Phase 12.1D
 
 DeptSLM uses PostgreSQL 16, SQLAlchemy 2, psycopg 3, and Alembic. Revision `0006_phase8_rag_feedback` follows `0005_phase7_rag_answers`. Alembic is the only schema-creation mechanism; runtime never calls `metadata.create_all`.
 
@@ -95,6 +95,24 @@ LlamaFactory/profile contracts, lowercase hashes, positive file sizes/counts,
 exact tensor aggregates, and the `declared_external_training_association` /
 `training_provenance_verified` distinction. The worker compares an evolving
 version snapshot before each transition and final authority transaction.
+
+## Phase 12.1D metadata-only reads
+
+Phase 12.1D adds no migration and no new table. The two read routes project
+existing `adapters`, `adapter_import_sources`, and
+`adapter_upstream_dependencies` rows through a closed PostgreSQL-only schema.
+The service requires an exact same-department source association and matching
+Phase 11/Phase 10 retention dependency before returning a row. A non-purged
+adapter must retain an active dependency; a purged historical adapter may show
+the released dependency and release timestamp.
+
+Reads authorize `system_admin`, `department_admin`, and `instructor` through
+the normal request-time membership resolver. Students, viewers, inactive or
+expired memberships, archived departments, and cross-department selectors fail
+closed. They do not append audit events, increment versions, inspect external
+registry storage, or expose bytes, paths, hashes, tensor data, identities,
+secrets, or runtime settings. Phase 12.1E reconciliation and purge remain
+unstarted.
 - `documents`: department-owned source metadata with an internal uploader relation, normalized filename, canonical media type, positive size, SHA-256 digest, lifecycle state, version, and timestamps. It stores no body or path, and public document schemas do not expose internal identity IDs; see [document-model.md](document-model.md).
 - `document_extractions`: immutable attempt history and PostgreSQL queue state, including source/pipeline identity, claim lease, safe result metadata, and an allowlisted error code. It stores no content, path, filename, stderr, or exception.
 - `document_chunks`: department/document/extraction-scoped offsets, byte size, internal digest, and mutually exclusive page/line provenance. Chunk text remains external.
