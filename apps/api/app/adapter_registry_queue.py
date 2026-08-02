@@ -1041,7 +1041,7 @@ def _verify_training_bundle_authority(
             or job.attempt_number != claim.training_job_attempt_number
             or job.publication_attempt_id != claim.training_job_publication_attempt_id
             or job.version != claim.training_job_version
-            or job_attempt.execution_scope_id != claim.training_job_execution_scope_id
+            or job.execution_scope_id != claim.training_job_execution_scope_id
             or job_attempt.code_revision != claim.training_job_code_revision
             or job_attempt.ownership_manifest != manifest
             or manifest.get("department_id") != str(claim.department_id)
@@ -1448,7 +1448,7 @@ def _job_snapshot_matches(
         and attempt.training_job_id == claim.training_job_id
         and attempt.status == "succeeded"
         and attempt.code_revision == claim.training_job_code_revision
-        and attempt.execution_scope_id == claim.training_job_execution_scope_id
+        and job.execution_scope_id == claim.training_job_execution_scope_id
         and attempt.version == claim.training_job_attempt_version
         and attempt.ownership_manifest == job.publication_manifest
     )

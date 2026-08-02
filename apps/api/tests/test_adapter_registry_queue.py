@@ -1,4 +1,4 @@
-"""Queue contract smoke tests for Phase 12.1C."""
+"""Queue contract tests for Phase 12.1C."""
 
 from datetime import UTC, datetime
 from types import SimpleNamespace

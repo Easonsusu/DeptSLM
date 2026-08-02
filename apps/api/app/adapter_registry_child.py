@@ -29,6 +29,7 @@ from app.adapter_contract import (
 from app.adapter_registry_domain import (
     ADAPTER_ARTIFACT_CONTRACT_VERSION,
     ADAPTER_REGISTRY_MANIFEST_CONTRACT_VERSION,
+    GOVERNANCE_KEYS,
     build_registry_manifest,
     canonical_json_bytes,
 )
@@ -253,7 +254,7 @@ def _private_fd(descriptor: int, *, directory: bool, writable: bool = False) -> 
         (directory and not stat.S_ISDIR(metadata.st_mode))
         or (not directory and not stat.S_ISREG(metadata.st_mode))
         or metadata.st_uid != os.geteuid()
-        or metadata.st_nlink != 1
+        or (metadata.st_nlink < 2 if directory else metadata.st_nlink != 1)
         or mode not in ({0o700} if directory else {0o600})
         or (writable and not metadata.st_mode & stat.S_IWUSR)
     ):
@@ -306,6 +307,8 @@ def _validate_source_manifest(
     if (
         len(raw) != int(source["intake_manifest_byte_size"])
         or hashlib.sha256(raw).hexdigest() != source["intake_manifest_sha256"]
+        or source["adapter_config_byte_size"] != config_size
+        or source["adapter_model_byte_size"] != model_size
     ):
         raise ValueError("source manifest authority")
     if (
@@ -589,8 +592,14 @@ def build_registry_stage(request: dict[str, object]) -> dict[str, object]:
         "adapter_config_contract_version": source["config_contract_version"],
         "adapter_tensor_contract_version": source["tensor_contract_version"],
     }
-    manifest_governance = dict(value["governance_lineage"])
-    manifest_governance["profile_id"] = manifest_governance.pop("training_job_profile_id")
+    # The child receives the complete PostgreSQL governance snapshot, while
+    # the published registry manifest intentionally retains only its reviewed
+    # public governance allowlist.  Never copy execution/hash-size fields that
+    # are only needed for the input authority check into the final contract.
+    manifest_governance = {
+        key: value["governance_lineage"][key] for key in GOVERNANCE_KEYS if key != "profile_id"
+    }
+    manifest_governance["profile_id"] = value["governance_lineage"]["training_job_profile_id"]
     manifest = build_registry_manifest(
         department_id=_uuid_text(value["department_id"]),
         adapter_id=_uuid_text(value["adapter_id"]),

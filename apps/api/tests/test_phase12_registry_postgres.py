@@ -219,3 +219,186 @@ def test_existing_0010_committed_source_backfills_manifest_size(engine) -> None:
             ) == len(raw_manifest)
     finally:
         command.upgrade(config, "head")
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "noncommitted",
+        "missing_manifest_fields",
+        "wrong_file_descriptor",
+        "wrong_digest",
+        "wrong_attempt",
+        "wrong_publication",
+        "wrong_code",
+    ],
+)
+def test_online_0011_backfill_rejects_invalid_historical_authority(engine, mutation: str) -> None:
+    """The online upgrade must reject every unsafe 0010 authority shape."""
+
+    config = Config("alembic.ini")
+    command.downgrade(config, "0010_phase12_adapter_sources")
+    department_id = uuid4()
+    user_id = uuid4()
+    source_id = uuid4()
+    attempt_id = uuid4()
+    publication_attempt_id = uuid4()
+    code_revision = "a" * 40
+    manifest = {
+        "source_contract_version": "phase12-adapter-source-v1",
+        "intake_contract_version": "phase12-adapter-intake-v1",
+        "config_contract_version": "phase12-adapter-config-v1",
+        "tensor_contract_version": "phase12-adapter-tensors-v1",
+        "department_id": str(department_id),
+        "source_bundle_id": str(source_id),
+        "import_attempt_id": str(attempt_id),
+        "publication_attempt_id": str(publication_attempt_id),
+        "attempt_number": 1,
+        "imported_by_user_id": str(user_id),
+        "code_revision": code_revision,
+        "base_model_id": "Qwen/Qwen3-0.6B",
+        "base_model_revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+        "base_model_license": "Apache-2.0",
+        "peft_version": "0.18.1",
+        "safetensors_format": "0.7.0",
+        "tensor_dtype": "F16",
+        "tensor_count": 392,
+        "tensor_element_count": 10092544,
+        "tensor_payload_byte_size": 20185088,
+        "files": {
+            "adapter_config.json": {"sha256": "a" * 64, "byte_size": 1},
+            "adapter_model.safetensors": {"sha256": "b" * 64, "byte_size": 2},
+        },
+    }
+    raw_manifest = (
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        + b"\n"
+    )
+    ownership = manifest
+    attempt_status = "committed"
+    attempt_number = 1
+    attempt_publication = publication_attempt_id
+    attempt_revision = code_revision
+    intake_digest = hashlib.sha256(raw_manifest).hexdigest()
+    if mutation == "noncommitted":
+        attempt_status = "registered"
+    elif mutation == "missing_manifest_fields":
+        ownership = {}
+    elif mutation == "wrong_file_descriptor":
+        ownership = {**manifest, "files": {"adapter_config.json": {"sha256": "a" * 64}}}
+    elif mutation == "wrong_digest":
+        intake_digest = "f" * 64
+    elif mutation == "wrong_attempt":
+        attempt_number = 2
+    elif mutation == "wrong_publication":
+        attempt_publication = uuid4()
+    elif mutation == "wrong_code":
+        attempt_revision = "b" * 40
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO user_identities (id, issuer, subject, status) "
+                "VALUES (:id, 'https://migration.invalid', :subject, 'active')"
+            ),
+            {"id": user_id, "subject": str(user_id)},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO departments (id, slug, display_name, status, version) "
+                "VALUES (:id, :slug, 'Migration negative', 'active', 1)"
+            ),
+            {"id": department_id, "slug": f"migration-negative-{department_id.hex[:10]}"},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO adapter_import_sources "
+                "(id, department_id, imported_by_user_id, status, source_contract_version, "
+                "intake_contract_version, config_contract_version, tensor_contract_version, "
+                "base_model_id, base_model_revision, base_model_license, peft_version, "
+                "safetensors_format, code_revision, version) VALUES "
+                "(:id, :department_id, :user_id, 'staging', "
+                "'phase12-adapter-source-v1', 'phase12-adapter-intake-v1', "
+                "'phase12-adapter-config-v1', 'phase12-adapter-tensors-v1', "
+                "'Qwen/Qwen3-0.6B', 'c1899de289a04d12100db370d81485cdf75e47ca', "
+                "'Apache-2.0', '0.18.1', '0.7.0', :code_revision, 1)"
+            ),
+            {
+                "id": source_id,
+                "department_id": department_id,
+                "user_id": user_id,
+                "code_revision": code_revision,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO adapter_import_attempts "
+                "(id, department_id, source_bundle_id, attempt_number, publication_attempt_id, "
+                "status, code_revision, version) VALUES "
+                "(:id, :department_id, :source_id, 1, :publication_attempt_id, "
+                "'registered', :code_revision, 1)"
+            ),
+            {
+                "id": attempt_id,
+                "department_id": department_id,
+                "source_id": source_id,
+                "publication_attempt_id": publication_attempt_id,
+                "code_revision": code_revision,
+            },
+        )
+        if attempt_status == "committed":
+            connection.execute(
+                text(
+                    "UPDATE adapter_import_attempts SET status = :status, "
+                    "attempt_number = :attempt, "
+                    "publication_attempt_id = :publication, code_revision = :attempt_revision, "
+                    "ownership_manifest = CAST(:manifest AS JSON), validated_at = now(), "
+                    "staged_at = now(), published_at = now(), committed_at = now(), "
+                    "finished_at = now(), version = 5 WHERE id = :id"
+                ),
+                {
+                    "id": attempt_id,
+                    "status": attempt_status,
+                    "attempt": attempt_number,
+                    "publication": attempt_publication,
+                    "attempt_revision": attempt_revision,
+                    "manifest": json.dumps(ownership),
+                },
+            )
+        connection.execute(
+            text(
+                "UPDATE adapter_import_sources SET status = 'committed', "
+                "authoritative_attempt_id = :attempt_id, adapter_config_sha256 = :config_sha, "
+                "adapter_config_byte_size = 1, adapter_model_sha256 = :model_sha, "
+                "adapter_model_byte_size = 2, intake_manifest_sha256 = :manifest_sha, "
+                "tensor_dtype = 'F16', tensor_count = 392, tensor_element_count = 10092544, "
+                "tensor_payload_byte_size = 20185088, committed_at = now(), version = 2 "
+                "WHERE id = :id"
+            ),
+            {
+                "id": source_id,
+                "attempt_id": attempt_id,
+                "config_sha": "a" * 64,
+                "model_sha": "b" * 64,
+                "manifest_sha": intake_digest,
+            },
+        )
+    try:
+        with pytest.raises(Exception):
+            command.upgrade(config, "0011_phase12_adapter_registry")
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "0010_phase12_adapter_sources"
+            )
+            assert (
+                connection.scalar(
+                    text(
+                        "SELECT 1 FROM information_schema.columns WHERE table_name = "
+                        "'adapter_import_sources' AND column_name = 'intake_manifest_byte_size'"
+                    )
+                )
+                is None
+            )
+    finally:
+        command.downgrade(config, "0009_phase11_training_jobs")
+        command.upgrade(config, "head")
