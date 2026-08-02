@@ -32,6 +32,17 @@ class _Factory:
         return _Transaction(self.session)
 
 
+class _Rows:
+    def __init__(self, rows: list[object]) -> None:
+        self.rows = rows
+
+    def scalars(self) -> "_Rows":
+        return self
+
+    def all(self) -> list[object]:
+        return self.rows
+
+
 def _adapter() -> SimpleNamespace:
     return SimpleNamespace(
         status="running",
@@ -39,7 +50,10 @@ def _adapter() -> SimpleNamespace:
         worker_id="worker",
         claim_token="token",
         lease_expires_at=datetime.now(UTC),
+        started_at=datetime.now(UTC),
         finished_at=None,
+        validated_at=None,
+        purged_at=None,
         version=7,
     )
 
@@ -167,11 +181,15 @@ def test_terminal_claim_failure_preserves_published_surface() -> None:
         worker_id="worker",
         claim_token="token",
         lease_expires_at=datetime.now(UTC),
+        started_at=datetime.now(UTC),
         finished_at=None,
+        validated_at=None,
+        purged_at=None,
         version=2,
     )
     manifest = {"manifest": "published"}
     attempt = SimpleNamespace(
+        id="attempt-id",
         adapter_id="adapter",
         department_id="department",
         publication_attempt_id="publication",
@@ -180,19 +198,23 @@ def test_terminal_claim_failure_preserves_published_surface() -> None:
         code_revision="a" * 40,
         status="published",
         error_code=None,
-        worker_id="historical-worker",
+        worker_id="worker",
         claimed_at=datetime.now(UTC),
         ownership_manifest=manifest,
+        staged_at=datetime.now(UTC),
+        published_at=datetime.now(UTC),
         finished_at=None,
+        cleanup_confirmed_at=None,
         version=4,
     )
+    session = SimpleNamespace(execute=lambda _query: _Rows([attempt]))
     queue._terminal_claim_failure(
-        SimpleNamespace(), adapter, datetime.now(UTC), "claim_lost", attempt=attempt
+        session, adapter, datetime.now(UTC), "claim_lost", attempt=attempt
     )
 
     assert adapter.status == "failed"
     assert attempt.status == "failed"
-    assert attempt.worker_id == "historical-worker"
+    assert attempt.worker_id == "worker"
     assert attempt.claimed_at is not None
     assert attempt.ownership_manifest == manifest
 
@@ -210,10 +232,14 @@ def test_terminal_claim_failure_rejects_substituted_attempt() -> None:
         worker_id="worker",
         claim_token="token",
         lease_expires_at=datetime.now(UTC),
+        started_at=datetime.now(UTC),
         finished_at=None,
+        validated_at=None,
+        purged_at=None,
         version=2,
     )
     attempt = SimpleNamespace(
+        id="attempt-id",
         adapter_id="other-adapter",
         department_id="department",
         publication_attempt_id="publication",
@@ -225,12 +251,116 @@ def test_terminal_claim_failure_rejects_substituted_attempt() -> None:
         worker_id="historical-worker",
         claimed_at=datetime.now(UTC),
         ownership_manifest={"manifest": "published"},
+        staged_at=datetime.now(UTC),
+        published_at=datetime.now(UTC),
         finished_at=None,
+        cleanup_confirmed_at=None,
         version=4,
     )
-    queue._terminal_claim_failure(
-        SimpleNamespace(), adapter, datetime.now(UTC), "claim_lost", attempt=attempt
+    active = SimpleNamespace(
+        id="actual-attempt-id",
+        adapter_id="adapter",
+        department_id="department",
+        publication_attempt_id="publication",
+        execution_scope_id="scope",
+        attempt_number=1,
+        code_revision="a" * 40,
+        status="published",
+        error_code=None,
+        worker_id="worker",
+        claimed_at=datetime.now(UTC),
+        ownership_manifest={"manifest": "published"},
+        staged_at=datetime.now(UTC),
+        published_at=datetime.now(UTC),
+        finished_at=None,
+        cleanup_confirmed_at=None,
+        version=4,
     )
+    session = SimpleNamespace(execute=lambda _query: _Rows([active]))
+    with pytest.raises(AdapterRegistryQueueError, match="claim_lost"):
+        queue._terminal_claim_failure(
+            session, adapter, datetime.now(UTC), "claim_lost", attempt=attempt
+        )
 
     assert adapter.status == "running"
     assert attempt.status == "published"
+
+
+def _terminal_surface() -> tuple[SimpleNamespace, SimpleNamespace]:
+    adapter = SimpleNamespace(
+        id="adapter",
+        department_id="department",
+        publication_attempt_id="publication",
+        execution_scope_id="scope",
+        attempt_number=1,
+        code_revision="a" * 40,
+        status="running",
+        error_code=None,
+        worker_id="worker",
+        claim_token="token",
+        lease_expires_at=datetime.now(UTC),
+        started_at=datetime.now(UTC),
+        finished_at=None,
+        validated_at=None,
+        purged_at=None,
+        version=2,
+    )
+    attempt = SimpleNamespace(
+        id="attempt-id",
+        adapter_id="adapter",
+        department_id="department",
+        publication_attempt_id="publication",
+        execution_scope_id="scope",
+        attempt_number=1,
+        code_revision="a" * 40,
+        status="published",
+        error_code=None,
+        worker_id="worker",
+        claimed_at=datetime.now(UTC),
+        staged_at=datetime.now(UTC),
+        published_at=datetime.now(UTC),
+        ownership_manifest={"manifest": "published"},
+        finished_at=None,
+        cleanup_confirmed_at=None,
+        version=4,
+    )
+    return adapter, attempt
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda attempt: setattr(attempt, "version", 3),
+        lambda attempt: setattr(attempt, "worker_id", "other-worker"),
+        lambda attempt: setattr(attempt, "ownership_manifest", None),
+    ],
+)
+def test_terminal_claim_failure_refuses_malformed_active_surface(mutation) -> None:
+    adapter, attempt = _terminal_surface()
+    mutation(attempt)
+    session = SimpleNamespace(execute=lambda _query: _Rows([attempt]))
+
+    with pytest.raises(AdapterRegistryQueueError, match="claim_lost"):
+        queue._terminal_claim_failure(session, adapter, datetime.now(UTC), "claim_lost")
+
+    assert adapter.status == "running"
+    assert adapter.error_code is None
+    assert attempt.status == "published"
+    assert attempt.error_code is None
+
+
+def test_terminal_claim_failure_refuses_zero_or_multiple_active_rows() -> None:
+    adapter, attempt = _terminal_surface()
+    empty = SimpleNamespace(execute=lambda _query: _Rows([]))
+    with pytest.raises(AdapterRegistryQueueError, match="claim_lost"):
+        queue._terminal_claim_failure(empty, adapter, datetime.now(UTC), "claim_lost")
+    assert adapter.status == "running"
+
+    _other_adapter, other_attempt = _terminal_surface()
+    other_attempt.id = "other-attempt-id"
+    multiple = SimpleNamespace(execute=lambda _query: _Rows([attempt, other_attempt]))
+    with pytest.raises(AdapterRegistryQueueError, match="claim_lost"):
+        queue._terminal_claim_failure(multiple, adapter, datetime.now(UTC), "claim_lost")
+    assert adapter.status == "running"
+    assert attempt.status == "published"
+    assert other_attempt.status == "published"

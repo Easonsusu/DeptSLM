@@ -1701,58 +1701,181 @@ def _terminal_claim_failure(
     *,
     attempt: AdapterRegistryAttempt | None = None,
 ) -> None:
+    """Terminalize one failed claim only after validating its exact surface.
+
+    This helper is called inside the claim transaction.  A malformed, missing,
+    substituted, or otherwise ambiguous active attempt is a claim-loss
+    condition, not an authorization to mutate the adapter.  Raising before any
+    assignment makes SQLAlchemy roll back claim/reclaim mutations already made
+    in the transaction.
+    """
     code = (
         code
         if code in AdapterRegistryQueueError.SAFE_CODES
         else "adapter_registry_publication_failed"
     )
-    targets: list[AdapterRegistryAttempt] = []
-    if attempt is None:
-        targets = (
-            session.execute(
-                select(AdapterRegistryAttempt)
-                .where(
-                    AdapterRegistryAttempt.adapter_id == adapter.id,
-                    AdapterRegistryAttempt.department_id == adapter.department_id,
-                    AdapterRegistryAttempt.publication_attempt_id == adapter.publication_attempt_id,
-                    AdapterRegistryAttempt.execution_scope_id == adapter.execution_scope_id,
-                    AdapterRegistryAttempt.attempt_number == adapter.attempt_number,
-                    AdapterRegistryAttempt.code_revision == adapter.code_revision,
-                    AdapterRegistryAttempt.status.in_(
-                        ("registered", "running", "staged", "published")
-                    ),
-                )
-                .with_for_update()
-            )
-            .scalars()
-            .all()
+    if (
+        getattr(adapter, "status", None) not in {"queued", "running"}
+        or getattr(adapter, "finished_at", None) is not None
+        or getattr(adapter, "validated_at", None) is not None
+        or getattr(adapter, "purged_at", None) is not None
+        or getattr(adapter, "error_code", None) is not None
+    ):
+        raise AdapterRegistryQueueError("claim_lost")
+    if adapter.status == "queued":
+        adapter_lifecycle_valid = all(
+            getattr(adapter, name, None) is None
+            for name in ("worker_id", "claim_token", "lease_expires_at", "started_at")
         )
     else:
-        targets = [attempt]
-    if attempt is None and len(targets) > 1:
-        # A duplicate active surface cannot be safely assigned to one
-        # terminal transition.  Leave all rows and bytes untouched.
-        return
-    for target in targets:
-        previous_status = target.status
-        if (
-            previous_status not in ("registered", "running", "staged", "published")
-            or target.adapter_id != adapter.id
-            or target.department_id != adapter.department_id
-            or target.publication_attempt_id != adapter.publication_attempt_id
-            or target.execution_scope_id != adapter.execution_scope_id
-            or target.attempt_number != adapter.attempt_number
-            or target.code_revision != adapter.code_revision
+        adapter_lifecycle_valid = all(
+            getattr(adapter, name, None) is not None
+            for name in ("worker_id", "claim_token", "lease_expires_at", "started_at")
+        )
+    if not adapter_lifecycle_valid:
+        raise AdapterRegistryQueueError("claim_lost")
+
+    # Lock every active row for the exact adapter/department pair.  Filtering
+    # by the expected publication identity here would hide duplicate or
+    # substituted active rows and could make a later adapter mutation unsafe.
+    targets = (
+        session.execute(
+            select(AdapterRegistryAttempt)
+            .where(
+                AdapterRegistryAttempt.adapter_id == adapter.id,
+                AdapterRegistryAttempt.department_id == adapter.department_id,
+                AdapterRegistryAttempt.status.in_(("registered", "running", "staged", "published")),
+            )
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    if len(targets) != 1:
+        raise AdapterRegistryQueueError("claim_lost")
+    target = targets[0]
+    target_id = getattr(target, "id", None)
+    if target_id is None:
+        raise AdapterRegistryQueueError("claim_lost")
+    if attempt is not None:
+        if getattr(attempt, "id", None) != target_id:
+            raise AdapterRegistryQueueError("claim_lost")
+        for field in (
+            "adapter_id",
+            "department_id",
+            "publication_attempt_id",
+            "execution_scope_id",
+            "attempt_number",
+            "code_revision",
+            "status",
+            "worker_id",
+            "claimed_at",
+            "staged_at",
+            "published_at",
+            "finished_at",
+            "cleanup_confirmed_at",
+            "version",
+            "ownership_manifest",
+            "error_code",
         ):
-            return
-        target.status = "failed"
-        target.error_code = code
-        if previous_status in ("registered", "running"):
-            target.worker_id = None
-            target.claimed_at = None
-            target.ownership_manifest = None
-        target.finished_at = now
-        target.version += 1
+            if not hasattr(attempt, field):
+                raise AdapterRegistryQueueError("claim_lost")
+            if getattr(attempt, field, None) != getattr(target, field, None):
+                raise AdapterRegistryQueueError("claim_lost")
+
+    missing = object()
+    target_values = {
+        field: getattr(target, field, missing)
+        for field in (
+            "status",
+            "adapter_id",
+            "department_id",
+            "publication_attempt_id",
+            "execution_scope_id",
+            "attempt_number",
+            "code_revision",
+            "worker_id",
+            "claimed_at",
+            "staged_at",
+            "published_at",
+            "finished_at",
+            "cleanup_confirmed_at",
+            "version",
+            "ownership_manifest",
+            "error_code",
+        )
+    }
+    if missing in target_values.values():
+        raise AdapterRegistryQueueError("claim_lost")
+    previous_status = target_values["status"]
+    expected_version = {"registered": 1, "running": 2, "staged": 3, "published": 4}.get(
+        previous_status
+    )
+    exact_identity = (
+        target_values["adapter_id"] == adapter.id
+        and target_values["department_id"] == adapter.department_id
+        and target_values["publication_attempt_id"] == adapter.publication_attempt_id
+        and target_values["execution_scope_id"] == adapter.execution_scope_id
+        and target_values["attempt_number"] == adapter.attempt_number
+        and target_values["code_revision"] == adapter.code_revision
+    )
+    worker_valid = (previous_status == "registered" and target_values["worker_id"] is None) or (
+        previous_status in {"running", "staged", "published"}
+        and target_values["worker_id"] is not None
+        and target_values["worker_id"] == adapter.worker_id
+    )
+    lifecycle_valid = (
+        expected_version is not None
+        and target_values["version"] == expected_version
+        and target_values["finished_at"] is None
+        and target_values["error_code"] is None
+        and target_values["cleanup_confirmed_at"] is None
+        and worker_valid
+        and (
+            (
+                previous_status == "registered"
+                and target_values["claimed_at"] is None
+                and target_values["staged_at"] is None
+                and target_values["published_at"] is None
+                and target_values["ownership_manifest"] is None
+            )
+            or (
+                previous_status == "running"
+                and target_values["claimed_at"] is not None
+                and target_values["staged_at"] is None
+                and target_values["published_at"] is None
+                and target_values["ownership_manifest"] is None
+            )
+            or (
+                previous_status == "staged"
+                and target_values["claimed_at"] is not None
+                and target_values["staged_at"] is not None
+                and target_values["published_at"] is None
+                and target_values["ownership_manifest"] is not None
+            )
+            or (
+                previous_status == "published"
+                and target_values["claimed_at"] is not None
+                and target_values["staged_at"] is not None
+                and target_values["published_at"] is not None
+                and target_values["ownership_manifest"] is not None
+            )
+        )
+    )
+    if not exact_identity or not lifecycle_valid:
+        raise AdapterRegistryQueueError("claim_lost")
+
+    # All validation is complete before either row is changed.  Registered and
+    # running attempts have no external surface; staged and published attempts
+    # retain their ownership metadata for exact later cleanup.
+    target.status = "failed"
+    target.error_code = code
+    if previous_status in ("registered", "running"):
+        target.worker_id = None
+        target.claimed_at = None
+        target.ownership_manifest = None
+    target.finished_at = now
+    target.version += 1
     adapter.status = "failed"
     adapter.error_code = code
     adapter.worker_id = None
