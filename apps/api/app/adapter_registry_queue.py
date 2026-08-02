@@ -270,6 +270,7 @@ def claim_next_adapter(
                             AdapterRegistryAttempt.execution_scope_id == adapter.execution_scope_id,
                             AdapterRegistryAttempt.attempt_number == adapter.attempt_number,
                             AdapterRegistryAttempt.worker_id == adapter.worker_id,
+                            AdapterRegistryAttempt.code_revision == adapter.code_revision,
                             AdapterRegistryAttempt.status.in_(("running", "staged", "published")),
                         )
                         .with_for_update()
@@ -281,10 +282,19 @@ def claim_next_adapter(
                     _terminal_claim_failure(session, adapter, now, "claim_lost")
                     return None
                 old = old_rows[0]
+                expected_version = {"running": 2, "staged": 3, "published": 4}.get(old.status)
+                if (
+                    expected_version is None
+                    or old.version != expected_version
+                    or old.finished_at is not None
+                    or old.error_code is not None
+                    or (old.status in ("staged", "published") and old.ownership_manifest is None)
+                ):
+                    _terminal_claim_failure(session, adapter, now, "claim_lost")
+                    return None
                 old.status = "reclaimed"
                 old.error_code = "claim_lost"
                 old.finished_at = now
-                old.worker_id = None
                 old.version += 1
                 adapter.attempt_number += 1
                 adapter.execution_scope_id = uuid4()
@@ -299,26 +309,42 @@ def claim_next_adapter(
             adapter.validated_at = None
             adapter.error_code = None
             adapter.version += 1
-            attempt_rows = (
-                session.execute(
-                    select(AdapterRegistryAttempt)
-                    .where(
-                        AdapterRegistryAttempt.adapter_id == adapter.id,
-                        AdapterRegistryAttempt.department_id == adapter.department_id,
-                        AdapterRegistryAttempt.publication_attempt_id
-                        == adapter.publication_attempt_id,
-                        AdapterRegistryAttempt.execution_scope_id == adapter.execution_scope_id,
-                        AdapterRegistryAttempt.attempt_number == adapter.attempt_number,
-                    )
-                    .with_for_update()
+            if stale_attempt is not None:
+                # Reclaim creates a fresh durable attempt in this transaction;
+                # it must never assume that the replacement row already exists.
+                attempt = AdapterRegistryAttempt(
+                    id=uuid4(),
+                    department_id=adapter.department_id,
+                    adapter_id=adapter.id,
+                    attempt_number=adapter.attempt_number,
+                    publication_attempt_id=adapter.publication_attempt_id,
+                    execution_scope_id=adapter.execution_scope_id,
+                    code_revision=adapter.code_revision,
+                    status="registered",
                 )
-                .scalars()
-                .all()
-            )
-            if len(attempt_rows) != 1 or attempt_rows[0].status != "registered":
-                _terminal_claim_failure(session, adapter, now, "claim_lost")
-                return None
-            attempt = attempt_rows[0]
+                session.add(attempt)
+                session.flush()
+            else:
+                attempt_rows = (
+                    session.execute(
+                        select(AdapterRegistryAttempt)
+                        .where(
+                            AdapterRegistryAttempt.adapter_id == adapter.id,
+                            AdapterRegistryAttempt.department_id == adapter.department_id,
+                            AdapterRegistryAttempt.publication_attempt_id
+                            == adapter.publication_attempt_id,
+                            AdapterRegistryAttempt.execution_scope_id == adapter.execution_scope_id,
+                            AdapterRegistryAttempt.attempt_number == adapter.attempt_number,
+                        )
+                        .with_for_update()
+                    )
+                    .scalars()
+                    .all()
+                )
+                if len(attempt_rows) != 1 or attempt_rows[0].status != "registered":
+                    _terminal_claim_failure(session, adapter, now, "claim_lost")
+                    return None
+                attempt = attempt_rows[0]
             attempt.status = "running"
             attempt.worker_id = worker_id
             attempt.claimed_at = now
@@ -1625,22 +1651,26 @@ def _attempt(session: Session, claim: ClaimedAdapter) -> AdapterRegistryAttempt:
 def _record_failure(
     factory: sessionmaker[Session], claim: ClaimedAdapter, code: str, *, validation: bool
 ) -> None:
+    code = (
+        code
+        if code in AdapterRegistryQueueError.SAFE_CODES
+        else "adapter_registry_publication_failed"
+    )
     try:
         with factory.begin() as session:
-            adapter = session.execute(
-                select(Adapter)
-                .where(
-                    Adapter.id == claim.id,
-                    Adapter.department_id == claim.department_id,
-                    Adapter.worker_id == claim.worker_id,
-                    Adapter.claim_token == claim.claim_token,
-                    Adapter.publication_attempt_id == claim.publication_attempt_id,
-                    Adapter.status == "running",
-                    Adapter.lease_expires_at > func.clock_timestamp(),
-                )
-                .with_for_update()
-            ).scalar_one_or_none()
-            if adapter is None:
+            try:
+                adapter = _live_claim(session, claim)
+                attempt = _attempt(session, claim)
+            except AdapterRegistryQueueError:
+                # A lost or expired claim is never allowed to mutate either
+                # the adapter or its historical attempt.
+                return
+            if attempt.status != claim.registry_attempt_status or attempt.status not in {
+                "registered",
+                "running",
+                "staged",
+                "published",
+            }:
                 return
             now = session.scalar(select(func.clock_timestamp()))
             adapter.status = "validation_failed" if validation else "failed"
@@ -1650,15 +1680,16 @@ def _record_failure(
             adapter.lease_expires_at = None
             adapter.finished_at = now
             adapter.version += 1
-            attempt = _attempt(session, claim)
             attempt.status = "validation_failed" if validation else "failed"
             attempt.error_code = code
-            attempt.worker_id = None
-            attempt.claimed_at = None
-            attempt.ownership_manifest = None
+            previous_status = claim.registry_attempt_status
+            if previous_status in ("registered", "running"):
+                attempt.worker_id = None
+                attempt.claimed_at = None
+                attempt.ownership_manifest = None
             attempt.finished_at = now
             attempt.version += 1
-    except SQLAlchemyError:
+    except (AdapterRegistryQueueError, SQLAlchemyError):
         return
 
 
@@ -1670,6 +1701,11 @@ def _terminal_claim_failure(
     *,
     attempt: AdapterRegistryAttempt | None = None,
 ) -> None:
+    code = (
+        code
+        if code in AdapterRegistryQueueError.SAFE_CODES
+        else "adapter_registry_publication_failed"
+    )
     targets: list[AdapterRegistryAttempt] = []
     if attempt is None:
         targets = (
@@ -1681,7 +1717,10 @@ def _terminal_claim_failure(
                     AdapterRegistryAttempt.publication_attempt_id == adapter.publication_attempt_id,
                     AdapterRegistryAttempt.execution_scope_id == adapter.execution_scope_id,
                     AdapterRegistryAttempt.attempt_number == adapter.attempt_number,
-                    AdapterRegistryAttempt.status.in_(("registered", "running")),
+                    AdapterRegistryAttempt.code_revision == adapter.code_revision,
+                    AdapterRegistryAttempt.status.in_(
+                        ("registered", "running", "staged", "published")
+                    ),
                 )
                 .with_for_update()
             )
@@ -1690,12 +1729,28 @@ def _terminal_claim_failure(
         )
     else:
         targets = [attempt]
+    if attempt is None and len(targets) > 1:
+        # A duplicate active surface cannot be safely assigned to one
+        # terminal transition.  Leave all rows and bytes untouched.
+        return
     for target in targets:
+        previous_status = target.status
+        if (
+            previous_status not in ("registered", "running", "staged", "published")
+            or target.adapter_id != adapter.id
+            or target.department_id != adapter.department_id
+            or target.publication_attempt_id != adapter.publication_attempt_id
+            or target.execution_scope_id != adapter.execution_scope_id
+            or target.attempt_number != adapter.attempt_number
+            or target.code_revision != adapter.code_revision
+        ):
+            return
         target.status = "failed"
         target.error_code = code
-        target.worker_id = None
-        target.claimed_at = None
-        target.ownership_manifest = None
+        if previous_status in ("registered", "running"):
+            target.worker_id = None
+            target.claimed_at = None
+            target.ownership_manifest = None
         target.finished_at = now
         target.version += 1
     adapter.status = "failed"

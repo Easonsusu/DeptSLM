@@ -32,3 +32,43 @@ def test_phase12_1c_migration_is_self_contained_and_frozen() -> None:
     assert "adapter_registry_attempts" in source
     assert "adapter_upstream_dependencies" in source
     assert "fk_adapter_import_source_claimed_adapter_scope" in source
+
+
+def test_phase12_1c_backfill_uses_canonical_manifest_authority() -> None:
+    path = Path(__file__).parents[1] / "alembic" / "versions" / "0011_phase12_adapter_registry.py"
+    spec = importlib.util.spec_from_file_location("phase12_1c_backfill", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    manifest = {
+        "source_contract_version": "phase12-adapter-source-v1",
+        "intake_contract_version": "phase12-adapter-intake-v1",
+        "config_contract_version": "phase12-adapter-config-v1",
+        "tensor_contract_version": "phase12-adapter-tensors-v1",
+        "department_id": "11111111-1111-4111-8111-111111111111",
+        "source_bundle_id": "22222222-2222-4222-8222-222222222222",
+        "import_attempt_id": "33333333-3333-4333-8333-333333333333",
+        "publication_attempt_id": "44444444-4444-4444-8444-444444444444",
+        "attempt_number": 1,
+        "imported_by_user_id": "55555555-5555-4555-8555-555555555555",
+        "code_revision": "a" * 40,
+        "base_model_id": "Qwen/Qwen3-0.6B",
+        "base_model_revision": "c1899de289a04d12100db370d81485cdf75e47ca",
+        "base_model_license": "Apache-2.0",
+        "peft_version": "0.18.1",
+        "safetensors_format": "0.7.0",
+        "tensor_dtype": "F16",
+        "tensor_count": 392,
+        "tensor_element_count": 10092544,
+        "tensor_payload_byte_size": 20185088,
+        "files": {
+            "adapter_config.json": {"sha256": "a" * 64, "byte_size": 1},
+            "adapter_model.safetensors": {"sha256": "b" * 64, "byte_size": 2},
+        },
+    }
+    encoded = module._canonical_manifest_bytes(manifest)
+    assert encoded is not None and encoded.endswith(b"\n")
+    assert module.hashlib.sha256(encoded).hexdigest()
+    malformed = dict(manifest)
+    malformed["files"] = {"unknown": {"sha256": "a" * 64, "byte_size": 1}}
+    assert module._canonical_manifest_bytes(malformed) is None

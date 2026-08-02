@@ -8,6 +8,9 @@ application model or any runtime code.
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 import sqlalchemy as sa
 
 from alembic import op
@@ -123,6 +126,173 @@ def _source_lifecycle() -> sa.CheckConstraint:
     )
 
 
+_IMPORT_MANIFEST_KEYS = frozenset(
+    {
+        "source_contract_version",
+        "intake_contract_version",
+        "config_contract_version",
+        "tensor_contract_version",
+        "department_id",
+        "source_bundle_id",
+        "import_attempt_id",
+        "publication_attempt_id",
+        "attempt_number",
+        "imported_by_user_id",
+        "code_revision",
+        "base_model_id",
+        "base_model_revision",
+        "base_model_license",
+        "peft_version",
+        "safetensors_format",
+        "tensor_dtype",
+        "tensor_count",
+        "tensor_element_count",
+        "tensor_payload_byte_size",
+        "files",
+    }
+)
+
+
+def _canonical_manifest_bytes(value: object) -> bytes | None:
+    """Reproduce the frozen Phase 12.1B manifest encoding without app imports."""
+
+    if not isinstance(value, dict) or set(value) != _IMPORT_MANIFEST_KEYS:
+        return None
+    if (
+        value.get("source_contract_version") != "phase12-adapter-source-v1"
+        or value.get("intake_contract_version") != "phase12-adapter-intake-v1"
+        or value.get("config_contract_version") != "phase12-adapter-config-v1"
+        or value.get("tensor_contract_version") != "phase12-adapter-tensors-v1"
+        or value.get("base_model_id") != "Qwen/Qwen3-0.6B"
+        or value.get("base_model_revision") != "c1899de289a04d12100db370d81485cdf75e47ca"
+        or value.get("base_model_license") != "Apache-2.0"
+        or value.get("peft_version") != "0.18.1"
+        or value.get("safetensors_format") != "0.7.0"
+        or value.get("tensor_dtype") not in {"F16", "BF16", "F32"}
+        or value.get("tensor_count") != 392
+        or value.get("tensor_element_count") != 10092544
+        or value.get("tensor_payload_byte_size")
+        != {"F16": 20185088, "BF16": 20185088, "F32": 40370176}.get(value.get("tensor_dtype"))
+        or type(value.get("attempt_number")) is not int
+        or value.get("attempt_number", 0) <= 0
+    ):
+        return None
+    files = value.get("files")
+    if not isinstance(files, dict) or set(files) != {
+        "adapter_config.json",
+        "adapter_model.safetensors",
+    }:
+        return None
+    for descriptor in files.values():
+        if not isinstance(descriptor, dict) or set(descriptor) != {"sha256", "byte_size"}:
+            return None
+        digest = descriptor.get("sha256")
+        size = descriptor.get("byte_size")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or digest != digest.lower()
+            or any(character not in "0123456789abcdef" for character in digest)
+            or type(size) is not int
+            or size <= 0
+        ):
+            return None
+    try:
+        return (
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+            + b"\n"
+        )
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return None
+
+
+def _backfill_intake_manifest_sizes(bind: sa.Connection) -> None:
+    """Backfill 0010 committed rows from their exact closed attempt authority.
+
+    This deliberately runs before the new lifecycle checks are installed.  A
+    malformed or incomplete historical authority aborts the migration instead
+    of inventing a size or silently weakening the source contract.
+    """
+
+    result = bind.execute(
+        sa.text(
+            "SELECT s.id AS source_id, s.department_id, s.authoritative_attempt_id, "
+            "s.code_revision, s.imported_by_user_id, s.intake_manifest_sha256, "
+            "a.id AS attempt_id, a.department_id AS attempt_department_id, "
+            "a.source_bundle_id AS attempt_source_bundle_id, "
+            "a.publication_attempt_id AS attempt_publication_attempt_id, "
+            "a.attempt_number AS attempt_number_value, a.code_revision AS attempt_code_revision, "
+            "a.status AS attempt_status, a.ownership_manifest "
+            "FROM adapter_import_sources AS s "
+            "LEFT JOIN adapter_import_attempts AS a "
+            "ON a.id = s.authoritative_attempt_id "
+            "WHERE s.status IN ('committed','claimed','consumed','purge_pending','purged')"
+        )
+    )
+    # Alembic's offline ``MockConnection`` cannot inspect existing rows.  The
+    # authoritative backfill is therefore performed by the online migration;
+    # offline SQL generation still emits the schema changes without crashing.
+    if result is None:
+        return
+    rows = result.mappings()
+    for row in rows:
+        source_id = row["source_id"]
+        manifest = row["ownership_manifest"]
+        if (
+            row["authoritative_attempt_id"] is None
+            or row["attempt_id"] != row["authoritative_attempt_id"]
+            or row["attempt_department_id"] != row["department_id"]
+            or row["attempt_source_bundle_id"] != source_id
+            or row["attempt_code_revision"] != row["code_revision"]
+            or row["attempt_status"] != "committed"
+            or not isinstance(manifest, dict)
+        ):
+            raise RuntimeError(
+                f"0011 cannot backfill intake_manifest_byte_size for source {source_id}: "
+                "authoritative import attempt is incomplete"
+            )
+        if (
+            manifest.get("department_id") != str(row["department_id"])
+            or manifest.get("source_bundle_id") != str(source_id)
+            or manifest.get("import_attempt_id") != str(row["authoritative_attempt_id"])
+            or manifest.get("publication_attempt_id") != str(row["attempt_publication_attempt_id"])
+            or manifest.get("attempt_number") != row["attempt_number_value"]
+            or manifest.get("imported_by_user_id") != str(row["imported_by_user_id"])
+            or manifest.get("code_revision") != row["code_revision"]
+        ):
+            raise RuntimeError(
+                f"0011 cannot backfill intake_manifest_byte_size for source {source_id}: "
+                "manifest authority does not match source metadata"
+            )
+        encoded = _canonical_manifest_bytes(manifest)
+        if encoded is None:
+            raise RuntimeError(
+                f"0011 cannot backfill intake_manifest_byte_size for source {source_id}: "
+                "ownership manifest is malformed"
+            )
+        digest = hashlib.sha256(encoded).hexdigest()
+        byte_size = len(encoded)
+        if (
+            byte_size <= 0
+            or not isinstance(row["intake_manifest_sha256"], str)
+            or row["intake_manifest_sha256"] != digest
+        ):
+            raise RuntimeError(
+                f"0011 cannot backfill intake_manifest_byte_size for source {source_id}: "
+                "manifest digest authority is missing or inconsistent"
+            )
+        bind.execute(
+            sa.text(
+                "UPDATE adapter_import_sources "
+                "SET intake_manifest_byte_size = :byte_size "
+                "WHERE id = :source_id"
+            ),
+            {"byte_size": byte_size, "source_id": source_id},
+        )
+
+
 def upgrade() -> None:
     op.drop_constraint(
         "ck_adapter_import_source_lifecycle", "adapter_import_sources", type_="check"
@@ -131,6 +301,7 @@ def upgrade() -> None:
     op.add_column("adapter_import_sources", sa.Column("claimed_at", sa.DateTime(timezone=True)))
     op.add_column("adapter_import_sources", sa.Column("consumed_at", sa.DateTime(timezone=True)))
     op.add_column("adapter_import_sources", sa.Column("intake_manifest_byte_size", sa.BigInteger()))
+    _backfill_intake_manifest_sizes(op.get_bind())
     op.create_check_constraint(
         "ck_adapter_import_source_lifecycle",
         "adapter_import_sources",
@@ -709,8 +880,8 @@ def downgrade() -> None:
         "adapter_import_sources",
         "(status = 'staging' AND authoritative_attempt_id IS NULL AND committed_at IS NULL AND rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL AND error_code IS NULL) OR "
         "(status = 'committed' AND authoritative_attempt_id IS NOT NULL AND adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND intake_manifest_sha256 IS NOT NULL AND tensor_dtype IS NOT NULL AND tensor_count = 392 AND tensor_element_count = 10092544 AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL AND error_code IS NULL) OR "
-        "(status = 'rejected' AND rejected_at IS NOT NULL AND committed_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL AND authoritative_attempt_id IS NULL) OR "
-        "(status = 'abandoned' AND abandoned_at IS NOT NULL AND rejected_at IS NULL AND committed_at IS NULL AND purged_at IS NULL AND authoritative_attempt_id IS NULL) OR "
+        "(status = 'rejected' AND rejected_at IS NOT NULL AND committed_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL AND authoritative_attempt_id IS NULL AND error_code IN ('adapter_config_invalid','adapter_config_unsupported','adapter_header_invalid','adapter_header_too_large','adapter_file_too_large','adapter_tensor_set_invalid','adapter_tensor_shape_invalid','adapter_tensor_dtype_invalid','adapter_tensor_offsets_invalid','adapter_tensor_size_invalid','adapter_input_invalid','adapter_input_unsafe')) OR "
+        "(status = 'abandoned' AND abandoned_at IS NOT NULL AND rejected_at IS NULL AND committed_at IS NULL AND purged_at IS NULL AND authoritative_attempt_id IS NULL AND error_code IN ('adapter_source_changed','adapter_source_publication_failed','adapter_source_authority_changed','department_unavailable','requester_unauthorized','database_unavailable')) OR "
         "(status IN ('claimed','consumed','purge_pending') AND authoritative_attempt_id IS NOT NULL AND adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND intake_manifest_sha256 IS NOT NULL AND tensor_dtype IS NOT NULL AND tensor_count = 392 AND tensor_element_count = 10092544 AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL AND error_code IS NULL) OR "
         "(status = 'purged' AND authoritative_attempt_id IS NOT NULL AND adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND intake_manifest_sha256 IS NOT NULL AND tensor_dtype IS NOT NULL AND tensor_count = 392 AND tensor_element_count = 10092544 AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND purged_at IS NOT NULL AND rejected_at IS NULL AND abandoned_at IS NULL AND error_code IS NULL)",
     )
