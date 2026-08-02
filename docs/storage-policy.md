@@ -269,6 +269,21 @@ backups or Google Drive history.
 
 Instructions, target responses, source chunk identifiers, paths, and manifests are contentful external data. PostgreSQL keeps no such content and public APIs do not disclose it. Google Drive remains external development storage, not a production object store or backup.
 
+### Phase 12.1C authority hardening
+
+Registry enqueue stores the complete content-free source, Phase 11, and Phase
+10 attempt snapshot, including the Phase 11 five-file digests and sizes. The
+parent retains descriptor-relative handles for all five Phase 11 files and
+rechecks their identities before and after the fixed child; only the manifest
+descriptor crosses the child boundary. Every lifecycle transition compares
+evolving versions for the adapter, registry attempt, upstream attempts, source,
+and active retention dependency. Reclaim marks exactly one prior attempt and
+creates a fresh attempt without adopting old surfaces. Phase 10 and Phase 11
+final-file deletion reauthorizes the exact resource and active adapter fence
+immediately before mutation. Registry-stage/final deletion is not implemented
+in this phase, so stale registry surfaces remain untouched for a future reviewed
+reconciliation phase.
+
 ## Google Drive limitations
 
 Google Drive provides convenient local synchronization, not a production object store, database, queue, locking service, or backup policy. Concurrent writers and large model artifacts may create sync conflicts, partial uploads, quota pressure, or slow startup. Production storage will require a separately reviewed design; this policy does not claim that the local Google Drive layout is suitable for production deployment.

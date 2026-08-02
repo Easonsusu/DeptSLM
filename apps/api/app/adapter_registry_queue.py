@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -45,6 +46,8 @@ from app.models import (
     TrainingJobAttempt,
     TrainingJobPurgeReservation,
 )
+from app.training_job_domain import canonical_json_bytes as training_canonical_json_bytes
+from app.training_job_domain import parse_job_manifest
 
 
 class AdapterRegistryQueueError(RuntimeError):
@@ -106,7 +109,7 @@ _VALIDATION_FAILURE_CODES = frozenset(
 )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ClaimedAdapter:
     id: UUID
     department_id: UUID
@@ -118,6 +121,7 @@ class ClaimedAdapter:
     source_version: int
     source_code_revision: str
     source_intake_manifest_sha256: str
+    source_intake_manifest_byte_size: int
     source_adapter_config_sha256: str
     source_adapter_config_byte_size: int
     source_adapter_model_sha256: str
@@ -132,6 +136,16 @@ class ClaimedAdapter:
     training_job_attempt_number: int
     training_job_code_revision: str
     training_job_manifest_sha256: str
+    training_job_manifest_byte_size: int
+    training_job_execution_scope_id: UUID
+    training_job_config_sha256: str
+    training_job_config_byte_size: int
+    training_job_dataset_info_sha256: str
+    training_job_dataset_info_byte_size: int
+    training_job_train_sha256: str
+    training_job_train_byte_size: int
+    training_job_validation_sha256: str
+    training_job_validation_byte_size: int
     training_job_profile_id: str
     dataset_build_id: UUID
     dataset_build_version: int
@@ -149,6 +163,17 @@ class ClaimedAdapter:
     source: dict[str, object]
     governance_lineage: dict[str, object]
     stale_publication_attempt_id: UUID | None
+    adapter_version: int
+    registry_attempt_id: UUID
+    registry_attempt_version: int
+    adapter_status: str
+    registry_attempt_status: str
+    lease_expires_at: datetime
+    source_attempt_version: int
+    training_job_attempt_version: int
+    dataset_attempt_version: int
+    dependency_id: UUID
+    dependency_version: int
 
 
 class _OperationGuard:
@@ -167,6 +192,7 @@ class _OperationGuard:
         self.lease_seconds = lease_seconds
         self.deadline = time.monotonic() + max(1, operation_seconds)
         self.should_stop = should_stop
+        self._last_heartbeat = 0.0
 
     def checkpoint(self) -> None:
         if self.should_stop():
@@ -177,7 +203,13 @@ class _OperationGuard:
 
     def heartbeat(self) -> None:
         self.checkpoint()
-        renew_adapter_lease(self.factory, self.claim, self.lease_seconds)
+        interval = max(0.25, self.lease_seconds / 3)
+        now = time.monotonic()
+        if now - self._last_heartbeat < interval:
+            return
+        renewed = renew_adapter_lease(self.factory, self.claim, self.lease_seconds)
+        self.claim = renewed
+        self._last_heartbeat = now
 
 
 def claim_next_adapter(
@@ -228,21 +260,32 @@ def claim_next_adapter(
             stale_attempt: UUID | None = None
             if adapter.status == "running":
                 stale_attempt = adapter.publication_attempt_id
-                old = session.execute(
-                    select(AdapterRegistryAttempt)
-                    .where(
-                        AdapterRegistryAttempt.adapter_id == adapter.id,
-                        AdapterRegistryAttempt.department_id == adapter.department_id,
-                        AdapterRegistryAttempt.publication_attempt_id == stale_attempt,
-                        AdapterRegistryAttempt.status.in_(("running", "staged", "published")),
+                old_rows = (
+                    session.execute(
+                        select(AdapterRegistryAttempt)
+                        .where(
+                            AdapterRegistryAttempt.adapter_id == adapter.id,
+                            AdapterRegistryAttempt.department_id == adapter.department_id,
+                            AdapterRegistryAttempt.publication_attempt_id == stale_attempt,
+                            AdapterRegistryAttempt.execution_scope_id == adapter.execution_scope_id,
+                            AdapterRegistryAttempt.attempt_number == adapter.attempt_number,
+                            AdapterRegistryAttempt.worker_id == adapter.worker_id,
+                            AdapterRegistryAttempt.status.in_(("running", "staged", "published")),
+                        )
+                        .with_for_update()
                     )
-                    .with_for_update()
-                ).scalar_one_or_none()
-                if old is not None:
-                    old.status = "reclaimed"
-                    old.error_code = "claim_lost"
-                    old.finished_at = now
-                    old.version += 1
+                    .scalars()
+                    .all()
+                )
+                if len(old_rows) != 1:
+                    _terminal_claim_failure(session, adapter, now, "claim_lost")
+                    return None
+                old = old_rows[0]
+                old.status = "reclaimed"
+                old.error_code = "claim_lost"
+                old.finished_at = now
+                old.worker_id = None
+                old.version += 1
                 adapter.attempt_number += 1
                 adapter.execution_scope_id = uuid4()
                 adapter.publication_attempt_id = uuid4()
@@ -256,33 +299,100 @@ def claim_next_adapter(
             adapter.validated_at = None
             adapter.error_code = None
             adapter.version += 1
-            attempt = session.execute(
-                select(AdapterRegistryAttempt)
-                .where(
-                    AdapterRegistryAttempt.adapter_id == adapter.id,
-                    AdapterRegistryAttempt.department_id == adapter.department_id,
-                    AdapterRegistryAttempt.publication_attempt_id == adapter.publication_attempt_id,
+            attempt_rows = (
+                session.execute(
+                    select(AdapterRegistryAttempt)
+                    .where(
+                        AdapterRegistryAttempt.adapter_id == adapter.id,
+                        AdapterRegistryAttempt.department_id == adapter.department_id,
+                        AdapterRegistryAttempt.publication_attempt_id
+                        == adapter.publication_attempt_id,
+                        AdapterRegistryAttempt.execution_scope_id == adapter.execution_scope_id,
+                        AdapterRegistryAttempt.attempt_number == adapter.attempt_number,
+                    )
+                    .with_for_update()
                 )
-                .with_for_update()
-            ).scalar_one_or_none()
-            if attempt is None:
-                attempt = AdapterRegistryAttempt(
-                    id=uuid4(),
-                    department_id=adapter.department_id,
-                    adapter_id=adapter.id,
-                    attempt_number=adapter.attempt_number,
-                    publication_attempt_id=adapter.publication_attempt_id,
-                    execution_scope_id=adapter.execution_scope_id,
-                    code_revision=adapter.code_revision,
-                    status="registered",
-                )
-                session.add(attempt)
-                session.flush()
+                .scalars()
+                .all()
+            )
+            if len(attempt_rows) != 1 or attempt_rows[0].status != "registered":
+                _terminal_claim_failure(session, adapter, now, "claim_lost")
+                return None
+            attempt = attempt_rows[0]
             attempt.status = "running"
             attempt.worker_id = worker_id
             attempt.claimed_at = now
             attempt.version += 1
-            return _claimed(adapter, source, worker_id, stale_attempt)
+            dependency = session.execute(
+                select(AdapterUpstreamDependency)
+                .where(
+                    AdapterUpstreamDependency.adapter_id == adapter.id,
+                    AdapterUpstreamDependency.department_id == adapter.department_id,
+                    AdapterUpstreamDependency.training_job_id == adapter.training_job_id,
+                    AdapterUpstreamDependency.dataset_build_id == adapter.dataset_build_id,
+                    AdapterUpstreamDependency.status == "active",
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if dependency is None:
+                _terminal_claim_failure(session, adapter, now, "claim_lost", attempt=attempt)
+                return None
+            source_attempt = session.execute(
+                select(AdapterImportAttempt)
+                .where(
+                    AdapterImportAttempt.id == adapter.source_authoritative_attempt_id,
+                    AdapterImportAttempt.department_id == adapter.department_id,
+                    AdapterImportAttempt.source_bundle_id == adapter.source_bundle_id,
+                    AdapterImportAttempt.publication_attempt_id
+                    == adapter.source_publication_attempt_id,
+                    AdapterImportAttempt.attempt_number == adapter.source_attempt_number,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            training_attempt = session.execute(
+                select(TrainingJobAttempt)
+                .where(
+                    TrainingJobAttempt.training_job_id == adapter.training_job_id,
+                    TrainingJobAttempt.department_id == adapter.department_id,
+                    TrainingJobAttempt.publication_attempt_id
+                    == adapter.training_job_publication_attempt_id,
+                    TrainingJobAttempt.attempt_number == adapter.training_job_attempt_number,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            dataset_attempt = session.execute(
+                select(SftDatasetBuildAttempt)
+                .where(
+                    SftDatasetBuildAttempt.build_id == adapter.dataset_build_id,
+                    SftDatasetBuildAttempt.department_id == adapter.department_id,
+                    SftDatasetBuildAttempt.publication_attempt_id
+                    == adapter.dataset_publication_attempt_id,
+                    SftDatasetBuildAttempt.attempt_number
+                    == adapter.dataset_publication_attempt_number,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if source_attempt is None or training_attempt is None or dataset_attempt is None:
+                _terminal_claim_failure(session, adapter, now, "claim_lost", attempt=attempt)
+                return None
+            if (
+                source_attempt.version != adapter.source_attempt_version
+                or training_attempt.version != adapter.training_job_attempt_version
+                or dataset_attempt.version != adapter.dataset_attempt_version
+            ):
+                _terminal_claim_failure(session, adapter, now, "claim_lost", attempt=attempt)
+                return None
+            return _claimed(
+                adapter,
+                source,
+                worker_id,
+                stale_attempt,
+                attempt,
+                dependency,
+                adapter.source_attempt_version,
+                adapter.training_job_attempt_version,
+                adapter.dataset_attempt_version,
+            )
     except AdapterRegistryQueueError:
         raise
     except SQLAlchemyError as error:
@@ -291,13 +401,16 @@ def claim_next_adapter(
 
 def renew_adapter_lease(
     factory: sessionmaker[Session], claim: ClaimedAdapter, lease_seconds: int
-) -> None:
+) -> ClaimedAdapter:
     try:
         with factory.begin() as session:
             row = _live_claim(session, claim)
             now = session.scalar(select(func.clock_timestamp()))
             row.lease_expires_at = now + timedelta(seconds=lease_seconds)
             row.version += 1
+            claim.lease_expires_at = row.lease_expires_at
+            claim.adapter_version = row.version
+            return claim
     except AdapterRegistryQueueError:
         raise
     except SQLAlchemyError as error:
@@ -348,6 +461,8 @@ def process_adapter_registry(
             checkpoint()
             source_final.verify_identity()
             training_final.verify_identity()
+            begin_operation()
+            _verify_training_bundle_authority(factory, claim, training_final)
             begin_operation()
             stage = store.prepare_registry_stage(
                 DepartmentScope(claim.department_id), claim.id, claim.publication_attempt_id
@@ -458,7 +573,15 @@ def terminal_failure(factory: sessionmaker[Session], claim: ClaimedAdapter, code
 
 
 def _claimed(
-    adapter: Adapter, source: AdapterImportSource, worker_id: UUID, stale: UUID | None
+    adapter: Adapter,
+    source: AdapterImportSource,
+    worker_id: UUID,
+    stale: UUID | None,
+    attempt: AdapterRegistryAttempt,
+    dependency: AdapterUpstreamDependency,
+    source_attempt_version: int,
+    training_job_attempt_version: int,
+    dataset_attempt_version: int,
 ) -> ClaimedAdapter:
     source_snapshot = {
         "source_bundle_id": str(adapter.source_bundle_id),
@@ -467,12 +590,16 @@ def _claimed(
         "attempt_number": adapter.source_attempt_number,
         "version": adapter.source_version,
         "imported_by_user_id": str(adapter.source_imported_by_user_id),
+        "base_model_id": adapter.base_model_id,
+        "base_model_revision": adapter.base_model_revision,
+        "base_model_license": adapter.base_model_license,
         "code_revision": adapter.source_code_revision,
         "source_contract_version": adapter.source_contract_version,
         "intake_contract_version": adapter.intake_contract_version,
         "config_contract_version": adapter.config_contract_version,
         "tensor_contract_version": adapter.tensor_contract_version,
         "intake_manifest_sha256": adapter.source_intake_manifest_sha256,
+        "intake_manifest_byte_size": adapter.source_intake_manifest_byte_size,
         "adapter_config_sha256": adapter.source_adapter_config_sha256,
         "adapter_config_byte_size": adapter.source_adapter_config_byte_size,
         "adapter_model_sha256": adapter.source_adapter_model_sha256,
@@ -491,6 +618,16 @@ def _claimed(
         "training_job_attempt_number": adapter.training_job_attempt_number,
         "training_job_code_revision": adapter.training_job_code_revision,
         "training_job_manifest_sha256": adapter.training_job_manifest_sha256,
+        "training_job_manifest_byte_size": adapter.training_job_manifest_byte_size,
+        "training_job_execution_scope_id": str(adapter.training_job_execution_scope_id),
+        "training_job_config_sha256": adapter.training_job_config_sha256,
+        "training_job_config_byte_size": adapter.training_job_config_byte_size,
+        "training_job_dataset_info_sha256": adapter.training_job_dataset_info_sha256,
+        "training_job_dataset_info_byte_size": adapter.training_job_dataset_info_byte_size,
+        "training_job_train_sha256": adapter.training_job_train_sha256,
+        "training_job_train_byte_size": adapter.training_job_train_byte_size,
+        "training_job_validation_sha256": adapter.training_job_validation_sha256,
+        "training_job_validation_byte_size": adapter.training_job_validation_byte_size,
         "training_job_profile_id": adapter.training_job_profile_id,
         "training_job_artifact_contract_version": adapter.training_job_artifact_contract_version,
         "training_job_manifest_contract_version": adapter.training_job_manifest_contract_version,
@@ -536,6 +673,7 @@ def _claimed(
         source_version=adapter.source_version,
         source_code_revision=adapter.source_code_revision,
         source_intake_manifest_sha256=adapter.source_intake_manifest_sha256,
+        source_intake_manifest_byte_size=adapter.source_intake_manifest_byte_size,
         source_adapter_config_sha256=adapter.source_adapter_config_sha256,
         source_adapter_config_byte_size=adapter.source_adapter_config_byte_size,
         source_adapter_model_sha256=adapter.source_adapter_model_sha256,
@@ -550,6 +688,16 @@ def _claimed(
         training_job_attempt_number=adapter.training_job_attempt_number,
         training_job_code_revision=adapter.training_job_code_revision,
         training_job_manifest_sha256=adapter.training_job_manifest_sha256,
+        training_job_manifest_byte_size=adapter.training_job_manifest_byte_size,
+        training_job_execution_scope_id=adapter.training_job_execution_scope_id,
+        training_job_config_sha256=adapter.training_job_config_sha256,
+        training_job_config_byte_size=adapter.training_job_config_byte_size,
+        training_job_dataset_info_sha256=adapter.training_job_dataset_info_sha256,
+        training_job_dataset_info_byte_size=adapter.training_job_dataset_info_byte_size,
+        training_job_train_sha256=adapter.training_job_train_sha256,
+        training_job_train_byte_size=adapter.training_job_train_byte_size,
+        training_job_validation_sha256=adapter.training_job_validation_sha256,
+        training_job_validation_byte_size=adapter.training_job_validation_byte_size,
         training_job_profile_id=adapter.training_job_profile_id,
         dataset_build_id=adapter.dataset_build_id,
         dataset_build_version=adapter.dataset_build_version,
@@ -567,6 +715,17 @@ def _claimed(
         source=source_snapshot,
         governance_lineage=governance,
         stale_publication_attempt_id=stale,
+        adapter_version=adapter.version,
+        registry_attempt_id=attempt.id,
+        registry_attempt_version=attempt.version,
+        adapter_status=adapter.status,
+        registry_attempt_status=attempt.status,
+        lease_expires_at=adapter.lease_expires_at,
+        source_attempt_version=source_attempt_version,
+        training_job_attempt_version=training_job_attempt_version,
+        dataset_attempt_version=dataset_attempt_version,
+        dependency_id=dependency.id,
+        dependency_version=dependency.version,
     )
 
 
@@ -583,6 +742,7 @@ def _live_claim(session: Session, claim: ClaimedAdapter) -> Adapter:
             Adapter.publication_attempt_id == claim.publication_attempt_id,
             Adapter.execution_scope_id == claim.execution_scope_id,
             Adapter.attempt_number == claim.attempt_number,
+            Adapter.version == claim.adapter_version,
             Adapter.lease_expires_at > func.clock_timestamp(),
         )
         .with_for_update()
@@ -637,6 +797,10 @@ def _mark_staged(
         attempt.staged_at = session.scalar(select(func.clock_timestamp()))
         attempt.version += 1
         adapter.version += 1
+        claim.adapter_version = adapter.version
+        claim.registry_attempt_version = attempt.version
+        claim.adapter_status = adapter.status
+        claim.registry_attempt_status = attempt.status
 
 
 def _mark_published(
@@ -649,6 +813,10 @@ def _mark_published(
         attempt.published_at = session.scalar(select(func.clock_timestamp()))
         attempt.version += 1
         adapter.version += 1
+        claim.adapter_version = adapter.version
+        claim.registry_attempt_version = attempt.version
+        claim.adapter_status = adapter.status
+        claim.registry_attempt_status = attempt.status
 
 
 def _validate_result_against_claim(claim: ClaimedAdapter, result: dict[str, object]) -> None:
@@ -748,10 +916,149 @@ def _verify_retained_registry(stage: RegistryStage, result: dict[str, object]) -
         digest, size = expected[name]
         if size != after.st_size:
             raise AdapterRegistryQueueError("adapter_registry_authority_changed")
-        # The digest was captured by verify_registry_final; the PostgreSQL
-        # transaction only compares its closed result, never rehashes bytes.
         if not isinstance(digest, str) or len(digest) != 64:
             raise AdapterRegistryQueueError("adapter_registry_authority_changed")
+
+
+def _verify_training_bundle_authority(
+    factory_or_session, claim: ClaimedAdapter, training_final
+) -> None:
+    """Bind every retained Phase 11 file to the current PostgreSQL row."""
+
+    def check(session: Session) -> None:
+        training_final.verify_identity()
+        digests = training_final.digest_files()
+        raw_manifest = training_final.read_small("manifest.json")
+        try:
+            manifest = parse_job_manifest(raw_manifest)
+            if training_canonical_json_bytes(manifest) + b"\n" != raw_manifest:
+                raise ValueError("noncanonical training manifest")
+        except Exception as error:
+            raise AdapterRegistryQueueError("training_job_artifact_mismatch") from error
+        job = session.execute(
+            select(TrainingJob)
+            .where(
+                TrainingJob.id == claim.training_job_id,
+                TrainingJob.department_id == claim.department_id,
+                TrainingJob.status == "succeeded",
+                TrainingJob.review_status == "approved",
+                TrainingJob.archived_at.is_(None),
+                TrainingJob.purged_at.is_(None),
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        job_attempt = session.execute(
+            select(TrainingJobAttempt)
+            .where(
+                TrainingJobAttempt.training_job_id == claim.training_job_id,
+                TrainingJobAttempt.department_id == claim.department_id,
+                TrainingJobAttempt.status == "succeeded",
+                TrainingJobAttempt.publication_attempt_id
+                == claim.training_job_publication_attempt_id,
+                TrainingJobAttempt.attempt_number == claim.training_job_attempt_number,
+                TrainingJobAttempt.version == claim.training_job_attempt_version,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
+        if job is None or job_attempt is None:
+            raise AdapterRegistryQueueError("training_job_authority_changed")
+        expected = {
+            "manifest.json": (
+                claim.training_job_manifest_sha256,
+                claim.training_job_manifest_byte_size,
+            ),
+            "training.yaml": (
+                claim.training_job_config_sha256,
+                claim.training_job_config_byte_size,
+            ),
+            "dataset_info.json": (
+                claim.training_job_dataset_info_sha256,
+                claim.training_job_dataset_info_byte_size,
+            ),
+            "train.jsonl": (claim.training_job_train_sha256, claim.training_job_train_byte_size),
+            "validation.jsonl": (
+                claim.training_job_validation_sha256,
+                claim.training_job_validation_byte_size,
+            ),
+        }
+        manifest_files = manifest.get("files")
+        if not isinstance(manifest_files, dict) or set(manifest_files) != {
+            "training.yaml",
+            "dataset_info.json",
+            "train.jsonl",
+            "validation.jsonl",
+        }:
+            raise AdapterRegistryQueueError("training_job_artifact_mismatch")
+        for name, (digest, size) in expected.items():
+            actual = digests.get(name)
+            descriptor = manifest_files.get(name)
+            if (
+                not isinstance(digest, str)
+                or type(size) is not int
+                or actual != (digest, size)
+                or not isinstance(descriptor, dict)
+                or descriptor.get("sha256") != digest
+                or descriptor.get("byte_size") != size
+            ):
+                raise AdapterRegistryQueueError("training_job_artifact_mismatch")
+        if (
+            job.result_manifest_sha256 != claim.training_job_manifest_sha256
+            or job.training_config_sha256 != claim.training_job_config_sha256
+            or job.training_config_byte_size != claim.training_job_config_byte_size
+            or job.dataset_info_sha256 != claim.training_job_dataset_info_sha256
+            or job.dataset_info_byte_size != claim.training_job_dataset_info_byte_size
+            or job.train_sha256 != claim.training_job_train_sha256
+            or job.train_byte_size != claim.training_job_train_byte_size
+            or job.validation_sha256 != claim.training_job_validation_sha256
+            or job.validation_byte_size != claim.training_job_validation_byte_size
+            or job.execution_scope_id != claim.training_job_execution_scope_id
+            or job.attempt_number != claim.training_job_attempt_number
+            or job.publication_attempt_id != claim.training_job_publication_attempt_id
+            or job.version != claim.training_job_version
+            or job_attempt.execution_scope_id != claim.training_job_execution_scope_id
+            or job_attempt.code_revision != claim.training_job_code_revision
+            or job_attempt.ownership_manifest != manifest
+            or manifest.get("department_id") != str(claim.department_id)
+            or manifest.get("training_job_id") != str(claim.training_job_id)
+            or manifest.get("publication_attempt_id")
+            != str(claim.training_job_publication_attempt_id)
+            or manifest.get("execution_scope_id") != str(claim.training_job_execution_scope_id)
+            or manifest.get("attempt_number") != claim.training_job_attempt_number
+            or manifest.get("code_revision") != claim.training_job_code_revision
+            or manifest.get("dataset_build_id") != str(claim.dataset_build_id)
+            or manifest.get("dataset_build_version") != claim.dataset_build_version
+            or manifest.get("dataset_manifest_sha256") != claim.dataset_manifest_sha256
+            or manifest.get("profile_id") != claim.training_job_profile_id
+            or manifest.get("artifact_contract_version")
+            != claim.training_job_artifact_contract_version
+            or manifest.get("manifest_contract_version")
+            != claim.training_job_manifest_contract_version
+            or manifest.get("configuration_contract_version")
+            != claim.training_configuration_contract_version
+            or manifest.get("dataset_info_contract_version")
+            != claim.training_dataset_info_contract_version
+            or manifest.get("execution_profile_contract_version")
+            != claim.training_execution_profile_contract_version
+            or manifest.get("base_model_id") != "Qwen/Qwen3-0.6B"
+            or manifest.get("base_model_revision") != "c1899de289a04d12100db370d81485cdf75e47ca"
+            or manifest.get("base_model_license") != "Apache-2.0"
+            or manifest.get("llamafactory_version") != claim.llamafactory_version
+            or manifest.get("dataset_rights_attested") is not True
+            or manifest.get("evaluation_contamination_reviewed") is not True
+            or manifest.get("maximum_record_content_bytes") != 7680
+            or manifest.get("tokenizer_preflight_required") is not True
+            or job.publication_manifest != manifest
+        ):
+            raise AdapterRegistryQueueError("training_job_authority_changed")
+
+    if isinstance(factory_or_session, Session):
+        check(factory_or_session)
+    else:
+        try:
+            with factory_or_session.begin() as session:
+                check(session)
+        except SQLAlchemyError as error:
+            raise AdapterRegistryQueueError("database_unavailable") from error
 
 
 def _same_identity(first, second) -> bool:
@@ -798,6 +1105,7 @@ def _verify_current_authority(
             AdapterImportAttempt.source_bundle_id == claim.source_bundle_id,
             AdapterImportAttempt.status == "committed",
             AdapterImportAttempt.publication_attempt_id == claim.source_publication_attempt_id,
+            AdapterImportAttempt.attempt_number == claim.source_attempt_number,
         )
         .with_for_update()
     ).scalar_one_or_none()
@@ -846,6 +1154,20 @@ def _verify_current_authority(
         )
         .with_for_update()
     ).scalar_one_or_none()
+    registry_attempt = session.execute(
+        select(AdapterRegistryAttempt)
+        .where(
+            AdapterRegistryAttempt.id == claim.registry_attempt_id,
+            AdapterRegistryAttempt.adapter_id == claim.id,
+            AdapterRegistryAttempt.department_id == claim.department_id,
+            AdapterRegistryAttempt.attempt_number == claim.attempt_number,
+            AdapterRegistryAttempt.publication_attempt_id == claim.publication_attempt_id,
+            AdapterRegistryAttempt.execution_scope_id == claim.execution_scope_id,
+            AdapterRegistryAttempt.status == claim.registry_attempt_status,
+            AdapterRegistryAttempt.version == claim.registry_attempt_version,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
     dependency = session.execute(
         select(AdapterUpstreamDependency)
         .where(
@@ -854,6 +1176,8 @@ def _verify_current_authority(
             AdapterUpstreamDependency.training_job_id == claim.training_job_id,
             AdapterUpstreamDependency.dataset_build_id == claim.dataset_build_id,
             AdapterUpstreamDependency.status == "active",
+            AdapterUpstreamDependency.id == claim.dependency_id,
+            AdapterUpstreamDependency.version == claim.dependency_version,
         )
         .with_for_update()
     ).scalar_one_or_none()
@@ -864,6 +1188,7 @@ def _verify_current_authority(
         or job_attempt is None
         or dataset is None
         or dataset_attempt is None
+        or registry_attempt is None
         or dependency is None
         or not _source_snapshot_matches(source, source_attempt, claim)
         or not _job_snapshot_matches(job, job_attempt, claim)
@@ -877,16 +1202,100 @@ def _adapter_snapshot_matches(adapter: Adapter, claim: ClaimedAdapter) -> bool:
     return (
         adapter.id == claim.id
         and adapter.department_id == claim.department_id
+        and adapter.requested_by_user_id == claim.requested_by_user_id
         and adapter.source_bundle_id == claim.source_bundle_id
         and adapter.source_authoritative_attempt_id == claim.source_authoritative_attempt_id
+        and adapter.source_publication_attempt_id == claim.source_publication_attempt_id
+        and adapter.source_attempt_number == claim.source_attempt_number
         and adapter.source_version == claim.source_version
+        and adapter.source_attempt_version == claim.source_attempt_version
+        and str(adapter.source_imported_by_user_id) == claim.source["imported_by_user_id"]
+        and adapter.source_code_revision == claim.source_code_revision
+        and adapter.source_contract_version == claim.source["source_contract_version"]
+        and adapter.intake_contract_version == claim.source["intake_contract_version"]
+        and adapter.config_contract_version == claim.source["config_contract_version"]
+        and adapter.tensor_contract_version == claim.source["tensor_contract_version"]
+        and adapter.source_intake_manifest_sha256 == claim.source_intake_manifest_sha256
+        and adapter.source_intake_manifest_byte_size == claim.source_intake_manifest_byte_size
+        and adapter.source_adapter_config_sha256 == claim.source_adapter_config_sha256
+        and adapter.source_adapter_config_byte_size == claim.source_adapter_config_byte_size
+        and adapter.source_adapter_model_sha256 == claim.source_adapter_model_sha256
+        and adapter.source_adapter_model_byte_size == claim.source_adapter_model_byte_size
+        and adapter.peft_version == claim.source["peft_version"]
+        and adapter.safetensors_format == claim.source["safetensors_format"]
+        and adapter.tensor_dtype == claim.tensor_dtype
+        and adapter.tensor_count == claim.tensor_count
+        and adapter.tensor_element_count == claim.tensor_element_count
+        and adapter.tensor_payload_byte_size == claim.tensor_payload_byte_size
         and adapter.training_job_id == claim.training_job_id
         and adapter.training_job_version == claim.training_job_version
+        and adapter.training_job_publication_attempt_id == claim.training_job_publication_attempt_id
+        and adapter.training_job_attempt_number == claim.training_job_attempt_number
+        and adapter.training_job_attempt_version == claim.training_job_attempt_version
+        and adapter.training_job_code_revision == claim.training_job_code_revision
+        and adapter.training_job_execution_scope_id == claim.training_job_execution_scope_id
+        and adapter.training_job_manifest_sha256 == claim.training_job_manifest_sha256
+        and adapter.training_job_manifest_byte_size == claim.training_job_manifest_byte_size
+        and adapter.training_job_config_sha256 == claim.training_job_config_sha256
+        and adapter.training_job_config_byte_size == claim.training_job_config_byte_size
+        and adapter.training_job_dataset_info_sha256 == claim.training_job_dataset_info_sha256
+        and adapter.training_job_dataset_info_byte_size == claim.training_job_dataset_info_byte_size
+        and adapter.training_job_train_sha256 == claim.training_job_train_sha256
+        and adapter.training_job_train_byte_size == claim.training_job_train_byte_size
+        and adapter.training_job_validation_sha256 == claim.training_job_validation_sha256
+        and adapter.training_job_validation_byte_size == claim.training_job_validation_byte_size
         and adapter.dataset_build_id == claim.dataset_build_id
         and adapter.dataset_build_version == claim.dataset_build_version
+        and adapter.dataset_publication_attempt_id == claim.dataset_publication_attempt_id
+        and adapter.dataset_publication_attempt_number == claim.dataset_publication_attempt_number
+        and adapter.dataset_attempt_version == claim.dataset_attempt_version
+        and adapter.dataset_code_revision == claim.dataset_code_revision
+        and adapter.dataset_manifest_sha256 == claim.dataset_manifest_sha256
+        and adapter.dataset_source_bundle_id == claim.dataset_source_bundle_id
+        and adapter.dataset_artifact_contract_version
+        == claim.governance_lineage["dataset_artifact_contract_version"]
+        and adapter.dataset_example_contract_version
+        == claim.governance_lineage["dataset_example_contract_version"]
+        and adapter.dataset_normalization_version
+        == claim.governance_lineage["dataset_normalization_version"]
+        and adapter.dataset_split_version == claim.governance_lineage["dataset_split_version"]
+        and adapter.dataset_train_sha256 == claim.governance_lineage["dataset_train_sha256"]
+        and adapter.dataset_train_byte_size == claim.governance_lineage["dataset_train_byte_size"]
+        and adapter.dataset_validation_sha256
+        == claim.governance_lineage["dataset_validation_sha256"]
+        and adapter.dataset_validation_byte_size
+        == claim.governance_lineage["dataset_validation_byte_size"]
+        and adapter.dataset_provenance_sha256
+        == claim.governance_lineage["dataset_provenance_sha256"]
+        and adapter.dataset_provenance_byte_size
+        == claim.governance_lineage["dataset_provenance_byte_size"]
+        and adapter.dataset_train_example_count
+        == claim.governance_lineage["dataset_train_example_count"]
+        and adapter.dataset_validation_example_count
+        == claim.governance_lineage["dataset_validation_example_count"]
+        and adapter.dataset_source_example_count
+        == claim.governance_lineage["dataset_source_example_count"]
+        and adapter.dataset_source_group_count
+        == claim.governance_lineage["dataset_source_group_count"]
+        and adapter.dataset_source_reference_count
+        == claim.governance_lineage["dataset_source_reference_count"]
+        and adapter.dataset_rights_attested is True
+        and adapter.evaluation_contamination_reviewed is True
         and adapter.code_revision == claim.code_revision
         and adapter.execution_scope_id == claim.execution_scope_id
         and adapter.attempt_number == claim.attempt_number
+        and adapter.version == claim.adapter_version
+        and adapter.status == claim.adapter_status
+        and adapter.worker_id == claim.worker_id
+        and adapter.claim_token == claim.claim_token
+        and adapter.publication_attempt_id == claim.publication_attempt_id
+        and adapter.base_model_id == BASE_MODEL_ID
+        and adapter.base_model_revision == BASE_MODEL_REVISION
+        and adapter.base_model_license == BASE_MODEL_LICENSE
+        and adapter.artifact_contract_version == "phase12-adapter-artifact-v1"
+        and adapter.registry_manifest_contract_version == "phase12-adapter-manifest-v1"
+        and adapter.declared_external_training_association is True
+        and adapter.training_provenance_verified is False
     )
 
 
@@ -898,7 +1307,7 @@ def _source_snapshot_matches(
         source.id == claim.source_bundle_id
         and source.department_id == claim.department_id
         and source.authoritative_attempt_id == claim.source_authoritative_attempt_id
-        and source.version == claim.source_version + 1
+        and source.version == claim.source_version
         and source.status == "claimed"
         and source.claimed_adapter_id == claim.id
         and source.claimed_at is not None
@@ -908,6 +1317,7 @@ def _source_snapshot_matches(
         and source.code_revision == claim.source_code_revision
         and str(source.imported_by_user_id) == snapshot["imported_by_user_id"]
         and source.intake_manifest_sha256 == claim.source_intake_manifest_sha256
+        and source.intake_manifest_byte_size == claim.source_intake_manifest_byte_size
         and source.adapter_config_sha256 == claim.source_adapter_config_sha256
         and source.adapter_config_byte_size == claim.source_adapter_config_byte_size
         and source.adapter_model_sha256 == claim.source_adapter_model_sha256
@@ -918,6 +1328,9 @@ def _source_snapshot_matches(
         and source.tensor_contract_version == snapshot["tensor_contract_version"]
         and source.peft_version == snapshot["peft_version"]
         and source.safetensors_format == snapshot["safetensors_format"]
+        and source.base_model_id == snapshot["base_model_id"]
+        and source.base_model_revision == snapshot["base_model_revision"]
+        and source.base_model_license == snapshot["base_model_license"]
         and source.tensor_dtype == snapshot["tensor_dtype"]
         and source.tensor_count == snapshot["tensor_count"]
         and source.tensor_element_count == snapshot["tensor_element_count"]
@@ -929,8 +1342,13 @@ def _source_snapshot_matches(
         and attempt.publication_attempt_id == claim.source_publication_attempt_id
         and attempt.attempt_number == claim.source_attempt_number
         and attempt.code_revision == claim.source_code_revision
+        and attempt.version == claim.source_attempt_version
         and attempt.committed_at is not None
-        and isinstance(attempt.ownership_manifest, dict)
+        and _manifest_digest_matches(
+            attempt.ownership_manifest,
+            claim.source_intake_manifest_sha256,
+            claim.source_intake_manifest_byte_size,
+        )
     )
 
 
@@ -946,9 +1364,19 @@ def _job_snapshot_matches(
         and job.archived_at is None
         and job.purged_at is None
         and job.version == claim.training_job_version
+        and job.execution_scope_id == claim.training_job_execution_scope_id
+        and job.attempt_number == claim.training_job_attempt_number
         and job.publication_attempt_id == claim.training_job_publication_attempt_id
         and job.code_revision == claim.training_job_code_revision
         and job.result_manifest_sha256 == claim.training_job_manifest_sha256
+        and job.training_config_sha256 == claim.training_job_config_sha256
+        and job.training_config_byte_size == claim.training_job_config_byte_size
+        and job.dataset_info_sha256 == claim.training_job_dataset_info_sha256
+        and job.dataset_info_byte_size == claim.training_job_dataset_info_byte_size
+        and job.train_sha256 == claim.training_job_train_sha256
+        and job.train_byte_size == claim.training_job_train_byte_size
+        and job.validation_sha256 == claim.training_job_validation_sha256
+        and job.validation_byte_size == claim.training_job_validation_byte_size
         and job.profile_id == claim.training_job_profile_id
         and job.base_model_id == BASE_MODEL_ID
         and job.base_model_revision == BASE_MODEL_REVISION
@@ -994,6 +1422,9 @@ def _job_snapshot_matches(
         and attempt.training_job_id == claim.training_job_id
         and attempt.status == "succeeded"
         and attempt.code_revision == claim.training_job_code_revision
+        and attempt.execution_scope_id == claim.training_job_execution_scope_id
+        and attempt.version == claim.training_job_attempt_version
+        and attempt.ownership_manifest == job.publication_manifest
     )
 
 
@@ -1032,14 +1463,13 @@ def _dataset_snapshot_matches(
         and dataset.normalization_version
         == claim.governance_lineage["dataset_normalization_version"]
         and dataset.split_version == claim.governance_lineage["dataset_split_version"]
-        and getattr(dataset, "dataset_rights_attested", True) is True
-        and getattr(dataset, "evaluation_contamination_reviewed", True) is True
         and attempt.department_id == claim.department_id
         and attempt.build_id == claim.dataset_build_id
         and attempt.status == "succeeded"
         and attempt.publication_attempt_id == claim.dataset_publication_attempt_id
         and attempt.attempt_number == claim.dataset_publication_attempt_number
         and attempt.code_revision == claim.dataset_code_revision
+        and attempt.version == claim.dataset_attempt_version
         and attempt.published_at is not None
         and attempt.finished_at is not None
     )
@@ -1075,6 +1505,16 @@ def _has_active_purge_reservation(session: Session, claim: ClaimedAdapter) -> bo
     return bool(job_reserved or dataset_reserved)
 
 
+def _manifest_digest_matches(value: object, expected_sha256: str, expected_size: int) -> bool:
+    if not isinstance(value, dict):
+        return False
+    try:
+        raw = canonical_json_bytes(value)
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return False
+    return len(raw) == expected_size and hashlib.sha256(raw).hexdigest() == expected_sha256
+
+
 def _finish_success(
     factory: sessionmaker[Session],
     claim: ClaimedAdapter,
@@ -1095,6 +1535,7 @@ def _finish_success(
         stage.recheck()
         _verify_retained_registry(stage, result)
         adapter = _live_claim(session, claim)
+        _verify_training_bundle_authority(session, claim, training_final)
         source = session.execute(
             select(AdapterImportSource)
             .where(
@@ -1110,6 +1551,10 @@ def _finish_success(
             .where(
                 AdapterUpstreamDependency.adapter_id == claim.id,
                 AdapterUpstreamDependency.department_id == claim.department_id,
+                AdapterUpstreamDependency.training_job_id == claim.training_job_id,
+                AdapterUpstreamDependency.dataset_build_id == claim.dataset_build_id,
+                AdapterUpstreamDependency.id == claim.dependency_id,
+                AdapterUpstreamDependency.version == claim.dependency_version,
                 AdapterUpstreamDependency.status == "active",
             )
             .with_for_update()
@@ -1162,9 +1607,13 @@ def _attempt(session: Session, claim: ClaimedAdapter) -> AdapterRegistryAttempt:
     attempt = session.execute(
         select(AdapterRegistryAttempt)
         .where(
+            AdapterRegistryAttempt.id == claim.registry_attempt_id,
             AdapterRegistryAttempt.adapter_id == claim.id,
             AdapterRegistryAttempt.department_id == claim.department_id,
             AdapterRegistryAttempt.publication_attempt_id == claim.publication_attempt_id,
+            AdapterRegistryAttempt.execution_scope_id == claim.execution_scope_id,
+            AdapterRegistryAttempt.attempt_number == claim.attempt_number,
+            AdapterRegistryAttempt.version == claim.registry_attempt_version,
         )
         .with_for_update()
     ).scalar_one_or_none()
@@ -1204,15 +1653,56 @@ def _record_failure(
             attempt = _attempt(session, claim)
             attempt.status = "validation_failed" if validation else "failed"
             attempt.error_code = code
+            attempt.worker_id = None
+            attempt.claimed_at = None
+            attempt.ownership_manifest = None
             attempt.finished_at = now
             attempt.version += 1
     except SQLAlchemyError:
         return
 
 
-def _terminal_claim_failure(session: Session, adapter: Adapter, now, code: str) -> None:
+def _terminal_claim_failure(
+    session: Session,
+    adapter: Adapter,
+    now,
+    code: str,
+    *,
+    attempt: AdapterRegistryAttempt | None = None,
+) -> None:
+    targets: list[AdapterRegistryAttempt] = []
+    if attempt is None:
+        targets = (
+            session.execute(
+                select(AdapterRegistryAttempt)
+                .where(
+                    AdapterRegistryAttempt.adapter_id == adapter.id,
+                    AdapterRegistryAttempt.department_id == adapter.department_id,
+                    AdapterRegistryAttempt.publication_attempt_id == adapter.publication_attempt_id,
+                    AdapterRegistryAttempt.execution_scope_id == adapter.execution_scope_id,
+                    AdapterRegistryAttempt.attempt_number == adapter.attempt_number,
+                    AdapterRegistryAttempt.status.in_(("registered", "running")),
+                )
+                .with_for_update()
+            )
+            .scalars()
+            .all()
+        )
+    else:
+        targets = [attempt]
+    for target in targets:
+        target.status = "failed"
+        target.error_code = code
+        target.worker_id = None
+        target.claimed_at = None
+        target.ownership_manifest = None
+        target.finished_at = now
+        target.version += 1
     adapter.status = "failed"
     adapter.error_code = code
+    adapter.worker_id = None
+    adapter.claim_token = None
+    adapter.lease_expires_at = None
     adapter.finished_at = now
     adapter.version += 1
 

@@ -5,13 +5,23 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import struct
 import sys
+from uuid import UUID
 
 from app.adapter_contract import (
+    BASE_MODEL_ID,
+    BASE_MODEL_LICENSE,
+    BASE_MODEL_REVISION,
+    EXPECTED_TENSOR_BYTES,
+    EXPECTED_TENSOR_COUNT,
+    EXPECTED_TENSOR_ELEMENTS,
     MAX_CONFIG_BYTES,
     MAX_SAFETENSORS_HEADER_BYTES,
+    PEFT_FORMAT_REFERENCE_VERSION,
+    SAFETENSORS_FORMAT_REFERENCE_VERSION,
     canonical_adapter_config_bytes,
     parse_external_adapter_config,
     validate_safetensors_metadata,
@@ -42,6 +52,7 @@ SOURCE_SNAPSHOT_KEYS = frozenset(
         "config_contract_version",
         "tensor_contract_version",
         "intake_manifest_sha256",
+        "intake_manifest_byte_size",
         "adapter_config_sha256",
         "adapter_config_byte_size",
         "adapter_model_sha256",
@@ -53,6 +64,9 @@ SOURCE_SNAPSHOT_KEYS = frozenset(
         "tensor_element_count",
         "tensor_payload_byte_size",
         "imported_by_user_id",
+        "base_model_id",
+        "base_model_revision",
+        "base_model_license",
     }
 )
 GOVERNANCE_SNAPSHOT_KEYS = frozenset(
@@ -63,6 +77,16 @@ GOVERNANCE_SNAPSHOT_KEYS = frozenset(
         "training_job_attempt_number",
         "training_job_code_revision",
         "training_job_manifest_sha256",
+        "training_job_manifest_byte_size",
+        "training_job_execution_scope_id",
+        "training_job_config_sha256",
+        "training_job_config_byte_size",
+        "training_job_dataset_info_sha256",
+        "training_job_dataset_info_byte_size",
+        "training_job_train_sha256",
+        "training_job_train_byte_size",
+        "training_job_validation_sha256",
+        "training_job_validation_byte_size",
         "training_job_profile_id",
         "training_job_artifact_contract_version",
         "training_job_manifest_contract_version",
@@ -143,6 +167,7 @@ CHILD_ERROR_CODES = frozenset(
         "adapter_input_unsafe",
     }
 )
+_REVISION = re.compile(r"\A[0-9a-f]{40}\Z")
 
 
 class AdapterRegistryChildError(RuntimeError):
@@ -195,8 +220,18 @@ def _exact_request(value: object) -> dict[str, object]:
     for key in ("department_id", "adapter_id", "publication_attempt_id"):
         if not isinstance(value[key], str) or len(value[key]) != 36:
             raise AdapterRegistryChildError("adapter_registry_manifest_invalid")
-    if not isinstance(value["code_revision"], str) or len(value["code_revision"]) != 40:
+    if (
+        not isinstance(value["code_revision"], str)
+        or _REVISION.fullmatch(value["code_revision"]) is None
+    ):
         raise AdapterRegistryChildError("adapter_registry_manifest_invalid")
+    for key in ("department_id", "adapter_id", "publication_attempt_id"):
+        try:
+            parsed = UUID(value[key])
+        except (TypeError, ValueError):
+            raise AdapterRegistryChildError("adapter_registry_manifest_invalid") from None
+        if parsed.int == 0 or str(parsed) != value[key]:
+            raise AdapterRegistryChildError("adapter_registry_manifest_invalid")
     if not isinstance(value["source"], dict) or not isinstance(value["governance_lineage"], dict):
         raise AdapterRegistryChildError("adapter_registry_manifest_invalid")
     if (
@@ -268,6 +303,22 @@ def _validate_source_manifest(
     model_size: int,
     config_digest: str,
 ) -> None:
+    if (
+        len(raw) != int(source["intake_manifest_byte_size"])
+        or hashlib.sha256(raw).hexdigest() != source["intake_manifest_sha256"]
+    ):
+        raise ValueError("source manifest authority")
+    if (
+        source["base_model_id"] != BASE_MODEL_ID
+        or source["base_model_revision"] != BASE_MODEL_REVISION
+        or source["base_model_license"] != BASE_MODEL_LICENSE
+        or source["peft_version"] != PEFT_FORMAT_REFERENCE_VERSION
+        or source["safetensors_format"] != SAFETENSORS_FORMAT_REFERENCE_VERSION
+        or source["tensor_count"] != EXPECTED_TENSOR_COUNT
+        or source["tensor_element_count"] != EXPECTED_TENSOR_ELEMENTS
+        or source["tensor_payload_byte_size"] != EXPECTED_TENSOR_BYTES.get(source["tensor_dtype"])
+    ):
+        raise ValueError("source contract authority")
     value = _closed_object(raw)
     if set(value) != SOURCE_MANIFEST_KEYS:
         raise ValueError("source manifest keys")
@@ -282,9 +333,10 @@ def _validate_source_manifest(
         "publication_attempt_id": source["publication_attempt_id"],
         "attempt_number": source["attempt_number"],
         "code_revision": source["code_revision"],
-        "base_model_id": "Qwen/Qwen3-0.6B",
-        "base_model_revision": "c1899de289a04d12100db370d81485cdf75e47ca",
-        "base_model_license": "Apache-2.0",
+        "imported_by_user_id": source["imported_by_user_id"],
+        "base_model_id": source["base_model_id"],
+        "base_model_revision": source["base_model_revision"],
+        "base_model_license": source["base_model_license"],
         "peft_version": source["peft_version"],
         "safetensors_format": source["safetensors_format"],
         "tensor_dtype": source["tensor_dtype"],
@@ -353,6 +405,29 @@ def _validate_training_manifest(
     }
     if any(manifest.get(key) != expected_value for key, expected_value in expected.items()):
         raise ValueError("training manifest authority")
+    if manifest.get("execution_scope_id") != governance.get("training_job_execution_scope_id"):
+        raise ValueError("training manifest execution scope")
+    files = manifest.get("files")
+    expected_files = {
+        "training.yaml": {
+            "sha256": governance.get("training_job_config_sha256"),
+            "byte_size": governance.get("training_job_config_byte_size"),
+        },
+        "dataset_info.json": {
+            "sha256": governance.get("training_job_dataset_info_sha256"),
+            "byte_size": governance.get("training_job_dataset_info_byte_size"),
+        },
+        "train.jsonl": {
+            "sha256": governance.get("training_job_train_sha256"),
+            "byte_size": governance.get("training_job_train_byte_size"),
+        },
+        "validation.jsonl": {
+            "sha256": governance.get("training_job_validation_sha256"),
+            "byte_size": governance.get("training_job_validation_byte_size"),
+        },
+    }
+    if files != expected_files:
+        raise ValueError("training manifest files")
     if (
         hashlib.sha256(canonical_json_bytes(manifest)).hexdigest()
         != governance["training_job_manifest_sha256"]
@@ -423,7 +498,12 @@ def build_registry_stage(request: dict[str, object]) -> dict[str, object]:
     ):
         raise AdapterRegistryChildError("adapter_source_artifact_mismatch")
     try:
-        parse_external_adapter_config(config_raw)
+        config_summary = parse_external_adapter_config(config_raw)
+        if (
+            config_summary.base_model_id != source["base_model_id"]
+            or config_summary.peft_version != source["peft_version"]
+        ):
+            raise ValueError("config summary authority")
     except Exception as error:
         code = getattr(error, "code", "adapter_config_invalid")
         raise AdapterRegistryChildError(code) from error
@@ -457,10 +537,18 @@ def build_registry_stage(request: dict[str, object]) -> dict[str, object]:
         raise AdapterRegistryChildError("adapter_source_artifact_mismatch")
     # Read only the fixed safetensors header; values are never deserialized.
     try:
-        validate_safetensors_metadata(
+        tensor_summary = validate_safetensors_metadata(
             _PreadReader(source_model_fd, min(model_size, 8 + MAX_SAFETENSORS_HEADER_BYTES)),
             model_size,
         )
+        if (
+            tensor_summary.dtype != source["tensor_dtype"]
+            or tensor_summary.tensor_count != source["tensor_count"]
+            or tensor_summary.total_tensor_elements != source["tensor_element_count"]
+            or tensor_summary.total_tensor_bytes != source["tensor_payload_byte_size"]
+            or source["safetensors_format"] != "0.7.0"
+        ):
+            raise AdapterRegistryChildError("adapter_source_artifact_mismatch")
     except Exception as error:
         code = getattr(error, "code", "adapter_header_invalid")
         raise AdapterRegistryChildError(code) from error
@@ -494,10 +582,10 @@ def build_registry_stage(request: dict[str, object]) -> dict[str, object]:
         "base_model_license": "Apache-2.0",
         "peft_version": source["peft_version"],
         "safetensors_format": source["safetensors_format"],
-        "tensor_dtype": source["tensor_dtype"],
-        "tensor_count": source["tensor_count"],
-        "tensor_element_count": source["tensor_element_count"],
-        "tensor_payload_byte_size": source["tensor_payload_byte_size"],
+        "tensor_dtype": tensor_summary.dtype,
+        "tensor_count": tensor_summary.tensor_count,
+        "tensor_element_count": tensor_summary.total_tensor_elements,
+        "tensor_payload_byte_size": tensor_summary.total_tensor_bytes,
         "adapter_config_contract_version": source["config_contract_version"],
         "adapter_tensor_contract_version": source["tensor_contract_version"],
     }
@@ -526,10 +614,10 @@ def build_registry_stage(request: dict[str, object]) -> dict[str, object]:
         "registry_adapter_config_byte_size": files["adapter_config.json"]["byte_size"],
         "registry_adapter_model_sha256": model_sha,
         "registry_adapter_model_byte_size": model_bytes,
-        "tensor_dtype": source["tensor_dtype"],
-        "tensor_count": source["tensor_count"],
-        "tensor_element_count": source["tensor_element_count"],
-        "tensor_payload_byte_size": source["tensor_payload_byte_size"],
+        "tensor_dtype": tensor_summary.dtype,
+        "tensor_count": tensor_summary.tensor_count,
+        "tensor_element_count": tensor_summary.total_tensor_elements,
+        "tensor_payload_byte_size": tensor_summary.total_tensor_bytes,
     }
     return result
 
@@ -537,7 +625,13 @@ def build_registry_stage(request: dict[str, object]) -> dict[str, object]:
 def _uuid_text(value: object) -> str:
     if not isinstance(value, str) or len(value) != 36:
         raise AdapterRegistryChildError("adapter_registry_manifest_invalid")
-    return value  # domain validation performs canonical UUID validation
+    try:
+        parsed = UUID(value)
+    except (TypeError, ValueError):
+        raise AdapterRegistryChildError("adapter_registry_manifest_invalid") from None
+    if parsed.int == 0 or str(parsed) != value:
+        raise AdapterRegistryChildError("adapter_registry_manifest_invalid")
+    return value
 
 
 def _write_file(stage_fd: int, name: str, raw: bytes) -> None:

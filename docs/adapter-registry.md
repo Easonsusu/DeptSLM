@@ -704,3 +704,26 @@ Phase 12 as a whole is complete only when tests prove that:
 - Phase 13 remains unstarted.
 
 Until these criteria are met, an adapter is not available for runtime use.
+
+## Phase 12.1C hardening notes
+
+Migration `0011_phase12_adapter_registry` binds the reverse source claim and
+the exact source, Phase 11, and Phase 10 publication attempts with restrictive
+composite foreign keys. `AdapterUpstreamDependency` points to the exact
+adapter/job/dataset snapshot. SQL and ORM checks freeze all model, package,
+artifact, profile, tensor, hash, size, and governance contracts; the two
+dataset declarations are copied only from the approved Phase 11 job.
+
+The parent verifies every retained Phase 11 file and its manifest before and
+after child execution. Only `manifest.json` is sent to the child. Intake
+manifest bytes are hash- and size-bound, including the exact imported-by
+identity. The child compares actual configuration and safetensors summaries,
+then copies model bytes opaquely without deserializing values.
+
+Claim operations carry an evolving version snapshot for every authority row and
+throttle heartbeats to a lease fraction. Reclaim requires one exact prior active
+attempt, preserves its manifest as historical metadata, and never adopts its
+stage or final. Phase 10 and Phase 11 deletion checks lock and recheck active
+dependencies before filesystem mutation. Phase 12.1C intentionally has no
+registry-stage/final deletion helper; stale registry surfaces wait for Phase
+12.1E.

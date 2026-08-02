@@ -165,6 +165,7 @@ class AdapterAuthoritySnapshot:
     adapter_model_sha256: str | None
     adapter_model_byte_size: int | None
     intake_manifest_sha256: str | None
+    intake_manifest_byte_size: int | None
     tensor_dtype: str | None
     tensor_count: int | None
     tensor_element_count: int | None
@@ -493,6 +494,7 @@ def _snapshot(
         adapter_model_sha256=source.adapter_model_sha256,
         adapter_model_byte_size=source.adapter_model_byte_size,
         intake_manifest_sha256=source.intake_manifest_sha256,
+        intake_manifest_byte_size=source.intake_manifest_byte_size,
         tensor_dtype=source.tensor_dtype,
         tensor_count=source.tensor_count,
         tensor_element_count=source.tensor_element_count,
@@ -867,6 +869,7 @@ def _commit_published(
         source.status = "committed"
         source.authoritative_attempt_id = attempt.id
         source.intake_manifest_sha256 = manifest_digest
+        source.intake_manifest_byte_size = len(_manifest_bytes(manifest))
         source.committed_at = _server_now(session)
         source.error_code = None
         attempt.status = "committed"

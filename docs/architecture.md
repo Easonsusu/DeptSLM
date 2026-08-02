@@ -183,11 +183,16 @@ Phase 6 fixes `Qwen/Qwen3-Embedding-0.6B` revision `d23109d65ca9fdf61eef61420974
 ### LLaMA-Factory and the training worker
 
 Phase 11's training-job worker generates immutable bundles but does not launch
-LLaMA-Factory. A future Phase 12 implementation may consume one exact approved
-bundle through a separately reviewed external adapter intake. Training data,
-outputs, logs, and adapters remain under `DEPTSLM_DATA_DIR`; every dataset,
-job, evaluation, and adapter is department-scoped and bound to an exact
-base-model revision. No cross-department adapter fallback is permitted.
+LLaMA-Factory. Phase 12.1A and 12.1B define the model-free external source
+contract, and Phase 12.1C consumes one exact approved bundle through a separate
+administrator-enqueued registry worker. The worker captures exact source,
+Phase 11, and Phase 10 attempt identities and evolving versions, retains all
+five Phase 11 descriptors in the parent, and sends only `manifest.json` to the
+fixed child. It reauthorizes retention fences immediately before Phase 10/11
+final-file deletion; registry stale-surface deletion remains deferred.
+Training data, outputs, logs, and adapters remain under `DEPTSLM_DATA_DIR`;
+every dataset, job, evaluation, and adapter is department-scoped and bound to
+an exact base-model revision. No cross-department adapter fallback is permitted.
 
 ### Shared package
 
@@ -235,6 +240,13 @@ the exact content-free registry bundle. Evaluation, approval, promotion,
 rollback, reconciliation, and purge remain future reviewed phases.
 
 The exact training scheduler, GPU execution environment, registry schema, and approval workflow are future decisions.
+
+Phase 12.1C PostgreSQL publication and external filesystem publication are not
+atomic. A filesystem rename without a committed succeeded row is not runtime,
+evaluation, or promotion authority; future reconciliation must handle that
+surface explicitly. Claim loss, timeout, shutdown, and database failure prevent
+success publication and completion audit, while a later worker may reclaim only
+the exact prior attempt.
 
 ## Isolation and trust boundaries
 

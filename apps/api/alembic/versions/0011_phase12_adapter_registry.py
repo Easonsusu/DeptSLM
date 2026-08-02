@@ -130,10 +130,33 @@ def upgrade() -> None:
     op.add_column("adapter_import_sources", sa.Column("claimed_adapter_id", sa.Uuid()))
     op.add_column("adapter_import_sources", sa.Column("claimed_at", sa.DateTime(timezone=True)))
     op.add_column("adapter_import_sources", sa.Column("consumed_at", sa.DateTime(timezone=True)))
+    op.add_column("adapter_import_sources", sa.Column("intake_manifest_byte_size", sa.BigInteger()))
     op.create_check_constraint(
         "ck_adapter_import_source_lifecycle",
         "adapter_import_sources",
         _source_lifecycle().sqltext,
+    )
+    op.create_check_constraint(
+        "ck_adapter_import_source_manifest_size",
+        "adapter_import_sources",
+        "((status IN ('committed','claimed','consumed','purge_pending','purged') AND intake_manifest_byte_size > 0) OR "
+        "(status IN ('staging','rejected','abandoned') AND intake_manifest_byte_size IS NULL))",
+    )
+
+    op.create_unique_constraint(
+        "uq_adapter_import_attempt_exact",
+        "adapter_import_attempts",
+        ["id", "department_id", "source_bundle_id", "publication_attempt_id", "attempt_number"],
+    )
+    op.create_unique_constraint(
+        "uq_training_job_attempt_exact",
+        "training_job_attempts",
+        ["training_job_id", "department_id", "publication_attempt_id", "attempt_number"],
+    )
+    op.create_unique_constraint(
+        "uq_sft_build_attempt_exact",
+        "sft_dataset_build_attempts",
+        ["build_id", "department_id", "publication_attempt_id", "attempt_number"],
     )
 
     op.create_table(
@@ -169,6 +192,7 @@ def upgrade() -> None:
         sa.Column("source_authoritative_attempt_id", sa.Uuid(), nullable=False),
         sa.Column("source_publication_attempt_id", sa.Uuid(), nullable=False),
         sa.Column("source_attempt_number", sa.Integer(), nullable=False),
+        sa.Column("source_attempt_version", sa.Integer(), nullable=False),
         sa.Column("source_imported_by_user_id", sa.Uuid(), nullable=False),
         sa.Column("source_version", sa.Integer(), nullable=False),
         sa.Column("source_code_revision", sa.String(40), nullable=False),
@@ -177,6 +201,7 @@ def upgrade() -> None:
         sa.Column("config_contract_version", sa.String(100), nullable=False),
         sa.Column("tensor_contract_version", sa.String(100), nullable=False),
         sa.Column("source_intake_manifest_sha256", sa.String(64), nullable=False),
+        sa.Column("source_intake_manifest_byte_size", sa.BigInteger(), nullable=False),
         sa.Column("source_adapter_config_sha256", sa.String(64), nullable=False),
         sa.Column("source_adapter_config_byte_size", sa.BigInteger(), nullable=False),
         sa.Column("source_adapter_model_sha256", sa.String(64), nullable=False),
@@ -191,8 +216,19 @@ def upgrade() -> None:
         sa.Column("training_job_version", sa.Integer(), nullable=False),
         sa.Column("training_job_publication_attempt_id", sa.Uuid(), nullable=False),
         sa.Column("training_job_attempt_number", sa.Integer(), nullable=False),
+        sa.Column("training_job_attempt_version", sa.Integer(), nullable=False),
         sa.Column("training_job_code_revision", sa.String(40), nullable=False),
         sa.Column("training_job_manifest_sha256", sa.String(64), nullable=False),
+        sa.Column("training_job_manifest_byte_size", sa.BigInteger(), nullable=False),
+        sa.Column("training_job_execution_scope_id", sa.Uuid(), nullable=False),
+        sa.Column("training_job_config_sha256", sa.String(64), nullable=False),
+        sa.Column("training_job_config_byte_size", sa.BigInteger(), nullable=False),
+        sa.Column("training_job_dataset_info_sha256", sa.String(64), nullable=False),
+        sa.Column("training_job_dataset_info_byte_size", sa.BigInteger(), nullable=False),
+        sa.Column("training_job_train_sha256", sa.String(64), nullable=False),
+        sa.Column("training_job_train_byte_size", sa.BigInteger(), nullable=False),
+        sa.Column("training_job_validation_sha256", sa.String(64), nullable=False),
+        sa.Column("training_job_validation_byte_size", sa.BigInteger(), nullable=False),
         sa.Column("training_job_profile_id", sa.String(80), nullable=False),
         sa.Column("training_job_artifact_contract_version", sa.String(100), nullable=False),
         sa.Column("training_job_manifest_contract_version", sa.String(100), nullable=False),
@@ -204,6 +240,7 @@ def upgrade() -> None:
         sa.Column("dataset_build_version", sa.Integer(), nullable=False),
         sa.Column("dataset_publication_attempt_id", sa.Uuid(), nullable=False),
         sa.Column("dataset_publication_attempt_number", sa.Integer(), nullable=False),
+        sa.Column("dataset_attempt_version", sa.Integer(), nullable=False),
         sa.Column("dataset_code_revision", sa.String(40), nullable=False),
         sa.Column("dataset_manifest_sha256", sa.String(64), nullable=False),
         sa.Column("dataset_source_bundle_id", sa.Uuid(), nullable=False),
@@ -262,49 +299,117 @@ def upgrade() -> None:
             name="ck_adapter_registry_contracts",
         ),
         sa.CheckConstraint(
+            "base_model_id = 'Qwen/Qwen3-0.6B' AND "
+            "base_model_revision = 'c1899de289a04d12100db370d81485cdf75e47ca' AND "
+            "base_model_license = 'Apache-2.0' AND peft_version = '0.18.1' AND "
+            "safetensors_format = '0.7.0' AND "
+            "training_job_artifact_contract_version = 'phase11-training-job-v1' AND "
+            "training_job_manifest_contract_version = 'phase11-training-job-manifest-v1' AND "
+            "training_configuration_contract_version = 'phase11-training-config-v1' AND "
+            "training_dataset_info_contract_version = 'phase11-dataset-info-v1' AND "
+            "training_execution_profile_contract_version = 'phase11-execution-profile-v1' AND "
+            "llamafactory_version = '0.9.5' AND "
+            "training_job_profile_id IN ('phase11-qwen3-0.6b-lora-v1','phase11-qwen3-0.6b-qlora-nf4-v1') AND "
+            "dataset_artifact_contract_version = 'phase10-sft-dataset-v1' AND "
+            "dataset_example_contract_version = 'phase10-sft-example-v1' AND "
+            "dataset_normalization_version = 'phase10-sft-normalization-v1' AND "
+            "dataset_split_version = 'phase10-sft-group-split-v1' AND "
+            "dataset_rights_attested IS TRUE AND evaluation_contamination_reviewed IS TRUE",
+            name="ck_adapter_upstream_contracts",
+        ),
+        sa.CheckConstraint(
+            "source_intake_manifest_byte_size > 0 AND source_adapter_config_byte_size > 0 AND "
+            "source_adapter_model_byte_size > 0 AND training_job_manifest_byte_size > 0 AND "
+            "training_job_config_byte_size > 0 AND training_job_dataset_info_byte_size > 0 AND "
+            "training_job_train_byte_size > 0 AND training_job_validation_byte_size > 0 AND "
+            "dataset_train_byte_size > 0 AND dataset_validation_byte_size > 0 AND "
+            "dataset_provenance_byte_size > 0 AND dataset_train_example_count > 0 AND "
+            "dataset_validation_example_count > 0 AND dataset_source_example_count >= 2 AND "
+            "dataset_source_group_count >= 2 AND "
+            "dataset_source_reference_count >= dataset_source_example_count AND "
+            "tensor_count = 392 AND "
+            "tensor_element_count = 10092544 AND "
+            "((tensor_dtype IN ('F16','BF16') AND tensor_payload_byte_size = 20185088) OR "
+            "(tensor_dtype = 'F32' AND tensor_payload_byte_size = 40370176))",
+            name="ck_adapter_exact_sizes",
+        ),
+        sa.CheckConstraint(
             "tensor_dtype IN ('F16','BF16','F32') AND tensor_count = 392 AND tensor_element_count = 10092544 AND tensor_payload_byte_size > 0",
             name="ck_adapter_tensor_contract",
         ),
         sa.CheckConstraint(
-            "source_adapter_model_sha256 = registry_adapter_model_sha256 AND source_adapter_model_byte_size = registry_adapter_model_byte_size",
+            "(registry_adapter_model_sha256 IS NULL AND registry_adapter_model_byte_size IS NULL) OR "
+            "(source_adapter_model_sha256 = registry_adapter_model_sha256 AND "
+            "source_adapter_model_byte_size = registry_adapter_model_byte_size)",
             name="ck_adapter_model_digest_match",
         ),
         sa.CheckConstraint(
-            "source_adapter_config_sha256 ~ '^[0-9a-f]{64}$' AND source_adapter_model_sha256 ~ '^[0-9a-f]{64}$'",
+            "source_adapter_config_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "source_adapter_model_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "training_job_manifest_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "training_job_config_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "training_job_dataset_info_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "training_job_train_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "training_job_validation_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "dataset_manifest_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "dataset_train_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "dataset_validation_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "dataset_provenance_sha256 ~ '^[0-9a-f]{64}$'",
             name="ck_adapter_source_hashes",
         ),
         sa.CheckConstraint(
-            "registry_manifest_sha256 IS NULL OR registry_manifest_sha256 ~ '^[0-9a-f]{64}$'",
+            "(registry_manifest_sha256 IS NULL OR registry_manifest_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(registry_adapter_config_sha256 IS NULL OR registry_adapter_config_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(registry_adapter_model_sha256 IS NULL OR registry_adapter_model_sha256 ~ '^[0-9a-f]{64}$')",
             name="ck_adapter_registry_hashes",
         ),
         sa.CheckConstraint(
-            "attempt_number > 0 AND version > 0 AND source_version > 0 AND training_job_version > 0 AND dataset_build_version > 0",
+            "attempt_number > 0 AND version > 0 AND source_version > 0 AND source_attempt_version > 0 "
+            "AND training_job_version > 0 AND training_job_attempt_version > 0 "
+            "AND dataset_build_version > 0 AND dataset_attempt_version > 0",
             name="ck_adapter_versions",
         ),
         sa.CheckConstraint(
             "(status = 'queued' AND worker_id IS NULL AND claim_token IS NULL AND claimed_at IS NULL "
             "AND lease_expires_at IS NULL AND started_at IS NULL AND finished_at IS NULL "
-            "AND validated_at IS NULL AND error_code IS NULL AND verified_governance_lineage IS FALSE "
+            "AND validated_at IS NULL AND purged_at IS NULL AND error_code IS NULL "
+            "AND verified_governance_lineage IS FALSE "
             "AND verified_artifact_compatibility IS FALSE AND registry_manifest_sha256 IS NULL "
             "AND registry_adapter_config_sha256 IS NULL AND registry_adapter_config_byte_size IS NULL "
             "AND registry_adapter_model_sha256 IS NULL AND registry_adapter_model_byte_size IS NULL) OR "
             "(status = 'running' AND worker_id IS NOT NULL AND claim_token IS NOT NULL "
             "AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL AND started_at IS NOT NULL "
-            "AND finished_at IS NULL AND validated_at IS NULL AND error_code IS NULL "
+            "AND finished_at IS NULL AND validated_at IS NULL AND purged_at IS NULL "
+            "AND error_code IS NULL "
             "AND verified_governance_lineage IS FALSE AND verified_artifact_compatibility IS FALSE "
             "AND registry_manifest_sha256 IS NULL AND registry_adapter_config_sha256 IS NULL "
             "AND registry_adapter_config_byte_size IS NULL AND registry_adapter_model_sha256 IS NULL "
             "AND registry_adapter_model_byte_size IS NULL) OR "
             "(status = 'validated' AND worker_id IS NULL AND claim_token IS NULL AND lease_expires_at IS NULL "
-            "AND validated_at IS NOT NULL AND finished_at IS NOT NULL AND error_code IS NULL "
+            "AND validated_at IS NOT NULL AND finished_at IS NOT NULL AND purged_at IS NULL "
+            "AND error_code IS NULL "
             "AND verified_governance_lineage IS TRUE AND verified_artifact_compatibility IS TRUE "
             "AND registry_manifest_sha256 IS NOT NULL AND registry_adapter_config_sha256 IS NOT NULL "
             "AND registry_adapter_config_byte_size > 0 AND registry_adapter_model_sha256 IS NOT NULL "
             "AND registry_adapter_model_byte_size > 0) OR "
             "(status IN ('validation_failed','failed') AND worker_id IS NULL AND claim_token IS NULL "
             "AND lease_expires_at IS NULL AND validated_at IS NULL AND finished_at IS NOT NULL "
-            "AND error_code IS NOT NULL AND verified_governance_lineage IS FALSE "
-            "AND verified_artifact_compatibility IS FALSE) OR status IN ('purge_pending','purged')",
+            "AND purged_at IS NULL AND error_code IS NOT NULL AND verified_governance_lineage IS FALSE "
+            "AND verified_artifact_compatibility IS FALSE AND registry_manifest_sha256 IS NULL "
+            "AND registry_adapter_config_sha256 IS NULL AND registry_adapter_config_byte_size IS NULL "
+            "AND registry_adapter_model_sha256 IS NULL AND registry_adapter_model_byte_size IS NULL) OR "
+            "(status = 'purge_pending' AND worker_id IS NULL AND claim_token IS NULL AND "
+            "lease_expires_at IS NULL AND validated_at IS NOT NULL AND finished_at IS NOT NULL AND "
+            "purged_at IS NULL AND error_code IS NULL AND verified_governance_lineage IS TRUE AND "
+            "verified_artifact_compatibility IS TRUE AND registry_manifest_sha256 IS NOT NULL AND "
+            "registry_adapter_config_sha256 IS NOT NULL AND registry_adapter_config_byte_size > 0 AND "
+            "registry_adapter_model_sha256 IS NOT NULL AND registry_adapter_model_byte_size > 0) OR "
+            "(status = 'purged' AND worker_id IS NULL AND claim_token IS NULL AND "
+            "lease_expires_at IS NULL AND validated_at IS NOT NULL AND finished_at IS NOT NULL AND "
+            "purged_at IS NOT NULL AND error_code IS NULL AND verified_governance_lineage IS TRUE AND "
+            "verified_artifact_compatibility IS TRUE AND registry_manifest_sha256 IS NOT NULL AND "
+            "registry_adapter_config_sha256 IS NOT NULL AND registry_adapter_config_byte_size > 0 AND "
+            "registry_adapter_model_sha256 IS NOT NULL AND registry_adapter_model_byte_size > 0)",
             name="ck_adapter_lifecycle",
         ),
         sa.ForeignKeyConstraint(["department_id"], ["departments.id"], ondelete="RESTRICT"),
@@ -329,9 +434,69 @@ def upgrade() -> None:
             name="fk_adapter_dataset_build_scope",
             ondelete="RESTRICT",
         ),
+        sa.ForeignKeyConstraint(
+            [
+                "source_authoritative_attempt_id",
+                "department_id",
+                "source_bundle_id",
+                "source_publication_attempt_id",
+                "source_attempt_number",
+            ],
+            [
+                "adapter_import_attempts.id",
+                "adapter_import_attempts.department_id",
+                "adapter_import_attempts.source_bundle_id",
+                "adapter_import_attempts.publication_attempt_id",
+                "adapter_import_attempts.attempt_number",
+            ],
+            name="fk_adapter_source_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            [
+                "training_job_id",
+                "department_id",
+                "training_job_publication_attempt_id",
+                "training_job_attempt_number",
+            ],
+            [
+                "training_job_attempts.training_job_id",
+                "training_job_attempts.department_id",
+                "training_job_attempts.publication_attempt_id",
+                "training_job_attempts.attempt_number",
+            ],
+            name="fk_adapter_training_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            [
+                "dataset_build_id",
+                "department_id",
+                "dataset_publication_attempt_id",
+                "dataset_publication_attempt_number",
+            ],
+            [
+                "sft_dataset_build_attempts.build_id",
+                "sft_dataset_build_attempts.department_id",
+                "sft_dataset_build_attempts.publication_attempt_id",
+                "sft_dataset_build_attempts.attempt_number",
+            ],
+            name="fk_adapter_dataset_attempt_exact",
+            ondelete="RESTRICT",
+        ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("id", "department_id", name="uq_adapter_department"),
         sa.UniqueConstraint("source_bundle_id", "department_id", name="uq_adapter_source_scope"),
+        sa.UniqueConstraint(
+            "id", "department_id", "source_bundle_id", name="uq_adapter_source_claim_scope"
+        ),
+        sa.UniqueConstraint(
+            "id",
+            "department_id",
+            "training_job_id",
+            "dataset_build_id",
+            name="uq_adapter_governance_scope",
+        ),
         sa.UniqueConstraint("publication_attempt_id", name="uq_adapter_publication_attempt"),
     )
     op.create_index(
@@ -400,6 +565,26 @@ def upgrade() -> None:
             "status NOT IN ('succeeded','validation_failed','failed','reclaimed')",
             name="ck_adapter_registry_attempt_lifecycle",
         ),
+        sa.CheckConstraint(
+            "cleanup_confirmed_at IS NULL AND "
+            "((status = 'registered' AND worker_id IS NULL AND claimed_at IS NULL AND "
+            "staged_at IS NULL AND published_at IS NULL AND finished_at IS NULL AND "
+            "ownership_manifest IS NULL AND error_code IS NULL) OR "
+            "(status = 'running' AND worker_id IS NOT NULL AND claimed_at IS NOT NULL AND "
+            "staged_at IS NULL AND published_at IS NULL AND finished_at IS NULL AND "
+            "ownership_manifest IS NULL AND error_code IS NULL) OR "
+            "(status = 'staged' AND worker_id IS NOT NULL AND claimed_at IS NOT NULL AND "
+            "staged_at IS NOT NULL AND published_at IS NULL AND finished_at IS NULL AND "
+            "ownership_manifest IS NOT NULL AND error_code IS NULL) OR "
+            "(status = 'published' AND worker_id IS NOT NULL AND claimed_at IS NOT NULL AND "
+            "staged_at IS NOT NULL AND published_at IS NOT NULL AND finished_at IS NULL AND "
+            "ownership_manifest IS NOT NULL AND error_code IS NULL) OR "
+            "(status = 'succeeded' AND staged_at IS NOT NULL AND published_at IS NOT NULL AND "
+            "finished_at IS NOT NULL AND ownership_manifest IS NOT NULL AND error_code IS NULL) OR "
+            "(status IN ('validation_failed','failed','reclaimed') AND finished_at IS NOT NULL AND "
+            "error_code IS NOT NULL))",
+            name="ck_adapter_registry_attempt_exact_lifecycle",
+        ),
         sa.ForeignKeyConstraint(
             ["adapter_id", "department_id"],
             ["adapters.id", "adapters.department_id"],
@@ -467,6 +652,17 @@ def upgrade() -> None:
             name="fk_adapter_dependency_dataset_scope",
             ondelete="RESTRICT",
         ),
+        sa.ForeignKeyConstraint(
+            ["adapter_id", "department_id", "training_job_id", "dataset_build_id"],
+            [
+                "adapters.id",
+                "adapters.department_id",
+                "adapters.training_job_id",
+                "adapters.dataset_build_id",
+            ],
+            name="fk_adapter_dependency_adapter_snapshot",
+            ondelete="RESTRICT",
+        ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("adapter_id", name="uq_adapter_dependency_adapter"),
     )
@@ -474,8 +670,8 @@ def upgrade() -> None:
         "fk_adapter_import_source_claimed_adapter_scope",
         "adapter_import_sources",
         "adapters",
-        ["claimed_adapter_id", "department_id"],
-        ["id", "department_id"],
+        ["claimed_adapter_id", "department_id", "id"],
+        ["id", "department_id", "source_bundle_id"],
         ondelete="RESTRICT",
     )
 
@@ -495,12 +691,19 @@ def downgrade() -> None:
     op.drop_index("ix_adapter_claim", table_name="adapters")
     op.drop_index("ix_adapter_department_status_created", table_name="adapters")
     op.drop_table("adapters")
+    op.drop_constraint("uq_sft_build_attempt_exact", "sft_dataset_build_attempts", type_="unique")
+    op.drop_constraint("uq_training_job_attempt_exact", "training_job_attempts", type_="unique")
+    op.drop_constraint("uq_adapter_import_attempt_exact", "adapter_import_attempts", type_="unique")
     op.drop_constraint(
         "ck_adapter_import_source_lifecycle", "adapter_import_sources", type_="check"
+    )
+    op.drop_constraint(
+        "ck_adapter_import_source_manifest_size", "adapter_import_sources", type_="check"
     )
     op.drop_column("adapter_import_sources", "consumed_at")
     op.drop_column("adapter_import_sources", "claimed_at")
     op.drop_column("adapter_import_sources", "claimed_adapter_id")
+    op.drop_column("adapter_import_sources", "intake_manifest_byte_size")
     op.create_check_constraint(
         "ck_adapter_import_source_lifecycle",
         "adapter_import_sources",

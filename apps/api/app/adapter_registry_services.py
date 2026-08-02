@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ from app.models import (
     TrainingJobPurgeReservation,
 )
 from app.services import ServiceError, append_mutation_audit, authorize_transaction
+from app.training_job_domain import canonical_json_bytes as training_canonical_json_bytes
 
 _CODE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 _ADMIN_ROLES = frozenset({DepartmentRole.SYSTEM_ADMIN, DepartmentRole.DEPARTMENT_ADMIN})
@@ -231,14 +233,18 @@ def enqueue_adapter_registry(
             source_authoritative_attempt_id=source.authoritative_attempt_id,
             source_publication_attempt_id=source_attempt.publication_attempt_id,
             source_attempt_number=source_attempt.attempt_number,
+            source_attempt_version=source_attempt.version,
             source_imported_by_user_id=source.imported_by_user_id,
-            source_version=source.version,
+            # The adapter stores the version that will exist after the
+            # atomic source-claim mutation below.
+            source_version=source.version + 1,
             source_code_revision=source.code_revision,
             source_contract_version=source.source_contract_version,
             intake_contract_version=source.intake_contract_version,
             config_contract_version=source.config_contract_version,
             tensor_contract_version=source.tensor_contract_version,
             source_intake_manifest_sha256=source.intake_manifest_sha256,
+            source_intake_manifest_byte_size=source.intake_manifest_byte_size,
             source_adapter_config_sha256=source.adapter_config_sha256,
             source_adapter_config_byte_size=source.adapter_config_byte_size,
             source_adapter_model_sha256=source.adapter_model_sha256,
@@ -253,8 +259,19 @@ def enqueue_adapter_registry(
             training_job_version=job.version,
             training_job_publication_attempt_id=job.publication_attempt_id,
             training_job_attempt_number=job_attempt.attempt_number,
+            training_job_attempt_version=job_attempt.version,
             training_job_code_revision=job.code_revision,
             training_job_manifest_sha256=job.result_manifest_sha256,
+            training_job_manifest_byte_size=_training_manifest_byte_size(job),
+            training_job_execution_scope_id=job.execution_scope_id,
+            training_job_config_sha256=job.training_config_sha256,
+            training_job_config_byte_size=job.training_config_byte_size,
+            training_job_dataset_info_sha256=job.dataset_info_sha256,
+            training_job_dataset_info_byte_size=job.dataset_info_byte_size,
+            training_job_train_sha256=job.train_sha256,
+            training_job_train_byte_size=job.train_byte_size,
+            training_job_validation_sha256=job.validation_sha256,
+            training_job_validation_byte_size=job.validation_byte_size,
             training_job_profile_id=job.profile_id,
             training_job_artifact_contract_version=job.artifact_contract_version,
             training_job_manifest_contract_version=job.manifest_contract_version,
@@ -266,6 +283,7 @@ def enqueue_adapter_registry(
             dataset_build_version=dataset.version,
             dataset_publication_attempt_id=dataset.publication_attempt_id,
             dataset_publication_attempt_number=dataset.attempt_number,
+            dataset_attempt_version=dataset_attempt.version,
             dataset_code_revision=dataset.code_revision,
             dataset_manifest_sha256=dataset.result_manifest_sha256,
             dataset_source_bundle_id=dataset.source_bundle_id,
@@ -284,8 +302,10 @@ def enqueue_adapter_registry(
             dataset_source_example_count=dataset.source_example_count,
             dataset_source_group_count=dataset.source_group_count,
             dataset_source_reference_count=dataset.source_reference_count,
-            dataset_rights_attested=dataset_rights(dataset),
-            evaluation_contamination_reviewed=dataset_contamination(dataset),
+            # These governance declarations are authoritative Phase 11 job
+            # fields about the selected dataset, not Phase 10 row fields.
+            dataset_rights_attested=job.dataset_rights_attested,
+            evaluation_contamination_reviewed=job.evaluation_contamination_reviewed,
             base_model_id=BASE_MODEL_ID,
             base_model_revision=BASE_MODEL_REVISION,
             base_model_license=BASE_MODEL_LICENSE,
@@ -412,9 +432,37 @@ def _require_job_authority(
     if (
         attempt.status != "succeeded"
         or attempt.publication_attempt_id != job.publication_attempt_id
+        or attempt.attempt_number != job.attempt_number
         or job.result_manifest_sha256 is None
+        or not isinstance(job.publication_manifest, dict)
+        or job.training_config_sha256 is None
+        or job.training_config_byte_size is None
+        or job.dataset_info_sha256 is None
+        or job.dataset_info_byte_size is None
+        or job.train_sha256 is None
+        or job.train_byte_size is None
+        or job.validation_sha256 is None
+        or job.validation_byte_size is None
+        or any(
+            value is None or value <= 0
+            for value in (
+                job.training_config_byte_size,
+                job.dataset_info_byte_size,
+                job.train_byte_size,
+                job.validation_byte_size,
+                dataset.train_byte_size,
+                dataset.validation_byte_size,
+                dataset.provenance_byte_size,
+                dataset.train_example_count,
+                dataset.validation_example_count,
+                dataset.source_example_count,
+                dataset.source_group_count,
+                dataset.source_reference_count,
+            )
+        )
         or dataset_attempt.status != "succeeded"
         or dataset_attempt.publication_attempt_id != dataset.publication_attempt_id
+        or dataset_attempt.attempt_number != dataset.attempt_number
         or dataset.result_manifest_sha256 is None
         or job.dataset_build_id != dataset.id
         or job.dataset_build_version != dataset.version
@@ -436,16 +484,25 @@ def _require_job_authority(
         or job.dataset_source_reference_count != dataset.source_reference_count
         or job.dataset_rights_attested is not True
         or job.evaluation_contamination_reviewed is not True
-        or job.dataset_rights_attested != dataset_rights(dataset)
-        or job.evaluation_contamination_reviewed != dataset_contamination(dataset)
         or job.dataset_artifact_contract_version != dataset.artifact_contract_version
         or job.dataset_example_contract_version != dataset.example_contract_version
         or job.dataset_normalization_version != dataset.normalization_version
         or job.dataset_split_version != dataset.split_version
-        or not dataset_rights(dataset)
-        or not dataset_contamination(dataset)
     ):
         raise ServiceError(409, "Dataset authority changed")
+
+
+def _training_manifest_byte_size(job: TrainingJob) -> int:
+    manifest = job.publication_manifest
+    if not isinstance(manifest, dict):
+        raise ServiceError(409, "Training job authority changed")
+    raw = training_canonical_json_bytes(manifest) + b"\n"
+    if (
+        job.result_manifest_sha256 is None
+        or hashlib.sha256(raw).hexdigest() != job.result_manifest_sha256
+    ):
+        raise ServiceError(409, "Training job authority changed")
+    return len(raw)
 
 
 def _require_source_authority(source: AdapterImportSource, attempt: AdapterImportAttempt) -> None:
@@ -458,11 +515,18 @@ def _require_source_authority(source: AdapterImportSource, attempt: AdapterImpor
         or source.adapter_config_sha256 is None
         or source.adapter_model_sha256 is None
         or source.intake_manifest_sha256 is None
+        or source.intake_manifest_byte_size is None
+        or source.intake_manifest_byte_size <= 0
         or source.adapter_config_byte_size is None
         or source.adapter_model_byte_size is None
         or source.tensor_count is None
         or source.tensor_element_count is None
         or source.tensor_payload_byte_size is None
+        or source.tensor_count != 392
+        or source.tensor_element_count != 10_092_544
+        or source.tensor_dtype not in {"F16", "BF16", "F32"}
+        or source.tensor_payload_byte_size
+        != {"F16": 20_185_088, "BF16": 20_185_088, "F32": 40_370_176}.get(source.tensor_dtype)
     ):
         raise ServiceError(409, "Adapter source authority changed")
 
@@ -479,14 +543,6 @@ def _require_dataset_contract(dataset: SftDatasetBuild) -> None:
         or not dataset.provenance_sha256
     ):
         raise ServiceError(409, "Dataset authority changed")
-
-
-def dataset_rights(dataset: SftDatasetBuild) -> bool:
-    return bool(getattr(dataset, "dataset_rights_attested", True))
-
-
-def dataset_contamination(dataset: SftDatasetBuild) -> bool:
-    return bool(getattr(dataset, "evaluation_contamination_reviewed", True))
 
 
 def _parser() -> argparse.ArgumentParser:

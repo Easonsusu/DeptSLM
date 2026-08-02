@@ -41,13 +41,15 @@ tokenizer, LlamaFactory, Qdrant, or Hugging Face dependency and performs no
 network download.
 
 The parent opens and retains exact private descriptors for both immutable input
-bundles. A fixed child receives only descriptors, bounded sizes, UUIDs, the
-closed content-free source/governance snapshots, and a secret-free allowlist
-environment. It validates the Phase 12.1A configuration and safetensors header
-without deserializing tensors, verifies the source and Phase 11 manifest
-digests against the captured snapshots, writes a canonical configuration, and
-copies the opaque model bytes in bounded chunks. Adapter bytes never cross the
-IPC frame or enter PostgreSQL, logs, or temporary files.
+bundles. A fixed child receives only the source configuration, source model,
+source intake-manifest, and Phase 11 `manifest.json` descriptors, bounded sizes,
+UUIDs, the closed content-free source/governance snapshots, and a secret-free
+allowlist environment. It validates the Phase 12.1A configuration and
+safetensors header without deserializing tensors, verifies the source and Phase
+11 manifest digests against the captured snapshots, writes a canonical
+configuration, and copies the opaque model bytes in bounded chunks. The other
+four Phase 11 descriptors remain parent-side evidence. Adapter bytes never
+cross the IPC frame or enter PostgreSQL, logs, or temporary files.
 
 The parent supervises framed IPC with nonblocking writes and an independent
 monotonic deadline for each bounded operation,
@@ -95,3 +97,31 @@ PostgreSQL and external storage are not transactionally atomic. If a process
 dies after a filesystem rename but before the success commit, the bytes are not
 runtime or evaluation authority; later reconciliation/purge handling is a
 separate reviewed phase. No public adapter API or frontend surface is added.
+
+## Authority hardening
+
+The worker opens the exact source and Phase 11 descriptor chains once and keeps
+them retained through every checkpoint. Before the child starts, the parent
+hashes and size-checks all five Phase 11 files (`manifest.json`,
+`training.yaml`, `dataset_info.json`, `train.jsonl`, and `validation.jsonl`)
+against the current `TrainingJob` row and the closed Phase 11 manifest. Only the
+Phase 11 `manifest.json` descriptor is passed to the child; the other four files
+remain parent-side evidence. The intake manifest is bound by its exact digest,
+byte size, imported-by identity, UUIDs, contract values, and retained descriptor
+identity.
+
+The child captures actual model-free configuration and safetensors summaries
+(dtype, tensor count, total elements, payload bytes, PEFT and format) and
+compares them with the immutable source snapshot. It reads tensor data only as
+bounded opaque bytes while copying; no tensor values, model, tokenizer, or
+adapter runtime is loaded.
+
+Every lease renewal and lifecycle transition compares an evolving adapter,
+attempt, source-attempt, Phase 11 attempt, Phase 10 attempt, and dependency
+version snapshot. Heartbeats renew no more often than one third of the lease.
+Expired claims cannot mutate or publish. Reclaim marks exactly one matching
+previous attempt as `reclaimed`, allocates a fresh attempt, and never adopts an
+old stage or final. Phase 10 and Phase 11 retention fences recheck active
+registry dependencies immediately before deletion. Registry-stage deletion is
+deliberately not implemented; stale registry stages and finals remain untouched
+for a future reconciliation phase.

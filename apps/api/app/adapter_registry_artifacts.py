@@ -82,6 +82,20 @@ class RetainedFinal:
             raise AdapterRegistryArtifactError("adapter_registry_authority_changed")
         return raw
 
+    def digest_files(self) -> dict[str, tuple[str, int]]:
+        """Digest the retained files without reopening any pathname."""
+
+        self.verify_identity()
+        result: dict[str, tuple[str, int]] = {}
+        for name, descriptor, before in self.files:
+            digest, size = _digest_descriptor(descriptor)
+            after = os.fstat(descriptor)
+            if size != before.st_size or not _same_file(before, after):
+                raise AdapterRegistryArtifactError("adapter_registry_authority_changed")
+            result[name] = (digest, size)
+        self.verify_identity()
+        return result
+
     def verify_identity(self) -> None:
         current_directory = _require_private_directory(
             self.directory_fd, writable=not self.read_only
@@ -327,10 +341,10 @@ class AdapterRegistryArtifactStore:
                 stage = _create_private_child(stage_parent, str(publication_attempt_id))
                 created = True
             except FileExistsError:
-                stage = _open_private_child(stage_parent, str(publication_attempt_id))
-                names = set(os.listdir(stage))
-                if names not in (set(), {REGISTRY_STAGE_MARKER}):
-                    raise AdapterRegistryArtifactError("adapter_registry_authority_changed")
+                # Phase 12.1C never reconciles or deletes stale surfaces.  A
+                # pre-existing attempt directory is therefore an authority
+                # conflict, regardless of whether it contains a marker.
+                raise AdapterRegistryArtifactError("adapter_registry_authority_changed")
             if created or REGISTRY_STAGE_MARKER not in set(os.listdir(stage)):
                 _write_exact(stage, REGISTRY_STAGE_MARKER, REGISTRY_STAGE_MARKER_BYTES)
             final_department = _ensure_private_child(self._registry_fd, str(department.value))
@@ -420,36 +434,6 @@ class AdapterRegistryArtifactStore:
                 except OSError:
                     pass
             raise
-
-    def remove_owned_registry_stage(
-        self, department: DepartmentScope, adapter_id: UUID, publication_attempt_id: UUID
-    ) -> bool:
-        """Delete only an exact private UUID stage; marker bytes are not authority."""
-
-        parent: int | None = None
-        stage: int | None = None
-        try:
-            department_fd = _open_private_child(self._staging_registry_fd, str(department.value))
-            try:
-                parent = _open_private_child(department_fd, str(adapter_id))
-            finally:
-                os.close(department_fd)
-            stage = _open_private_child(parent, str(publication_attempt_id))
-            _require_private_directory(stage, writable=True)
-            _entry_matches(parent, str(publication_attempt_id), stage)
-            _remove_contents(stage)
-            _entry_matches(parent, str(publication_attempt_id), stage)
-            os.rmdir(str(publication_attempt_id), dir_fd=parent)
-            _fsync(parent)
-            return True
-        except FileNotFoundError:
-            return False
-        except (AdapterRegistryArtifactError, NotADirectoryError, OSError) as error:
-            if isinstance(error, AdapterRegistryArtifactError):
-                raise
-            raise AdapterRegistryArtifactError("adapter_registry_authority_changed") from error
-        finally:
-            _close_files([], stage, parent)
 
 
 def _open_directory_path(path: Path, *, writable: bool) -> int:
@@ -585,25 +569,6 @@ def _verify_marker(directory_fd: int) -> None:
 def _unlink_exact(directory_fd: int, name: str) -> None:
     _safe_name(name)
     os.unlink(name, dir_fd=directory_fd)
-
-
-def _remove_contents(directory_fd: int) -> None:
-    for name in os.listdir(directory_fd):
-        _safe_name(name)
-        try:
-            descriptor = os.open(
-                name,
-                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=directory_fd,
-            )
-        except OSError as error:
-            raise AdapterRegistryArtifactError("adapter_registry_authority_changed") from error
-        try:
-            _require_private_file(descriptor, maximum=None)
-        finally:
-            os.close(descriptor)
-        os.unlink(name, dir_fd=directory_fd)
-    _fsync(directory_fd)
 
 
 def _digest_descriptor(descriptor: int) -> tuple[str, int]:

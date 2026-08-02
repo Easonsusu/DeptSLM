@@ -52,6 +52,17 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > 12.1D through 12.1E and Phase 12.2 through Phase 12.4 remain unimplemented;
 > no runtime routing exists.
 
+> **Phase 12.1C hardening:** The registry binds exact composite source, Phase 11
+> attempt, and Phase 10 attempt identities and carries evolving versions for
+> every authority row, the registry attempt, and the active retention fence.
+> The parent retains and rechecks all five Phase 11 files by descriptor, hash,
+> size, and manifest authority; only `manifest.json` crosses the fixed child
+> boundary. Reclaim creates a fresh exact attempt and never adopts an old stage
+> or final. Final-file deletion reauthorizes the exact Phase 10/11 resource and
+> active adapter dependency before filesystem mutation. Registry stale-surface
+> deletion is intentionally deferred, and PostgreSQL remains retrieval/runtime
+> authority because filesystem publication is not transactionally atomic.
+
 The static contract models the completed PEFT 0.18.1 artifact: saved
 `inference_mode=true`, `auto_mapping=null`, `peft_version="0.18.1"`, and the
 exact safetensors metadata `{"format":"pt"}`. That metadata is closed and

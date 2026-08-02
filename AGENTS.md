@@ -142,3 +142,16 @@ If retrieval finds no source, only irrelevant sources, or sources below the appr
 - Missing, unknown, suspended, revoked, cross-department, and role-incompatible access must be denied without revealing resource existence.
 - `system_admin` has no implicit cross-department bypass. Any future support workflow requires narrow authorization and audit design.
 - Audit output must never include bearer tokens, JWT signatures, secrets, raw bodies, profile content, document content, or training content.
+
+Phase 12.1C hardening requires exact composite foreign keys for the source,
+Phase 11 attempt, and Phase 10 attempt snapshots. An evolving version is
+checked for the adapter, registry attempt, every upstream attempt, source, and
+retention dependency. The registry parent retains all five Phase 11 descriptors
+and verifies hashes, sizes, manifest fields, and current PostgreSQL authority
+before and after the child; the child receives only the Phase 11 manifest
+descriptor and closed metadata. Claims are reclaimed only through one exact
+prior attempt, with terminal claim-loss handling and no registry-stage/final
+deletion helper. Phase 10 and Phase 11 final-file deletion reauthorizes the
+exact resource and active adapter dependency immediately before filesystem
+mutation. PostgreSQL remains the final authority; external filesystem
+publication is not transactionally atomic.

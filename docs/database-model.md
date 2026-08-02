@@ -85,6 +85,16 @@ timestamps, and safe error codes; it stores no adapter bytes, tensor values,
 dataset records, prompts, model output, paths, credentials, or runtime settings.
 The worker's final success audit and source `consumed` transition occur in one
 short PostgreSQL transaction after descriptor-bound final artifact verification.
+The source claim is constrained by `(adapter_id, department_id, source_bundle_id)`;
+the adapter stores exact composite references to the committed source attempt,
+the succeeded Phase 11 attempt, and the succeeded Phase 10 attempt. Matching
+unique targets are created in `0011` and removed on downgrade. The dependency
+row additionally references the adapter's exact job/dataset snapshot. SQL and
+ORM checks freeze the model/revision/license, PEFT and safetensors contracts,
+LlamaFactory/profile contracts, lowercase hashes, positive file sizes/counts,
+exact tensor aggregates, and the `declared_external_training_association` /
+`training_provenance_verified` distinction. The worker compares an evolving
+version snapshot before each transition and final authority transaction.
 - `documents`: department-owned source metadata with an internal uploader relation, normalized filename, canonical media type, positive size, SHA-256 digest, lifecycle state, version, and timestamps. It stores no body or path, and public document schemas do not expose internal identity IDs; see [document-model.md](document-model.md).
 - `document_extractions`: immutable attempt history and PostgreSQL queue state, including source/pipeline identity, claim lease, safe result metadata, and an allowlisted error code. It stores no content, path, filename, stderr, or exception.
 - `document_chunks`: department/document/extraction-scoped offsets, byte size, internal digest, and mutually exclusive page/line provenance. Chunk text remains external.
