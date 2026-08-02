@@ -6,8 +6,9 @@ not itself create an adapter registry record, evaluate, approve, promote, load,
 reconcile, or purge an adapter. Phase 12.1C now consumes this exact committed
 source only through its separate reviewed worker, which binds it to one
 approved succeeded Phase 11 job and captured Phase 10 authority before
-publishing the private registry artifact. Phase 12.1D through 12.4 and Phase
-13 remain unstarted.
+publishing the private registry artifact. Phase 12.1D now adds only the
+metadata-only PostgreSQL registry read boundary; Phase 12.1E through 12.4 and
+Phase 13 remain unstarted.
 
 ## Command boundary
 

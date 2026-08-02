@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import ValidationError
 
+from app.adapter_registry_read_services import list_adapters, read_adapter
 from app.audit import AuditResult
 from app.auth import AuthenticatedPrincipal
 from app.authorization import (
@@ -66,6 +67,8 @@ from app.rag_feedback_services import (
     submit_feedback,
 )
 from app.schemas import (
+    AdapterMetadataListResponse,
+    AdapterMetadataResponse,
     ChunkListResponse,
     ChunkResponse,
     DepartmentArchive,
@@ -1222,6 +1225,48 @@ async def patch_sft_build_review(
                 action=body.action,
                 expected_version=body.expected_version,
             )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/adapters",
+    response_model=AdapterMetadataListResponse,
+    tags=["adapters"],
+)
+def get_adapters(
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> AdapterMetadataListResponse:
+    try:
+        rows = list_adapters(session, principal, request_scope, limit=limit, offset=offset)
+        return AdapterMetadataListResponse(
+            items=[AdapterMetadataResponse.model_validate(row.public_data()) for row in rows],
+            limit=limit,
+            offset=offset,
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/adapters/{adapter_id}",
+    response_model=AdapterMetadataResponse,
+    tags=["adapters"],
+)
+def get_adapter(
+    adapter_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> AdapterMetadataResponse:
+    try:
+        return AdapterMetadataResponse.model_validate(
+            read_adapter(session, principal, request_scope, adapter_id).public_data()
         )
     except ServiceError as error:
         _raise(error)

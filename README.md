@@ -40,17 +40,18 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > keeps the reservation active. Review changes are rejected while a reservation
 > is active. This is a reviewed boundary, not training execution.
 
-> **Phase 12 status:** Phase 12.0 is completed and Phase 12.1 is under review.
-> Phase 12.1A and Phase 12.1B are completed. This review implements Phase
-> 12.1C's separate administrator-enqueued worker: it binds one exact committed
-> source to one approved succeeded Phase 11 job and its captured Phase 10
-> authority, then publishes exactly `manifest.json`, `adapter_config.json`, and
-> `adapter_model.safetensors` in private registry storage. It records declared
-> external training association and verified governance/static artifact
-> compatibility; training provenance remains unverified. It does not evaluate,
-> approve, promote, load, route, reconcile, purge, or execute training. Phase
-> 12.1D through 12.1E and Phase 12.2 through Phase 12.4 remain unimplemented;
-> no runtime routing exists.
+> **Phase 12 status:** Phase 12.0 is completed and Phase 12.1 remains under
+> review. Phase 12.1A, Phase 12.1B, and Phase 12.1C are completed. Phase 12.1D
+> adds only department-scoped, metadata-only registry list/detail reads from
+> PostgreSQL authority, with a closed projection for lineage, contracts,
+> verification, lifecycle, and retention. It exposes no adapter bytes, paths,
+> hashes, tensor data, identities, or runtime settings and performs no
+> mutation or audit. The registry worker still binds one exact committed source
+> to one approved succeeded Phase 11 job and publishes only the immutable
+> private registry bundle; training provenance remains unverified. No evaluation,
+> approval, promotion, loading, routing, reconciliation, purge, or training is
+> implemented. Phase 12.1E and Phase 12.2 through Phase 12.4 remain unstarted;
+> no runtime routing exists. Phase 12.1D is the current review scope.
 
 > **Phase 12.1C hardening:** The registry binds exact composite source, Phase 11
 > attempt, and Phase 10 attempt identities and carries evolving versions for
@@ -287,6 +288,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Phase 12.1A static adapter contract](docs/adapter-static-contract.md)
 - [Phase 12.1B adapter source intake](docs/adapter-source-intake.md)
 - [Phase 12.1C adapter registry publication](docs/adapter-registry-publication.md)
+- [Phase 12.1D adapter metadata reads](docs/adapter-registry-metadata.md)
 - [Phase 12 adapter registry contract](docs/adapter-registry.md)
 - [Grounded RAG answering](docs/rag-answering.md)
 - [Prompt-injection boundary](docs/prompt-injection-boundary.md)
@@ -305,7 +307,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 
 Phase 9 does not implement LLM judging, semantic grading, public raw results, a frontend dashboard, feedback-derived cases, automatic threshold or RAG changes, training datasets, SFT, adapters, model promotion, cross-department benchmarking, production OAuth/OIDC/SSO, or production deployment.
 
-Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 remains contract and threat-model work. Phase 12.1A and Phase 12.1B are complete; Phase 12.1C adds only administrator-controlled, metadata-bound immutable registry publication with no evaluation, approval, promotion, rollback, runtime routing, reconciliation, or purge. Google Drive storage is an external development runtime location, not a production object store or backup.
+Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 remains contract and threat-model work. Phase 12.1A, Phase 12.1B, and Phase 12.1C are complete; Phase 12.1D adds only administrator-authorized, department-scoped metadata list/detail reads from PostgreSQL with no artifact access, mutation, audit, evaluation, approval, promotion, rollback, or runtime routing. Phase 12.1E remains unstarted. Google Drive storage is an external development runtime location, not a production object store or backup.
 
 ## License
 

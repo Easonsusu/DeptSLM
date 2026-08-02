@@ -1,10 +1,11 @@
 # Phase 12.1C immutable adapter registry publication
 
-Phase 12.1C is the reviewed, department-scoped publication boundary for one
-external LoRA or QLoRA adapter. It is implemented on the existing branch under
-review; Phase 12.1D and later adapter lifecycle work has not started. This
-phase does not evaluate, approve, promote, load, route, reconcile, purge, or
-execute training.
+Phase 12.1C is the completed, department-scoped publication boundary for one
+external LoRA or QLoRA adapter. Phase 12.1D separately adds only PostgreSQL
+metadata list/detail reads; it does not change this publication contract.
+Phase 12.1E and later adapter lifecycle work have not started. This phase does
+not evaluate, approve, promote, load, route, reconcile, purge, or execute
+training.
 
 ## Authority and eligibility
 
@@ -96,7 +97,9 @@ completion-success audit or a validated adapter.
 PostgreSQL and external storage are not transactionally atomic. If a process
 dies after a filesystem rename but before the success commit, the bytes are not
 runtime or evaluation authority; later reconciliation/purge handling is a
-separate reviewed phase. No public adapter API or frontend surface is added.
+separate reviewed phase. Phase 12.1C adds no mutation or artifact API and no
+frontend surface; the separate Phase 12.1D metadata-only GETs do not access
+these files.
 
 ## Authority hardening
 
