@@ -1,10 +1,13 @@
 # Phase 12.1B adapter source intake
 
-Phase 12.1B is under review. It adds one administrator-only local CLI for
+Phase 12.1B is completed. It adds one administrator-only local CLI for
 validating and privately storing an externally produced adapter source. It does
-not create an adapter registry record, bind a Phase 11 job, evaluate, approve,
-promote, load, reconcile, or purge an adapter. Phase 12.1C through 12.4 and
-Phase 13 remain unstarted.
+not itself create an adapter registry record, evaluate, approve, promote, load,
+reconcile, or purge an adapter. Phase 12.1C now consumes this exact committed
+source only through its separate reviewed worker, which binds it to one
+approved succeeded Phase 11 job and captured Phase 10 authority before
+publishing the private registry artifact. Phase 12.1D through 12.4 and Phase
+13 remain unstarted.
 
 ## Command boundary
 
@@ -83,7 +86,10 @@ cannot publish a committed source or success audit.
 
 ## PostgreSQL authority and crash boundaries
 
-Migration `0010_phase12_adapter_sources` creates only
+Migration `0010_phase12_adapter_sources` creates the source tables. Migration
+`0011_phase12_adapter_registry` adds the source claim columns and registry
+authority tables; it is documented separately in
+[adapter-registry-publication.md](adapter-registry-publication.md). The source and
 `adapter_import_sources` and `adapter_import_attempts`. The source and attempt
 rows are registered before filesystem mutation, transition through the reviewed
 staging/validation/publication states, and commit only content-free contracts,
@@ -114,13 +120,16 @@ runtime-usable, or proof of external training provenance.
 
 ## Explicit non-goals
 
-This phase adds no API route, browser upload, adapter download, worker service,
-registry table, Phase 11 binding or retention dependency, evaluation, review,
-approval, promotion, deployment, runtime loading, purge, or reconciliation.
+This phase adds no API route, browser upload, adapter download, registry worker,
+Phase 11 binding or retention dependency, evaluation, review, approval,
+promotion, deployment, runtime loading, purge, or reconciliation. Those
+boundaries belong to Phase 12.1C or later; the 12.1C worker does not change the
+source-intake CLI contract.
 It adds no PEFT, Transformers, PyTorch, safetensors, or LlamaFactory dependency,
 does not download a model, and does not load or materialize tensor values.
-Migration `0010_phase12_adapter_sources` freezes its reviewed SQL literals and
-does not import mutable application contract code. CI upgrades to that head,
+Migrations `0010_phase12_adapter_sources` and
+`0011_phase12_adapter_registry` freeze their reviewed SQL literals and do not
+import mutable application contract code. CI upgrades to the latter head,
 creates a private temporary adapters root, and runs the complete PostgreSQL,
 Qdrant, worker, storage, frontend, artifact-policy, and infrastructure checks;
 normal CI downloads no model weights.

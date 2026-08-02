@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.auth import AuthenticatedPrincipal
 from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.models import (
+    AdapterUpstreamDependency,
     SftArtifactReconciliationOperation,
     SftArtifactReconciliationOperationItem,
     SftDatasetBuild,
@@ -334,6 +335,13 @@ def _register_or_resume_purge(
                     SftDatasetBuild.status == "succeeded",
                     SftDatasetBuild.review_status.in_(("rejected", "archived")),
                     SftDatasetBuild.reviewed_at <= cutoff,
+                    ~select(AdapterUpstreamDependency.id)
+                    .where(
+                        AdapterUpstreamDependency.department_id == department_id,
+                        AdapterUpstreamDependency.dataset_build_id == SftDatasetBuild.id,
+                        AdapterUpstreamDependency.status == "active",
+                    )
+                    .exists(),
                 )
                 .order_by(SftDatasetBuild.reviewed_at, SftDatasetBuild.id)
                 .with_for_update(skip_locked=True)
@@ -350,6 +358,20 @@ def _register_or_resume_purge(
                         SftDatasetBuild.department_id == department_id,
                         SftDatasetBuild.source_bundle_id == SftSourceBundle.id,
                         SftDatasetBuild.review_status != "purged",
+                    )
+                    .exists(),
+                    ~select(AdapterUpstreamDependency.id)
+                    .join(
+                        SftDatasetBuild,
+                        (SftDatasetBuild.id == AdapterUpstreamDependency.dataset_build_id)
+                        & (
+                            SftDatasetBuild.department_id == AdapterUpstreamDependency.department_id
+                        ),
+                    )
+                    .where(
+                        AdapterUpstreamDependency.department_id == department_id,
+                        AdapterUpstreamDependency.status == "active",
+                        SftDatasetBuild.source_bundle_id == SftSourceBundle.id,
                     )
                     .exists(),
                 )
@@ -526,6 +548,14 @@ def _execute_artifact_operation(
     with SftArtifactStore(data_dir) as store:
         for item in items:
             try:
+                _authorize_sft_predeletion(
+                    factory,
+                    operation_id=operation_id,
+                    department_id=department_id,
+                    item=item,
+                    actor_issuer=actor_issuer,
+                    actor_subject=actor_subject,
+                )
                 _remove_item_artifact(store, DepartmentScope(department_id), item)
                 _terminalize_artifact_item(
                     factory,
@@ -551,6 +581,82 @@ def _execute_artifact_operation(
                 blocked += 1
     _complete_artifact_operation(factory, operation_id, department_id, actor_issuer, actor_subject)
     return SftMaintenanceResult(len(items), applied, blocked)
+
+
+def _authorize_sft_predeletion(
+    factory: sessionmaker,
+    *,
+    operation_id: UUID,
+    department_id: UUID,
+    item: _ArtifactOperationItem,
+    actor_issuer: str,
+    actor_subject: str,
+) -> None:
+    """Reauthorize the exact final item immediately before filesystem mutation."""
+
+    if item.resource_type not in {"source_final", "dataset_final"}:
+        return
+    try:
+        with factory.begin() as session:
+            operation = session.execute(
+                select(SftArtifactReconciliationOperation)
+                .where(
+                    SftArtifactReconciliationOperation.id == operation_id,
+                    SftArtifactReconciliationOperation.department_id == department_id,
+                    SftArtifactReconciliationOperation.status == "registered",
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            registered = session.execute(
+                select(SftArtifactReconciliationOperationItem)
+                .where(
+                    SftArtifactReconciliationOperationItem.id == item.id,
+                    SftArtifactReconciliationOperationItem.operation_id == operation_id,
+                    SftArtifactReconciliationOperationItem.department_id == department_id,
+                    SftArtifactReconciliationOperationItem.status == "registered",
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if operation is None or registered is None:
+                raise SftArtifactError("artifact_ownership_mismatch")
+            authorize_transaction(
+                session,
+                AuthenticatedPrincipal(actor_subject, actor_issuer),
+                DepartmentRequestScope(DepartmentScope(department_id)),
+                SFT_ADMIN_ROLES,
+                lock=True,
+                audit_action=f"sft.artifact.{operation.operation_type}.authorization",
+            )
+            if item.resource_type == "dataset_final":
+                resource = session.execute(
+                    select(SftDatasetBuild)
+                    .where(
+                        SftDatasetBuild.id == item.resource_id,
+                        SftDatasetBuild.department_id == department_id,
+                    )
+                    .with_for_update()
+                ).scalar_one_or_none()
+                if resource is None or _has_active_dataset_dependency(
+                    session, department_id, item.resource_id
+                ):
+                    raise SftArtifactError("artifact_ownership_mismatch")
+            else:
+                resource = session.execute(
+                    select(SftSourceBundle)
+                    .where(
+                        SftSourceBundle.id == item.resource_id,
+                        SftSourceBundle.department_id == department_id,
+                    )
+                    .with_for_update()
+                ).scalar_one_or_none()
+                if resource is None or _has_active_source_dependency(
+                    session, department_id, item.resource_id
+                ):
+                    raise SftArtifactError("artifact_ownership_mismatch")
+    except SftArtifactError:
+        raise
+    except SQLAlchemyError as error:
+        raise SftArtifactError("artifact_ownership_mismatch") from error
 
 
 def _remove_item_artifact(
@@ -706,6 +812,8 @@ def _finalize_purge_resource(
     now,
 ) -> bool:
     if item.resource_type == "dataset_final":
+        if _has_active_dataset_dependency(session, department_id, item.resource_id):
+            return False
         build = session.execute(
             select(SftDatasetBuild)
             .where(
@@ -724,6 +832,8 @@ def _finalize_purge_resource(
         build.version += 1
         return True
     if item.resource_type == "source_final":
+        if _has_active_source_dependency(session, department_id, item.resource_id):
+            return False
         source = session.execute(
             select(SftSourceBundle)
             .where(
@@ -740,6 +850,40 @@ def _finalize_purge_resource(
         source.version += 1
         return True
     return False
+
+
+def _has_active_dataset_dependency(
+    session: Session, department_id: UUID, dataset_build_id: UUID
+) -> bool:
+    return bool(
+        session.scalar(
+            select(func.count(AdapterUpstreamDependency.id)).where(
+                AdapterUpstreamDependency.department_id == department_id,
+                AdapterUpstreamDependency.dataset_build_id == dataset_build_id,
+                AdapterUpstreamDependency.status == "active",
+            )
+        )
+    )
+
+
+def _has_active_source_dependency(
+    session: Session, department_id: UUID, source_bundle_id: UUID
+) -> bool:
+    return bool(
+        session.scalar(
+            select(func.count(AdapterUpstreamDependency.id))
+            .join(
+                SftDatasetBuild,
+                (SftDatasetBuild.id == AdapterUpstreamDependency.dataset_build_id)
+                & (SftDatasetBuild.department_id == AdapterUpstreamDependency.department_id),
+            )
+            .where(
+                AdapterUpstreamDependency.department_id == department_id,
+                AdapterUpstreamDependency.status == "active",
+                SftDatasetBuild.source_bundle_id == source_bundle_id,
+            )
+        )
+    )
 
 
 def _finalize_reconciliation_resource(

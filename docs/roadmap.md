@@ -67,15 +67,22 @@ This roadmap separates foundational safety work from product implementation. A l
 - Phase 12.0 (completed) defines the adapter-registry threat model, immutable administrator-controlled source boundary, closed artifact and metadata contracts, governance-lineage versus training-provenance limits, and future lifecycle, evaluation, promotion, rollback, reconciliation, and purge design.
 - Phase 12.1 (under review): immutable external adapter intake and metadata-only registry foundations; no runtime loading.
 - Phase 12.1A (completed): pure standard-library static compatibility validation for the pinned Qwen3-0.6B LoRA/QLoRA configuration, tensor-key and shape contract, and bounded safetensors metadata.
-- Phase 12.1B (implemented in this review; under review): administrator-only,
+- Phase 12.1B (completed): administrator-only,
   dry-run-by-default source intake accepts exactly `adapter_config.json` and
   `adapter_model.safetensors`, validates them through the Phase 12.1A child,
   streams them into private immutable `adapters/imports` storage, and commits
   only content-free source/attempt authority metadata. It creates no registry
   record, Phase 11 binding, evaluation, approval, promotion, runtime loading,
   reconciliation, or purge.
-- Phase 12.1C through 12.1E (not started): registry consumption,
-  reconciliation, and purge implementation remain future reviewed work.
+- Phase 12.1C (implemented in this review; under review): binds one exact
+  same-department committed Phase 12.1B source to one approved succeeded
+  Phase 11 job and its captured Phase 10 authority, then publishes an
+  immutable, content-free registry bundle through a leased, descriptor-bound
+  worker. It preserves declared external training association while leaving
+  training provenance unverified. It does not evaluate, approve, promote,
+  load, route, reconcile, purge, or execute training.
+- Phase 12.1D–12.1E (not started): registry reconciliation, purge, and later
+  lifecycle hardening remain future reviewed work.
 - Phase 12.2 (not started): adapter-target evaluation, baseline/candidate evidence, and fixed numeric quality and safety gates; no automatic promotion.
 - Phase 12.3 (not started): review, approval, promotion, supersession, rollback, and deployment event history; no silent fallback.
 - Phase 12.4 (not started): department-bound runtime routing, immutable request snapshots, fail-closed loading, and explicit rollback-to-base.

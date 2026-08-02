@@ -224,6 +224,54 @@ ADAPTER_IMPORT_ERROR_CODES = (
     "requester_unauthorized",
     "database_unavailable",
 )
+ADAPTER_REGISTRY_STATUSES = (
+    "queued",
+    "running",
+    "validated",
+    "validation_failed",
+    "failed",
+    "purge_pending",
+    "purged",
+)
+ADAPTER_REGISTRY_ATTEMPT_STATUSES = (
+    "registered",
+    "running",
+    "staged",
+    "published",
+    "succeeded",
+    "validation_failed",
+    "failed",
+    "reclaimed",
+)
+ADAPTER_REGISTRY_DEPENDENCY_STATUSES = ("active", "released")
+ADAPTER_REGISTRY_ERROR_CODES = (
+    "adapter_source_unavailable",
+    "adapter_source_artifact_mismatch",
+    "adapter_source_authority_changed",
+    "training_job_unavailable",
+    "training_job_artifact_mismatch",
+    "training_job_authority_changed",
+    "dataset_authority_changed",
+    "adapter_config_invalid",
+    "adapter_config_unsupported",
+    "adapter_header_invalid",
+    "adapter_header_too_large",
+    "adapter_file_too_large",
+    "adapter_tensor_set_invalid",
+    "adapter_tensor_shape_invalid",
+    "adapter_tensor_dtype_invalid",
+    "adapter_tensor_offsets_invalid",
+    "adapter_tensor_size_invalid",
+    "adapter_registry_manifest_invalid",
+    "adapter_registry_publication_failed",
+    "adapter_registry_authority_changed",
+    "department_unavailable",
+    "requester_unauthorized",
+    "claim_lost",
+    "worker_shutdown",
+    "worker_timeout",
+    "database_unavailable",
+)
 
 
 class Base(DeclarativeBase):
@@ -2078,6 +2126,13 @@ class SftDatasetBuildAttempt(Base):
         UniqueConstraint("id", "department_id", "build_id", name="uq_sft_build_attempt_scope"),
         UniqueConstraint("build_id", "attempt_number", name="uq_sft_build_attempt_number"),
         UniqueConstraint("publication_attempt_id", name="uq_sft_build_attempt_publication"),
+        UniqueConstraint(
+            "build_id",
+            "department_id",
+            "publication_attempt_id",
+            "attempt_number",
+            name="uq_sft_build_attempt_exact",
+        ),
         CheckConstraint(
             "status IN ('running','reclaimed','succeeded','failed','cancelled')",
             name="ck_sft_build_attempt_status",
@@ -2227,6 +2282,12 @@ class AdapterImportSource(Base):
     __tablename__ = "adapter_import_sources"
     __table_args__ = (
         ForeignKeyConstraint(
+            ["claimed_adapter_id", "department_id", "id"],
+            ["adapters.id", "adapters.department_id", "adapters.source_bundle_id"],
+            name="fk_adapter_import_source_claimed_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
             ["authoritative_attempt_id", "department_id", "id"],
             [
                 "adapter_import_attempts.id",
@@ -2256,6 +2317,7 @@ class AdapterImportSource(Base):
         CheckConstraint(
             "(adapter_config_byte_size IS NULL OR adapter_config_byte_size > 0) AND "
             "(adapter_model_byte_size IS NULL OR adapter_model_byte_size > 0) AND "
+            "(intake_manifest_byte_size IS NULL OR intake_manifest_byte_size > 0) AND "
             "(tensor_payload_byte_size IS NULL OR tensor_payload_byte_size > 0)",
             name="ck_adapter_import_source_sizes",
         ),
@@ -2280,6 +2342,12 @@ class AdapterImportSource(Base):
             name="ck_adapter_import_source_tensor_contract",
         ),
         CheckConstraint(
+            "(status IN ('committed','claimed','consumed','purge_pending','purged') "
+            "AND intake_manifest_byte_size > 0) OR "
+            "(status IN ('staging','rejected','abandoned') AND intake_manifest_byte_size IS NULL)",
+            name="ck_adapter_import_source_manifest_size",
+        ),
+        CheckConstraint(
             "source_contract_version = '" + ADAPTER_SOURCE_CONTRACT_VERSION + "' AND "
             "intake_contract_version = '" + ADAPTER_INTAKE_CONTRACT_VERSION + "' AND "
             "config_contract_version = '" + ADAPTER_CONFIG_CONTRACT_VERSION + "' AND "
@@ -2294,7 +2362,8 @@ class AdapterImportSource(Base):
         CheckConstraint(
             "(status = 'staging' AND authoritative_attempt_id IS NULL AND "
             "committed_at IS NULL AND rejected_at IS NULL AND abandoned_at IS NULL "
-            "AND purged_at IS NULL AND error_code IS NULL) OR "
+            "AND purged_at IS NULL AND error_code IS NULL AND claimed_adapter_id IS NULL "
+            "AND claimed_at IS NULL AND consumed_at IS NULL) OR "
             "(status = 'committed' AND authoritative_attempt_id IS NOT NULL AND "
             "adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND "
             "adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND "
@@ -2305,20 +2374,25 @@ class AdapterImportSource(Base):
             + str(EXPECTED_TENSOR_ELEMENTS)
             + " AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND "
             "rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL AND "
-            "error_code IS NULL) OR "
+            "error_code IS NULL AND claimed_adapter_id IS NULL AND claimed_at IS NULL "
+            "AND consumed_at IS NULL) OR "
             "(status = 'rejected' AND rejected_at IS NOT NULL AND committed_at IS NULL "
             "AND abandoned_at IS NULL AND purged_at IS NULL AND "
-            "authoritative_attempt_id IS NULL AND error_code IN ('adapter_config_invalid',"
+            "authoritative_attempt_id IS NULL AND claimed_adapter_id IS NULL AND "
+            "claimed_at IS NULL AND consumed_at IS NULL AND "
+            "error_code IN ('adapter_config_invalid',"
             "'adapter_config_unsupported','adapter_header_invalid','adapter_header_too_large',"
             "'adapter_file_too_large','adapter_tensor_set_invalid','adapter_tensor_shape_invalid',"
             "'adapter_tensor_dtype_invalid','adapter_tensor_offsets_invalid',"
             "'adapter_tensor_size_invalid','adapter_input_invalid','adapter_input_unsafe')) OR "
             "(status = 'abandoned' AND abandoned_at IS NOT NULL AND rejected_at IS NULL "
             "AND committed_at IS NULL AND purged_at IS NULL AND "
-            "authoritative_attempt_id IS NULL AND error_code IN ('adapter_source_changed',"
+            "authoritative_attempt_id IS NULL AND claimed_adapter_id IS NULL AND "
+            "claimed_at IS NULL AND consumed_at IS NULL AND "
+            "error_code IN ('adapter_source_changed',"
             "'adapter_source_publication_failed','adapter_source_authority_changed',"
             "'department_unavailable','requester_unauthorized','database_unavailable')) OR "
-            "(status IN ('claimed','consumed','purge_pending') AND "
+            "(status = 'claimed' AND "
             "authoritative_attempt_id IS NOT NULL AND "
             "adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND "
             "adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND "
@@ -2329,7 +2403,33 @@ class AdapterImportSource(Base):
             + str(EXPECTED_TENSOR_ELEMENTS)
             + " AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND "
             "rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL AND "
-            "error_code IS NULL) OR "
+            "error_code IS NULL AND claimed_adapter_id IS NOT NULL AND claimed_at IS NOT NULL "
+            "AND consumed_at IS NULL) OR "
+            "(status = 'consumed' AND authoritative_attempt_id IS NOT NULL AND "
+            "adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND "
+            "adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND "
+            "intake_manifest_sha256 IS NOT NULL AND tensor_dtype IS NOT NULL AND "
+            "tensor_count = "
+            + str(EXPECTED_TENSOR_COUNT)
+            + " AND tensor_element_count = "
+            + str(EXPECTED_TENSOR_ELEMENTS)
+            + " AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND "
+            "rejected_at IS NULL AND abandoned_at IS NULL AND purged_at IS NULL AND "
+            "error_code IS NULL AND claimed_adapter_id IS NOT NULL AND claimed_at IS NOT NULL "
+            "AND consumed_at IS NOT NULL) OR "
+            "(status = 'purge_pending' AND authoritative_attempt_id IS NOT NULL AND "
+            "adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND "
+            "adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND "
+            "intake_manifest_sha256 IS NOT NULL AND tensor_dtype IS NOT NULL AND "
+            "tensor_count = "
+            + str(EXPECTED_TENSOR_COUNT)
+            + " AND tensor_element_count = "
+            + str(EXPECTED_TENSOR_ELEMENTS)
+            + " AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND "
+            "purged_at IS NULL AND rejected_at IS NULL AND abandoned_at IS NULL AND "
+            "error_code IS NULL AND "
+            "((claimed_adapter_id IS NULL AND claimed_at IS NULL AND consumed_at IS NULL) OR "
+            "(claimed_adapter_id IS NOT NULL AND claimed_at IS NOT NULL))) OR "
             "(status = 'purged' AND authoritative_attempt_id IS NOT NULL AND "
             "adapter_config_sha256 IS NOT NULL AND adapter_config_byte_size > 0 AND "
             "adapter_model_sha256 IS NOT NULL AND adapter_model_byte_size > 0 AND "
@@ -2340,7 +2440,9 @@ class AdapterImportSource(Base):
             + str(EXPECTED_TENSOR_ELEMENTS)
             + " AND tensor_payload_byte_size > 0 AND committed_at IS NOT NULL AND "
             "purged_at IS NOT NULL AND rejected_at IS NULL AND abandoned_at IS NULL AND "
-            "error_code IS NULL)",
+            "error_code IS NULL AND "
+            "((claimed_adapter_id IS NULL AND claimed_at IS NULL AND consumed_at IS NULL) OR "
+            "(claimed_adapter_id IS NOT NULL AND claimed_at IS NOT NULL)))",
             name="ck_adapter_import_source_lifecycle",
         ),
         CheckConstraint(
@@ -2366,6 +2468,9 @@ class AdapterImportSource(Base):
     )
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="staging")
     authoritative_attempt_id: Mapped[UUID | None] = mapped_column()
+    claimed_adapter_id: Mapped[UUID | None] = mapped_column()
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     source_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
     intake_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
     config_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -2380,6 +2485,7 @@ class AdapterImportSource(Base):
     adapter_model_sha256: Mapped[str | None] = mapped_column(String(64))
     adapter_model_byte_size: Mapped[int | None] = mapped_column(BigInteger)
     intake_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    intake_manifest_byte_size: Mapped[int | None] = mapped_column(BigInteger)
     tensor_dtype: Mapped[str | None] = mapped_column(String(8))
     tensor_count: Mapped[int | None] = mapped_column(Integer)
     tensor_element_count: Mapped[int | None] = mapped_column(BigInteger)
@@ -2415,6 +2521,14 @@ class AdapterImportAttempt(Base):
             "source_bundle_id", "attempt_number", name="uq_adapter_import_attempt_number"
         ),
         UniqueConstraint("publication_attempt_id", name="uq_adapter_import_publication_attempt"),
+        UniqueConstraint(
+            "id",
+            "department_id",
+            "source_bundle_id",
+            "publication_attempt_id",
+            "attempt_number",
+            name="uq_adapter_import_attempt_exact",
+        ),
         CheckConstraint(
             "status IN ('registered','validated','staged','published','committed','failed',"
             "'abandoned')",
@@ -2491,6 +2605,550 @@ class AdapterImportAttempt(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class Adapter(Base):
+    """Content-free authority for one immutable Phase 12.1C adapter registry entry."""
+
+    __tablename__ = "adapters"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_bundle_id", "department_id"],
+            ["adapter_import_sources.id", "adapter_import_sources.department_id"],
+            name="fk_adapter_source_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["training_job_id", "department_id"],
+            ["training_jobs.id", "training_jobs.department_id"],
+            name="fk_adapter_training_job_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_build_id", "department_id"],
+            ["sft_dataset_builds.id", "sft_dataset_builds.department_id"],
+            name="fk_adapter_dataset_build_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "source_authoritative_attempt_id",
+                "department_id",
+                "source_bundle_id",
+                "source_publication_attempt_id",
+                "source_attempt_number",
+            ],
+            [
+                "adapter_import_attempts.id",
+                "adapter_import_attempts.department_id",
+                "adapter_import_attempts.source_bundle_id",
+                "adapter_import_attempts.publication_attempt_id",
+                "adapter_import_attempts.attempt_number",
+            ],
+            name="fk_adapter_source_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "training_job_id",
+                "department_id",
+                "training_job_publication_attempt_id",
+                "training_job_attempt_number",
+            ],
+            [
+                "training_job_attempts.training_job_id",
+                "training_job_attempts.department_id",
+                "training_job_attempts.publication_attempt_id",
+                "training_job_attempts.attempt_number",
+            ],
+            name="fk_adapter_training_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "dataset_build_id",
+                "department_id",
+                "dataset_publication_attempt_id",
+                "dataset_publication_attempt_number",
+            ],
+            [
+                "sft_dataset_build_attempts.build_id",
+                "sft_dataset_build_attempts.department_id",
+                "sft_dataset_build_attempts.publication_attempt_id",
+                "sft_dataset_build_attempts.attempt_number",
+            ],
+            name="fk_adapter_dataset_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("id", "department_id", name="uq_adapter_department"),
+        UniqueConstraint("source_bundle_id", "department_id", name="uq_adapter_source_scope"),
+        UniqueConstraint(
+            "id", "department_id", "source_bundle_id", name="uq_adapter_source_claim_scope"
+        ),
+        UniqueConstraint(
+            "id",
+            "department_id",
+            "training_job_id",
+            "dataset_build_id",
+            name="uq_adapter_governance_scope",
+        ),
+        CheckConstraint(
+            "status IN ('queued','running','validated','validation_failed','failed',"
+            "'purge_pending','purged')",
+            name="ck_adapter_status",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            + ",".join("'" + code + "'" for code in ADAPTER_REGISTRY_ERROR_CODES)
+            + ")",
+            name="ck_adapter_error_code",
+        ),
+        CheckConstraint(
+            "code_revision ~ '^[0-9a-f]{40}$' AND source_code_revision ~ '^[0-9a-f]{40}$' "
+            "AND training_job_code_revision ~ '^[0-9a-f]{40}$' "
+            "AND dataset_code_revision ~ '^[0-9a-f]{40}$'",
+            name="ck_adapter_code_revisions",
+        ),
+        CheckConstraint(
+            "source_contract_version = 'phase12-adapter-source-v1' AND "
+            "intake_contract_version = 'phase12-adapter-intake-v1' AND "
+            "config_contract_version = 'phase12-adapter-config-v1' AND "
+            "tensor_contract_version = 'phase12-adapter-tensors-v1'",
+            name="ck_adapter_source_contracts",
+        ),
+        CheckConstraint(
+            "artifact_contract_version = 'phase12-adapter-artifact-v1' AND "
+            "registry_manifest_contract_version = 'phase12-adapter-manifest-v1' AND "
+            "declared_external_training_association IS TRUE AND "
+            "training_provenance_verified IS FALSE",
+            name="ck_adapter_registry_contracts",
+        ),
+        CheckConstraint(
+            "base_model_id = 'Qwen/Qwen3-0.6B' AND "
+            "base_model_revision = 'c1899de289a04d12100db370d81485cdf75e47ca' AND "
+            "base_model_license = 'Apache-2.0' AND peft_version = '0.18.1' AND "
+            "safetensors_format = '0.7.0' AND "
+            "training_job_artifact_contract_version = 'phase11-training-job-v1' AND "
+            "training_job_manifest_contract_version = 'phase11-training-job-manifest-v1' AND "
+            "training_configuration_contract_version = 'phase11-training-config-v1' AND "
+            "training_dataset_info_contract_version = 'phase11-dataset-info-v1' AND "
+            "training_execution_profile_contract_version = 'phase11-execution-profile-v1' AND "
+            "llamafactory_version = '0.9.5' AND "
+            "training_job_profile_id IN ("
+            "'phase11-qwen3-0.6b-lora-v1','phase11-qwen3-0.6b-qlora-nf4-v1') AND "
+            "dataset_artifact_contract_version = 'phase10-sft-dataset-v1' AND "
+            "dataset_example_contract_version = 'phase10-sft-example-v1' AND "
+            "dataset_normalization_version = 'phase10-sft-normalization-v1' AND "
+            "dataset_split_version = 'phase10-sft-group-split-v1' AND "
+            "dataset_rights_attested IS TRUE AND evaluation_contamination_reviewed IS TRUE",
+            name="ck_adapter_upstream_contracts",
+        ),
+        CheckConstraint(
+            "source_intake_manifest_byte_size > 0 AND source_adapter_config_byte_size > 0 AND "
+            "source_adapter_model_byte_size > 0 AND training_job_manifest_byte_size > 0 AND "
+            "training_job_config_byte_size > 0 AND training_job_dataset_info_byte_size > 0 AND "
+            "training_job_train_byte_size > 0 AND training_job_validation_byte_size > 0 AND "
+            "dataset_train_byte_size > 0 AND dataset_validation_byte_size > 0 AND "
+            "dataset_provenance_byte_size > 0 AND dataset_train_example_count > 0 AND "
+            "dataset_validation_example_count > 0 AND dataset_source_example_count >= 2 AND "
+            "dataset_source_group_count >= 2 AND "
+            "dataset_source_reference_count >= dataset_source_example_count AND "
+            "tensor_count = 392 AND "
+            "tensor_element_count = 10092544 AND "
+            "((tensor_dtype IN ('F16','BF16') AND tensor_payload_byte_size = 20185088) OR "
+            "(tensor_dtype = 'F32' AND tensor_payload_byte_size = 40370176))",
+            name="ck_adapter_exact_sizes",
+        ),
+        CheckConstraint(
+            "tensor_dtype IN ('F16','BF16','F32') AND tensor_count = 392 "
+            "AND tensor_element_count = 10092544 AND tensor_payload_byte_size > 0",
+            name="ck_adapter_tensor_contract",
+        ),
+        CheckConstraint(
+            "(registry_adapter_model_sha256 IS NULL AND "
+            "registry_adapter_model_byte_size IS NULL) OR "
+            "(source_adapter_model_sha256 = registry_adapter_model_sha256 AND "
+            "source_adapter_model_byte_size = registry_adapter_model_byte_size)",
+            name="ck_adapter_model_digest_match",
+        ),
+        CheckConstraint(
+            "source_adapter_config_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "source_adapter_model_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "training_job_manifest_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "training_job_config_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "training_job_dataset_info_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "training_job_train_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "training_job_validation_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "dataset_manifest_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "dataset_train_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "dataset_validation_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "dataset_provenance_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_adapter_source_hashes",
+        ),
+        CheckConstraint(
+            "(registry_manifest_sha256 IS NULL OR registry_manifest_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(registry_adapter_config_sha256 IS NULL OR "
+            "registry_adapter_config_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(registry_adapter_model_sha256 IS NULL OR "
+            "registry_adapter_model_sha256 ~ '^[0-9a-f]{64}$')",
+            name="ck_adapter_registry_hashes",
+        ),
+        CheckConstraint(
+            "attempt_number > 0 AND version > 0 AND source_version > 0 "
+            "AND source_attempt_version > 0 AND training_job_version > 0 "
+            "AND training_job_attempt_version > 0 AND dataset_build_version > 0 "
+            "AND dataset_attempt_version > 0",
+            name="ck_adapter_versions",
+        ),
+        CheckConstraint(
+            "(status = 'queued' AND worker_id IS NULL AND claim_token IS NULL "
+            "AND claimed_at IS NULL AND lease_expires_at IS NULL AND started_at IS NULL "
+            "AND finished_at IS NULL AND validated_at IS NULL AND error_code IS NULL "
+            "AND purged_at IS NULL "
+            "AND verified_governance_lineage IS FALSE AND verified_artifact_compatibility IS FALSE "
+            "AND registry_manifest_sha256 IS NULL AND registry_adapter_config_sha256 IS NULL "
+            "AND registry_adapter_config_byte_size IS NULL "
+            "AND registry_adapter_model_sha256 IS NULL "
+            "AND registry_adapter_model_byte_size IS NULL) OR "
+            "(status = 'running' AND worker_id IS NOT NULL AND claim_token IS NOT NULL "
+            "AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL "
+            "AND started_at IS NOT NULL AND finished_at IS NULL AND validated_at IS NULL "
+            "AND error_code IS NULL AND purged_at IS NULL "
+            "AND verified_governance_lineage IS FALSE "
+            "AND verified_artifact_compatibility IS FALSE AND registry_manifest_sha256 IS NULL "
+            "AND registry_adapter_config_sha256 IS NULL "
+            "AND registry_adapter_config_byte_size IS NULL "
+            "AND registry_adapter_model_sha256 IS NULL "
+            "AND registry_adapter_model_byte_size IS NULL) OR "
+            "(status = 'validated' AND worker_id IS NULL AND claim_token IS NULL "
+            "AND lease_expires_at IS NULL AND validated_at IS NOT NULL AND finished_at IS NOT NULL "
+            "AND purged_at IS NULL AND error_code IS NULL "
+            "AND verified_governance_lineage IS TRUE "
+            "AND verified_artifact_compatibility IS TRUE AND registry_manifest_sha256 IS NOT NULL "
+            "AND registry_adapter_config_sha256 IS NOT NULL "
+            "AND registry_adapter_config_byte_size > 0 "
+            "AND registry_adapter_model_sha256 IS NOT NULL "
+            "AND registry_adapter_model_byte_size > 0) OR "
+            "(status IN ('validation_failed','failed') AND worker_id IS NULL "
+            "AND claim_token IS NULL "
+            "AND lease_expires_at IS NULL AND validated_at IS NULL AND finished_at IS NOT NULL "
+            "AND purged_at IS NULL AND error_code IS NOT NULL "
+            "AND verified_governance_lineage IS FALSE "
+            "AND verified_artifact_compatibility IS FALSE "
+            "AND registry_manifest_sha256 IS NULL AND registry_adapter_config_sha256 IS NULL "
+            "AND registry_adapter_config_byte_size IS NULL "
+            "AND registry_adapter_model_sha256 IS NULL "
+            "AND registry_adapter_model_byte_size IS NULL) OR "
+            "(status = 'purge_pending' AND worker_id IS NULL AND claim_token IS NULL "
+            "AND lease_expires_at IS NULL AND validated_at IS NOT NULL AND finished_at IS NOT NULL "
+            "AND purged_at IS NULL AND error_code IS NULL "
+            "AND verified_governance_lineage IS TRUE AND verified_artifact_compatibility IS TRUE "
+            "AND registry_manifest_sha256 IS NOT NULL "
+            "AND registry_adapter_config_sha256 IS NOT NULL "
+            "AND registry_adapter_config_byte_size > 0 "
+            "AND registry_adapter_model_sha256 IS NOT NULL "
+            "AND registry_adapter_model_byte_size > 0) OR "
+            "(status = 'purged' AND worker_id IS NULL AND claim_token IS NULL "
+            "AND lease_expires_at IS NULL AND validated_at IS NOT NULL AND finished_at IS NOT NULL "
+            "AND purged_at IS NOT NULL AND error_code IS NULL "
+            "AND verified_governance_lineage IS TRUE AND verified_artifact_compatibility IS TRUE "
+            "AND registry_manifest_sha256 IS NOT NULL "
+            "AND registry_adapter_config_sha256 IS NOT NULL "
+            "AND registry_adapter_config_byte_size > 0 "
+            "AND registry_adapter_model_sha256 IS NOT NULL "
+            "AND registry_adapter_model_byte_size > 0)",
+            name="ck_adapter_lifecycle",
+        ),
+        Index("ix_adapter_department_status_created", "department_id", "status", "created_at"),
+        Index("ix_adapter_claim", "status", "lease_expires_at", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(
+        ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False
+    )
+    requested_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("user_identities.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="queued")
+    worker_id: Mapped[UUID | None] = mapped_column()
+    claim_token: Mapped[UUID | None] = mapped_column()
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    publication_attempt_id: Mapped[UUID] = mapped_column(unique=True, nullable=False)
+    execution_scope_id: Mapped[UUID] = mapped_column(nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    queued_at: Mapped[datetime] = utc_timestamp()
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    source_bundle_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_authoritative_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_attempt_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_imported_by_user_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    source_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    intake_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    config_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    tensor_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    source_intake_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_intake_manifest_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_adapter_config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_adapter_config_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_adapter_model_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_adapter_model_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    peft_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    safetensors_format: Mapped[str] = mapped_column(String(32), nullable=False)
+    tensor_dtype: Mapped[str] = mapped_column(String(8), nullable=False)
+    tensor_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    tensor_element_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    tensor_payload_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    training_job_id: Mapped[UUID] = mapped_column(nullable=False)
+    training_job_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    training_job_publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    training_job_attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    training_job_attempt_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    training_job_code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    training_job_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_job_manifest_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    training_job_execution_scope_id: Mapped[UUID] = mapped_column(nullable=False)
+    training_job_config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_job_config_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    training_job_dataset_info_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_job_dataset_info_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    training_job_train_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_job_train_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    training_job_validation_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_job_validation_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    training_job_profile_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    training_job_artifact_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    training_job_manifest_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    training_configuration_contract_version: Mapped[str] = mapped_column(
+        String(100), nullable=False
+    )
+    training_dataset_info_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    training_execution_profile_contract_version: Mapped[str] = mapped_column(
+        String(100), nullable=False
+    )
+    llamafactory_version: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    dataset_build_id: Mapped[UUID] = mapped_column(nullable=False)
+    dataset_build_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    dataset_publication_attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_attempt_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    dataset_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_source_bundle_id: Mapped[UUID] = mapped_column(nullable=False)
+    dataset_artifact_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    dataset_example_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    dataset_normalization_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    dataset_split_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    dataset_train_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_train_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    dataset_validation_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_validation_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    dataset_provenance_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_provenance_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    dataset_train_example_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_validation_example_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_source_example_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_source_group_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_source_reference_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_rights_attested: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    evaluation_contamination_reviewed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+    base_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    base_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    base_model_license: Mapped[str] = mapped_column(String(40), nullable=False)
+    artifact_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    registry_manifest_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    declared_external_training_association: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    verified_governance_lineage: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    verified_artifact_compatibility: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    training_provenance_verified: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+
+    registry_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    registry_adapter_config_sha256: Mapped[str | None] = mapped_column(String(64))
+    registry_adapter_config_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    registry_adapter_model_sha256: Mapped[str | None] = mapped_column(String(64))
+    registry_adapter_model_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+
+
+class AdapterRegistryAttempt(Base):
+    """Durable content-free ownership for every registry publication attempt."""
+
+    __tablename__ = "adapter_registry_attempts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_registry_attempt_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "id", "department_id", "adapter_id", name="uq_adapter_registry_attempt_scope"
+        ),
+        UniqueConstraint("adapter_id", "attempt_number", name="uq_adapter_registry_attempt_number"),
+        UniqueConstraint("publication_attempt_id", name="uq_adapter_registry_attempt_publication"),
+        CheckConstraint(
+            "status IN ('registered','running','staged','published','succeeded',"
+            "'validation_failed','failed','reclaimed')",
+            name="ck_adapter_registry_attempt_status",
+        ),
+        CheckConstraint(
+            "attempt_number > 0 AND version > 0", name="ck_adapter_registry_attempt_versions"
+        ),
+        CheckConstraint(
+            "ownership_manifest IS NULL OR json_typeof(ownership_manifest) = 'object'",
+            name="ck_adapter_registry_attempt_manifest_object",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            + ",".join("'" + code + "'" for code in ADAPTER_REGISTRY_ERROR_CODES)
+            + ")",
+            name="ck_adapter_registry_attempt_error_code",
+        ),
+        CheckConstraint(
+            "(status IN ('staged','published','succeeded') AND ownership_manifest IS NOT NULL) "
+            "OR status NOT IN ('staged','published','succeeded')",
+            name="ck_adapter_registry_attempt_manifest_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'succeeded' AND staged_at IS NOT NULL AND published_at IS NOT NULL "
+            "AND finished_at IS NOT NULL AND error_code IS NULL) OR "
+            "(status IN ('validation_failed','failed','reclaimed') AND finished_at IS NOT NULL "
+            "AND error_code IS NOT NULL) "
+            "OR status NOT IN ('succeeded','validation_failed','failed','reclaimed')",
+            name="ck_adapter_registry_attempt_lifecycle",
+        ),
+        CheckConstraint(
+            "cleanup_confirmed_at IS NULL AND "
+            "((status = 'registered' AND worker_id IS NULL AND claimed_at IS NULL AND "
+            "staged_at IS NULL AND published_at IS NULL AND finished_at IS NULL AND "
+            "ownership_manifest IS NULL AND error_code IS NULL) OR "
+            "(status = 'running' AND worker_id IS NOT NULL AND claimed_at IS NOT NULL AND "
+            "staged_at IS NULL AND published_at IS NULL AND finished_at IS NULL AND "
+            "ownership_manifest IS NULL AND error_code IS NULL) OR "
+            "(status = 'staged' AND worker_id IS NOT NULL AND claimed_at IS NOT NULL AND "
+            "staged_at IS NOT NULL AND published_at IS NULL AND finished_at IS NULL AND "
+            "ownership_manifest IS NOT NULL AND error_code IS NULL) OR "
+            "(status = 'published' AND worker_id IS NOT NULL AND claimed_at IS NOT NULL AND "
+            "staged_at IS NOT NULL AND published_at IS NOT NULL AND finished_at IS NULL AND "
+            "ownership_manifest IS NOT NULL AND error_code IS NULL) OR "
+            "(status = 'succeeded' AND staged_at IS NOT NULL AND published_at IS NOT NULL AND "
+            "finished_at IS NOT NULL AND ownership_manifest IS NOT NULL AND error_code IS NULL) OR "
+            "(status IN ('validation_failed','failed','reclaimed') AND finished_at IS NOT NULL AND "
+            "error_code IS NOT NULL))",
+            name="ck_adapter_registry_attempt_exact_lifecycle",
+        ),
+        Index(
+            "ix_adapter_registry_attempt_department_status", "department_id", "status", "created_at"
+        ),
+        Index(
+            "uq_adapter_registry_attempt_active",
+            "adapter_id",
+            unique=True,
+            postgresql_where=text("status IN ('registered','running','staged','published')"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    adapter_id: Mapped[UUID] = mapped_column(nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    execution_scope_id: Mapped[UUID] = mapped_column(nullable=False)
+    worker_id: Mapped[UUID | None] = mapped_column()
+    code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="registered")
+    ownership_manifest: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    registered_at: Mapped[datetime] = utc_timestamp()
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    staged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cleanup_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class AdapterUpstreamDependency(Base):
+    """Retention fence for the exact Phase 11 job and Phase 10 dataset."""
+
+    __tablename__ = "adapter_upstream_dependencies"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_dependency_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["training_job_id", "department_id"],
+            ["training_jobs.id", "training_jobs.department_id"],
+            name="fk_adapter_dependency_training_job_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dataset_build_id", "department_id"],
+            ["sft_dataset_builds.id", "sft_dataset_builds.department_id"],
+            name="fk_adapter_dependency_dataset_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["adapter_id", "department_id", "training_job_id", "dataset_build_id"],
+            [
+                "adapters.id",
+                "adapters.department_id",
+                "adapters.training_job_id",
+                "adapters.dataset_build_id",
+            ],
+            name="fk_adapter_dependency_adapter_snapshot",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("adapter_id", name="uq_adapter_dependency_adapter"),
+        CheckConstraint("status IN ('active','released')", name="ck_adapter_dependency_status"),
+        CheckConstraint("version > 0", name="ck_adapter_dependency_version"),
+        CheckConstraint(
+            "(status = 'active' AND released_at IS NULL) OR "
+            "(status = 'released' AND released_at IS NOT NULL)",
+            name="ck_adapter_dependency_lifecycle",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    adapter_id: Mapped[UUID] = mapped_column(nullable=False)
+    training_job_id: Mapped[UUID] = mapped_column(nullable=False)
+    dataset_build_id: Mapped[UUID] = mapped_column(nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    created_at: Mapped[datetime] = utc_timestamp()
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
 
 class TrainingJob(Base):
@@ -2695,6 +3353,13 @@ class TrainingJobAttempt(Base):
             "department_id",
             "publication_attempt_id",
             name="uq_training_job_attempt_scope_publication",
+        ),
+        UniqueConstraint(
+            "training_job_id",
+            "department_id",
+            "publication_attempt_id",
+            "attempt_number",
+            name="uq_training_job_attempt_exact",
         ),
         CheckConstraint(
             "status IN ('registered','running','staged','published','succeeded',"

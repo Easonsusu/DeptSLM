@@ -2,7 +2,7 @@
 
 ## Status
 
-The Phase 8 API preserves the completed grounded-answer boundary and adds structured feedback submission and review metadata. Phase 11 exposes metadata for completed immutable training-job bundles only; it never executes LlamaFactory or creates adapters. Phase 12 is under review and Phase 12.0 is documentation-only contract work. Feedback routes use PostgreSQL only and expose no content or identity IDs. There is no public vector search, query-vector API, conversation history, streaming, reranking, adapter registry, adapter runtime routing, or production identity integration.
+The Phase 8 API preserves the completed grounded-answer boundary and adds structured feedback submission and review metadata. Phase 11 exposes metadata for completed immutable training-job bundles only; it never executes LlamaFactory or creates adapters. Phase 12 is under review: Phase 12.1C adds an internal administrator-enqueued registry worker, but no public adapter registry route or adapter runtime route. Feedback routes use PostgreSQL only and expose no content or identity IDs. There is no public vector search, query-vector API, conversation history, streaming, reranking, adapter upload/download, or production identity integration.
 
 For the default local configuration, the base URL is:
 
@@ -205,9 +205,9 @@ Retrieved passages are untrusted content. The server must keep them separated fr
 
 Long-running work should return a job resource rather than hold an HTTP request open.
 
-### Phase 12 adapter registry (conceptual; not implemented in Phase 12.0)
+### Phase 12 adapter registry (internal publication; no public API)
 
-The following metadata-only routes are conceptual and are not implemented:
+The following metadata-only routes remain conceptual and are not implemented:
 
 - `GET /departments/{department_id}/adapters`
 - `GET /departments/{department_id}/adapters/{adapter_id}`
@@ -234,9 +234,9 @@ must release upstream retention only after both byte surfaces are committed
 purged. The registry records verified governance lineage and a declared external
 training association, not proven dataset use or trusted training execution.
 Cross-department fallback is prohibited; runtime loading must eventually fail
-closed and never silently fall back to the base model. Phase 12.1 static
-validation must be model-free and cannot begin until its package versions,
-closed schema, and numeric limits are reviewed and fixed.
+closed and never silently fall back to the base model. Phase 12.1A static
+validation is model-free with fixed package references, closed schema, and
+numeric limits. Phase 12.1C adds no public route.
 
 ### Evaluations and exports
 

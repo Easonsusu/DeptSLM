@@ -41,15 +41,27 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > is active. This is a reviewed boundary, not training execution.
 
 > **Phase 12 status:** Phase 12.0 is completed and Phase 12.1 is under review.
-> Phase 12.1A is completed, and this review implements Phase 12.1B's
-> administrator-only immutable source intake. It accepts exactly
-> `adapter_config.json` and `adapter_model.safetensors`, validates their
-> model-free Phase 12.1A contract in an isolated descriptor child, streams the
-> bytes into private external storage, and commits only content-free source and
-> attempt authority metadata. It does not create an adapter registry record,
-> bind a Phase 11 job, evaluate, approve, promote, load, or purge an adapter.
-> Phase 12.1C through 12.1E and Phase 12.2 through Phase 12.4 remain
-> unimplemented; no runtime routing exists.
+> Phase 12.1A and Phase 12.1B are completed. This review implements Phase
+> 12.1C's separate administrator-enqueued worker: it binds one exact committed
+> source to one approved succeeded Phase 11 job and its captured Phase 10
+> authority, then publishes exactly `manifest.json`, `adapter_config.json`, and
+> `adapter_model.safetensors` in private registry storage. It records declared
+> external training association and verified governance/static artifact
+> compatibility; training provenance remains unverified. It does not evaluate,
+> approve, promote, load, route, reconcile, purge, or execute training. Phase
+> 12.1D through 12.1E and Phase 12.2 through Phase 12.4 remain unimplemented;
+> no runtime routing exists.
+
+> **Phase 12.1C hardening:** The registry binds exact composite source, Phase 11
+> attempt, and Phase 10 attempt identities and carries evolving versions for
+> every authority row, the registry attempt, and the active retention fence.
+> The parent retains and rechecks all five Phase 11 files by descriptor, hash,
+> size, and manifest authority; only `manifest.json` crosses the fixed child
+> boundary. Reclaim creates a fresh exact attempt and never adopts an old stage
+> or final. Final-file deletion reauthorizes the exact Phase 10/11 resource and
+> active adapter dependency before filesystem mutation. Registry stale-surface
+> deletion is intentionally deferred, and PostgreSQL remains retrieval/runtime
+> authority because filesystem publication is not transactionally atomic.
 
 The static contract models the completed PEFT 0.18.1 artifact: saved
 `inference_mode=true`, `auto_mapping=null`, `peft_version="0.18.1"`, and the
@@ -65,14 +77,17 @@ contract versions, and code revision. An external manifest, archive, directory,
 or arbitrary host path is never authority. Static validation is model-free and
 the child reads no tensor payload; the parent streams payload bytes only to
 hash and copy them. The immutable source bundle is separate from any future
-adapter registry and is not approved, evaluated, promoted, runtime-usable, or
-bound to a Phase 11 job. Reconciliation and purge are not implemented here.
+  adapter registry until the Phase 12.1C worker binds one exact approved
+  Phase 11 job and captured Phase 10 authority. The source remains untrusted,
+  is never runtime-usable, and is not approved, evaluated, or promoted.
+  Reconciliation and purge are not implemented here.
 The validated-byte authority is bound by complete digest passes before and
 after child validation, digest-checked descriptor-relative staging, and
 post-rename identity verification. Every PostgreSQL transition compares a
 complete frozen authority snapshot and both row versions; static contract
 errors remain distinct from fixed descriptor/operational errors. Migration
-0010 is self-contained and CI validates that head with a private temporary
+Migrations `0010_phase12_adapter_sources` and `0011_phase12_adapter_registry`
+are self-contained and CI validates that head with a private temporary
 adapters root; CI downloads no model weights.
 
 Phase 12.1A fixes the compatible package references, closed configuration and
@@ -271,6 +286,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Embedding model](docs/embedding-model.md)
 - [Phase 12.1A static adapter contract](docs/adapter-static-contract.md)
 - [Phase 12.1B adapter source intake](docs/adapter-source-intake.md)
+- [Phase 12.1C adapter registry publication](docs/adapter-registry-publication.md)
 - [Phase 12 adapter registry contract](docs/adapter-registry.md)
 - [Grounded RAG answering](docs/rag-answering.md)
 - [Prompt-injection boundary](docs/prompt-injection-boundary.md)
@@ -289,7 +305,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 
 Phase 9 does not implement LLM judging, semantic grading, public raw results, a frontend dashboard, feedback-derived cases, automatic threshold or RAG changes, training datasets, SFT, adapters, model promotion, cross-department benchmarking, production OAuth/OIDC/SSO, or production deployment.
 
-Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 remains contract and threat-model work. Phase 12.1A is complete, and Phase 12.1B adds only administrator-controlled immutable source intake with no registry, evaluation, approval, promotion, rollback, or runtime routing. Google Drive storage is an external development runtime location, not a production object store or backup.
+Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 remains contract and threat-model work. Phase 12.1A and Phase 12.1B are complete; Phase 12.1C adds only administrator-controlled, metadata-bound immutable registry publication with no evaluation, approval, promotion, rollback, runtime routing, reconciliation, or purge. Google Drive storage is an external development runtime location, not a production object store or backup.
 
 ## License
 

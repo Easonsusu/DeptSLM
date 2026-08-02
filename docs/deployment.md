@@ -2,9 +2,9 @@
 
 ## Phase 12 status
 
-DeptSLM is not a production deployment. Phase 9 completed the internal evaluation runner with external immutable suites, content-free result artifacts, and PostgreSQL-backed leases. It reuses the completed Phase 7 grounded-answer boundary; it is not a public evaluation API. Phase 10 completed an isolated dataset-builder worker that writes only private external SFT dataset artifacts. Phase 11 completed a separate worker that generates immutable LlamaFactory configuration bundles only; it does not install or execute LlamaFactory, train models, or create adapters. Phase 12.0 is completed and Phase 12.1 is under review; Phase 12.1A adds the pure model-free static adapter compatibility contract and Phase 12.1B adds only an administrator CLI for immutable source intake. Source intake uses no service, mount, dependency, environment variable, port, API route, or operational worker; it accepts exactly two files and stores only private external imports plus content-free PostgreSQL authority. Public vector search, conversations, history, streaming, reranking, scheduled evaluation, scheduled purge, malware scanning, OCR, training, registry consumption, runtime adapter routing, production identity/storage, secrets management, backups, clustering, and production operations remain deferred.
+DeptSLM is not a production deployment. Phase 9 completed the internal evaluation runner with external immutable suites, content-free result artifacts, and PostgreSQL-backed leases. It reuses the completed Phase 7 grounded-answer boundary; it is not a public evaluation API. Phase 10 completed an isolated dataset-builder worker that writes only private external SFT dataset artifacts. Phase 11 completed a separate worker that generates immutable LlamaFactory configuration bundles only; it does not install or execute LlamaFactory, train models, or create adapters. Phase 12.0 is completed and Phase 12.1 is under review; Phase 12.1A and Phase 12.1B are completed, and Phase 12.1C adds an isolated worker for immutable registry publication. Source intake accepts exactly two files and stores only private external imports plus content-free PostgreSQL authority. The Phase 12.1C worker receives only PostgreSQL, read-only imports and Phase 11 bundles, and private registry staging/final storage. Public vector search, conversations, history, streaming, reranking, scheduled evaluation, scheduled purge, malware scanning, OCR, training, evaluation, approval, promotion, runtime adapter routing, production identity/storage, secrets management, backups, clustering, reconciliation, and production operations remain deferred.
 
-Phase 12.1B is under review; Phase 12.1C through 12.1E and Phase 12.2 through 12.4 are not started. Do not provide a public adapter upload, download, loading, promotion, or rollback route from this document. The Phase 12.1B CLI is administrator-controlled and dry-run by default. Future adapter runtime design requires a separate reviewed deployment model with verified governance lineage, static validation, evaluation, approval, department promotion, explicit rollback-to-base, and fail-closed loading. PostgreSQL and external storage remain non-atomic.
+Phase 12.1C is under review; Phase 12.1D through 12.1E and Phase 12.2 through 12.4 are not started. Do not provide a public adapter upload, download, loading, promotion, or rollback route from this document. The source CLI is administrator-controlled and dry-run by default. The registry worker is administrator-enqueued through PostgreSQL and does not evaluate, approve, promote, load, reconcile, or purge. Its parent retains all five Phase 11 descriptors and sends only `manifest.json` to the fixed child; exact source, Phase 11, and Phase 10 attempt/version snapshots are revalidated at every lifecycle transition. Phase 10 and Phase 11 final-file deletion reauthorizes the exact resource and active adapter dependency immediately before mutation, while registry stale-surface deletion is deferred. Future adapter runtime design requires a separate reviewed deployment model with verified governance lineage, static validation, evaluation, approval, department promotion, explicit rollback-to-base, and fail-closed loading. PostgreSQL and external storage remain non-atomic.
 
 The planned intake begins with an administrator-controlled CLI that creates an
 immutable server-ID-derived import bundle from only the two payload files.
@@ -13,9 +13,9 @@ attempt, department, safe internal request reference, payload digests and sizes,
 contract version, and code revision; external manifests and host paths are never
 authority. Import sources have separate staging, committed, claimed, consumed,
 rejected, abandoned, purge-pending, and purged states, and one committed source
-may be consumed by only one exact adapter version. A future adapter-registry
-worker would mount PostgreSQL, adapter imports read-only, Phase 11 training-job
-bundles read-only, and registry storage read-write. The API and browser would
+may be consumed by only one exact adapter version. The separate adapter-registry
+worker mounts PostgreSQL, adapter imports read-only, Phase 11 training-job
+bundles read-only, and registry storage read-write. The API and browser
 receive no adapter storage mount or weight-upload route. A rollback-retention
 reference may be removed by a reviewed pre-purge mutation. Registry and source
 purge are separate, bounded, descriptor-relative, crash-resumable operations;
@@ -38,8 +38,9 @@ declared external training association, not proven training provenance.
 | `rag-runtime` | Private Phase 7 inference | HTTP supervisor plus one killable persistent model child; offline query embedding and non-thinking generation; no database/Qdrant/API-auth credentials or host port. |
 | `training-worker` | Phase 10 SFT dataset builder | PostgreSQL plus `training_datasets` only; no model, Qdrant, RAG, or adapter stack. |
 | `training-job-worker` | Phase 11 immutable job-bundle generator | PostgreSQL plus `training_datasets` only; no model, tokenizer, LlamaFactory package, Qdrant, RAG, or adapter stack. |
+| `adapter-registry-worker` | Phase 12.1C immutable registry publisher | PostgreSQL, read-only adapter imports and Phase 11 bundles, and private registry staging/final storage only; no model, Qdrant, RAG, evaluation, or public API. |
 
-Phase 6 pins `Qwen/Qwen3-Embedding-0.6B` at immutable revision `d23109d65ca9fdf61eef614209744716f337f50f`; Phase 7 pins `Qwen/Qwen3-0.6B` at revision `c1899de289a04d12100db370d81485cdf75e47ca`. Explicit administration downloads them outside Git while normal processes stay offline. LlamaIndex and adapter runtime loading remain future components. Phase 11 does not execute LLaMA-Factory; model inference dependencies remain outside API/extraction/indexing images. Phase 12.1A fixes a model-free static adapter contract using PEFT `0.18.1`, Transformers `4.55.0`, safetensors `0.7.0`, and bounded metadata only; Phase 12.1B invokes that contract in an isolated child and never loads a model, tokenizer, adapter, or tensor payload. Registry, purge, and runtime phases remain future work.
+Phase 6 pins `Qwen/Qwen3-Embedding-0.6B` at immutable revision `d23109d65ca9fdf61eef614209744716f337f50f`; Phase 7 pins `Qwen/Qwen3-0.6B` at revision `c1899de289a04d12100db370d81485cdf75e47ca`. Explicit administration downloads them outside Git while normal processes stay offline. LlamaIndex and adapter runtime loading remain future components. Phase 11 does not execute LLaMA-Factory; model inference dependencies remain outside API/extraction/indexing images. Phase 12.1A fixes a model-free static adapter contract using PEFT `0.18.1`, Transformers `4.55.0`, safetensors `0.7.0`, and bounded metadata only; Phase 12.1B invokes that contract in an isolated child and Phase 12.1C reuses it in a separate registry child. Neither phase loads a model, tokenizer, adapter, or tensor values. Evaluation, approval, promotion, reconciliation, purge, and runtime phases remain future work.
 
 ## Prerequisites
 
@@ -230,7 +231,7 @@ Docker Compose is for local development, not the production architecture. A prod
 - prompt-injection defenses and grounded-answer evaluation
 - monitoring, tracing, alerting, retention, disaster recovery, and incident response
 - safe database migrations and rollback
-- Phase 12.1C through 12.4 adapter registry, approval, deployment, and rollback
+- Phase 12.1D through 12.4 adapter reconciliation, approval, deployment, and rollback
 
 No Phase 0 file should be interpreted as a production security or availability guarantee.
 
