@@ -23,7 +23,11 @@ for path in \
   "$resolved_data_dir/adapters/.deleting/source_stage" \
   "$resolved_data_dir/adapters/.deleting/source_final" \
   "$resolved_data_dir/adapters/.deleting/registry_stage" \
-  "$resolved_data_dir/adapters/.deleting/registry_final"; do
+  "$resolved_data_dir/adapters/.deleting/registry_final" \
+  "$resolved_data_dir/adapters/.purge-deleting/source_stage" \
+  "$resolved_data_dir/adapters/.purge-deleting/source_final" \
+  "$resolved_data_dir/adapters/.purge-deleting/registry_stage" \
+  "$resolved_data_dir/adapters/.purge-deleting/registry_final"; do
   if [ ! -d "$path" ] || [ ! -r "$path" ] || [ ! -w "$path" ] || [ ! -x "$path" ]; then
     echo "adapter-maintenance error: adapter storage is unavailable." >&2
     exit 1

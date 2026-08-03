@@ -230,15 +230,13 @@ artifact compatibility, but `training_provenance_verified` remains false. Failed
 attempts remain bound to their exact source; the source and registry are never
 runtime, evaluation, promotion, or rollback authority.
 
-Future purge has separate source and registry operations. A rollback-retention
-reference may be removed through a reviewed pre-purge mutation; upstream Phase
-10/11 retention dependencies release only after no active deployment or
-rollback reference remains, all registry bytes and every bound source copy are
-confirmed purged through committed authorities, and the adapter state is
-`purged`. Registry-only deletion cannot mark an adapter purged while a source
-copy remains. A consumed source may be purged before the registry after registry
-publication is independently verified and no intake retry/reconciliation needs
-the source; the adapter may remain active because the registry is authority.
+Phase 12.1E-B has separate source and registry reservations. It reauthorizes
+the exact validated adapter, source, attempts, versions, manifests, and active
+E-A reconciliation state before mutation; registry bytes are independently
+verified and deleted before the source copy, and only then may both rows become
+`purged`. It never deletes Phase 10/11 artifacts or releases a future
+deployment/rollback dependency; active deployment fencing and later lifecycle
+transitions remain Phase 12.1E-C and subsequent work.
 
 Source reconciliation and purge are dry-run by default, strictly bounded,
 administrator-only, department-scoped, durable before mutation,
@@ -256,8 +254,9 @@ use, trusted training execution, or certified adapter provenance. Phase 12.1A
 now fixes the model-free static schema: PEFT `0.18.1`, Transformers `4.55.0`,
 safetensors format `0.7.0`, the closed configuration/tensor grammar, and
 `1,048,576`-byte header and `44,040,192`-byte file bounds. It loads no model or
-tokenizer and does not implement evaluation, approval, promotion, runtime
-loading, reconciliation, or purge.
+tokenizer and does not implement evaluation, approval, promotion, or runtime
+loading. Phase 12.1E-A reconciliation and the separate Phase 12.1E-B purge
+maintenance command never put adapter bytes in PostgreSQL or Git.
 
 A non-purged adapter record creates retention dependencies on the exact Phase 10
 dataset artifact and Phase 11 authoritative job bundle. Upstream Phase 10 and
@@ -315,6 +314,15 @@ releases a dependency, deletes Phase 10/11 artifacts, or claims deletion from
 backups or audit history. Filesystem publication and PostgreSQL state remain
 non-atomic, and an already in-flight filesystem request cannot be fenced by
 PostgreSQL.
+
+Phase 12.1E-B uses the same isolated maintenance profile but a separate
+`.purge-deleting` namespace and independent `adapter_purge_operations`,
+`adapter_purge_reservations`, and `adapter_purge_items` authority. It verifies
+the exact closed final manifest, digests, sizes, private ownership, and
+department/attempt versions before a no-replace move. Registry bytes are
+deleted before source bytes; per-file in-flight progress and directory unlink
+intent make retries crash-resumable. Purge retains Phase 10/11 data, lineage,
+deployment/review history, audit rows, backups, and Google Drive history.
 
 ## Google Drive limitations
 

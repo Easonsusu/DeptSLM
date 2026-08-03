@@ -1,11 +1,10 @@
-# Database Model Through Phase 12.1E-A
+# Database Model Through Phase 12.1E-B
 
 DeptSLM uses PostgreSQL 16, SQLAlchemy 2, psycopg 3, and Alembic. Revision
-`0013_phase12_adapter_reconciliation_cursor` is the current head after
+`0014_phase12_adapter_purge` is the current head after
+`0013_phase12_adapter_reconciliation_cursor`, which follows
 `0012_phase12_adapter_reconciliation`. Alembic is the only schema-creation
-mechanism; runtime never calls `metadata.create_all`. PR #19 has a separate
-`0013` migration on its branch and must be renumbered to `0014` after this
-hotfix merges.
+mechanism; runtime never calls `metadata.create_all`.
 
 ## Entities
 
@@ -38,6 +37,9 @@ erDiagram
     DEPARTMENTS ||--o{ ADAPTER_ARTIFACT_OPERATIONS : scopes
     DEPARTMENTS ||--o{ ADAPTER_ARTIFACT_RECONCILIATION_CURSORS : advances
     ADAPTER_ARTIFACT_OPERATIONS ||--o{ ADAPTER_ARTIFACT_OPERATION_ITEMS : contains
+    DEPARTMENTS ||--o{ ADAPTER_PURGE_OPERATIONS : scopes
+    ADAPTER_PURGE_OPERATIONS ||--o{ ADAPTER_PURGE_RESERVATIONS : reserves
+    ADAPTER_PURGE_RESERVATIONS ||--o{ ADAPTER_PURGE_ITEMS : contains
 ```
 
 - `user_identities`: UUID identity keyed uniquely by the exact opaque `(issuer, subject)`. Subjects are not lowercased or interpreted as email addresses. Status is `active`, `suspended`, or `revoked`.
@@ -70,8 +72,9 @@ codes only. They contain no adapter bytes, configuration JSON, tensor names or
 values, host paths, filenames, manifests supplied by an operator, credentials,
 or training provenance. PostgreSQL and external storage publication are not
 atomic; Phase 12.1E-A adds separate reconciliation metadata for four
-non-authoritative adapter artifact surfaces, while later purge and adapter
-lifecycle phases are not implemented here.
+non-authoritative adapter artifact surfaces. Revision `0014_phase12_adapter_purge`
+adds independent crash-resumable purge authority for exact source and registry
+finals; later adapter lifecycle phases are not implemented here.
 
 ## Phase 12.1C adapter registry metadata
 
@@ -176,6 +179,29 @@ surface and an all-blocked operation append none. Blocked item rows remain
 immutable history; a later authorized operation records a fresh retry
 generation after repair and emits only for a newly confirmed resource not
 already covered by a prior mixed-operation audit.
+
+## Phase 12.1E-B purge metadata
+
+Revision `0014_phase12_adapter_purge` adds the independent
+`adapter_purge_operations`, `adapter_purge_reservations`, and
+`adapter_purge_items` tables. The operation is a bounded, administrator-only,
+dry-run-by-default authority for one exact validated adapter. Composite
+restrictive foreign keys bind its department, adapter, source, requester
+membership, source attempt, and registry attempt. Reservations and items retain
+exact publication IDs, positive attempt numbers, expected resource/attempt
+versions and statuses, closed manifests, and content-free observed, tombstone,
+in-flight, and deletion-plan identities.
+
+An operation is `registered` or `deleting` until every item is `completed` or
+`blocked`; terminal states are `completed`, `completed_with_blocks`, or
+`blocked`. Registry and source reservations are independent and source
+completion is permitted only after the registry item is complete. Per-file
+`next_entry_index`/`in_flight_entry` and directory unlink intent make the
+operation crash-resumable. A successful final transaction rechecks the complete
+authority snapshot, changes only the adapter/source lifecycle to `purged`, and
+appends at most one `adapter.purge` audit. These tables contain no artifact
+bytes, paths, configuration, tensor data, model output, credentials, or
+backup metadata.
 - `documents`: department-owned source metadata with an internal uploader relation, normalized filename, canonical media type, positive size, SHA-256 digest, lifecycle state, version, and timestamps. It stores no body or path, and public document schemas do not expose internal identity IDs; see [document-model.md](document-model.md).
 - `document_extractions`: immutable attempt history and PostgreSQL queue state, including source/pipeline identity, claim lease, safe result metadata, and an allowlisted error code. It stores no content, path, filename, stderr, or exception.
 - `document_chunks`: department/document/extraction-scoped offsets, byte size, internal digest, and mutually exclusive page/line provenance. Chunk text remains external.

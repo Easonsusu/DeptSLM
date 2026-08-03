@@ -390,11 +390,22 @@ def _digest(descriptor: int) -> tuple[str, int]:
 
 
 class AdapterMaintenanceArtifactStore:
-    """One mount-visible descriptor root for all adapter reconciliation surfaces."""
+    """One mount-visible descriptor root for adapter maintenance surfaces.
 
-    def __init__(self, data_dir: Path) -> None:
+    ``tombstone_root_name`` is intentionally explicit so Phase 12.1E-B can
+    use a namespace separate from the E-A reconciliation tombstones without
+    changing any E-A path or adopting an existing tombstone.
+    """
+
+    def __init__(self, data_dir: Path, *, tombstone_root_name: str = ".deleting") -> None:
         if not isinstance(data_dir, Path) or not data_dir.is_absolute() or not data_dir.is_dir():
             raise AdapterMaintenanceArtifactError("artifact_permissions_invalid")
+        if not isinstance(tombstone_root_name, str) or tombstone_root_name not in {
+            ".deleting",
+            ".purge-deleting",
+        }:
+            raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+        self.tombstone_root_name = tombstone_root_name
         try:
             self.root_fd = os.open(
                 os.fspath(data_dir / "adapters"),
@@ -408,7 +419,7 @@ class AdapterMaintenanceArtifactStore:
             staging = _open_dir(self.root_fd, ".staging")
             self._staging_imports_fd = _open_dir(staging, "imports")
             self._staging_registry_fd = _open_dir(staging, "registry")
-            deleting = _open_dir(self.root_fd, ".deleting")
+            deleting = _open_dir(self.root_fd, tombstone_root_name)
             self._deleting_fds = {surface: _open_dir(deleting, surface) for surface in SURFACES}
             os.close(staging)
             os.close(deleting)
@@ -1105,9 +1116,17 @@ class AdapterMaintenanceArtifactStore:
             os.close(resource_parent)
 
 
+class AdapterPurgeArtifactStore(AdapterMaintenanceArtifactStore):
+    """Descriptor-bound adapter store using the independent purge namespace."""
+
+    def __init__(self, data_dir: Path) -> None:
+        super().__init__(data_dir, tombstone_root_name=".purge-deleting")
+
+
 __all__ = [
     "AdapterMaintenanceArtifactError",
     "AdapterMaintenanceArtifactStore",
+    "AdapterPurgeArtifactStore",
     "BoundSurface",
     "InspectedSurface",
     "PhysicalSurfaceIdentifier",

@@ -1,0 +1,426 @@
+"""PostgreSQL 16 coverage for the Phase 12.1E-B adapter purge authority."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from dataclasses import replace
+from datetime import UTC, datetime
+from pathlib import Path
+from uuid import UUID, uuid4
+
+import pytest
+from alembic.config import Config
+from sqlalchemy import delete, func, select
+from sqlalchemy.orm import Session, sessionmaker
+from test_phase12_1c_integration import (
+    Authority,
+    _enqueue,
+    _seed_authority,
+)
+from test_phase12_1e_a_postgres import (
+    _cleanup_test_rows,
+    _registry_final,
+    _registry_manifest_for_claim,
+    _source_final,
+)
+
+from alembic import command
+from app.adapter_purge import purge_adapter_artifacts
+from app.adapter_registry_queue import claim_next_adapter
+from app.adapter_source_artifacts import canonical_manifest_bytes
+from app.database import create_database_engine
+from app.models import (
+    Adapter,
+    AdapterImportAttempt,
+    AdapterImportSource,
+    AdapterPurgeItem,
+    AdapterPurgeOperation,
+    AdapterPurgeReservation,
+    AdapterRegistryAttempt,
+    Department,
+    Membership,
+    PersistentAuditEvent,
+    SftDatasetBuild,
+    SftDatasetBuildAttempt,
+    SftSourceBundle,
+    TrainingJob,
+    TrainingJobArtifactOperation,
+    TrainingJobArtifactOperationItem,
+    TrainingJobAttempt,
+    TrainingJobPurgeReservation,
+    UserIdentity,
+)
+
+pytestmark = pytest.mark.postgres
+
+
+def _database_url() -> str:
+    value = os.getenv("DATABASE_TEST_URL")
+    if value:
+        return value
+    if os.getenv("DEPTSLM_REQUIRE_POSTGRES_TESTS") == "1":
+        pytest.fail("DATABASE_TEST_URL is required; PostgreSQL tests may not be skipped")
+    pytest.skip("PostgreSQL integration database is unavailable")
+
+
+@pytest.fixture(scope="module")
+def engine():
+    database_url = _database_url()
+    value = create_database_engine(database_url)
+    previous = os.environ.get("DATABASE_URL")
+    os.environ["DATABASE_URL"] = database_url
+    try:
+        command.upgrade(Config(str(Path(__file__).resolve().parents[1] / "alembic.ini")), "head")
+    finally:
+        if previous is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = previous
+    yield value
+    value.dispose()
+
+
+@pytest.fixture
+def factory(engine):
+    return sessionmaker(engine)
+
+
+@pytest.fixture
+def authority(factory):
+    with factory() as session:
+        value = _seed_authority(session)
+    # The shared Phase 12.1C seed uses a fixed test issuer.  Give this module
+    # a unique issuer so stale rows from other isolated integration modules
+    # can never be mistaken for this fixture's actor during cleanup.
+    unique_issuer = f"https://phase12e-b-{uuid4().hex}.invalid"
+    with factory.begin() as session:
+        session.execute(
+            UserIdentity.__table__.update()
+            .where(UserIdentity.id == value.admin_id)
+            .values(issuer=unique_issuer)
+        )
+    value = replace(value, issuer=unique_issuer)
+    yield value
+    with factory.begin() as session:
+        session.execute(
+            delete(AdapterPurgeItem).where(AdapterPurgeItem.department_id == value.department_id)
+        )
+        session.execute(
+            delete(AdapterPurgeReservation).where(
+                AdapterPurgeReservation.department_id == value.department_id
+            )
+        )
+        session.execute(
+            delete(AdapterPurgeOperation).where(
+                AdapterPurgeOperation.department_id == value.department_id
+            )
+        )
+        session.execute(
+            delete(PersistentAuditEvent).where(
+                PersistentAuditEvent.department_id == value.department_id,
+                PersistentAuditEvent.action == "adapter.purge",
+            )
+        )
+    # The apply test legitimately reaches the terminal purged state.  Clear
+    # that lifecycle marker before reusing the Phase 12.1A restoration helper.
+    with factory.begin() as session:
+        session.execute(
+            AdapterImportSource.__table__.update()
+            .where(
+                AdapterImportSource.department_id == value.department_id,
+                AdapterImportSource.id == value.source_id,
+            )
+            .values(
+                status="committed",
+                purged_at=None,
+                claimed_adapter_id=None,
+                claimed_at=None,
+                consumed_at=None,
+            )
+        )
+    _cleanup_test_rows(factory, value)
+    with factory.begin() as session:
+        # The seed helpers intentionally create success/decision audit rows
+        # for the actor.  Remove every isolated department audit row before
+        # deleting that test identity; production audit retention is never
+        # changed by the purge service.
+        identity_ids = select(UserIdentity.id).where(UserIdentity.issuer == value.issuer)
+        session.execute(
+            delete(PersistentAuditEvent).where(
+                (PersistentAuditEvent.department_id == value.department_id)
+                | PersistentAuditEvent.actor_user_id.in_(identity_ids)
+            )
+        )
+        session.execute(
+            delete(Membership).where(
+                Membership.user_id.in_(identity_ids)
+                | Membership.created_by_user_id.in_(identity_ids)
+            )
+        )
+        session.execute(
+            delete(TrainingJobPurgeReservation).where(
+                TrainingJobPurgeReservation.department_id == value.department_id
+            )
+        )
+        session.execute(
+            delete(TrainingJobArtifactOperationItem).where(
+                TrainingJobArtifactOperationItem.department_id == value.department_id
+            )
+        )
+        session.execute(
+            delete(TrainingJobArtifactOperation).where(
+                TrainingJobArtifactOperation.department_id == value.department_id
+            )
+        )
+        session.execute(
+            delete(TrainingJobAttempt).where(
+                TrainingJobAttempt.department_id == value.department_id
+            )
+        )
+        session.execute(delete(TrainingJob).where(TrainingJob.department_id == value.department_id))
+        session.execute(
+            delete(SftDatasetBuildAttempt).where(
+                SftDatasetBuildAttempt.department_id == value.department_id
+            )
+        )
+        session.execute(
+            delete(SftDatasetBuild).where(SftDatasetBuild.department_id == value.department_id)
+        )
+        session.execute(
+            delete(SftSourceBundle).where(SftSourceBundle.department_id == value.department_id)
+        )
+        # Break the source/attempt composite foreign-key cycle before removing
+        # the seeded source lineage and its importing identity.
+        session.execute(
+            AdapterImportSource.__table__.update()
+            .where(
+                AdapterImportSource.department_id == value.department_id,
+                AdapterImportSource.id == value.source_id,
+            )
+            .values(
+                status="staging",
+                authoritative_attempt_id=None,
+                committed_at=None,
+                intake_manifest_sha256=None,
+                intake_manifest_byte_size=None,
+            )
+        )
+        session.execute(
+            delete(AdapterImportAttempt).where(
+                AdapterImportAttempt.department_id == value.department_id
+            )
+        )
+        session.execute(
+            delete(AdapterImportSource).where(
+                AdapterImportSource.department_id == value.department_id
+            )
+        )
+        session.execute(delete(UserIdentity).where(UserIdentity.issuer == value.issuer))
+        session.execute(delete(Department).where(Department.id == value.department_id))
+
+
+def _storage(root: Path) -> Path:
+    for relative in (
+        "adapters",
+        "adapters/.staging",
+        "adapters/.deleting",
+        "adapters/imports",
+        "adapters/registry",
+        "adapters/.staging/imports",
+        "adapters/.staging/registry",
+        "adapters/.deleting/source_stage",
+        "adapters/.deleting/source_final",
+        "adapters/.deleting/registry_stage",
+        "adapters/.deleting/registry_final",
+        "adapters/.purge-deleting",
+        "adapters/.purge-deleting/source_stage",
+        "adapters/.purge-deleting/source_final",
+        "adapters/.purge-deleting/registry_stage",
+        "adapters/.purge-deleting/registry_final",
+    ):
+        path = root / relative
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.chmod(0o700)
+    return root
+
+
+def _prepare_authority(factory: sessionmaker[Session], authority: Authority, root: Path) -> UUID:
+    """Create exact source bytes before registry publication and purge."""
+
+    config = b"{}"
+    model = b"model"
+    config_sha = hashlib.sha256(config).hexdigest()
+    model_sha = hashlib.sha256(model).hexdigest()
+    with factory.begin() as session:
+        source = session.get(AdapterImportSource, authority.source_id)
+        attempt = session.get(AdapterImportAttempt, authority.source_attempt_id)
+        assert source is not None and attempt is not None
+        manifest = dict(attempt.ownership_manifest or {})
+        manifest["files"] = {
+            "adapter_config.json": {"sha256": config_sha, "byte_size": len(config)},
+            "adapter_model.safetensors": {"sha256": model_sha, "byte_size": len(model)},
+        }
+        raw = canonical_manifest_bytes(manifest)
+        attempt.ownership_manifest = manifest
+        source.adapter_config_sha256 = config_sha
+        source.adapter_config_byte_size = len(config)
+        source.adapter_model_sha256 = model_sha
+        source.adapter_model_byte_size = len(model)
+        source.intake_manifest_sha256 = hashlib.sha256(raw).hexdigest()
+        source.intake_manifest_byte_size = len(raw)
+    _source_final(root, authority, manifest)
+    enqueue = _enqueue(factory, authority, apply=True)
+    claim = claim_next_adapter(factory, uuid4(), 30, authority.code_revision)
+    assert claim is not None and enqueue.adapter_id == claim.id
+    registry_manifest, registry_raw = _registry_manifest_for_claim(claim, config, model)
+    _registry_final(root, authority, claim, registry_raw)
+    now = datetime.now(UTC)
+    with factory.begin() as session:
+        attempt = session.get(AdapterRegistryAttempt, claim.registry_attempt_id)
+        adapter = session.get(Adapter, claim.id)
+        source = session.get(AdapterImportSource, authority.source_id)
+        assert attempt is not None and adapter is not None and source is not None
+        attempt.status = "succeeded"
+        attempt.ownership_manifest = registry_manifest
+        attempt.staged_at = now
+        attempt.published_at = now
+        attempt.finished_at = now
+        attempt.worker_id = None
+        attempt.claimed_at = None
+        attempt.version += 1
+        adapter.status = "validated"
+        adapter.worker_id = None
+        adapter.claim_token = None
+        adapter.lease_expires_at = None
+        adapter.validated_at = now
+        adapter.finished_at = now
+        adapter.registry_manifest_sha256 = hashlib.sha256(registry_raw).hexdigest()
+        adapter.registry_adapter_config_sha256 = config_sha
+        adapter.registry_adapter_config_byte_size = len(config)
+        adapter.registry_adapter_model_sha256 = model_sha
+        adapter.registry_adapter_model_byte_size = len(model)
+        adapter.verified_governance_lineage = True
+        adapter.verified_artifact_compatibility = True
+        adapter.training_provenance_verified = False
+        adapter.version += 1
+        source.status = "consumed"
+        source.consumed_at = now
+        source.version += 1
+    return claim.id
+
+
+def _adapter_id(factory: sessionmaker[Session], authority: Authority) -> UUID:
+    with factory() as session:
+        value = session.scalar(
+            select(Adapter.id).where(Adapter.department_id == authority.department_id)
+        )
+        assert value is not None
+        return value
+
+
+def _purge(factory, authority: Authority, root: Path, *, apply: bool = True, department_id=None):
+    return purge_adapter_artifacts(
+        factory,
+        data_dir=root,
+        department_id=department_id or authority.department_id,
+        adapter_id=_adapter_id(factory, authority),
+        actor_issuer=authority.issuer,
+        actor_subject=authority.subject,
+        apply=apply,
+    )
+
+
+def test_dry_run_is_read_only_and_content_free(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    root = _storage(tmp_path)
+    _prepare_authority(factory, authority, root)
+    result = _purge(factory, authority, root, apply=False)
+    assert result.eligible_count == 2
+    assert result.applied_count == 0
+    assert result.operation_id is None
+    with factory() as session:
+        assert (
+            session.scalar(
+                select(func.count(AdapterPurgeOperation.id)).where(
+                    AdapterPurgeOperation.department_id == authority.department_id
+                )
+            )
+            == 0
+        )
+        adapter = session.scalar(
+            select(Adapter).where(Adapter.department_id == authority.department_id)
+        )
+        source = session.get(AdapterImportSource, authority.source_id)
+        assert adapter is not None and adapter.status == "validated"
+        assert source is not None and source.status == "consumed"
+
+
+def test_apply_purges_registry_then_source_and_replays_once(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    root = _storage(tmp_path)
+    _prepare_authority(factory, authority, root)
+    result = _purge(factory, authority, root)
+    assert result.applied_count == 2
+    with factory() as session:
+        adapter = session.scalar(
+            select(Adapter).where(Adapter.department_id == authority.department_id)
+        )
+        source = session.get(AdapterImportSource, authority.source_id)
+        assert adapter is not None and adapter.status == "purged"
+        assert source is not None and source.status == "purged"
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.purge",
+                )
+            )
+            == 1
+        )
+    replay = _purge(factory, authority, root)
+    assert replay.eligible_count == 0
+    assert replay.applied_count == 0
+    with factory() as session:
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.purge",
+                )
+            )
+            == 1
+        )
+
+
+def test_registry_failure_blocks_source_without_deleting_it(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    root = _storage(tmp_path)
+    _prepare_authority(factory, authority, root)
+    registry = root / "adapters" / "registry" / str(authority.department_id)
+    for path in registry.iterdir():
+        if path.is_dir():
+            for child in path.iterdir():
+                child.unlink()
+            path.rmdir()
+    source = root / "adapters" / "imports" / str(authority.department_id) / str(authority.source_id)
+    assert source.exists()
+    result = _purge(factory, authority, root)
+    assert result.blocked_count >= 1
+    assert source.exists()
+    with factory() as session:
+        operation = session.scalar(
+            select(AdapterPurgeOperation).where(
+                AdapterPurgeOperation.department_id == authority.department_id
+            )
+        )
+        assert operation is not None and operation.status == "completed_with_blocks"
+        adapter = session.scalar(
+            select(Adapter).where(Adapter.department_id == authority.department_id)
+        )
+        source_row = session.get(AdapterImportSource, authority.source_id)
+        assert adapter is not None and adapter.status == "purge_pending"
+        assert source_row is not None and source_row.status == "purge_pending"

@@ -137,9 +137,10 @@ sources have separate `staging`, `committed`, `claimed`, `consumed`, `rejected`,
 `abandoned`, `purge_pending`, and `purged` states; one committed source can be
 consumed by only one exact adapter version. Registry and source-byte purge are
 separate, bounded, crash-resumable, operation-audited operations. PostgreSQL and
-external storage are non-atomic. Future reconciliation and purge must be fenced
-against active deployments and exact intake/retry ownership; they must not
-delete Phase 10 datasets, Phase 11 job bundles, backups, or audit history. See
+external storage are non-atomic. Phase 12.1E-B fences exact intake/retry
+ownership through independent reservations; it does not delete Phase 10
+datasets, Phase 11 job bundles, backups, or audit history. Future deployment
+fencing remains a later lifecycle requirement. See
 [adapter-registry.md](adapter-registry.md) for the full contract.
 
 The static contract fixes the Qwen3-0.6B/PEFT/safetensors compatibility metadata
@@ -241,14 +242,18 @@ The import source is not runtime, evaluation, promotion, or rollback authority.
 The registry becomes adapter authority only after a successful PostgreSQL
 publication commit. Phase 12.1A validates adapter metadata with the reviewed
 static schema without loading a model or tokenizer; Phase 12.1C publishes only
-the exact content-free registry bundle. Phase 12.1E-A separately provides only
-bounded reconciliation for four non-authoritative artifact surfaces. Evaluation,
-approval, promotion, rollback, purge, and later adapter lifecycle remain future
-reviewed phases.
+the exact content-free registry bundle. Phase 12.1E-A separately provides
+bounded reconciliation for four non-authoritative artifact surfaces. Phase
+12.1E-B adds a separate maintenance-only purge authority: PostgreSQL reserves
+the exact source and registry attempts before mutation, registry bytes are
+deleted before source bytes, and final artifacts use descriptor-bound
+`.purge-deleting` tombstones with crash-resumable identity-fenced unlink.
+Evaluation, approval, promotion, rollback, runtime loading, and later lifecycle
+phases remain future reviewed work.
 
 The exact training scheduler, GPU execution environment, registry schema, and approval workflow are future decisions.
 
-### Adapter artifact reconciliation (Phase 12.1E-A)
+### Adapter artifact reconciliation and purge (Phase 12.1E-A/B)
 
 The manual `adapter-maintenance` Compose profile is the only component allowed
 to reconcile adapter artifact surfaces. It receives PostgreSQL and one external
@@ -272,7 +277,13 @@ attempt-group limits, cross-operation cleanup confirmation, and one
 operation-level audit provide crash recovery without claiming PostgreSQL and
 filesystem atomicity. Authoritative finals, purge states, dependencies, Phase
 10/11 artifacts, evaluation, approval, promotion, loading, and runtime routing
-are outside this phase.
+are outside E-A. E-B is a separate administrator-only, dry-run-by-default
+command in the same isolated maintenance profile. It independently reserves
+source and registry finals, verifies complete manifests and exact digests,
+deletes the registry surface first, then the source surface, and retains all
+PostgreSQL lineage, history, audit rows, backups, and upstream Phase 10/11
+artifacts. It has no public route and no model, Qdrant, RAG, dataset, or
+training-job dependency.
 
 Phase 12.1C PostgreSQL publication and external filesystem publication are not
 atomic. A filesystem rename without a committed succeeded row is not runtime,
@@ -314,6 +325,6 @@ PostgreSQL claims, Qdrant retrieval, Phase 5 artifacts, result publication, and 
 - Production extraction sandbox, malware controls, and additional reviewed formats
 - Hybrid retrieval, reranking, and relevance thresholds beyond the Phase 5 character chunker
 - Production retention, physical purge, reconciliation, and tamper-resistant audit requirements
-- Phase 12.1E-B/C through 12.4 adapter purge, evaluation, registry lifecycle,
-  and runtime deployment
+- Phase 12.1E-C through 12.4 adapter evaluation, registry lifecycle, and runtime
+  deployment
 - Production topology, secrets, observability, backup, and disaster recovery

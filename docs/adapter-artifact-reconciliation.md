@@ -1,4 +1,4 @@
-# Phase 12.1E-A adapter artifact reconciliation
+# Phase 12.1E-A adapter artifact reconciliation (completed)
 
 Phase 12.1E-A is a maintenance-only foundation. It does not purge an adapter
 or source, release an upstream dependency, evaluate or approve an adapter,
@@ -134,13 +134,17 @@ controls, not a distributed transaction. An in-flight filesystem operation
 cannot be fenced atomically by PostgreSQL; exact descriptors, tombstones, and
 subsequent authority checks keep unknown or orphaned bytes untrusted.
 
+Phase 12.1E-B is the separate current reviewed purge boundary documented in
+[adapter-artifact-purge.md](adapter-artifact-purge.md). It uses independent
+reservations and the `.purge-deleting` namespace for authoritative registry and
+source finals; it never changes the E-A reconciliation rows or adopts their
+tombstones. Phase 12.1E-C, evaluation, approval, promotion, loading, runtime
+routing, and later Phase 12/13 work remain separate future phases.
+
 Migration `0013_phase12_adapter_reconciliation_cursor` adds the independent
-cursor table and the complete attempt keyset indexes. The cursor identity is
+cursor table and complete attempt keyset indexes. The cursor identity is
 `(department_id, family, lifecycle_status)`: each independently quota-limited
 status stream advances and wraps on its own, so a later key in one status can
-never jump over an uninspected key in another status. PR #19 has a different
-`0013` migration on its branch; it must be rebased and renumbered to `0014`
-after this hotfix merges, before the branches are combined.
-
-Phase 12.1E-B/C, evaluation, approval, promotion, loading, runtime routing,
-and later Phase 12/13 work remain separate future phases.
+never jump over an uninspected key in another status. Migration
+`0014_phase12_adapter_purge` is the separate E-B purge schema layered on top
+of that cursor revision.

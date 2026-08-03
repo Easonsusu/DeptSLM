@@ -41,19 +41,20 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > is active. This is a reviewed boundary, not training execution.
 
 > **Phase 12 status:** Phase 12.0 and Phase 12.1A through Phase 12.1D are
-> completed. Phase 12.1E-A is the current reviewed scope: it adds only an
-> administrator-only, dry-run-by-default reconciliation foundation for four
-> non-authoritative adapter artifact surfaces. It uses durable PostgreSQL
-> operation/item authority, exact department and attempt keys, descriptor-bound
-> no-follow storage, read-only inspection before a durable verified state,
-> pre-rename move intent, no-replace tombstone binding, crash-resumable deletion,
-> and non-starving blocked reconciliation. Unbound tombstones are never adopted;
-> final cleanup requires committed tombstone identity, and attempt cleanup is
-> confirmed only after every applicable surface and tombstone is absent. It
-> never changes source or adapter purge
-> state, releases an upstream dependency, reads adapter bytes into PostgreSQL,
-> or exposes a public route. Phase 12.1E-B/C, Phase 12.2 through Phase 12.4,
-> and runtime routing remain unstarted.
+> completed, and Phase 12.1E-A reconciliation is complete. Phase 12.1E-B is
+> the current reviewed scope: it adds a separate administrator-only,
+> dry-run-by-default purge command for one exact validated adapter. PostgreSQL
+> independently reserves the source and registry identities, attempts,
+> versions, manifests, and retention dependencies before mutation. Registry
+> bytes are verified and removed first; source bytes are removed only after
+> that independent registry purge succeeds. Final artifacts use the private
+> `.purge-deleting` namespace, descriptor-relative no-follow checks,
+> same-filesystem no-replace moves, fsync, exact identity checks, and
+> crash-resumable per-file and directory deletion progress. APIs, audits, and
+> CLI output remain content-free. Purge never deletes Phase 10/11 artifacts,
+> history, backups, or audit rows, and it does not add runtime loading,
+> deployment, evaluation, or training behavior. Phase 12.1E-C, Phase 12.2
+> through Phase 12.4, and runtime routing remain unstarted.
 
 > **Phase 12.1C hardening:** The registry binds exact composite source, Phase 11
 > attempt, and Phase 10 attempt identities and carries evolving versions for
@@ -91,12 +92,12 @@ post-rename identity verification. Every PostgreSQL transition compares a
 complete frozen authority snapshot and both row versions; static contract
 errors remain distinct from fixed descriptor/operational errors. Migrations
 `0010_phase12_adapter_sources`, `0011_phase12_adapter_registry`,
-`0012_phase12_adapter_reconciliation`, and
-`0013_phase12_adapter_reconciliation_cursor` are self-contained and CI
-validates that head with a private temporary adapters root; CI downloads no
-model weights. The 0013 cursor revision stores independent per-status scan
-positions on this hotfix branch; PR #19's separate 0013 must be renumbered to
-0014 after this branch merges.
+`0012_phase12_adapter_reconciliation`,
+`0013_phase12_adapter_reconciliation_cursor`, and
+`0014_phase12_adapter_purge` are self-contained and CI validates that head
+with a private temporary adapters root; CI downloads no model weights. The
+0013 cursor revision stores independent per-status scan positions, while the
+0014 purge revision adds the separate exact-artifact purge authority.
 
 Phase 12.1A fixes the compatible package references, closed configuration and
 tensor grammar, bounded header/file limits, and model-free validation rules in a
@@ -307,6 +308,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Phase 12.1C adapter registry publication](docs/adapter-registry-publication.md)
 - [Phase 12.1D adapter metadata reads](docs/adapter-registry-metadata.md)
 - [Phase 12.1E-A adapter artifact reconciliation](docs/adapter-artifact-reconciliation.md)
+- [Phase 12.1E-B adapter artifact purge](docs/adapter-artifact-purge.md)
 - [Phase 12 adapter registry contract](docs/adapter-registry.md)
 - [Grounded RAG answering](docs/rag-answering.md)
 - [Prompt-injection boundary](docs/prompt-injection-boundary.md)
@@ -325,7 +327,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 
 Phase 9 does not implement LLM judging, semantic grading, public raw results, a frontend dashboard, feedback-derived cases, automatic threshold or RAG changes, training datasets, SFT, adapters, model promotion, cross-department benchmarking, production OAuth/OIDC/SSO, or production deployment.
 
-Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 remains contract and threat-model work. Phase 12.1A, Phase 12.1B, and Phase 12.1C are complete; Phase 12.1D adds only administrator-authorized, department-scoped metadata list/detail reads from PostgreSQL with no artifact access, mutation, audit, evaluation, approval, promotion, rollback, or runtime routing. Phase 12.1E-A adds only the separate reviewed, administrator-only, dry-run-by-default reconciliation foundation for four non-authoritative adapter artifact surfaces; it does not purge, release dependencies, evaluate, approve, promote, load, or route adapters. Phase 12.1E-B/C and later phases remain unstarted. Google Drive storage is an external development runtime location, not a production object store or backup.
+Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 remains contract and threat-model work. Phase 12.1A through Phase 12.1E-A are complete; Phase 12.1E-B adds only the separate reviewed, administrator-only, dry-run-by-default purge authority described above. It does not evaluate, approve, promote, load, or route adapters, and it never deletes upstream Phase 10/11 artifacts, history, backups, or audit rows. Phase 12.1E-C and later phases remain unstarted. Google Drive storage is an external development runtime location, not a production object store or backup.
 
 ## License
 
