@@ -3842,6 +3842,25 @@ class AdapterArtifactOperationItem(Base):
             name="ck_adapter_artifact_item_progress",
         ),
         CheckConstraint(
+            "((status NOT IN ('deleting','completed')) OR "
+            "(status = 'deleting' AND json_typeof(observed_identity) = 'object' "
+            "AND json_typeof(tombstone_identity) = 'object' "
+            "AND json_typeof(expected_tombstone_namespace) = 'object' "
+            "AND json_typeof(deletion_plan) = 'array' "
+            "AND next_entry_index BETWEEN 0 AND json_array_length(deletion_plan) "
+            "AND (directory_unlink_started_at IS NULL OR "
+            "next_entry_index = json_array_length(deletion_plan)) "
+            "AND (in_flight_entry IS NULL OR "
+            "(json_typeof(in_flight_entry) = 'object' "
+            "AND next_entry_index < json_array_length(deletion_plan) "
+            "AND in_flight_entry->>'name' = "
+            "(deletion_plan->next_entry_index)->>'name')))) OR "
+            "(status = 'completed' AND (deletion_plan IS NULL AND next_entry_index = 0 OR "
+            "(json_typeof(deletion_plan) = 'array' AND "
+            "next_entry_index = json_array_length(deletion_plan)))))",
+            name="ck_adapter_artifact_item_progress_exact",
+        ),
+        CheckConstraint(
             "blocked_reason_code IS NULL OR blocked_reason_code IN "
             "('staging_path_unsafe','artifact_ownership_mismatch','artifact_manifest_invalid',"
             "'artifact_permissions_invalid','artifact_authority_changed','artifact_tombstone_conflict')",
@@ -3855,20 +3874,32 @@ class AdapterArtifactOperationItem(Base):
             "AND deletion_started_at IS NULL AND directory_unlink_started_at IS NULL "
             "AND completed_at IS NULL AND blocked_at IS NULL "
             "AND blocked_reason_code IS NULL) OR "
-            "(status = 'verified' AND observed_identity IS NOT NULL AND deletion_plan IS NOT NULL "
+            "(status = 'verified' AND json_typeof(observed_identity) = 'object' "
+            "AND json_typeof(deletion_plan) = 'array' "
             "AND tombstone_identity IS NULL AND verified_at IS NOT NULL "
+            "AND next_entry_index = 0 AND in_flight_entry IS NULL "
+            "AND tombstone_bound_at IS NULL AND deletion_started_at IS NULL "
+            "AND directory_unlink_started_at IS NULL "
             "AND ((move_authorized_at IS NULL AND expected_tombstone_namespace IS NULL) OR "
             "(move_authorized_at IS NOT NULL AND expected_tombstone_namespace IS NOT NULL)) "
             "AND completed_at IS NULL "
             "AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR "
-            "(status = 'tombstone_bound' AND observed_identity IS NOT NULL "
-            "AND deletion_plan IS NOT NULL "
-            "AND tombstone_identity IS NOT NULL AND tombstone_bound_at IS NOT NULL "
+            "(status = 'tombstone_bound' AND json_typeof(observed_identity) = 'object' "
+            "AND json_typeof(deletion_plan) = 'array' "
+            "AND json_typeof(tombstone_identity) = 'object' "
+            "AND json_typeof(expected_tombstone_namespace) = 'object' "
+            "AND tombstone_bound_at IS NOT NULL "
+            "AND next_entry_index = 0 AND in_flight_entry IS NULL "
+            "AND deletion_started_at IS NULL AND directory_unlink_started_at IS NULL "
             "AND move_authorized_at IS NOT NULL AND expected_tombstone_namespace IS NOT NULL "
             "AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR "
-            "(status = 'deleting' AND tombstone_identity IS NOT NULL "
-            "AND move_authorized_at IS NOT NULL AND expected_tombstone_namespace IS NOT NULL "
+            "(status = 'deleting' AND json_typeof(observed_identity) = 'object' "
+            "AND json_typeof(deletion_plan) = 'array' "
+            "AND json_typeof(tombstone_identity) = 'object' "
+            "AND json_typeof(expected_tombstone_namespace) = 'object' "
+            "AND move_authorized_at IS NOT NULL "
             "AND deletion_started_at IS NOT NULL "
+            "AND deletion_plan IS NOT NULL "
             "AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR "
             "(status = 'completed' AND completed_at IS NOT NULL AND blocked_at IS NULL "
             "AND blocked_reason_code IS NULL AND in_flight_entry IS NULL) OR "
@@ -3889,13 +3920,49 @@ class AdapterArtifactOperationItem(Base):
             name="uq_adapter_artifact_item_operation_surface",
         ),
         Index(
-            "uq_adapter_artifact_item_active_surface",
+            "uq_adapter_artifact_item_active_source_stage",
             "department_id",
             "surface_type",
+            "source_bundle_id",
+            "import_attempt_id",
+            unique=True,
+            postgresql_where=text(
+                "surface_type = 'source_stage' AND status IN "
+                "('registered','verified','tombstone_bound','deleting')"
+            ),
+        ),
+        Index(
+            "uq_adapter_artifact_item_active_registry_stage",
+            "department_id",
+            "surface_type",
+            "adapter_id",
             "publication_attempt_id",
             unique=True,
             postgresql_where=text(
-                "status IN ('registered','verified','tombstone_bound','deleting')"
+                "surface_type = 'registry_stage' AND status IN "
+                "('registered','verified','tombstone_bound','deleting')"
+            ),
+        ),
+        Index(
+            "uq_adapter_artifact_item_active_source_final",
+            "department_id",
+            "surface_type",
+            "source_bundle_id",
+            unique=True,
+            postgresql_where=text(
+                "surface_type = 'source_final' AND status IN "
+                "('registered','verified','tombstone_bound','deleting')"
+            ),
+        ),
+        Index(
+            "uq_adapter_artifact_item_active_registry_final",
+            "department_id",
+            "surface_type",
+            "adapter_id",
+            unique=True,
+            postgresql_where=text(
+                "surface_type = 'registry_final' AND status IN "
+                "('registered','verified','tombstone_bound','deleting')"
             ),
         ),
         Index(
@@ -3918,13 +3985,23 @@ class AdapterArtifactOperationItem(Base):
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
     expected_resource_version: Mapped[int] = mapped_column(Integer, nullable=False)
     expected_attempt_version: Mapped[int] = mapped_column(Integer, nullable=False)
-    ownership_manifest: Mapped[dict[str, object] | None] = mapped_column(JSON)
-    observed_identity: Mapped[dict[str, object] | list[object] | None] = mapped_column(JSON)
-    tombstone_identity: Mapped[dict[str, object] | list[object] | None] = mapped_column(JSON)
-    deletion_plan: Mapped[dict[str, object] | list[object] | None] = mapped_column(JSON)
-    expected_tombstone_namespace: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    ownership_manifest: Mapped[dict[str, object] | None] = mapped_column(JSON(none_as_null=True))
+    observed_identity: Mapped[dict[str, object] | list[object] | None] = mapped_column(
+        JSON(none_as_null=True)
+    )
+    tombstone_identity: Mapped[dict[str, object] | list[object] | None] = mapped_column(
+        JSON(none_as_null=True)
+    )
+    deletion_plan: Mapped[dict[str, object] | list[object] | None] = mapped_column(
+        JSON(none_as_null=True)
+    )
+    expected_tombstone_namespace: Mapped[dict[str, object] | None] = mapped_column(
+        JSON(none_as_null=True)
+    )
     next_entry_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    in_flight_entry: Mapped[dict[str, object] | list[object] | None] = mapped_column(JSON)
+    in_flight_entry: Mapped[dict[str, object] | list[object] | None] = mapped_column(
+        JSON(none_as_null=True)
+    )
     directory_unlink_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="registered")
     blocked_reason_code: Mapped[str | None] = mapped_column(String(64))

@@ -209,13 +209,13 @@ def upgrade() -> None:
         sa.Column("attempt_number", sa.Integer(), nullable=False),
         sa.Column("expected_resource_version", sa.Integer(), nullable=False),
         sa.Column("expected_attempt_version", sa.Integer(), nullable=False),
-        sa.Column("ownership_manifest", sa.JSON()),
-        sa.Column("observed_identity", sa.JSON()),
-        sa.Column("tombstone_identity", sa.JSON()),
-        sa.Column("deletion_plan", sa.JSON()),
-        sa.Column("expected_tombstone_namespace", sa.JSON()),
+        sa.Column("ownership_manifest", sa.JSON(none_as_null=True)),
+        sa.Column("observed_identity", sa.JSON(none_as_null=True)),
+        sa.Column("tombstone_identity", sa.JSON(none_as_null=True)),
+        sa.Column("deletion_plan", sa.JSON(none_as_null=True)),
+        sa.Column("expected_tombstone_namespace", sa.JSON(none_as_null=True)),
         sa.Column("next_entry_index", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("in_flight_entry", sa.JSON()),
+        sa.Column("in_flight_entry", sa.JSON(none_as_null=True)),
         sa.Column("directory_unlink_started_at", sa.DateTime(timezone=True)),
         sa.Column("status", sa.String(20), nullable=False),
         sa.Column("blocked_reason_code", sa.String(64)),
@@ -345,19 +345,90 @@ def upgrade() -> None:
             name="ck_adapter_artifact_item_reason",
         ),
         sa.CheckConstraint(
-            "((status = 'registered' AND observed_identity IS NULL AND tombstone_identity IS NULL AND deletion_plan IS NULL AND expected_tombstone_namespace IS NULL AND next_entry_index = 0 AND in_flight_entry IS NULL AND verified_at IS NULL AND move_authorized_at IS NULL AND tombstone_bound_at IS NULL AND deletion_started_at IS NULL AND directory_unlink_started_at IS NULL AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR (status = 'verified' AND observed_identity IS NOT NULL AND deletion_plan IS NOT NULL AND tombstone_identity IS NULL AND verified_at IS NOT NULL AND ((move_authorized_at IS NULL AND expected_tombstone_namespace IS NULL) OR (move_authorized_at IS NOT NULL AND expected_tombstone_namespace IS NOT NULL)) AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR (status = 'tombstone_bound' AND observed_identity IS NOT NULL AND deletion_plan IS NOT NULL AND tombstone_identity IS NOT NULL AND tombstone_bound_at IS NOT NULL AND move_authorized_at IS NOT NULL AND expected_tombstone_namespace IS NOT NULL AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR (status = 'deleting' AND tombstone_identity IS NOT NULL AND move_authorized_at IS NOT NULL AND expected_tombstone_namespace IS NOT NULL AND deletion_started_at IS NOT NULL AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR (status = 'completed' AND completed_at IS NOT NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL AND in_flight_entry IS NULL) OR (status = 'blocked' AND blocked_at IS NOT NULL AND completed_at IS NULL AND blocked_reason_code IS NOT NULL))",
+            "((status = 'registered' AND observed_identity IS NULL AND tombstone_identity IS NULL "
+            "AND deletion_plan IS NULL AND expected_tombstone_namespace IS NULL "
+            "AND next_entry_index = 0 AND in_flight_entry IS NULL AND verified_at IS NULL "
+            "AND move_authorized_at IS NULL AND tombstone_bound_at IS NULL "
+            "AND deletion_started_at IS NULL AND directory_unlink_started_at IS NULL "
+            "AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR "
+            "(status = 'verified' AND json_typeof(observed_identity) = 'object' "
+            "AND json_typeof(deletion_plan) = 'array' AND tombstone_identity IS NULL "
+            "AND verified_at IS NOT NULL AND next_entry_index = 0 AND in_flight_entry IS NULL "
+            "AND tombstone_bound_at IS NULL AND deletion_started_at IS NULL "
+            "AND directory_unlink_started_at IS NULL "
+            "AND ((move_authorized_at IS NULL AND expected_tombstone_namespace IS NULL) OR "
+            "(move_authorized_at IS NOT NULL AND expected_tombstone_namespace IS NOT NULL)) "
+            "AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR "
+            "(status = 'tombstone_bound' AND json_typeof(observed_identity) = 'object' "
+            "AND json_typeof(deletion_plan) = 'array' "
+            "AND json_typeof(tombstone_identity) = 'object' "
+            "AND json_typeof(expected_tombstone_namespace) = 'object' "
+            "AND tombstone_bound_at IS NOT NULL AND move_authorized_at IS NOT NULL "
+            "AND next_entry_index = 0 AND in_flight_entry IS NULL "
+            "AND deletion_started_at IS NULL AND directory_unlink_started_at IS NULL "
+            "AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR "
+            "(status = 'deleting' AND json_typeof(observed_identity) = 'object' "
+            "AND json_typeof(deletion_plan) = 'array' "
+            "AND json_typeof(tombstone_identity) = 'object' "
+            "AND json_typeof(expected_tombstone_namespace) = 'object' "
+            "AND move_authorized_at IS NOT NULL AND deletion_started_at IS NOT NULL "
+            "AND deletion_plan IS NOT NULL AND completed_at IS NULL "
+            "AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR "
+            "(status = 'completed' AND completed_at IS NOT NULL AND blocked_at IS NULL "
+            "AND blocked_reason_code IS NULL AND in_flight_entry IS NULL) OR "
+            "(status = 'blocked' AND blocked_at IS NOT NULL AND completed_at IS NULL "
+            "AND blocked_reason_code IS NOT NULL))",
             name="ck_adapter_artifact_item_lifecycle",
+        ),
+        sa.CheckConstraint(
+            "((status NOT IN ('deleting','completed')) OR "
+            "(status = 'deleting' AND json_typeof(observed_identity) = 'object' "
+            "AND json_typeof(tombstone_identity) = 'object' "
+            "AND json_typeof(expected_tombstone_namespace) = 'object' "
+            "AND json_typeof(deletion_plan) = 'array' "
+            "AND next_entry_index BETWEEN 0 AND json_array_length(deletion_plan) "
+            "AND (directory_unlink_started_at IS NULL OR "
+            "next_entry_index = json_array_length(deletion_plan)) "
+            "AND (in_flight_entry IS NULL OR (json_typeof(in_flight_entry) = 'object' "
+            "AND next_entry_index < json_array_length(deletion_plan) "
+            "AND in_flight_entry->>'name' = "
+            "(deletion_plan->next_entry_index)->>'name'))) OR "
+            "(status = 'completed' AND "
+            "(deletion_plan IS NULL AND next_entry_index = 0 OR "
+            "(json_typeof(deletion_plan) = 'array' AND "
+            "next_entry_index = json_array_length(deletion_plan)))))",
+            name="ck_adapter_artifact_item_progress_exact",
         ),
         sa.CheckConstraint("version > 0", name="ck_adapter_artifact_item_version"),
     )
+    active_status = "status IN ('registered','verified','tombstone_bound','deleting')"
     op.create_index(
-        "uq_adapter_artifact_item_active_surface",
+        "uq_adapter_artifact_item_active_source_stage",
         "adapter_artifact_operation_items",
-        ["department_id", "surface_type", "publication_attempt_id"],
+        ["department_id", "surface_type", "source_bundle_id", "import_attempt_id"],
         unique=True,
-        postgresql_where=sa.text(
-            "status IN ('registered','verified','tombstone_bound','deleting')"
-        ),
+        postgresql_where=sa.text("surface_type = 'source_stage' AND " + active_status),
+    )
+    op.create_index(
+        "uq_adapter_artifact_item_active_registry_stage",
+        "adapter_artifact_operation_items",
+        ["department_id", "surface_type", "adapter_id", "publication_attempt_id"],
+        unique=True,
+        postgresql_where=sa.text("surface_type = 'registry_stage' AND " + active_status),
+    )
+    op.create_index(
+        "uq_adapter_artifact_item_active_source_final",
+        "adapter_artifact_operation_items",
+        ["department_id", "surface_type", "source_bundle_id"],
+        unique=True,
+        postgresql_where=sa.text("surface_type = 'source_final' AND " + active_status),
+    )
+    op.create_index(
+        "uq_adapter_artifact_item_active_registry_final",
+        "adapter_artifact_operation_items",
+        ["department_id", "surface_type", "adapter_id"],
+        unique=True,
+        postgresql_where=sa.text("surface_type = 'registry_final' AND " + active_status),
     )
     op.create_index(
         "ix_adapter_artifact_item_operation_status",
@@ -370,9 +441,13 @@ def downgrade() -> None:
     op.drop_index(
         "ix_adapter_artifact_item_operation_status", table_name="adapter_artifact_operation_items"
     )
-    op.drop_index(
-        "uq_adapter_artifact_item_active_surface", table_name="adapter_artifact_operation_items"
-    )
+    for index_name in (
+        "uq_adapter_artifact_item_active_registry_final",
+        "uq_adapter_artifact_item_active_source_final",
+        "uq_adapter_artifact_item_active_registry_stage",
+        "uq_adapter_artifact_item_active_source_stage",
+    ):
+        op.drop_index(index_name, table_name="adapter_artifact_operation_items")
     op.drop_table("adapter_artifact_operation_items")
     op.drop_index(
         "ix_adapter_artifact_operation_department_created", table_name="adapter_artifact_operations"

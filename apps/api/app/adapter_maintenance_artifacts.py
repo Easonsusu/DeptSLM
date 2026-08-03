@@ -10,7 +10,6 @@ closed manifest before they can be moved to a tombstone.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import stat
 import sys
@@ -19,7 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
-from app.adapter_registry_domain import parse_registry_manifest
+from app.adapter_registry_domain import AdapterRegistryDomainError, parse_registry_manifest
+from app.adapter_source_artifacts import AdapterSourceArtifactError, parse_source_manifest
 
 SOURCE_STAGE_FILES = frozenset(
     {
@@ -137,11 +137,30 @@ class BoundSurface:
     surface_type: str
     department_id: UUID
     resource_id: UUID
-    attempt_id: UUID
+    attempt_id: UUID | None
     item_id: UUID
     observed_identity: dict[str, object]
     deletion_plan: list[dict[str, object]]
     tombstone_identity: dict[str, object]
+
+    @property
+    def address(self) -> PhysicalSurfaceIdentifier:
+        return physical_surface_identifier(
+            self.surface_type,
+            self.department_id,
+            self.resource_id,
+            self.attempt_id,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalSurfaceIdentifier:
+    """The only pathname identity accepted for an adapter surface."""
+
+    surface_type: str
+    department_id: UUID
+    resource_id: UUID
+    path_attempt_id: UUID | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,15 +175,60 @@ class InspectedSurface:
     surface_type: str
     department_id: UUID
     resource_id: UUID
-    attempt_id: UUID
+    attempt_id: UUID | None
     item_id: UUID
     observed_identity: dict[str, object]
     deletion_plan: list[dict[str, object]]
+
+    @property
+    def address(self) -> PhysicalSurfaceIdentifier:
+        return physical_surface_identifier(
+            self.surface_type,
+            self.department_id,
+            self.resource_id,
+            self.attempt_id,
+        )
 
 
 def _safe_uuid(value: UUID) -> None:
     if not isinstance(value, UUID) or value.int == 0:
         raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+
+
+def physical_surface_identifier(
+    surface_type: str,
+    department_id: UUID,
+    resource_id: UUID,
+    path_attempt_id: UUID | None,
+) -> PhysicalSurfaceIdentifier:
+    """Build the exact physical address for one reviewed surface.
+
+    Stage paths use the source import attempt or registry publication attempt;
+    final paths never contain an attempt component.  Keeping this mapping in
+    one closed helper prevents registry-attempt primary keys from becoming
+    pathname components by accident.
+    """
+
+    if surface_type not in SURFACES:
+        raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+    _safe_uuid(department_id)
+    _safe_uuid(resource_id)
+    if surface_type.endswith("_stage"):
+        _safe_uuid(path_attempt_id)
+    elif path_attempt_id is not None:
+        raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+    return PhysicalSurfaceIdentifier(surface_type, department_id, resource_id, path_attempt_id)
+
+
+def _checked_surface_address(value: object) -> PhysicalSurfaceIdentifier:
+    if not isinstance(value, PhysicalSurfaceIdentifier):
+        raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+    return physical_surface_identifier(
+        value.surface_type,
+        value.department_id,
+        value.resource_id,
+        value.path_attempt_id,
+    )
 
 
 def _safe_name(value: str) -> None:
@@ -394,22 +458,22 @@ class AdapterMaintenanceArtifactStore:
         return base, (), names, surface.endswith("_stage")
 
     def _open_surface(
-        self, surface: str, department_id: UUID, resource_id: UUID, attempt_id: UUID
+        self, address: PhysicalSurfaceIdentifier
     ) -> tuple[int, int, list[int], frozenset[str], bool] | None:
-        _safe_uuid(department_id)
-        _safe_uuid(resource_id)
-        _safe_uuid(attempt_id)
-        base, _unused, allowlist, is_stage = self._surface_parent(surface)
+        address = _checked_surface_address(address)
+        base, _unused, allowlist, is_stage = self._surface_parent(address.surface_type)
         opened: list[int] = []
         try:
-            department = _open_dir(base, str(department_id))
+            department = _open_dir(base, str(address.department_id))
             opened.append(department)
             resource_parent = department
-            resource_name = str(resource_id) if is_stage is False else str(resource_id)
+            resource_name = str(address.resource_id)
             if is_stage:
                 resource_dir = _open_dir(resource_parent, resource_name)
                 opened.append(resource_dir)
-                stage = _open_dir(resource_dir, str(attempt_id))
+                if address.path_attempt_id is None:
+                    raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+                stage = _open_dir(resource_dir, str(address.path_attempt_id))
                 opened.append(stage)
                 return resource_dir, stage, opened, allowlist, True
             final = _open_dir(resource_parent, resource_name)
@@ -431,7 +495,14 @@ class AdapterMaintenanceArtifactStore:
             raise
 
     def _inspect(
-        self, fd: int, allowlist: frozenset[str], *, stage: bool, expected: object | None
+        self,
+        fd: int,
+        allowlist: frozenset[str],
+        *,
+        stage: bool,
+        expected: object | None,
+        expected_manifest_sha256: str | None,
+        expected_manifest_byte_size: int | None,
     ) -> tuple[dict[str, object], list[dict[str, object]]]:
         names = set(os.listdir(fd))
         if not names.issubset(allowlist) or any(name not in allowlist for name in names):
@@ -462,20 +533,28 @@ class AdapterMaintenanceArtifactStore:
                     if len(raw) > _MAX_MANIFEST_BYTES:
                         raise AdapterMaintenanceArtifactError("artifact_manifest_invalid")
                     try:
-                        value = json.loads(raw.decode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                        value = (
+                            parse_registry_manifest(raw)
+                            if name == "manifest.json"
+                            else parse_source_manifest(raw)
+                        )
+                    except (
+                        AdapterRegistryDomainError,
+                        AdapterSourceArtifactError,
+                        ValueError,
+                        TypeError,
+                    ) as error:
                         raise AdapterMaintenanceArtifactError(
                             "artifact_manifest_invalid"
                         ) from error
                     if not isinstance(value, dict) or value != expected:
                         raise AdapterMaintenanceArtifactError("artifact_manifest_invalid")
-                    if name == "manifest.json":
-                        try:
-                            parse_registry_manifest(raw)
-                        except ValueError as error:
-                            raise AdapterMaintenanceArtifactError(
-                                "artifact_manifest_invalid"
-                            ) from error
+                    if expected_manifest_sha256 is not None:
+                        if entry["sha256"] != expected_manifest_sha256:
+                            raise AdapterMaintenanceArtifactError("artifact_manifest_invalid")
+                    if expected_manifest_byte_size is not None:
+                        if entry["size"] != expected_manifest_byte_size:
+                            raise AdapterMaintenanceArtifactError("artifact_manifest_invalid")
             finally:
                 os.close(descriptor)
         if not stage:
@@ -543,13 +622,12 @@ class AdapterMaintenanceArtifactStore:
 
     def inspect_surface(
         self,
-        surface: str,
-        department_id: UUID,
-        resource_id: UUID,
-        attempt_id: UUID,
+        address: PhysicalSurfaceIdentifier,
         item_id: UUID,
         *,
         expected_manifest: dict[str, object] | None,
+        expected_manifest_sha256: str | None = None,
+        expected_manifest_byte_size: int | None = None,
     ) -> InspectedSurface | None:
         """Capture one exact original surface without mutating storage.
 
@@ -560,20 +638,25 @@ class AdapterMaintenanceArtifactStore:
         """
 
         _safe_uuid(item_id)
-        opened = self._open_surface(surface, department_id, resource_id, attempt_id)
+        opened = self._open_surface(address)
         if opened is None:
             return None
         parent, directory, descriptors, allowlist, stage = opened
         try:
             observed, entries = self._inspect(
-                directory, allowlist, stage=stage, expected=expected_manifest
+                directory,
+                allowlist,
+                stage=stage,
+                expected=expected_manifest,
+                expected_manifest_sha256=expected_manifest_sha256,
+                expected_manifest_byte_size=expected_manifest_byte_size,
             )
             plan = [{"name": entry["name"], "identity": dict(entry)} for entry in entries]
             return InspectedSurface(
-                surface,
-                department_id,
-                resource_id,
-                attempt_id,
+                address.surface_type,
+                address.department_id,
+                address.resource_id,
+                address.path_attempt_id,
                 item_id,
                 observed,
                 plan,
@@ -587,20 +670,17 @@ class AdapterMaintenanceArtifactStore:
 
     def _open_tombstone_path(
         self,
-        surface: str,
-        department_id: UUID,
-        resource_id: UUID,
+        address: PhysicalSurfaceIdentifier,
         item_id: UUID,
     ) -> tuple[int, int, list[int]] | None:
-        _safe_uuid(department_id)
-        _safe_uuid(resource_id)
+        address = _checked_surface_address(address)
         _safe_uuid(item_id)
-        parent = self._deleting_fds[surface]
+        parent = self._deleting_fds[address.surface_type]
         opened: list[int] = []
         try:
-            department = _open_dir(parent, str(department_id))
+            department = _open_dir(parent, str(address.department_id))
             opened.append(department)
-            resource = _open_dir(department, str(resource_id))
+            resource = _open_dir(department, str(address.resource_id))
             opened.append(resource)
             item = _open_dir(resource, str(item_id))
             opened.append(item)
@@ -620,32 +700,105 @@ class AdapterMaintenanceArtifactStore:
                     pass
             raise
 
-    def tombstone_exists(
-        self, surface: str, department_id: UUID, resource_id: UUID, item_id: UUID
-    ) -> bool:
-        """Return whether an item-scoped tombstone exists, without adopting it."""
+    def enumerate_tombstones(self, address: PhysicalSurfaceIdentifier) -> tuple[UUID, ...]:
+        """Enumerate every private UUID item tombstone for one exact resource.
 
-        if surface not in SURFACES:
-            raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
-        opened = self._open_tombstone_path(surface, department_id, resource_id, item_id)
-        if opened is None:
-            return False
-        resource, _directory, descriptors = opened
+        Enumeration is descriptor-relative and content-free.  Any unknown
+        name, symlink, non-directory, foreign owner, or permissive directory
+        fails closed rather than being ignored.
+        """
+
+        address = _checked_surface_address(address)
+        parent = self._deleting_fds[address.surface_type]
+        opened: list[int] = []
         try:
-            current = os.stat(str(item_id), dir_fd=resource, follow_symlinks=False)
-            if not stat.S_ISDIR(current.st_mode):
-                raise AdapterMaintenanceArtifactError("staging_path_unsafe")
-            return True
+            department = _open_dir(parent, str(address.department_id))
+            opened.append(department)
+            resource = _open_dir(department, str(address.resource_id))
+            opened.append(resource)
+        except FileNotFoundError:
+            for descriptor in reversed(opened):
+                os.close(descriptor)
+            return ()
+        try:
+            result: list[UUID] = []
+            result.extend(self._enumerate_item_ids(resource))
+            return tuple(result)
         finally:
-            for descriptor in reversed(descriptors):
+            for descriptor in reversed(opened):
                 os.close(descriptor)
 
-    def surface_exists(
-        self, surface: str, department_id: UUID, resource_id: UUID, attempt_id: UUID
-    ) -> bool:
+    @staticmethod
+    def _enumerate_item_ids(resource: int) -> tuple[UUID, ...]:
+        """Validate one resource tombstone directory without reading content."""
+
+        result: list[UUID] = []
+        for name in sorted(os.listdir(resource)):
+            try:
+                item_id = UUID(name)
+            except (TypeError, ValueError):
+                raise AdapterMaintenanceArtifactError("artifact_tombstone_conflict") from None
+            if item_id.int == 0 or str(item_id) != name:
+                raise AdapterMaintenanceArtifactError("artifact_tombstone_conflict")
+            item = _open_dir(resource, name)
+            os.close(item)
+            result.append(item_id)
+        return tuple(result)
+
+    def enumerate_department_tombstones(
+        self, surface_type: str, department_id: UUID
+    ) -> tuple[tuple[UUID, UUID], ...]:
+        """Enumerate every resource/item tombstone for one department.
+
+        Reconciliation uses this broader view before confirming an attempt so
+        an unknown resource namespace cannot be mistaken for an empty exact
+        surface. Only canonical UUID directory names and private service-owned
+        directories are accepted; no tombstone contents are opened.
+        """
+
+        if surface_type not in SURFACES:
+            raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+        _safe_uuid(department_id)
+        parent = self._deleting_fds[surface_type]
+        opened: list[int] = []
+        try:
+            department = _open_dir(parent, str(department_id))
+            opened.append(department)
+        except FileNotFoundError:
+            return ()
+        try:
+            result: list[tuple[UUID, UUID]] = []
+            for resource_name in sorted(os.listdir(department)):
+                try:
+                    resource_id = UUID(resource_name)
+                except (TypeError, ValueError):
+                    raise AdapterMaintenanceArtifactError("artifact_tombstone_conflict") from None
+                if resource_id.int == 0 or str(resource_id) != resource_name:
+                    raise AdapterMaintenanceArtifactError("artifact_tombstone_conflict")
+                resource = _open_dir(department, resource_name)
+                try:
+                    result.extend(
+                        (resource_id, item_id) for item_id in self._enumerate_item_ids(resource)
+                    )
+                finally:
+                    os.close(resource)
+            return tuple(result)
+        finally:
+            for descriptor in reversed(opened):
+                os.close(descriptor)
+
+    def tombstone_exists(self, address: PhysicalSurfaceIdentifier, item_id: UUID) -> bool:
+        """Return whether an item-scoped tombstone exists, without adopting it."""
+
+        address = _checked_surface_address(address)
+        _safe_uuid(item_id)
+        return item_id in self.enumerate_tombstones(address)
+
+    def surface_exists(self, address: PhysicalSurfaceIdentifier) -> bool:
         """Check exact original presence through the same no-follow chain."""
 
-        opened = self._open_surface(surface, department_id, resource_id, attempt_id)
+        address = _checked_surface_address(address)
+        opened = self._open_surface(address)
         if opened is None:
             return False
         _parent, _directory, descriptors, _allowlist, _stage = opened
@@ -678,10 +831,7 @@ class AdapterMaintenanceArtifactStore:
         if expected_tombstone_namespace != expected:
             raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
         opened = self._open_surface(
-            inspected.surface_type,
-            inspected.department_id,
-            inspected.resource_id,
-            inspected.attempt_id,
+            inspected.address,
         )
         if opened is None:
             # A missing original is only recoverable through the explicit
@@ -715,13 +865,13 @@ class AdapterMaintenanceArtifactStore:
                 self._deleting_fds[inspected.surface_type], str(inspected.department_id)
             )
             deleting_parent = _ensure_private_dir(resource_parent, str(inspected.resource_id))
-            try:
-                os.stat(str(inspected.item_id), dir_fd=deleting_parent, follow_symlinks=False)
-            except FileNotFoundError:
-                pass
-            else:
+            existing_items = self._enumerate_item_ids(deleting_parent)
+            if existing_items:
                 raise AdapterMaintenanceArtifactError("artifact_tombstone_conflict")
-            source_name = str(inspected.attempt_id) if stage else str(inspected.resource_id)
+            if inspected.address.path_attempt_id is None:
+                source_name = str(inspected.resource_id)
+            else:
+                source_name = str(inspected.address.path_attempt_id)
             current_entry = os.stat(source_name, dir_fd=parent, follow_symlinks=False)
             if not _same(current_entry, os.fstat(directory)):
                 raise AdapterMaintenanceArtifactError("artifact_authority_changed")
@@ -767,9 +917,7 @@ class AdapterMaintenanceArtifactStore:
 
         if not isinstance(bound, BoundSurface) or not isinstance(bound.tombstone_identity, dict):
             raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
-        opened = self._open_tombstone_path(
-            bound.surface_type, bound.department_id, bound.resource_id, bound.item_id
-        )
+        opened = self._open_tombstone_path(bound.address, bound.item_id)
         if opened is None:
             raise AdapterMaintenanceArtifactError("artifact_authority_changed")
         _resource, directory, descriptors = opened
@@ -819,9 +967,7 @@ class AdapterMaintenanceArtifactStore:
         if expected_tombstone_namespace != expected:
             raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
         opened = self._open_tombstone_path(
-            inspected.surface_type,
-            inspected.department_id,
-            inspected.resource_id,
+            inspected.address,
             inspected.item_id,
         )
         if opened is None:
@@ -865,39 +1011,6 @@ class AdapterMaintenanceArtifactStore:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
 
-    # Compatibility shim for callers from the initial unmerged draft.  It is
-    # deliberately an inspect-then-move sequence and never adopts a
-    # filesystem tombstone.  Reconciliation itself uses the explicit methods.
-    def bind_tombstone(
-        self,
-        surface: str,
-        department_id: UUID,
-        resource_id: UUID,
-        attempt_id: UUID,
-        item_id: UUID,
-        *,
-        expected_manifest: dict[str, object] | None,
-    ) -> BoundSurface | None:
-        inspected = self.inspect_surface(
-            surface,
-            department_id,
-            resource_id,
-            attempt_id,
-            item_id,
-            expected_manifest=expected_manifest,
-        )
-        if inspected is None:
-            return None
-        return self.move_verified_surface_to_tombstone(
-            inspected,
-            expected_tombstone_namespace={
-                "surface_type": surface,
-                "department_id": str(department_id),
-                "resource_id": str(resource_id),
-                "item_id": str(item_id),
-            },
-        )
-
     def _open_bound(self, bound: BoundSurface) -> tuple[int, int, list[int]]:
         parent = _open_dir(self._deleting_fds[bound.surface_type], str(bound.department_id))
         try:
@@ -939,10 +1052,16 @@ class AdapterMaintenanceArtifactStore:
                 )
                 if actual != expected:
                     raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+                current_entry = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if not _same(current_entry, os.fstat(descriptor)):
+                    raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+                # Keep the verified descriptor open until the unlink and
+                # directory fsync complete. The descriptor is never reopened
+                # through a pathname after authorization.
+                os.unlink(name, dir_fd=directory)
+                _fsync(directory)
             finally:
                 os.close(descriptor)
-            os.unlink(name, dir_fd=directory)
-            _fsync(directory)
         finally:
             for descriptor in reversed(opened):
                 os.close(descriptor)
@@ -985,24 +1104,14 @@ class AdapterMaintenanceArtifactStore:
         finally:
             os.close(resource_parent)
 
-    # Compatibility names retained for the initial unmerged draft.  They
-    # delegate only to the committed-tombstone operations above.
-    def unlink_tombstone_entry(
-        self, bound: BoundSurface, name: str, *, allow_missing: bool
-    ) -> None:
-        self.unlink_committed_tombstone_entry(bound, name, allow_missing=allow_missing)
-
-    def remove_tombstone_directory(
-        self, bound: BoundSurface, *, allow_missing: bool = False
-    ) -> None:
-        self.remove_committed_tombstone_directory(bound, allow_missing=allow_missing)
-
 
 __all__ = [
     "AdapterMaintenanceArtifactError",
     "AdapterMaintenanceArtifactStore",
     "BoundSurface",
     "InspectedSurface",
+    "PhysicalSurfaceIdentifier",
+    "physical_surface_identifier",
     "SOURCE_STAGE_FILES",
     "REGISTRY_STAGE_FILES",
     "SOURCE_FINAL_FILES",
