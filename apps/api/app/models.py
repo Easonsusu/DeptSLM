@@ -1,4 +1,4 @@
-"""PostgreSQL persistence models through Phase 8."""
+"""PostgreSQL persistence models through Phase 12.1E-A."""
 
 from __future__ import annotations
 
@@ -2561,7 +2561,8 @@ class AdapterImportAttempt(Base):
             "AND ownership_manifest IS NOT NULL AND cleanup_confirmed_at IS NULL "
             "AND error_code IS NULL) OR "
             "(status IN ('failed','abandoned') AND finished_at IS NOT NULL AND "
-            "committed_at IS NULL AND cleanup_confirmed_at IS NULL AND error_code IS NOT NULL)",
+            "committed_at IS NULL AND error_code IS NOT NULL AND "
+            "(cleanup_confirmed_at IS NULL OR cleanup_confirmed_at >= finished_at))",
             name="ck_adapter_import_attempt_lifecycle",
         ),
         CheckConstraint(
@@ -3010,6 +3011,14 @@ class AdapterRegistryAttempt(Base):
         ),
         UniqueConstraint("adapter_id", "attempt_number", name="uq_adapter_registry_attempt_number"),
         UniqueConstraint("publication_attempt_id", name="uq_adapter_registry_attempt_publication"),
+        UniqueConstraint(
+            "id",
+            "department_id",
+            "adapter_id",
+            "publication_attempt_id",
+            "attempt_number",
+            name="uq_adapter_registry_attempt_exact",
+        ),
         CheckConstraint(
             "status IN ('registered','running','staged','published','succeeded',"
             "'validation_failed','failed','reclaimed')",
@@ -3042,7 +3051,10 @@ class AdapterRegistryAttempt(Base):
             name="ck_adapter_registry_attempt_lifecycle",
         ),
         CheckConstraint(
-            "cleanup_confirmed_at IS NULL AND "
+            "((status IN ('registered','running','staged','published','succeeded') "
+            "AND cleanup_confirmed_at IS NULL) OR "
+            "status IN ('validation_failed','failed','reclaimed')) "
+            "AND "
             "((status = 'registered' AND worker_id IS NULL AND claimed_at IS NULL AND "
             "staged_at IS NULL AND published_at IS NULL AND finished_at IS NULL AND "
             "ownership_manifest IS NULL AND error_code IS NULL) OR "
@@ -3058,7 +3070,8 @@ class AdapterRegistryAttempt(Base):
             "(status = 'succeeded' AND staged_at IS NOT NULL AND published_at IS NOT NULL AND "
             "finished_at IS NOT NULL AND ownership_manifest IS NOT NULL AND error_code IS NULL) OR "
             "(status IN ('validation_failed','failed','reclaimed') AND finished_at IS NOT NULL AND "
-            "error_code IS NOT NULL))",
+            "error_code IS NOT NULL AND "
+            "(cleanup_confirmed_at IS NULL OR cleanup_confirmed_at >= finished_at)))",
             name="ck_adapter_registry_attempt_exact_lifecycle",
         ),
         Index(
@@ -3632,6 +3645,287 @@ class TrainingJobArtifactOperationItem(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = utc_timestamp()
+
+
+class AdapterArtifactOperation(Base):
+    """Durable, bounded Phase 12.1E-A reconciliation authority."""
+
+    __tablename__ = "adapter_artifact_operations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["requested_by_user_id", "department_id"],
+            ["memberships.user_id", "memberships.department_id"],
+            name="fk_adapter_artifact_operation_requester_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["requested_by_user_id"],
+            ["user_identities.id"],
+            name="fk_adapter_artifact_operation_requester_identity",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("id", "department_id", name="uq_adapter_artifact_operation_scope"),
+        CheckConstraint("operation_type = 'reconcile'", name="ck_adapter_artifact_operation_type"),
+        CheckConstraint(
+            "status IN ('registered','completed','completed_with_blocks')",
+            name="ck_adapter_artifact_operation_status",
+        ),
+        CheckConstraint(
+            "limit_value BETWEEN 1 AND 1000",
+            name="ck_adapter_artifact_operation_limit",
+        ),
+        CheckConstraint(
+            "minimum_age_seconds BETWEEN 300 AND 86400",
+            name="ck_adapter_artifact_operation_minimum_age",
+        ),
+        CheckConstraint(
+            "eligible_count >= 0 AND completed_count >= 0 AND blocked_count >= 0 AND "
+            "completed_count + blocked_count <= eligible_count",
+            name="ck_adapter_artifact_operation_counts",
+        ),
+        CheckConstraint(
+            "(status = 'registered' AND completed_at IS NULL) OR "
+            "(status IN ('completed','completed_with_blocks') AND completed_at IS NOT NULL)",
+            name="ck_adapter_artifact_operation_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'completed' AND blocked_count = 0) OR "
+            "(status = 'completed_with_blocks' AND blocked_count > 0) OR status = 'registered'",
+            name="ck_adapter_artifact_operation_blocked_lifecycle",
+        ),
+        CheckConstraint("version > 0", name="ck_adapter_artifact_operation_version"),
+        Index(
+            "uq_adapter_artifact_operation_active",
+            "department_id",
+            unique=True,
+            postgresql_where=text("operation_type = 'reconcile' AND status = 'registered'"),
+        ),
+        Index(
+            "ix_adapter_artifact_operation_department_created",
+            "department_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(
+        ForeignKey(
+            "departments.id", name="fk_adapter_artifact_operation_department", ondelete="RESTRICT"
+        ),
+        nullable=False,
+    )
+    requested_by_user_id: Mapped[UUID] = mapped_column(nullable=False)
+    operation_type: Mapped[str] = mapped_column(String(16), nullable=False, default="reconcile")
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="registered")
+    limit_value: Mapped[int] = mapped_column(Integer, nullable=False)
+    minimum_age_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
+    eligible_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    blocked_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class AdapterArtifactOperationItem(Base):
+    """One exact adapter stage/final surface owned by a reconciliation operation."""
+
+    __tablename__ = "adapter_artifact_operation_items"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["operation_id", "department_id"],
+            ["adapter_artifact_operations.id", "adapter_artifact_operations.department_id"],
+            name="fk_adapter_artifact_item_operation_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "import_attempt_id",
+                "department_id",
+                "source_bundle_id",
+                "publication_attempt_id",
+                "attempt_number",
+            ],
+            [
+                "adapter_import_attempts.id",
+                "adapter_import_attempts.department_id",
+                "adapter_import_attempts.source_bundle_id",
+                "adapter_import_attempts.publication_attempt_id",
+                "adapter_import_attempts.attempt_number",
+            ],
+            name="fk_adapter_artifact_item_import_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["source_bundle_id", "department_id"],
+            ["adapter_import_sources.id", "adapter_import_sources.department_id"],
+            name="fk_adapter_artifact_item_source_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "registry_attempt_id",
+                "department_id",
+                "adapter_id",
+                "publication_attempt_id",
+                "attempt_number",
+            ],
+            [
+                "adapter_registry_attempts.id",
+                "adapter_registry_attempts.department_id",
+                "adapter_registry_attempts.adapter_id",
+                "adapter_registry_attempts.publication_attempt_id",
+                "adapter_registry_attempts.attempt_number",
+            ],
+            name="fk_adapter_artifact_item_registry_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_artifact_item_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "surface_type IN ('source_stage','source_final','registry_stage','registry_final')",
+            name="ck_adapter_artifact_item_surface",
+        ),
+        CheckConstraint(
+            "((surface_type IN ('source_stage','source_final') AND source_bundle_id IS NOT NULL "
+            "AND import_attempt_id IS NOT NULL AND adapter_id IS NULL "
+            "AND registry_attempt_id IS NULL) OR "
+            "(surface_type IN ('registry_stage','registry_final') AND adapter_id IS NOT NULL "
+            "AND registry_attempt_id IS NOT NULL AND source_bundle_id IS NULL "
+            "AND import_attempt_id IS NULL))",
+            name="ck_adapter_artifact_item_surface_authority",
+        ),
+        CheckConstraint(
+            "publication_attempt_id IS NOT NULL AND attempt_number > 0 AND "
+            "expected_resource_version > 0 AND expected_attempt_version > 0",
+            name="ck_adapter_artifact_item_attempt_authority",
+        ),
+        CheckConstraint(
+            "status IN ('registered','verified','tombstone_bound','deleting',"
+            "'completed','blocked')",
+            name="ck_adapter_artifact_item_status",
+        ),
+        CheckConstraint(
+            "ownership_manifest IS NULL OR json_typeof(ownership_manifest) = 'object'",
+            name="ck_adapter_artifact_item_manifest_object",
+        ),
+        CheckConstraint(
+            "observed_identity IS NULL OR json_typeof(observed_identity) IN ('object','array')",
+            name="ck_adapter_artifact_item_observed_json",
+        ),
+        CheckConstraint(
+            "tombstone_identity IS NULL OR json_typeof(tombstone_identity) IN ('object','array')",
+            name="ck_adapter_artifact_item_tombstone_json",
+        ),
+        CheckConstraint(
+            "deletion_plan IS NULL OR json_typeof(deletion_plan) IN ('object','array')",
+            name="ck_adapter_artifact_item_plan_json",
+        ),
+        CheckConstraint(
+            "in_flight_entry IS NULL OR json_typeof(in_flight_entry) IN ('object','array')",
+            name="ck_adapter_artifact_item_in_flight_json",
+        ),
+        CheckConstraint(
+            "next_entry_index >= 0",
+            name="ck_adapter_artifact_item_progress",
+        ),
+        CheckConstraint(
+            "blocked_reason_code IS NULL OR blocked_reason_code IN "
+            "('staging_path_unsafe','artifact_ownership_mismatch','artifact_manifest_invalid',"
+            "'artifact_permissions_invalid','artifact_authority_changed','artifact_tombstone_conflict')",
+            name="ck_adapter_artifact_item_reason",
+        ),
+        CheckConstraint(
+            "((status = 'registered' AND observed_identity IS NULL AND tombstone_identity IS NULL "
+            "AND deletion_plan IS NULL AND next_entry_index = 0 AND in_flight_entry IS NULL "
+            "AND verified_at IS NULL AND tombstone_bound_at IS NULL "
+            "AND deletion_started_at IS NULL AND directory_unlink_started_at IS NULL "
+            "AND completed_at IS NULL AND blocked_at IS NULL "
+            "AND blocked_reason_code IS NULL) OR "
+            "(status = 'verified' AND observed_identity IS NOT NULL AND deletion_plan IS NOT NULL "
+            "AND tombstone_identity IS NULL AND verified_at IS NOT NULL AND completed_at IS NULL "
+            "AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR "
+            "(status = 'tombstone_bound' AND observed_identity IS NOT NULL "
+            "AND deletion_plan IS NOT NULL "
+            "AND tombstone_identity IS NOT NULL AND tombstone_bound_at IS NOT NULL "
+            "AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR "
+            "(status = 'deleting' AND tombstone_identity IS NOT NULL "
+            "AND deletion_started_at IS NOT NULL "
+            "AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR "
+            "(status = 'completed' AND completed_at IS NOT NULL AND blocked_at IS NULL "
+            "AND blocked_reason_code IS NULL AND in_flight_entry IS NULL) OR "
+            "(status = 'blocked' AND blocked_at IS NOT NULL AND completed_at IS NULL "
+            "AND blocked_reason_code IS NOT NULL))",
+            name="ck_adapter_artifact_item_lifecycle",
+        ),
+        CheckConstraint("version > 0", name="ck_adapter_artifact_item_version"),
+        UniqueConstraint(
+            "operation_id",
+            "surface_type",
+            "source_bundle_id",
+            "adapter_id",
+            "import_attempt_id",
+            "registry_attempt_id",
+            "publication_attempt_id",
+            "attempt_number",
+            name="uq_adapter_artifact_item_operation_surface",
+        ),
+        Index(
+            "uq_adapter_artifact_item_active_surface",
+            "department_id",
+            "surface_type",
+            "publication_attempt_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('registered','verified','tombstone_bound','deleting')"
+            ),
+        ),
+        Index(
+            "ix_adapter_artifact_item_operation_status",
+            "operation_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    operation_id: Mapped[UUID] = mapped_column(nullable=False)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    surface_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    source_bundle_id: Mapped[UUID | None] = mapped_column()
+    adapter_id: Mapped[UUID | None] = mapped_column()
+    import_attempt_id: Mapped[UUID | None] = mapped_column()
+    registry_attempt_id: Mapped[UUID | None] = mapped_column()
+    publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_resource_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_attempt_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    ownership_manifest: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    observed_identity: Mapped[dict[str, object] | list[object] | None] = mapped_column(JSON)
+    tombstone_identity: Mapped[dict[str, object] | list[object] | None] = mapped_column(JSON)
+    deletion_plan: Mapped[dict[str, object] | list[object] | None] = mapped_column(JSON)
+    next_entry_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    in_flight_entry: Mapped[dict[str, object] | list[object] | None] = mapped_column(JSON)
+    directory_unlink_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="registered")
+    blocked_reason_code: Mapped[str | None] = mapped_column(String(64))
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tombstone_bound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deletion_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
 
 
 class PersistentAuditEvent(Base):

@@ -98,8 +98,14 @@ runtime_subdirectories=(
   exports
   adapters/imports
   adapters/registry
+  adapters/.staging
   adapters/.staging/imports
   adapters/.staging/registry
+  adapters/.deleting
+  adapters/.deleting/source_stage
+  adapters/.deleting/source_final
+  adapters/.deleting/registry_stage
+  adapters/.deleting/registry_final
   service_state/postgres
   service_state/qdrant
 )

@@ -1,6 +1,9 @@
-# Database Model Through Phase 12.1D
+# Database Model Through Phase 12.1E-A
 
-DeptSLM uses PostgreSQL 16, SQLAlchemy 2, psycopg 3, and Alembic. Revision `0006_phase8_rag_feedback` follows `0005_phase7_rag_answers`. Alembic is the only schema-creation mechanism; runtime never calls `metadata.create_all`.
+DeptSLM uses PostgreSQL 16, SQLAlchemy 2, psycopg 3, and Alembic. Revision
+`0012_phase12_adapter_reconciliation` is the current head after
+`0011_phase12_adapter_registry`. Alembic is the only schema-creation
+mechanism; runtime never calls `metadata.create_all`.
 
 ## Entities
 
@@ -30,6 +33,8 @@ erDiagram
     SFT_DATASET_BUILDS ||--o{ ADAPTERS : governs
     ADAPTERS ||--o{ ADAPTER_REGISTRY_ATTEMPTS : attempts
     ADAPTERS ||--o{ ADAPTER_UPSTREAM_DEPENDENCIES : retains
+    DEPARTMENTS ||--o{ ADAPTER_ARTIFACT_OPERATIONS : scopes
+    ADAPTER_ARTIFACT_OPERATIONS ||--o{ ADAPTER_ARTIFACT_OPERATION_ITEMS : contains
 ```
 
 - `user_identities`: UUID identity keyed uniquely by the exact opaque `(issuer, subject)`. Subjects are not lowercased or interpreted as email addresses. Status is `active`, `suspended`, or `revoked`.
@@ -61,7 +66,9 @@ summary, lowercase SHA-256 digests, positive sizes, versions, and safe error
 codes only. They contain no adapter bytes, configuration JSON, tensor names or
 values, host paths, filenames, manifests supplied by an operator, credentials,
 or training provenance. PostgreSQL and external storage publication are not
-atomic; later reconciliation and purge phases are not implemented here.
+atomic; Phase 12.1E-A adds separate reconciliation metadata for four
+non-authoritative adapter artifact surfaces, while later purge and adapter
+lifecycle phases are not implemented here.
 
 ## Phase 12.1C adapter registry metadata
 
@@ -111,8 +118,28 @@ the normal request-time membership resolver. Students, viewers, inactive or
 expired memberships, archived departments, and cross-department selectors fail
 closed. They do not append audit events, increment versions, inspect external
 registry storage, or expose bytes, paths, hashes, tensor data, identities,
-secrets, or runtime settings. Phase 12.1E reconciliation and purge remain
-unstarted.
+secrets, or runtime settings. Phase 12.1E-A adds separate reconciliation
+operation/item authority and does not alter these read rows.
+
+## Phase 12.1E-A reconciliation metadata
+
+Revision `0012_phase12_adapter_reconciliation` adds
+`adapter_artifact_operations` and `adapter_artifact_operation_items`. An
+operation is a bounded, department-scoped, administrator-authorized,
+dry-run-by-default batch. Its item rows bind exactly one source or registry
+resource, publication attempt, attempt number, expected resource/attempt
+versions, surface, and optional closed final manifest. Composite restrictive
+foreign keys prevent cross-department or cross-attempt ownership.
+
+Items move through `registered`, `verified`, `tombstone_bound`, `deleting`,
+`completed`, or `blocked`. JSON fields contain only descriptor identities,
+allowlisted entry names, digests/sizes for complete finals, and crash-resume
+progress; they never contain adapter bytes, manifests from partial stages,
+paths, credentials, tensor values, or dependency data. A terminal item can set
+the source/registry attempt's `cleanup_confirmed_at` only after every sibling
+surface for that exact attempt is complete. The operation appends one safe
+success audit only after all items close, and a blocked item cannot starve a
+later item.
 - `documents`: department-owned source metadata with an internal uploader relation, normalized filename, canonical media type, positive size, SHA-256 digest, lifecycle state, version, and timestamps. It stores no body or path, and public document schemas do not expose internal identity IDs; see [document-model.md](document-model.md).
 - `document_extractions`: immutable attempt history and PostgreSQL queue state, including source/pipeline identity, claim lease, safe result metadata, and an allowlisted error code. It stores no content, path, filename, stderr, or exception.
 - `document_chunks`: department/document/extraction-scoped offsets, byte size, internal digest, and mutually exclusive page/line provenance. Chunk text remains external.

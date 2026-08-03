@@ -145,8 +145,8 @@ jobs:
         run: |
           export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-data"
           export CODE_REVISION="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-          mkdir -p "$DEPTSLM_DATA_DIR/uploads" "$DEPTSLM_DATA_DIR/extracted_text" "$DEPTSLM_DATA_DIR/eval_results" "$DEPTSLM_DATA_DIR/model_cache" "$DEPTSLM_DATA_DIR/adapters" "$DEPTSLM_DATA_DIR/adapters/imports" "$DEPTSLM_DATA_DIR/adapters/registry" "$DEPTSLM_DATA_DIR/adapters/.staging/imports" "$DEPTSLM_DATA_DIR/adapters/.staging/registry"
-          chmod 700 "$DEPTSLM_DATA_DIR/adapters"
+          mkdir -p "$DEPTSLM_DATA_DIR/uploads" "$DEPTSLM_DATA_DIR/extracted_text" "$DEPTSLM_DATA_DIR/eval_results" "$DEPTSLM_DATA_DIR/model_cache" "$DEPTSLM_DATA_DIR/adapters" "$DEPTSLM_DATA_DIR/adapters/imports" "$DEPTSLM_DATA_DIR/adapters/registry" "$DEPTSLM_DATA_DIR/adapters/.staging/imports" "$DEPTSLM_DATA_DIR/adapters/.staging/registry" "$DEPTSLM_DATA_DIR/adapters/.deleting"/source_stage "$DEPTSLM_DATA_DIR/adapters/.deleting"/source_final "$DEPTSLM_DATA_DIR/adapters/.deleting"/registry_stage "$DEPTSLM_DATA_DIR/adapters/.deleting"/registry_final
+          find "$DEPTSLM_DATA_DIR/adapters" -type d -exec chmod 700 {} +
           for attempt in {1..30}; do
             if curl --fail --silent --header "api-key: $DEPTSLM_TEST_QDRANT_API_KEY" "$DEPTSLM_TEST_QDRANT_URL/healthz" >/dev/null; then
               break
@@ -158,7 +158,7 @@ jobs:
             sleep 1
           done
           python -m alembic upgrade head
-          test "$(python -m alembic current | awk '{print $1}')" = "0011_phase12_adapter_registry"
+          test "$(python -m alembic current | awk '{print $1}')" = "0012_phase12_adapter_reconciliation"
           python -m pytest
       - name: Run one-shot worker smoke test
         working-directory: apps/api
@@ -247,6 +247,7 @@ jobs:
           sh -n services/training-worker/entrypoint.sh
           sh -n services/training-job-worker/entrypoint.sh
           sh -n services/adapter-registry-worker/entrypoint.sh
+          sh -n services/adapter-maintenance/entrypoint.sh
       - name: Check required infrastructure files and permissions
         run: |
           test -s docker-compose.yml
@@ -257,6 +258,7 @@ jobs:
           test -x services/training-worker/entrypoint.sh
           test -x services/training-job-worker/entrypoint.sh
           test -x services/adapter-registry-worker/entrypoint.sh
+          test -x services/adapter-maintenance/entrypoint.sh
       - name: Build and inspect API migration image
         run: |
           docker build --tag deptslm-api-ci --file apps/api/Dockerfile .
@@ -278,6 +280,7 @@ jobs:
           assert pathlib.Path("/app/alembic/versions/0009_phase11_training_jobs.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0010_phase12_adapter_sources.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0011_phase12_adapter_registry.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0012_phase12_adapter_reconciliation.py").is_file()
           import app.evaluation_admin
           import app.evaluation_services
           import app.sft_services
@@ -333,6 +336,25 @@ jobs:
           weight_matches="$(docker run --rm --entrypoint sh deptslm-adapter-registry-worker-ci -c 'find / -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) -print 2>/dev/null || true')"
           if [[ -n "$weight_matches" ]]; then
             printf 'Forbidden model-weight-like files in adapter registry image:\n%s\n' "$weight_matches" >&2
+            exit 1
+          fi
+      - name: Build and inspect Phase 12.1E-A maintenance image
+        run: |
+          docker build --tag deptslm-adapter-maintenance-ci --file services/adapter-maintenance/Dockerfile .
+          docker run --rm --entrypoint python deptslm-adapter-maintenance-ci -I -c '
+          import importlib.util
+          import app.adapter_artifact_maintenance
+          import app.adapter_maintenance_artifacts
+          assert importlib.util.find_spec("torch") is None
+          assert importlib.util.find_spec("transformers") is None
+          assert importlib.util.find_spec("qdrant_client") is None
+          assert importlib.util.find_spec("sentence_transformers") is None
+          assert importlib.util.find_spec("huggingface_hub") is None
+          assert importlib.util.find_spec("peft") is None
+          '
+          weight_matches="$(docker run --rm --entrypoint sh deptslm-adapter-maintenance-ci -c 'find / -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) -print 2>/dev/null || true')"
+          if [[ -n "$weight_matches" ]]; then
+            printf 'Forbidden model-weight-like files in adapter maintenance image:\n%s\n' "$weight_matches" >&2
             exit 1
           fi
       - name: Build and inspect extraction worker image
@@ -533,6 +555,15 @@ jobs:
           ! grep -E '@router\.(post|put|patch|delete)' apps/api/app/routes.py | grep -E '/departments/\{department_id\}/adapters'
           grep -F 'AdapterMetadataListResponse' apps/api/app/routes.py >/dev/null
           grep -F 'AdapterMetadataResponse' apps/api/app/routes.py >/dev/null
+      - name: Check Phase 12.1E-A maintenance isolation
+        run: |
+          ! grep -R -E '^(from|import) (torch|transformers|sentence_transformers|huggingface_hub|qdrant|safetensors|peft|llamafactory)' apps/api/app/adapter_artifact_maintenance.py apps/api/app/adapter_maintenance_artifacts.py
+          maintenance_compose="$(sed -n '/^  adapter-maintenance:/,/^  [a-z][a-z-]*:/p' docker-compose.yml)"
+          grep -F 'profiles: ["maintenance"]' <<<"$maintenance_compose" >/dev/null
+          grep -F '/adapters' <<<"$maintenance_compose" >/dev/null
+          ! grep -E 'uploads|extracted_text|training_datasets|model_cache|eval_results|qdrant|rag|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|PROXY' <<<"$maintenance_compose"
+          api_compose="$(sed -n '/^  api:/,/^  postgres:/p' docker-compose.yml)"
+          ! grep -E '/adapters|adapters/' <<<"$api_compose"
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then
@@ -546,6 +577,7 @@ jobs:
             mkdir -p "$DEPTSLM_DATA_DIR"/{uploads,extracted_text,vector_snapshots,training_datasets,adapters,model_cache,eval_results,logs,exports}
             mkdir -p "$DEPTSLM_DATA_DIR/training_datasets/jobs"
             mkdir -p "$DEPTSLM_DATA_DIR"/adapters/{imports,registry,.staging/imports,.staging/registry}
+            mkdir -p "$DEPTSLM_DATA_DIR"/adapters/.deleting/{source_stage,source_final,registry_stage,registry_final}
             mkdir -p "$DEPTSLM_DATA_DIR/service_state/postgres"
             mkdir -p "$DEPTSLM_DATA_DIR/service_state/qdrant"
             ./scripts/compose.sh config --quiet

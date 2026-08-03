@@ -37,6 +37,33 @@ def test_phase12_1c_migration_is_self_contained_and_frozen() -> None:
     assert "fk_adapter_import_source_claimed_adapter_scope" in source
 
 
+def test_phase12_1e_a_migration_is_self_contained_and_has_exact_surfaces() -> None:
+    path = (
+        Path(__file__).parents[1]
+        / "alembic"
+        / "versions"
+        / "0012_phase12_adapter_reconciliation.py"
+    )
+    source = path.read_text(encoding="utf-8")
+    assert "app.models" not in source
+    assert "app.adapter_maintenance_artifacts" not in source
+    spec = importlib.util.spec_from_file_location("phase12_1e_a_migration", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.revision == "0012_phase12_adapter_reconciliation"
+    assert module.down_revision == "0011_phase12_adapter_registry"
+    for surface in ("source_stage", "source_final", "registry_stage", "registry_final"):
+        assert surface in source
+    assert "adapter_artifact_operations" in source
+    assert "adapter_artifact_operation_items" in source
+    assert "fk_adapter_artifact_operation_requester_scope" in source
+    assert "fk_adapter_artifact_operation_requester_identity" in source
+    assert "fk_adapter_artifact_item_source_scope" in source
+    assert "fk_adapter_artifact_item_adapter_scope" in source
+    assert "uq_adapter_registry_attempt_exact" in source
+
+
 def test_phase12_1c_backfill_uses_canonical_manifest_authority() -> None:
     path = Path(__file__).parents[1] / "alembic" / "versions" / "0011_phase12_adapter_registry.py"
     spec = importlib.util.spec_from_file_location("phase12_1c_backfill", path)

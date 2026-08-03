@@ -151,7 +151,7 @@ Phase 10 source bundles and final dataset artifacts live only under `DEPTSLM_DAT
 
 Phase 11 writes only private job bundles below `DEPTSLM_DATA_DIR/training_datasets/jobs/<department UUID>/<training job UUID>`. A final bundle contains exactly `manifest.json`, `training.yaml`, `dataset_info.json`, `train.jsonl`, and `validation.jsonl`; staging adds only the private marker. The API never mounts this directory. The isolated bundle worker verifies and copies an approved Phase 10 dataset through retained descriptors; it does not execute the configuration or mount `model_cache`, `adapters`, logs, or model outputs. The final directory is one job-level surface with one validated succeeded-attempt owner; historical attempts own only their exact stage directories. Purge deletes stages first, then may delete that descriptor-verified final only after PostgreSQL commits final-deletion authorization. The authorization reservation binds the owner attempt, closed content-free manifest, and UUID tombstone namespace below private `.deleting/jobs`; the final is fully verified before an atomic no-replace move and both parent directories are fsynced. Before any member is removed, a `tombstone_bound` reservation persists the exact private directory, parent, and fixed-file identities. Retries require each identity to match; only the one durably in-flight unlink may be absent. Tombstone deletion never parses partial bytes, and a substituted, parked, or partial unbound tombstone remains actively fenced. A pre-move failure leaves the final directory intact. Generated job bundles, like all runtime data, are never committed to Git.
 
-## Phase 12 adapter source and registry (under review)
+## Phase 12 adapter source, registry, and reconciliation (under review)
 
 The proposed private external registry layout is:
 
@@ -167,8 +167,10 @@ adapters/
 │   └── adapter_model.safetensors
 ├── .staging/imports/<department UUID>/<source bundle UUID>/<import attempt UUID>/
 ├── .staging/registry/<department UUID>/<adapter UUID>/<publication UUID>/
-├── .deleting/imports/<department UUID>/<source bundle UUID>/<purge UUID>/
-└── .deleting/registry/<department UUID>/<adapter UUID>/<purge UUID>/
+├── .deleting/source_stage/<department UUID>/<source bundle UUID>/<operation item UUID>/
+├── .deleting/source_final/<department UUID>/<source bundle UUID>/<operation item UUID>/
+├── .deleting/registry_stage/<department UUID>/<adapter UUID>/<operation item UUID>/
+└── .deleting/registry_final/<department UUID>/<adapter UUID>/<operation item UUID>/
 ```
 
 Phase 12.1C now creates the private registry surface through its isolated
@@ -280,9 +282,28 @@ evolving versions for the adapter, registry attempt, upstream attempts, source,
 and active retention dependency. Reclaim marks exactly one prior attempt and
 creates a fresh attempt without adopting old surfaces. Phase 10 and Phase 11
 final-file deletion reauthorizes the exact resource and active adapter fence
-immediately before mutation. Registry-stage/final deletion is not implemented
-in this phase, so stale registry surfaces remain untouched for a future reviewed
-reconciliation phase.
+immediately before mutation. Phase 12.1E-A adds a manual `maintenance` profile
+for bounded reconciliation of exactly four non-authoritative surfaces: source
+stages, failed/abandoned source finals, terminal registry stages, and
+failed/validation-failed registry finals. Durable operation/item rows own the
+exact department, resource, publication attempt, attempt number, expected
+versions, and surface. The descriptor-bound store opens the private root and
+UUID path without following links, verifies UID/mode/identity, and keeps the
+chain authoritative through a no-replace move into `.deleting`. Entries are
+unlinked only through the exact tombstone descriptor and the parent entry is
+rechecked before `rmdir`.
+
+Partial markers and payloads are not parsed or logged; missing, zero-byte,
+truncated, or interrupted markers remain recoverable when exact metadata and
+private path authority match. Final surfaces still require the complete closed
+manifest and every exact digest and size. Symlinks, hard links, substituted
+parents, wrong UID/mode, foreign scope, unknown entries, and non-directories
+terminalize as blocked fixed-code items. A blocked item cannot starve later
+valid items. Reconciliation never transitions an adapter/source to purge,
+releases a dependency, deletes Phase 10/11 artifacts, or claims deletion from
+backups or audit history. Filesystem publication and PostgreSQL state remain
+non-atomic, and an already in-flight filesystem request cannot be fenced by
+PostgreSQL.
 
 ## Google Drive limitations
 

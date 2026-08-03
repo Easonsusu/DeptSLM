@@ -40,18 +40,16 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > keeps the reservation active. Review changes are rejected while a reservation
 > is active. This is a reviewed boundary, not training execution.
 
-> **Phase 12 status:** Phase 12.0 is completed and Phase 12.1 remains under
-> review. Phase 12.1A, Phase 12.1B, and Phase 12.1C are completed. Phase 12.1D
-> adds only department-scoped, metadata-only registry list/detail reads from
-> PostgreSQL authority, with a closed projection for lineage, contracts,
-> verification, lifecycle, and retention. It exposes no adapter bytes, paths,
-> hashes, tensor data, identities, or runtime settings and performs no
-> mutation or audit. The registry worker still binds one exact committed source
-> to one approved succeeded Phase 11 job and publishes only the immutable
-> private registry bundle; training provenance remains unverified. No evaluation,
-> approval, promotion, loading, routing, reconciliation, purge, or training is
-> implemented. Phase 12.1E and Phase 12.2 through Phase 12.4 remain unstarted;
-> no runtime routing exists. Phase 12.1D is the current review scope.
+> **Phase 12 status:** Phase 12.0 and Phase 12.1A through Phase 12.1D are
+> completed. Phase 12.1E-A is the current reviewed scope: it adds only an
+> administrator-only, dry-run-by-default reconciliation foundation for four
+> non-authoritative adapter artifact surfaces. It uses durable PostgreSQL
+> operation/item authority, exact department and attempt keys, descriptor-bound
+> no-follow storage, tombstone-before-unlink, crash-resumable deletion, and
+> non-starving blocked reconciliation. It never changes source or adapter purge
+> state, releases an upstream dependency, reads adapter bytes into PostgreSQL,
+> or exposes a public route. Phase 12.1E-B/C, Phase 12.2 through Phase 12.4,
+> and runtime routing remain unstarted.
 
 > **Phase 12.1C hardening:** The registry binds exact composite source, Phase 11
 > attempt, and Phase 10 attempt identities and carries evolving versions for
@@ -81,15 +79,16 @@ hash and copy them. The immutable source bundle is separate from any future
   adapter registry until the Phase 12.1C worker binds one exact approved
   Phase 11 job and captured Phase 10 authority. The source remains untrusted,
   is never runtime-usable, and is not approved, evaluated, or promoted.
-  Reconciliation and purge are not implemented here.
+  Adapter-artifact reconciliation is a separate Phase 12.1E-A maintenance
+  operation; it does not purge or release this source.
 The validated-byte authority is bound by complete digest passes before and
 after child validation, digest-checked descriptor-relative staging, and
 post-rename identity verification. Every PostgreSQL transition compares a
 complete frozen authority snapshot and both row versions; static contract
 errors remain distinct from fixed descriptor/operational errors. Migration
-Migrations `0010_phase12_adapter_sources` and `0011_phase12_adapter_registry`
-are self-contained and CI validates that head with a private temporary
-adapters root; CI downloads no model weights.
+Migrations `0010_phase12_adapter_sources`, `0011_phase12_adapter_registry`, and
+`0012_phase12_adapter_reconciliation` are self-contained and CI validates that
+head with a private temporary adapters root; CI downloads no model weights.
 
 Phase 12.1A fixes the compatible package references, closed configuration and
 tensor grammar, bounded header/file limits, and model-free validation rules in a
@@ -99,6 +98,16 @@ trusted training execution. See the [Phase 12.1A static adapter contract](docs/a
 and [Phase 12 adapter registry contract](docs/adapter-registry.md).
 
 Each evaluation publication has a server-generated attempt UUID and a positive run attempt number. Final suite/result manifests are closed schemas and removal requires descriptor-verified exact department, resource, ownership UUID, run attempt, code revision, payload digests, and sizes. Staging has a separate private UUID-path ownership contract so a supervised child killed during directory or payload creation can be removed without parsing partial content. The exact descriptor chain is opened once through deletion; a staging marker is housekeeping only, so missing, zero-byte, truncated, or partial marker states remain recoverable. Reconciliation registers a resumable content-free batch before deletion. Unsafe entries terminalize as fixed-code blocked items and cannot starve later valid items; completed batches write one audit only when deletion succeeded. It is dry-run by default, department-scoped, restricted to system or department administrators, and accepts a strict limit of 1 through 1000. PostgreSQL and external storage are not transactionally atomic: an orphaned external result after a crash is never retrieval or evaluation authority. Reconciliation does not delete backups or persistent audit history.
+
+Phase 12.1E-A applies the same boundary to adapter source and registry
+artifacts. It reconciles only `source_stage`, failed/abandoned `source_final`,
+terminal `registry_stage`, and failed/validation-failed `registry_final`.
+Authoritative finals, purge states, upstream dependencies, Phase 10 datasets,
+and Phase 11 bundles are outside scope. Partial stages are owned by exact
+PostgreSQL metadata plus UUID-derived private paths; marker bytes are never
+parsed. Final artifacts require their complete closed manifest and exact
+digests. The manual Compose `maintenance` profile mounts only the external
+adapters root read-write; the API has no adapter mount.
 
 The API manages content-free upload, extraction, and indexing metadata. For an authorized one-turn answer it creates content-free run metadata, retrieves through the fixed department-scoped Qdrant adapter, cross-checks every candidate against PostgreSQL, reads only selected verified chunks, and calls a private model runtime. After generation it reauthorizes every supplied source—including uncited evidence—against exact PostgreSQL and artifact state, while returning and persisting only cited labels. Questions, answers, prompts, retrieved text, and vectors are not persisted. PostgreSQL succeeded state remains retrieval authority.
 
@@ -289,6 +298,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Phase 12.1B adapter source intake](docs/adapter-source-intake.md)
 - [Phase 12.1C adapter registry publication](docs/adapter-registry-publication.md)
 - [Phase 12.1D adapter metadata reads](docs/adapter-registry-metadata.md)
+- [Phase 12.1E-A adapter artifact reconciliation](docs/adapter-artifact-reconciliation.md)
 - [Phase 12 adapter registry contract](docs/adapter-registry.md)
 - [Grounded RAG answering](docs/rag-answering.md)
 - [Prompt-injection boundary](docs/prompt-injection-boundary.md)
@@ -307,7 +317,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 
 Phase 9 does not implement LLM judging, semantic grading, public raw results, a frontend dashboard, feedback-derived cases, automatic threshold or RAG changes, training datasets, SFT, adapters, model promotion, cross-department benchmarking, production OAuth/OIDC/SSO, or production deployment.
 
-Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 remains contract and threat-model work. Phase 12.1A, Phase 12.1B, and Phase 12.1C are complete; Phase 12.1D adds only administrator-authorized, department-scoped metadata list/detail reads from PostgreSQL with no artifact access, mutation, audit, evaluation, approval, promotion, rollback, or runtime routing. Phase 12.1E remains unstarted. Google Drive storage is an external development runtime location, not a production object store or backup.
+Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 remains contract and threat-model work. Phase 12.1A, Phase 12.1B, and Phase 12.1C are complete; Phase 12.1D adds only administrator-authorized, department-scoped metadata list/detail reads from PostgreSQL with no artifact access, mutation, audit, evaluation, approval, promotion, rollback, or runtime routing. Phase 12.1E-A adds only the separate reviewed, administrator-only, dry-run-by-default reconciliation foundation for four non-authoritative adapter artifact surfaces; it does not purge, release dependencies, evaluate, approve, promote, load, or route adapters. Phase 12.1E-B/C and later phases remain unstarted. Google Drive storage is an external development runtime location, not a production object store or backup.
 
 ## License
 

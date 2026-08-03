@@ -3,7 +3,8 @@
 Phase 12.1C is the completed, department-scoped publication boundary for one
 external LoRA or QLoRA adapter. Phase 12.1D separately adds only PostgreSQL
 metadata list/detail reads; it does not change this publication contract.
-Phase 12.1E and later adapter lifecycle work have not started. This phase does
+Phase 12.1E-A is a separate maintenance boundary for terminal artifact
+reconciliation; later adapter lifecycle work have not started. This phase does
 not evaluate, approve, promote, load, route, reconcile, purge, or execute
 training.
 
@@ -126,5 +127,7 @@ Expired claims cannot mutate or publish. Reclaim marks exactly one matching
 previous attempt as `reclaimed`, allocates a fresh attempt, and never adopts an
 old stage or final. Phase 10 and Phase 11 retention fences recheck active
 registry dependencies immediately before deletion. Registry-stage deletion is
-deliberately not implemented; stale registry stages and finals remain untouched
-for a future reconciliation phase.
+handled only by the separate Phase 12.1E-A reconciliation operation. It may
+remove terminal stages and failed or validation-failed finals after exact
+PostgreSQL and descriptor checks, but it never deletes a succeeded authoritative
+final, changes purge state, or releases an upstream dependency.

@@ -422,6 +422,30 @@ services:
       postgres:
         condition: service_healthy
 
+  adapter-maintenance:
+    profiles: ["maintenance"]
+    build:
+      context: .
+      dockerfile: services/adapter-maintenance/Dockerfile
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      DEPTSLM_ADAPTER_RECONCILIATION_MIN_AGE_SECONDS: "${DEPTSLM_ADAPTER_RECONCILIATION_MIN_AGE_SECONDS:-3600}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/adapters"
+        target: /runtime/deptslm/adapters
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 networks:
   rag-internal:
     internal: true
