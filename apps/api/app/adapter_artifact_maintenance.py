@@ -8,6 +8,7 @@ to a purge state and never releases an upstream dependency.
 
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass
 from datetime import timedelta
@@ -25,6 +26,20 @@ from app.adapter_maintenance_artifacts import (
     InspectedSurface,
     PhysicalSurfaceIdentifier,
     physical_surface_identifier,
+)
+from app.adapter_registry_domain import (
+    AdapterRegistryDomainError,
+    parse_registry_manifest,
+)
+from app.adapter_registry_domain import (
+    canonical_json_bytes as registry_canonical_json_bytes,
+)
+from app.adapter_source_artifacts import (
+    AdapterSourceArtifactError,
+    parse_source_manifest,
+)
+from app.adapter_source_artifacts import (
+    canonical_manifest_bytes as source_canonical_manifest_bytes,
 )
 from app.auth import AuthenticatedPrincipal, DepartmentRole
 from app.authorization import DepartmentRequestScope, DepartmentScope
@@ -151,6 +166,53 @@ def _limit(value: object) -> None:
 def _age(value: object) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or not 300 <= value <= 86400:
         raise ServiceError(422, "Invalid adapter reconciliation minimum age")
+
+
+def _persisted_manifest_authority(surface_type: str, ownership_manifest: object) -> tuple[str, int]:
+    """Derive exact final-manifest bytes from the closed persisted attempt."""
+
+    if not isinstance(ownership_manifest, dict):
+        raise AdapterMaintenanceArtifactError("artifact_manifest_invalid")
+    try:
+        if surface_type == "source_final":
+            raw = source_canonical_manifest_bytes(ownership_manifest)
+            parse_source_manifest(raw)
+        elif surface_type == "registry_final":
+            raw = registry_canonical_json_bytes(ownership_manifest)
+            parse_registry_manifest(raw)
+        else:
+            raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+    except AdapterMaintenanceArtifactError:
+        raise
+    except (AdapterRegistryDomainError, AdapterSourceArtifactError, TypeError, ValueError):
+        raise AdapterMaintenanceArtifactError("artifact_manifest_invalid") from None
+    return hashlib.sha256(raw).hexdigest(), len(raw)
+
+
+def _attempt_has_blocked_item(
+    session: Session,
+    *,
+    department_id: UUID,
+    surface_type: str,
+    resource_column,
+    resource_id: UUID,
+    attempt_column,
+    attempt_id: UUID,
+) -> bool:
+    return (
+        session.scalar(
+            select(AdapterArtifactOperationItem.id)
+            .where(
+                AdapterArtifactOperationItem.department_id == department_id,
+                AdapterArtifactOperationItem.surface_type == surface_type,
+                resource_column == resource_id,
+                attempt_column == attempt_id,
+                AdapterArtifactOperationItem.status == "blocked",
+            )
+            .limit(1)
+        )
+        is not None
+    )
 
 
 def reconcile_adapter_artifacts(
@@ -320,6 +382,8 @@ def _select_candidates(
     cutoff = cutoff - timedelta(seconds=minimum_age_seconds)
     result: list[_Candidate] = []
     selected_attempts = 0
+    selected_source_finals: set[UUID] = set()
+    selected_registry_finals: set[UUID] = set()
     # Terminal source attempts are safe to inspect even when their source is
     # abandoned/rejected; protected source states are explicitly excluded.
     source_rows = session.execute(
@@ -344,11 +408,19 @@ def _select_candidates(
         )
         .order_by(AdapterImportAttempt.created_at, AdapterImportAttempt.id)
         .with_for_update(skip_locked=True)
-        .limit(limit),
     ).all()
     for attempt, source in source_rows:
         if selected_attempts >= limit:
             break
+        stage_blocked = _attempt_has_blocked_item(
+            session,
+            department_id=department_id,
+            surface_type="source_stage",
+            resource_column=AdapterArtifactOperationItem.source_bundle_id,
+            resource_id=source.id,
+            attempt_column=AdapterArtifactOperationItem.import_attempt_id,
+            attempt_id=attempt.id,
+        )
         committed_sibling = session.scalar(
             select(AdapterImportAttempt.id)
             .where(
@@ -363,30 +435,10 @@ def _select_candidates(
         stale = attempt.status not in TERMINAL_SOURCE_ATTEMPT_STATUSES
         if stale and (source.status != "staging" or source.authoritative_attempt_id is not None):
             continue
-        result.append(
-            _Candidate(
-                "source_stage",
-                department_id,
-                source.id,
-                None,
-                attempt.id,
-                None,
-                attempt.publication_attempt_id,
-                attempt.attempt_number,
-                source.version,
-                attempt.version,
-                None,
-            )
-        )
-        if (
-            isinstance(attempt.ownership_manifest, dict)
-            and source.status not in PROTECTED_SOURCE_STATUSES
-            and source.intake_manifest_sha256 is not None
-            and source.intake_manifest_byte_size is not None
-        ):
+        if not stage_blocked:
             result.append(
                 _Candidate(
-                    "source_final",
+                    "source_stage",
                     department_id,
                     source.id,
                     None,
@@ -396,10 +448,46 @@ def _select_candidates(
                     attempt.attempt_number,
                     source.version,
                     attempt.version,
-                    dict(attempt.ownership_manifest),
+                    None,
                 )
             )
-        selected_attempts += 1
+        if (
+            isinstance(attempt.ownership_manifest, dict)
+            and source.status not in PROTECTED_SOURCE_STATUSES
+        ):
+            try:
+                _persisted_manifest_authority("source_final", attempt.ownership_manifest)
+            except AdapterMaintenanceArtifactError:
+                pass
+            else:
+                final_blocked = _attempt_has_blocked_item(
+                    session,
+                    department_id=department_id,
+                    surface_type="source_final",
+                    resource_column=AdapterArtifactOperationItem.source_bundle_id,
+                    resource_id=source.id,
+                    attempt_column=AdapterArtifactOperationItem.import_attempt_id,
+                    attempt_id=attempt.id,
+                )
+                if source.id not in selected_source_finals and not final_blocked:
+                    result.append(
+                        _Candidate(
+                            "source_final",
+                            department_id,
+                            source.id,
+                            None,
+                            attempt.id,
+                            None,
+                            attempt.publication_attempt_id,
+                            attempt.attempt_number,
+                            source.version,
+                            attempt.version,
+                            dict(attempt.ownership_manifest),
+                        )
+                    )
+                    selected_source_finals.add(source.id)
+        if not stage_blocked or source.id in selected_source_finals:
+            selected_attempts += 1
     remaining_attempts = max(0, limit - selected_attempts)
     if remaining_attempts == 0:
         return tuple(result)
@@ -418,11 +506,28 @@ def _select_candidates(
         )
         .order_by(AdapterRegistryAttempt.created_at, AdapterRegistryAttempt.id)
         .with_for_update(skip_locked=True)
-        .limit(remaining_attempts),
     ).all()
     for attempt, adapter in registry_rows:
         if selected_attempts >= limit:
             break
+        stage_blocked = _attempt_has_blocked_item(
+            session,
+            department_id=department_id,
+            surface_type="registry_stage",
+            resource_column=AdapterArtifactOperationItem.adapter_id,
+            resource_id=adapter.id,
+            attempt_column=AdapterArtifactOperationItem.registry_attempt_id,
+            attempt_id=attempt.id,
+        )
+        final_blocked = _attempt_has_blocked_item(
+            session,
+            department_id=department_id,
+            surface_type="registry_final",
+            resource_column=AdapterArtifactOperationItem.adapter_id,
+            resource_id=adapter.id,
+            attempt_column=AdapterArtifactOperationItem.registry_attempt_id,
+            attempt_id=attempt.id,
+        )
         succeeded_sibling = session.scalar(
             select(AdapterRegistryAttempt.id)
             .where(
@@ -443,29 +548,10 @@ def _select_candidates(
         )
         if succeeded_sibling is not None or active_sibling is not None:
             continue
-        result.append(
-            _Candidate(
-                "registry_stage",
-                department_id,
-                None,
-                adapter.id,
-                None,
-                attempt.id,
-                attempt.publication_attempt_id,
-                attempt.attempt_number,
-                adapter.version,
-                attempt.version,
-                None,
-            )
-        )
-        if (
-            isinstance(attempt.ownership_manifest, dict)
-            and adapter.status in {"failed", "validation_failed"}
-            and adapter.registry_manifest_sha256 is not None
-        ):
+        if not stage_blocked:
             result.append(
                 _Candidate(
-                    "registry_final",
+                    "registry_stage",
                     department_id,
                     None,
                     adapter.id,
@@ -475,10 +561,37 @@ def _select_candidates(
                     attempt.attempt_number,
                     adapter.version,
                     attempt.version,
-                    dict(attempt.ownership_manifest),
+                    None,
                 )
             )
-        selected_attempts += 1
+        if isinstance(attempt.ownership_manifest, dict) and adapter.status in {
+            "failed",
+            "validation_failed",
+        }:
+            try:
+                _persisted_manifest_authority("registry_final", attempt.ownership_manifest)
+            except AdapterMaintenanceArtifactError:
+                pass
+            else:
+                if adapter.id not in selected_registry_finals and not final_blocked:
+                    result.append(
+                        _Candidate(
+                            "registry_final",
+                            department_id,
+                            None,
+                            adapter.id,
+                            None,
+                            attempt.id,
+                            attempt.publication_attempt_id,
+                            attempt.attempt_number,
+                            adapter.version,
+                            attempt.version,
+                            dict(attempt.ownership_manifest),
+                        )
+                    )
+                    selected_registry_finals.add(adapter.id)
+        if not stage_blocked or adapter.id in selected_registry_finals:
+            selected_attempts += 1
     return tuple(result)
 
 
@@ -653,14 +766,6 @@ def _check_authority(session: Session, item: AdapterArtifactOperationItem) -> No
         )
         if committed_sibling is not None:
             raise ServiceError(409, "Adapter reconciliation authority changed")
-        if item.surface_type == "source_final":
-            if (
-                not isinstance(item.ownership_manifest, dict)
-                or source.intake_manifest_sha256 is None
-                or source.intake_manifest_byte_size is None
-                or source.intake_manifest_byte_size <= 0
-            ):
-                raise ServiceError(409, "Adapter reconciliation authority changed")
         return
     adapter = session.execute(
         select(Adapter)
@@ -714,17 +819,14 @@ def _check_authority(session: Session, item: AdapterArtifactOperationItem) -> No
     if succeeded_sibling is not None or active_sibling is not None:
         raise ServiceError(409, "Adapter reconciliation authority changed")
     if item.surface_type == "registry_final":
-        if (
-            not isinstance(item.ownership_manifest, dict)
-            or adapter.registry_manifest_sha256 is None
-        ):
+        if not isinstance(item.ownership_manifest, dict):
             raise ServiceError(409, "Adapter reconciliation authority changed")
 
 
 def _manifest_authority(
     session: Session, item: AdapterArtifactOperationItem
 ) -> tuple[str | None, int | None]:
-    """Return the current DB-authoritative final-manifest digest and size."""
+    """Return persisted-attempt manifest authority, checking optional resource fields."""
 
     if item.surface_type == "source_final":
         source = session.execute(
@@ -737,7 +839,20 @@ def _manifest_authority(
         ).scalar_one_or_none()
         if source is None:
             raise ServiceError(409, "Adapter reconciliation authority changed")
-        return source.intake_manifest_sha256, source.intake_manifest_byte_size
+        expected_sha256, expected_size = _persisted_manifest_authority(
+            "source_final", item.ownership_manifest
+        )
+        if (
+            source.intake_manifest_sha256 is not None
+            and source.intake_manifest_sha256 != expected_sha256
+        ):
+            raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+        if (
+            source.intake_manifest_byte_size is not None
+            and source.intake_manifest_byte_size != expected_size
+        ):
+            raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+        return expected_sha256, expected_size
     if item.surface_type == "registry_final":
         adapter = session.execute(
             select(Adapter)
@@ -749,7 +864,15 @@ def _manifest_authority(
         ).scalar_one_or_none()
         if adapter is None:
             raise ServiceError(409, "Adapter reconciliation authority changed")
-        return adapter.registry_manifest_sha256, None
+        expected_sha256, expected_size = _persisted_manifest_authority(
+            "registry_final", item.ownership_manifest
+        )
+        if (
+            adapter.registry_manifest_sha256 is not None
+            and adapter.registry_manifest_sha256 != expected_sha256
+        ):
+            raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+        return expected_sha256, expected_size
     return None, None
 
 
@@ -1201,11 +1324,20 @@ def _confirm_attempt_cleanup(
         if committed_sibling is not None or active_sibling is not None:
             return
         resource_id = item.source_bundle_id
-        final_applicable = (
-            isinstance(attempt.ownership_manifest, dict)
-            and source.intake_manifest_sha256 is not None
-            and source.intake_manifest_byte_size is not None
-        )
+        final_applicable = False
+        if isinstance(attempt.ownership_manifest, dict):
+            try:
+                expected_sha256, expected_size = _persisted_manifest_authority(
+                    "source_final", attempt.ownership_manifest
+                )
+            except AdapterMaintenanceArtifactError:
+                return
+            if source.intake_manifest_sha256 not in (
+                None,
+                expected_sha256,
+            ) or source.intake_manifest_byte_size not in (None, expected_size):
+                return
+            final_applicable = True
         expected_surfaces = ("source_stage",) + (("source_final",) if final_applicable else ())
         item_rows = session.scalars(
             select(AdapterArtifactOperationItem)
@@ -1267,10 +1399,17 @@ def _confirm_attempt_cleanup(
         if succeeded_sibling is not None or active_sibling is not None:
             return
         resource_id = item.adapter_id
-        final_applicable = (
-            isinstance(attempt.ownership_manifest, dict)
-            and adapter.registry_manifest_sha256 is not None
-        )
+        final_applicable = False
+        if isinstance(attempt.ownership_manifest, dict):
+            try:
+                expected_sha256, _expected_size = _persisted_manifest_authority(
+                    "registry_final", attempt.ownership_manifest
+                )
+            except AdapterMaintenanceArtifactError:
+                return
+            if adapter.registry_manifest_sha256 not in (None, expected_sha256):
+                return
+            final_applicable = True
         expected_surfaces = ("registry_stage",) + (("registry_final",) if final_applicable else ())
         item_rows = session.scalars(
             select(AdapterArtifactOperationItem)

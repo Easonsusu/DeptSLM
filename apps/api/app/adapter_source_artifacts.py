@@ -461,7 +461,7 @@ class AdapterSourceArtifactStore:
                 expected_files, "adapter_model.safetensors", model_digest
             ):
                 raise AdapterSourceArtifactError("adapter_source_changed")
-            manifest_bytes = _canonical_manifest(manifest)
+            manifest_bytes = canonical_manifest_bytes(manifest)
             manifest_digest = _write_exact(stage_fd, "intake_manifest.json", manifest_bytes)
             _fsync(stage_fd)
             _fsync(stage_parent)
@@ -532,7 +532,7 @@ def _validate_uuid_components(department: UUID, source: UUID, attempt: UUID) -> 
         raise AdapterSourceArtifactError("adapter_input_invalid")
 
 
-def _canonical_manifest(value: dict[str, object]) -> bytes:
+def canonical_manifest_bytes(value: dict[str, object]) -> bytes:
     if not isinstance(value, dict):
         raise AdapterSourceArtifactError("adapter_source_publication_failed")
     return (
@@ -577,7 +577,7 @@ def parse_source_manifest(raw: bytes | bytearray | memoryview | str) -> dict[str
         if isinstance(error, AdapterSourceArtifactError):
             raise
         raise AdapterSourceArtifactError("adapter_source_publication_failed") from error
-    if not isinstance(value, dict) or _canonical_manifest(value) != raw:
+    if not isinstance(value, dict) or canonical_manifest_bytes(value) != raw:
         raise AdapterSourceArtifactError("adapter_source_publication_failed")
     _validate_manifest(value)
     return value
@@ -1013,4 +1013,5 @@ __all__ = [
     "PublishedAdapterAuthority",
     "StagedAdapterSource",
     "AdapterSourceArtifactStore",
+    "canonical_manifest_bytes",
 ]
