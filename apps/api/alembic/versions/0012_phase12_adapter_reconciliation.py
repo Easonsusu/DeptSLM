@@ -30,7 +30,26 @@ def _quoted(values: tuple[str, ...]) -> str:
     return ",".join("'" + value + "'" for value in values)
 
 
+def _resize_alembic_version(length: int) -> None:
+    """Keep the required revision identifier representable on PostgreSQL."""
+
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        op.alter_column(
+            "alembic_version",
+            "version_num",
+            existing_type=sa.String(length=32),
+            type_=sa.String(length=length),
+            existing_nullable=False,
+        )
+
+
 def upgrade() -> None:
+    # Alembic creates this bookkeeping column as VARCHAR(32), while this
+    # phase's explicit revision identifier is longer.  Resize it before the
+    # version row is advanced so PostgreSQL can record the revision safely.
+    _resize_alembic_version(64)
+
     # The exact registry-attempt tuple is referenced by reconciliation items.
     op.create_unique_constraint(
         "uq_adapter_registry_attempt_exact",
@@ -404,3 +423,4 @@ def downgrade() -> None:
         "(status IN ('validation_failed','failed','reclaimed') AND finished_at IS NOT NULL "
         "AND error_code IS NOT NULL))",
     )
+    _resize_alembic_version(32)
