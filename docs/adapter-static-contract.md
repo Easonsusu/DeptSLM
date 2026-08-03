@@ -8,8 +8,9 @@ Phase 12.1A, the model-free static compatibility contract. Phase 12.1B now
 uses this contract from its isolated source-validation child, and Phase 12.1C
 reuses the same model-free checks in its registry publication child; this
 document does not describe storage or import authority. Phase 12.1D adds only a
-separate PostgreSQL metadata-read boundary; Phase 12.1E, Phases 12.2 through
-12.4, and Phase 13 are not started.
+separate PostgreSQL metadata-read boundary; Phase 12.1E-A separately adds the
+administrator-only artifact reconciliation foundation. Phase 12.1E-B/C,
+Phases 12.2 through 12.4, and Phase 13 are not started.
 
 The static-contract implementation itself adds no intake command, database model,
 migration, API route, queue, worker, registry, storage directory,
@@ -153,6 +154,6 @@ Phase 12.1C binds an adapter to one same-department Phase 10 dataset and Phase
 11 job as **verified governance lineage** after this static validation. That
 association cannot prove external training origin, exact dataset use, declared
 execution, or unmodified weight production. Evaluation, approval, promotion,
-runtime loading, rollback, reconciliation, and purge remain future reviewed
-phases. No adapter is trusted or usable because this static contract or the
+runtime loading, rollback, purge, and later adapter lifecycle remain future
+reviewed phases; Phase 12.1E-A only reconciles non-authoritative artifacts. No adapter is trusted or usable because this static contract or the
 metadata-only registry accepts it.

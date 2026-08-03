@@ -7,8 +7,9 @@ reconcile, or purge an adapter. Phase 12.1C now consumes this exact committed
 source only through its separate reviewed worker, which binds it to one
 approved succeeded Phase 11 job and captured Phase 10 authority before
 publishing the private registry artifact. Phase 12.1D now adds only the
-metadata-only PostgreSQL registry read boundary; Phase 12.1E through 12.4 and
-Phase 13 remain unstarted.
+metadata-only PostgreSQL registry read boundary. Phase 12.1E-A now provides
+separate artifact reconciliation only; it does not purge this source or release
+dependencies. Phase 12.1E-B/C through 12.4 and Phase 13 remain unstarted.
 
 ## Command boundary
 
@@ -123,13 +124,12 @@ runtime-usable, or proof of external training provenance.
 
 This phase adds no API route, browser upload, adapter download, registry worker,
 Phase 11 binding or retention dependency, evaluation, review, approval,
-promotion, deployment, runtime loading, purge, or reconciliation. Those
-boundaries belong to Phase 12.1C or later; the 12.1C worker does not change the
-source-intake CLI contract.
+promotion, deployment, runtime loading, purge, or artifact reconciliation. The
+separate Phase 12.1E-A command does not change the source-intake CLI contract.
 It adds no PEFT, Transformers, PyTorch, safetensors, or LlamaFactory dependency,
 does not download a model, and does not load or materialize tensor values.
-Migrations `0010_phase12_adapter_sources` and
-`0011_phase12_adapter_registry` freeze their reviewed SQL literals and do not
+Migrations `0010_phase12_adapter_sources`, `0011_phase12_adapter_registry`, and
+`0012_phase12_adapter_reconciliation` freeze their reviewed SQL literals and do not
 import mutable application contract code. CI upgrades to the latter head,
 creates a private temporary adapters root, and runs the complete PostgreSQL,
 Qdrant, worker, storage, frontend, artifact-policy, and infrastructure checks;

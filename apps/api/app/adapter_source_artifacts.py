@@ -461,7 +461,7 @@ class AdapterSourceArtifactStore:
                 expected_files, "adapter_model.safetensors", model_digest
             ):
                 raise AdapterSourceArtifactError("adapter_source_changed")
-            manifest_bytes = _canonical_manifest(manifest)
+            manifest_bytes = canonical_manifest_bytes(manifest)
             manifest_digest = _write_exact(stage_fd, "intake_manifest.json", manifest_bytes)
             _fsync(stage_fd)
             _fsync(stage_parent)
@@ -532,13 +532,55 @@ def _validate_uuid_components(department: UUID, source: UUID, attempt: UUID) -> 
         raise AdapterSourceArtifactError("adapter_input_invalid")
 
 
-def _canonical_manifest(value: dict[str, object]) -> bytes:
+def canonical_manifest_bytes(value: dict[str, object]) -> bytes:
     if not isinstance(value, dict):
         raise AdapterSourceArtifactError("adapter_source_publication_failed")
     return (
         json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         + b"\n"
     )
+
+
+def parse_source_manifest(raw: bytes | bytearray | memoryview | str) -> dict[str, object]:
+    """Parse the exact closed Phase 12.1B manifest bytes.
+
+    Reconciliation must validate the bytes retained on the final surface, not
+    merely compare a JSON object reconstructed from PostgreSQL.  Duplicate
+    keys, unknown fields, non-canonical ordering, and alternate encodings are
+    rejected before the reviewed manifest contract is applied.
+    """
+
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    elif isinstance(raw, (bytearray, memoryview)):
+        raw = bytes(raw)
+    if not isinstance(raw, bytes) or not raw.endswith(b"\n") or raw.endswith(b"\n\n"):
+        raise AdapterSourceArtifactError("adapter_source_publication_failed")
+
+    def _pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise AdapterSourceArtifactError("adapter_source_publication_failed")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            raw[:-1].decode("utf-8"),
+            object_pairs_hook=_pairs,
+            parse_constant=lambda _value: (_ for _ in ()).throw(
+                AdapterSourceArtifactError("adapter_source_publication_failed")
+            ),
+        )
+    except (UnicodeDecodeError, UnicodeError, ValueError, TypeError, RecursionError) as error:
+        if isinstance(error, AdapterSourceArtifactError):
+            raise
+        raise AdapterSourceArtifactError("adapter_source_publication_failed") from error
+    if not isinstance(value, dict) or canonical_manifest_bytes(value) != raw:
+        raise AdapterSourceArtifactError("adapter_source_publication_failed")
+    _validate_manifest(value)
+    return value
 
 
 def _validate_manifest(value: dict[str, object]) -> None:
@@ -971,4 +1013,5 @@ __all__ = [
     "PublishedAdapterAuthority",
     "StagedAdapterSource",
     "AdapterSourceArtifactStore",
+    "canonical_manifest_bytes",
 ]

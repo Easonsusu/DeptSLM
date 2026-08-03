@@ -241,10 +241,38 @@ The import source is not runtime, evaluation, promotion, or rollback authority.
 The registry becomes adapter authority only after a successful PostgreSQL
 publication commit. Phase 12.1A validates adapter metadata with the reviewed
 static schema without loading a model or tokenizer; Phase 12.1C publishes only
-the exact content-free registry bundle. Evaluation, approval, promotion,
-rollback, reconciliation, and purge remain future reviewed phases.
+the exact content-free registry bundle. Phase 12.1E-A separately provides only
+bounded reconciliation for four non-authoritative artifact surfaces. Evaluation,
+approval, promotion, rollback, purge, and later adapter lifecycle remain future
+reviewed phases.
 
 The exact training scheduler, GPU execution environment, registry schema, and approval workflow are future decisions.
+
+### Adapter artifact reconciliation (Phase 12.1E-A)
+
+The manual `adapter-maintenance` Compose profile is the only component allowed
+to reconcile adapter artifact surfaces. It receives PostgreSQL and one external
+`adapters` root read-write mount. The API, registry worker, model runtime,
+Qdrant, Phase 10, and Phase 11 workers do not receive that mount. The command
+is dry-run by default and registers an exact department/resource/attempt item
+before any apply mutation.
+
+Only incomplete source stages, failed/abandoned non-authoritative source
+finals, terminal registry stages, and failed/validation-failed registry finals
+are eligible. Exact PostgreSQL versions, private UUID paths, no-follow
+descriptor chains, complete final manifests, and per-entry identities are
+required. Inspection persists the closed observation as `verified`; a second
+short transaction persists `move_authorized_at` and the expected item-scoped
+tombstone namespace before rename. The move then reopens and compares the
+exact original descriptors, uses no-replace rename plus parent fsync, and
+commits `tombstone_bound` identity before any unlink. Partial markers and
+payloads are not parsed. Unbound tombstones are never adopted. In-flight
+progress, exact parent identity checks, blocked non-starvation, complete
+attempt-group limits, cross-operation cleanup confirmation, and one
+operation-level audit provide crash recovery without claiming PostgreSQL and
+filesystem atomicity. Authoritative finals, purge states, dependencies, Phase
+10/11 artifacts, evaluation, approval, promotion, loading, and runtime routing
+are outside this phase.
 
 Phase 12.1C PostgreSQL publication and external filesystem publication are not
 atomic. A filesystem rename without a committed succeeded row is not runtime,
@@ -279,6 +307,6 @@ PostgreSQL claims, Qdrant retrieval, Phase 5 artifacts, result publication, and 
 - Production extraction sandbox, malware controls, and additional reviewed formats
 - Hybrid retrieval, reranking, and relevance thresholds beyond the Phase 5 character chunker
 - Production retention, physical purge, reconciliation, and tamper-resistant audit requirements
-- Phase 12.1E through 12.4 adapter reconciliation, evaluation, registry
-  lifecycle, and runtime deployment
+- Phase 12.1E-B/C through 12.4 adapter purge, evaluation, registry lifecycle,
+  and runtime deployment
 - Production topology, secrets, observability, backup, and disaster recovery

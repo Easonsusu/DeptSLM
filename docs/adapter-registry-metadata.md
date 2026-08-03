@@ -1,7 +1,7 @@
 # Phase 12.1D adapter metadata reads
 
 Phase 12.1D adds a read-only, department-scoped view of the immutable adapter
-registry. It is a PostgreSQL control-plane projection under review; it does
+registry. It is a completed PostgreSQL control-plane projection; it does
 not load, stream, mutate, reconcile, purge, evaluate, approve, promote, or
 route an adapter.
 
@@ -55,13 +55,13 @@ metadata rather than leaking partial state.
 
 PostgreSQL is the sole read authority. The routes do not inspect external
 registry storage, and they do not claim that bytes, backups, Google Drive
-history, or audit history have been deleted. Future Phase 12.1E reconciliation
-and purge must remain explicit, bounded, department-scoped, and separately
-reviewed.
+history, or audit history have been deleted. Phase 12.1E-A reconciliation is a
+separate explicit, bounded, department-scoped maintenance operation and does
+not alter this read projection.
 
 ## Non-goals
 
 There is no upload, download, manifest/configuration endpoint, tensor endpoint,
 mutation endpoint, evaluation endpoint, approval or promotion endpoint,
 deployment pointer, runtime adapter loading, silent base-model fallback,
-cross-department cache, or Phase 12.1E behavior in this phase.
+  cross-department cache, or Phase 12.1E-B/C behavior in this phase.

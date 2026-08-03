@@ -31,6 +31,7 @@ from app.adapter_source_artifacts import (
     AdapterSourceArtifactStore,
     ExternalAdapterInput,
     StagedAdapterSource,
+    canonical_manifest_bytes,
 )
 from app.adapter_source_supervision import run_adapter_source_validation
 from app.auth import AuthenticatedPrincipal, DepartmentRole
@@ -892,14 +893,7 @@ def _commit_published(
 
 
 def _manifest_bytes(manifest: dict[str, object]) -> bytes:
-    import json
-
-    return (
-        json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
-        + b"\n"
-    )
+    return canonical_manifest_bytes(manifest)
 
 
 def _reject_registered(factory, principal, scope, source_id, attempt_id, code, *, expected=None):

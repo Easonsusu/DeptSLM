@@ -81,13 +81,21 @@ This roadmap separates foundational safety work from product implementation. A l
   worker. It preserves declared external training association while leaving
   training provenance unverified. It does not evaluate, approve, promote,
   load, route, reconcile, purge, or execute training.
-- Phase 12.1D (under review in this branch): adds only department-scoped,
+- Phase 12.1D (completed): adds only department-scoped,
   metadata-only registry list/detail reads backed by PostgreSQL authority.
   The closed projection exposes lineage, contract, verification, lifecycle,
   and retention metadata; it exposes no artifact bytes, paths, hashes, tensor
   data, identities, or runtime settings, and it performs no mutation or audit.
-- Phase 12.1E (not started): registry reconciliation, purge, and later
-  lifecycle hardening remain future reviewed work.
+- Phase 12.1E-A (current; under review): adds a bounded, administrator-only,
+  dry-run-by-default reconciliation foundation for source stages, failed or
+  abandoned source finals, terminal registry stages, and failed or validation-
+  failed registry finals. It separates descriptor-bound inspection from rename,
+  persists verified identity and pre-move intent before no-replace tombstone
+  binding, refuses unbound tombstone adoption, verifies each committed unlink,
+  and confirms cleanup only after every applicable surface is absent across all
+  operations. The limit selects complete attempt groups; it never changes purge
+  state or releases dependencies.
+- Phase 12.1E-B/C (not started): adapter purge and later lifecycle hardening.
 - Phase 12.2 (not started): adapter-target evaluation, baseline/candidate evidence, and fixed numeric quality and safety gates; no automatic promotion.
 - Phase 12.3 (not started): review, approval, promotion, supersession, rollback, and deployment event history; no silent fallback.
 - Phase 12.4 (not started): department-bound runtime routing, immutable request snapshots, fail-closed loading, and explicit rollback-to-base.

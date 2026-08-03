@@ -12,6 +12,11 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+from app.adapter_artifact_maintenance import (
+    AdapterArtifactMaintenanceConfigurationError,
+    AdapterArtifactMaintenanceSettings,
+    reconcile_adapter_artifacts,
+)
 from app.adapter_registry_services import enqueue_adapter_registry
 from app.adapter_source_services import (
     AdapterSourceImportConfigurationError,
@@ -195,6 +200,12 @@ def _parser() -> argparse.ArgumentParser:
     training_purge.add_argument("--actor-subject", required=True)
     training_purge.add_argument("--limit", type=_purge_limit, default=500)
     training_purge.add_argument("--apply", action="store_true")
+    adapter_reconcile = commands.add_parser("reconcile-adapter-artifacts")
+    adapter_reconcile.add_argument("--department-id", required=True, type=_nonzero_uuid)
+    adapter_reconcile.add_argument("--actor-issuer", required=True)
+    adapter_reconcile.add_argument("--actor-subject", required=True)
+    adapter_reconcile.add_argument("--limit", type=_purge_limit, default=100)
+    adapter_reconcile.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -412,6 +423,29 @@ def main(argv: list[str] | None = None) -> int:
                 f"blocked: {result.blocked_count}."
             )
             return 0
+        if args.command == "reconcile-adapter-artifacts":
+            settings = AdapterArtifactMaintenanceSettings.from_environment()
+            engine = create_database_engine(settings.database_url)
+            factory = create_session_factory(engine)
+            try:
+                result = reconcile_adapter_artifacts(
+                    factory,
+                    data_dir=settings.data_dir,
+                    department_id=args.department_id,
+                    actor_issuer=args.actor_issuer,
+                    actor_subject=args.actor_subject,
+                    limit=args.limit,
+                    minimum_age_seconds=settings.minimum_age_seconds,
+                    apply=args.apply,
+                )
+            finally:
+                engine.dispose()
+            print(f"Eligible count: {result.eligible_count}")
+            print(f"Completed count: {result.completed_count}")
+            print(f"Blocked count: {result.blocked_count}")
+            for surface in ("source_stage", "source_final", "registry_stage", "registry_final"):
+                print(f"{surface}: {result.surface_counts.get(surface, 0)}")
+            return 0
         settings = FeedbackPurgeSettings.from_environment()
         result = purge_rag_feedback(
             settings,
@@ -429,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
         SftImportConfigurationError,
         SftMaintenanceConfigurationError,
         TrainingJobMaintenanceConfigurationError,
+        AdapterArtifactMaintenanceConfigurationError,
         ServiceError,
     ) as error:
         print(str(error), file=sys.stderr)
