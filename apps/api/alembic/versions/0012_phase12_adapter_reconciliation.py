@@ -423,4 +423,3 @@ def downgrade() -> None:
         "(status IN ('validation_failed','failed','reclaimed') AND finished_at IS NOT NULL "
         "AND error_code IS NOT NULL))",
     )
-    _resize_alembic_version(32)
