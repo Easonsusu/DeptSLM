@@ -288,10 +288,12 @@ stages, failed/abandoned source finals, terminal registry stages, and
 failed/validation-failed registry finals. Durable operation/item rows own the
 exact department, resource, publication attempt, attempt number, expected
 versions, and surface. The descriptor-bound store opens the private root and
-UUID path without following links, verifies UID/mode/identity, and keeps the
-chain authoritative through a no-replace move into `.deleting`. Entries are
-unlinked only through the exact tombstone descriptor and the parent entry is
-rechecked before `rmdir`.
+UUID path without following links, verifies UID/mode/identity, and persists a
+closed inspection plus pre-rename move intent before a no-replace move into
+`.deleting`. Exact tombstone identity is committed before any unlink. Entries
+are unlinked only through the exact committed tombstone descriptor and the
+parent entry is rechecked before `rmdir`; an unbound tombstone is blocked, not
+adopted.
 
 Partial markers and payloads are not parsed or logged; missing, zero-byte,
 truncated, or interrupted markers remain recoverable when exact metadata and

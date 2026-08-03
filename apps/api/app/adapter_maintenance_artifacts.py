@@ -144,6 +144,24 @@ class BoundSurface:
     tombstone_identity: dict[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class InspectedSurface:
+    """Closed, content-free authority captured from the original surface.
+
+    The descriptors used to produce this value are deliberately closed before
+    the caller persists it.  The value is only an observation; it is never a
+    tombstone binding and cannot authorize deletion on its own.
+    """
+
+    surface_type: str
+    department_id: UUID
+    resource_id: UUID
+    attempt_id: UUID
+    item_id: UUID
+    observed_identity: dict[str, object]
+    deletion_plan: list[dict[str, object]]
+
+
 def _safe_uuid(value: UUID) -> None:
     if not isinstance(value, UUID) or value.int == 0:
         raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
@@ -523,7 +541,7 @@ class AdapterMaintenanceArtifactStore:
             finally:
                 os.close(descriptor)
 
-    def _adopt_tombstone(
+    def inspect_surface(
         self,
         surface: str,
         department_id: UUID,
@@ -532,53 +550,324 @@ class AdapterMaintenanceArtifactStore:
         item_id: UUID,
         *,
         expected_manifest: dict[str, object] | None,
-    ) -> BoundSurface | None:
-        """Resume a move that committed before its PostgreSQL item update."""
+    ) -> InspectedSurface | None:
+        """Capture one exact original surface without mutating storage.
 
-        deleting_parent = self._deleting_fds[surface]
+        The no-follow descriptor chain remains open for the entire inspection
+        and is closed only after the content-free identity and deletion plan
+        have been captured.  No marker or payload bytes are parsed for stages,
+        and no tombstone is created here.
+        """
+
+        _safe_uuid(item_id)
+        opened = self._open_surface(surface, department_id, resource_id, attempt_id)
+        if opened is None:
+            return None
+        parent, directory, descriptors, allowlist, stage = opened
         try:
-            department = _open_dir(deleting_parent, str(department_id))
+            observed, entries = self._inspect(
+                directory, allowlist, stage=stage, expected=expected_manifest
+            )
+            plan = [{"name": entry["name"], "identity": dict(entry)} for entry in entries]
+            return InspectedSurface(
+                surface,
+                department_id,
+                resource_id,
+                attempt_id,
+                item_id,
+                observed,
+                plan,
+            )
+        finally:
+            for descriptor in reversed(descriptors):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    def _open_tombstone_path(
+        self,
+        surface: str,
+        department_id: UUID,
+        resource_id: UUID,
+        item_id: UUID,
+    ) -> tuple[int, int, list[int]] | None:
+        _safe_uuid(department_id)
+        _safe_uuid(resource_id)
+        _safe_uuid(item_id)
+        parent = self._deleting_fds[surface]
+        opened: list[int] = []
+        try:
+            department = _open_dir(parent, str(department_id))
+            opened.append(department)
+            resource = _open_dir(department, str(resource_id))
+            opened.append(resource)
+            item = _open_dir(resource, str(item_id))
+            opened.append(item)
+            return resource, item, opened
+        except FileNotFoundError:
+            for descriptor in reversed(opened):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            return None
+        except Exception:
+            for descriptor in reversed(opened):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise
+
+    def tombstone_exists(
+        self, surface: str, department_id: UUID, resource_id: UUID, item_id: UUID
+    ) -> bool:
+        """Return whether an item-scoped tombstone exists, without adopting it."""
+
+        if surface not in SURFACES:
+            raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+        opened = self._open_tombstone_path(surface, department_id, resource_id, item_id)
+        if opened is None:
+            return False
+        resource, _directory, descriptors = opened
+        try:
+            current = os.stat(str(item_id), dir_fd=resource, follow_symlinks=False)
+            if not stat.S_ISDIR(current.st_mode):
+                raise AdapterMaintenanceArtifactError("staging_path_unsafe")
+            return True
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def surface_exists(
+        self, surface: str, department_id: UUID, resource_id: UUID, attempt_id: UUID
+    ) -> bool:
+        """Check exact original presence through the same no-follow chain."""
+
+        opened = self._open_surface(surface, department_id, resource_id, attempt_id)
+        if opened is None:
+            return False
+        _parent, _directory, descriptors, _allowlist, _stage = opened
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        return True
+
+    def move_verified_surface_to_tombstone(
+        self,
+        inspected: InspectedSurface,
+        *,
+        expected_tombstone_namespace: dict[str, object],
+    ) -> BoundSurface | None:
+        """Reopen and atomically move a previously verified exact surface.
+
+        The caller must persist the verified observation and move intent before
+        invoking this operation.  The original descriptors stay open through
+        the final identity checks and no-replace rename.  A pre-existing
+        item-scoped tombstone is never adopted or modified.
+        """
+
+        if not isinstance(inspected, InspectedSurface):
+            raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+        expected = {
+            "surface_type": inspected.surface_type,
+            "department_id": str(inspected.department_id),
+            "resource_id": str(inspected.resource_id),
+            "item_id": str(inspected.item_id),
+        }
+        if expected_tombstone_namespace != expected:
+            raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+        opened = self._open_surface(
+            inspected.surface_type,
+            inspected.department_id,
+            inspected.resource_id,
+            inspected.attempt_id,
+        )
+        if opened is None:
+            # A missing original is only recoverable through the explicit
+            # move-intent path, never by manufacturing a new plan here.
+            return None
+        parent, directory, descriptors, _allowlist, stage = opened
+        deleting_parent: int | None = None
+        deleting_resource: int | None = None
+        resource_parent: int | None = None
+        try:
+            entries = [
+                dict(entry["identity"])
+                for entry in inspected.deletion_plan
+                if isinstance(entry, dict) and isinstance(entry.get("identity"), dict)
+            ]
+            observed = {
+                "directory": SurfaceIdentity.from_stat(os.fstat(directory)).as_json(),
+                "entries": entries,
+            }
+            if observed != inspected.observed_identity:
+                raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+            if entries != [entry["identity"] for entry in inspected.deletion_plan]:
+                raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+            self._verify_entries(
+                directory,
+                [dict(entry["identity"]) for entry in inspected.deletion_plan],
+                stage=stage,
+                expected_directory=inspected.observed_identity["directory"],
+            )
+            resource_parent = _ensure_private_dir(
+                self._deleting_fds[inspected.surface_type], str(inspected.department_id)
+            )
+            deleting_parent = _ensure_private_dir(resource_parent, str(inspected.resource_id))
+            try:
+                os.stat(str(inspected.item_id), dir_fd=deleting_parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise AdapterMaintenanceArtifactError("artifact_tombstone_conflict")
+            source_name = str(inspected.attempt_id) if stage else str(inspected.resource_id)
+            current_entry = os.stat(source_name, dir_fd=parent, follow_symlinks=False)
+            if not _same(current_entry, os.fstat(directory)):
+                raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+            _rename_no_replace(parent, source_name, deleting_parent, str(inspected.item_id))
+            _fsync(parent)
+            _fsync(deleting_parent)
+            moved = _open_dir(deleting_parent, str(inspected.item_id))
+            deleting_resource = moved
+            moved_identity = SurfaceIdentity.from_stat(os.fstat(moved)).as_json()
+            if not _same_directory_identity(
+                SurfaceIdentity.from_json(moved_identity),
+                SurfaceIdentity.from_json(observed["directory"]),
+            ):
+                raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+            plan = [{"name": entry["name"], "identity": dict(entry)} for entry in entries]
+            return BoundSurface(
+                inspected.surface_type,
+                inspected.department_id,
+                inspected.resource_id,
+                inspected.attempt_id,
+                inspected.item_id,
+                dict(inspected.observed_identity),
+                plan,
+                {"directory": moved_identity, "entries": [dict(entry) for entry in entries]},
+            )
         except FileNotFoundError:
             return None
-        try:
-            try:
-                resource = _open_dir(department, str(resource_id))
-            except FileNotFoundError:
-                return None
-            try:
-                tombstone = _open_dir(resource, str(item_id))
-            except FileNotFoundError:
-                return None
-            try:
-                allowlist = (
-                    SOURCE_STAGE_FILES
-                    if surface == "source_stage"
-                    else REGISTRY_STAGE_FILES
-                    if surface == "registry_stage"
-                    else SOURCE_FINAL_FILES
-                    if surface == "source_final"
-                    else REGISTRY_FINAL_FILES
-                )
-                stage = surface.endswith("_stage")
-                observed, entries = self._inspect(
-                    tombstone, allowlist, stage=stage, expected=expected_manifest
-                )
-                plan = [{"name": entry["name"], "identity": entry} for entry in entries]
-                return BoundSurface(
-                    surface,
-                    department_id,
-                    resource_id,
-                    attempt_id,
-                    item_id,
-                    observed,
-                    plan,
-                    observed,
-                )
-            finally:
-                os.close(tombstone)
         finally:
-            os.close(department)
+            if deleting_resource is not None:
+                os.close(deleting_resource)
+            if deleting_parent is not None:
+                os.close(deleting_parent)
+            if resource_parent is not None:
+                os.close(resource_parent)
+            for descriptor in reversed(descriptors):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
+    def open_committed_tombstone(self, bound: BoundSurface) -> BoundSurface:
+        """Open only a PostgreSQL-bound tombstone and verify its exact plan."""
+
+        if not isinstance(bound, BoundSurface) or not isinstance(bound.tombstone_identity, dict):
+            raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+        opened = self._open_tombstone_path(
+            bound.surface_type, bound.department_id, bound.resource_id, bound.item_id
+        )
+        if opened is None:
+            raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+        _resource, directory, descriptors = opened
+        try:
+            expected_directory = bound.tombstone_identity.get("directory")
+            if not isinstance(expected_directory, dict):
+                raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+            if not _same_directory_identity(
+                SurfaceIdentity.from_stat(os.fstat(directory)),
+                SurfaceIdentity.from_json(expected_directory),
+            ):
+                raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+            entries = [entry.get("identity") for entry in bound.deletion_plan]
+            if any(not isinstance(entry, dict) for entry in entries):
+                raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+            self._verify_entries(
+                directory,
+                [dict(entry) for entry in entries],
+                stage=bound.surface_type.endswith("_stage"),
+                expected_directory=expected_directory,
+            )
+            return bound
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    def recover_authorized_move(
+        self,
+        inspected: InspectedSurface,
+        *,
+        expected_tombstone_namespace: dict[str, object],
+    ) -> BoundSurface:
+        """Recover a move only from a committed pre-rename move intent.
+
+        This path never reads a marker or constructs a plan from tombstone
+        contents.  It compares the exact persisted observation and deletion
+        plan against the item-scoped tombstone and is therefore safe only for
+        the caller that already committed the move intent.
+        """
+
+        expected = {
+            "surface_type": inspected.surface_type,
+            "department_id": str(inspected.department_id),
+            "resource_id": str(inspected.resource_id),
+            "item_id": str(inspected.item_id),
+        }
+        if expected_tombstone_namespace != expected:
+            raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+        opened = self._open_tombstone_path(
+            inspected.surface_type,
+            inspected.department_id,
+            inspected.resource_id,
+            inspected.item_id,
+        )
+        if opened is None:
+            raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+        resource, directory, descriptors = opened
+        try:
+            expected_entries = [
+                dict(entry["identity"])
+                for entry in inspected.deletion_plan
+                if isinstance(entry, dict) and isinstance(entry.get("identity"), dict)
+            ]
+            if len(expected_entries) != len(inspected.deletion_plan):
+                raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+            current_directory = SurfaceIdentity.from_stat(os.fstat(directory)).as_json()
+            expected_original_directory = inspected.observed_identity.get("directory")
+            if not isinstance(expected_original_directory, dict) or not _same_directory_identity(
+                SurfaceIdentity.from_json(current_directory),
+                SurfaceIdentity.from_json(expected_original_directory),
+            ):
+                raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+            self._verify_entries(
+                directory,
+                expected_entries,
+                stage=inspected.surface_type.endswith("_stage"),
+                expected_directory=current_directory,
+            )
+            return BoundSurface(
+                inspected.surface_type,
+                inspected.department_id,
+                inspected.resource_id,
+                inspected.attempt_id,
+                inspected.item_id,
+                dict(inspected.observed_identity),
+                [
+                    {"name": entry["name"], "identity": dict(entry["identity"])}
+                    for entry in inspected.deletion_plan
+                ],
+                {"directory": current_directory, "entries": expected_entries},
+            )
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
+    # Compatibility shim for callers from the initial unmerged draft.  It is
+    # deliberately an inspect-then-move sequence and never adopts a
+    # filesystem tombstone.  Reconciliation itself uses the explicit methods.
     def bind_tombstone(
         self,
         surface: str,
@@ -589,75 +878,25 @@ class AdapterMaintenanceArtifactStore:
         *,
         expected_manifest: dict[str, object] | None,
     ) -> BoundSurface | None:
-        """Verify and no-replace move one exact surface into its tombstone."""
-
-        _safe_uuid(item_id)
-        opened = self._open_surface(surface, department_id, resource_id, attempt_id)
-        if opened is None:
-            return self._adopt_tombstone(
-                surface,
-                department_id,
-                resource_id,
-                attempt_id,
-                item_id,
-                expected_manifest=expected_manifest,
-            )
-        parent, directory, descriptors, allowlist, stage = opened
-        deleting_parent = None
-        deleting_resource = None
-        deleting_surface = self._deleting_fds[surface]
-        try:
-            observed, entries = self._inspect(
-                directory, allowlist, stage=stage, expected=expected_manifest
-            )
-            resource_parent = _ensure_private_dir(deleting_surface, str(department_id))
-            deleting_parent = _ensure_private_dir(resource_parent, str(resource_id))
-            try:
-                os.stat(str(item_id), dir_fd=deleting_parent, follow_symlinks=False)
-            except FileNotFoundError:
-                pass
-            else:
-                raise AdapterMaintenanceArtifactError("artifact_tombstone_conflict")
-            source_name = str(attempt_id) if stage else str(resource_id)
-            # The descriptor chain is the authority.  Re-check the parent
-            # entry immediately before the descriptor-relative rename so a
-            # substituted directory is rejected before it can be moved.
-            self._verify_entries(
-                directory,
-                entries,
-                stage=stage,
-                expected_directory=observed["directory"],
-            )
-            current_entry = os.stat(source_name, dir_fd=parent, follow_symlinks=False)
-            if not _same(current_entry, os.fstat(directory)):
-                raise AdapterMaintenanceArtifactError("artifact_authority_changed")
-            _rename_no_replace(parent, source_name, deleting_parent, str(item_id))
-            _fsync(parent)
-            _fsync(deleting_parent)
-            moved = _open_dir(deleting_parent, str(item_id))
-            deleting_resource = moved
-            tombstone = {
-                "directory": SurfaceIdentity.from_stat(os.fstat(moved)).as_json(),
-                "entries": entries,
-            }
-            plan = [{"name": entry["name"], "identity": entry} for entry in entries]
-            return BoundSurface(
-                surface, department_id, resource_id, attempt_id, item_id, observed, plan, tombstone
-            )
-        except FileNotFoundError:
+        inspected = self.inspect_surface(
+            surface,
+            department_id,
+            resource_id,
+            attempt_id,
+            item_id,
+            expected_manifest=expected_manifest,
+        )
+        if inspected is None:
             return None
-        finally:
-            if deleting_resource is not None:
-                os.close(deleting_resource)
-            if deleting_parent is not None:
-                os.close(deleting_parent)
-            if "resource_parent" in locals() and resource_parent is not None:
-                os.close(resource_parent)
-            for descriptor in reversed(descriptors):
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
+        return self.move_verified_surface_to_tombstone(
+            inspected,
+            expected_tombstone_namespace={
+                "surface_type": surface,
+                "department_id": str(department_id),
+                "resource_id": str(resource_id),
+                "item_id": str(item_id),
+            },
+        )
 
     def _open_bound(self, bound: BoundSurface) -> tuple[int, int, list[int]]:
         parent = _open_dir(self._deleting_fds[bound.surface_type], str(bound.department_id))
@@ -669,7 +908,7 @@ class AdapterMaintenanceArtifactStore:
             os.close(parent)
             raise
 
-    def unlink_tombstone_entry(
+    def unlink_committed_tombstone_entry(
         self, bound: BoundSurface, name: str, *, allow_missing: bool
     ) -> None:
         if name not in {entry["name"] for entry in bound.deletion_plan}:
@@ -709,7 +948,7 @@ class AdapterMaintenanceArtifactStore:
                 os.close(descriptor)
             os.close(parent)
 
-    def remove_tombstone_directory(
+    def remove_committed_tombstone_directory(
         self, bound: BoundSurface, *, allow_missing: bool = False
     ) -> None:
         resource_parent = _open_dir(
@@ -746,11 +985,24 @@ class AdapterMaintenanceArtifactStore:
         finally:
             os.close(resource_parent)
 
+    # Compatibility names retained for the initial unmerged draft.  They
+    # delegate only to the committed-tombstone operations above.
+    def unlink_tombstone_entry(
+        self, bound: BoundSurface, name: str, *, allow_missing: bool
+    ) -> None:
+        self.unlink_committed_tombstone_entry(bound, name, allow_missing=allow_missing)
+
+    def remove_tombstone_directory(
+        self, bound: BoundSurface, *, allow_missing: bool = False
+    ) -> None:
+        self.remove_committed_tombstone_directory(bound, allow_missing=allow_missing)
+
 
 __all__ = [
     "AdapterMaintenanceArtifactError",
     "AdapterMaintenanceArtifactStore",
     "BoundSurface",
+    "InspectedSurface",
     "SOURCE_STAGE_FILES",
     "REGISTRY_STAGE_FILES",
     "SOURCE_FINAL_FILES",

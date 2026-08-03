@@ -261,8 +261,14 @@ Only incomplete source stages, failed/abandoned non-authoritative source
 finals, terminal registry stages, and failed/validation-failed registry finals
 are eligible. Exact PostgreSQL versions, private UUID paths, no-follow
 descriptor chains, complete final manifests, and per-entry identities are
-required. Partial markers and payloads are not parsed. Tombstone-before-unlink,
-in-flight progress, parent identity checks, blocked non-starvation, and one
+required. Inspection persists the closed observation as `verified`; a second
+short transaction persists `move_authorized_at` and the expected item-scoped
+tombstone namespace before rename. The move then reopens and compares the
+exact original descriptors, uses no-replace rename plus parent fsync, and
+commits `tombstone_bound` identity before any unlink. Partial markers and
+payloads are not parsed. Unbound tombstones are never adopted. In-flight
+progress, exact parent identity checks, blocked non-starvation, complete
+attempt-group limits, cross-operation cleanup confirmation, and one
 operation-level audit provide crash recovery without claiming PostgreSQL and
 filesystem atomicity. Authoritative finals, purge states, dependencies, Phase
 10/11 artifacts, evaluation, approval, promotion, loading, and runtime routing

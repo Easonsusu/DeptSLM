@@ -45,8 +45,12 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > administrator-only, dry-run-by-default reconciliation foundation for four
 > non-authoritative adapter artifact surfaces. It uses durable PostgreSQL
 > operation/item authority, exact department and attempt keys, descriptor-bound
-> no-follow storage, tombstone-before-unlink, crash-resumable deletion, and
-> non-starving blocked reconciliation. It never changes source or adapter purge
+> no-follow storage, read-only inspection before a durable verified state,
+> pre-rename move intent, no-replace tombstone binding, crash-resumable deletion,
+> and non-starving blocked reconciliation. Unbound tombstones are never adopted;
+> final cleanup requires committed tombstone identity, and attempt cleanup is
+> confirmed only after every applicable surface and tombstone is absent. It
+> never changes source or adapter purge
 > state, releases an upstream dependency, reads adapter bytes into PostgreSQL,
 > or exposes a public route. Phase 12.1E-B/C, Phase 12.2 through Phase 12.4,
 > and runtime routing remain unstarted.

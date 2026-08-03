@@ -213,12 +213,14 @@ def upgrade() -> None:
         sa.Column("observed_identity", sa.JSON()),
         sa.Column("tombstone_identity", sa.JSON()),
         sa.Column("deletion_plan", sa.JSON()),
+        sa.Column("expected_tombstone_namespace", sa.JSON()),
         sa.Column("next_entry_index", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("in_flight_entry", sa.JSON()),
         sa.Column("directory_unlink_started_at", sa.DateTime(timezone=True)),
         sa.Column("status", sa.String(20), nullable=False),
         sa.Column("blocked_reason_code", sa.String(64)),
         sa.Column("verified_at", sa.DateTime(timezone=True)),
+        sa.Column("move_authorized_at", sa.DateTime(timezone=True)),
         sa.Column("tombstone_bound_at", sa.DateTime(timezone=True)),
         sa.Column("deletion_started_at", sa.DateTime(timezone=True)),
         sa.Column("completed_at", sa.DateTime(timezone=True)),
@@ -331,6 +333,10 @@ def upgrade() -> None:
             "in_flight_entry IS NULL OR json_typeof(in_flight_entry) IN ('object','array')",
             name="ck_adapter_artifact_item_in_flight_json",
         ),
+        sa.CheckConstraint(
+            "expected_tombstone_namespace IS NULL OR json_typeof(expected_tombstone_namespace) = 'object'",
+            name="ck_adapter_artifact_item_move_namespace_json",
+        ),
         sa.CheckConstraint("next_entry_index >= 0", name="ck_adapter_artifact_item_progress"),
         sa.CheckConstraint(
             "blocked_reason_code IS NULL OR blocked_reason_code IN ("
@@ -339,7 +345,7 @@ def upgrade() -> None:
             name="ck_adapter_artifact_item_reason",
         ),
         sa.CheckConstraint(
-            "((status = 'registered' AND observed_identity IS NULL AND tombstone_identity IS NULL AND deletion_plan IS NULL AND next_entry_index = 0 AND in_flight_entry IS NULL AND verified_at IS NULL AND tombstone_bound_at IS NULL AND deletion_started_at IS NULL AND directory_unlink_started_at IS NULL AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR (status = 'verified' AND observed_identity IS NOT NULL AND deletion_plan IS NOT NULL AND tombstone_identity IS NULL AND verified_at IS NOT NULL AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR (status = 'tombstone_bound' AND observed_identity IS NOT NULL AND deletion_plan IS NOT NULL AND tombstone_identity IS NOT NULL AND tombstone_bound_at IS NOT NULL AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR (status = 'deleting' AND tombstone_identity IS NOT NULL AND deletion_started_at IS NOT NULL AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR (status = 'completed' AND completed_at IS NOT NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL AND in_flight_entry IS NULL) OR (status = 'blocked' AND blocked_at IS NOT NULL AND completed_at IS NULL AND blocked_reason_code IS NOT NULL))",
+            "((status = 'registered' AND observed_identity IS NULL AND tombstone_identity IS NULL AND deletion_plan IS NULL AND expected_tombstone_namespace IS NULL AND next_entry_index = 0 AND in_flight_entry IS NULL AND verified_at IS NULL AND move_authorized_at IS NULL AND tombstone_bound_at IS NULL AND deletion_started_at IS NULL AND directory_unlink_started_at IS NULL AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR (status = 'verified' AND observed_identity IS NOT NULL AND deletion_plan IS NOT NULL AND tombstone_identity IS NULL AND verified_at IS NOT NULL AND ((move_authorized_at IS NULL AND expected_tombstone_namespace IS NULL) OR (move_authorized_at IS NOT NULL AND expected_tombstone_namespace IS NOT NULL)) AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR (status = 'tombstone_bound' AND observed_identity IS NOT NULL AND deletion_plan IS NOT NULL AND tombstone_identity IS NOT NULL AND tombstone_bound_at IS NOT NULL AND move_authorized_at IS NOT NULL AND expected_tombstone_namespace IS NOT NULL AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR (status = 'deleting' AND tombstone_identity IS NOT NULL AND move_authorized_at IS NOT NULL AND expected_tombstone_namespace IS NOT NULL AND deletion_started_at IS NOT NULL AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR (status = 'completed' AND completed_at IS NOT NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL AND in_flight_entry IS NULL) OR (status = 'blocked' AND blocked_at IS NOT NULL AND completed_at IS NULL AND blocked_reason_code IS NOT NULL))",
             name="ck_adapter_artifact_item_lifecycle",
         ),
         sa.CheckConstraint("version > 0", name="ck_adapter_artifact_item_version"),

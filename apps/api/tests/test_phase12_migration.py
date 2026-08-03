@@ -62,6 +62,9 @@ def test_phase12_1e_a_migration_is_self_contained_and_has_exact_surfaces() -> No
     assert "fk_adapter_artifact_item_source_scope" in source
     assert "fk_adapter_artifact_item_adapter_scope" in source
     assert "uq_adapter_registry_attempt_exact" in source
+    assert "move_authorized_at" in source
+    assert "expected_tombstone_namespace" in source
+    assert "ck_adapter_artifact_item_move_namespace_json" in source
 
 
 def test_phase12_1c_backfill_uses_canonical_manifest_authority() -> None:

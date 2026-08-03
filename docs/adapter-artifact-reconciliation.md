@@ -42,10 +42,16 @@ purge state occurs and no dependency is released.
 
 The store opens the exact `adapters` root, department, resource, and stage or
 final chain with `O_NOFOLLOW`, private `0700` directories, current service UID,
-and identity checks. It keeps the chain authoritative through inspection and
-the descriptor-relative no-replace move into `.deleting/<surface>/<department>/<resource>/<item>`.
-Entries are removed only through that exact tombstone descriptor. Parent entry
-identity is checked immediately before both the move and final `rmdir`.
+and identity checks. Inspection is a read-only descriptor operation: it returns
+only a closed identity and deletion plan. PostgreSQL persists that observation
+as `registered -> verified`, then commits `move_authorized_at` and the exact
+item-scoped tombstone namespace before the worker reopens the original chain.
+The move compares every path, descriptor, digest, size, mode, UID, link count,
+`mtime_ns`, and `ctime_ns`, performs a no-replace rename, fsyncs both parents,
+and persists the resulting tombstone identity as `tombstone_bound` before any
+unlink. Entries are removed only through the committed tombstone descriptor;
+parent entry identity is checked immediately before both the move and final
+`rmdir`.
 
 Partial stages are owned by durable metadata plus the exact UUID path. Marker,
 manifest, and payload contents are never parsed or logged during partial-stage
@@ -55,13 +61,21 @@ SHA-256 digests, sizes, permissions, and identity. Symlinks, hard links,
 unknown entries, substituted parents, wrong UID or mode, foreign scope, and
 non-directories fail closed as fixed blocked item codes.
 
-The item records tombstone identity and a deletion plan before unlink. Each
-member unlink is fenced by its persisted identity and an in-flight marker;
-retries accept a missing member only after that exact unlink was durably
-recorded. A post-move crash remains resumable. A blocked item is terminalized
-without preventing later valid items in the same bounded batch. One completed
-operation appends at most one content-free success audit after every applicable
-item is complete; it never claims deletion from backups or historical audit.
+The item records the observed identity and deletion plan before rename, then
+records tombstone identity before unlink. An unbound item-scoped tombstone is
+never adopted or parsed: it blocks with `artifact_tombstone_conflict` and keeps
+both surfaces untouched. A post-rename/pre-commit crash is resumable only when
+the durable move intent exists, the original is absent, and the tombstone
+matches the previously committed observation and plan. Each member unlink is
+fenced by its persisted identity and an in-flight marker; retries accept a
+missing member only after that exact unlink was durably recorded. A blocked
+item is terminalized without preventing later valid items in the same bounded
+batch. The limit selects complete attempt groups, while `eligible_count` is the
+actual number of registered surfaces. Cleanup confirmation scans every
+operation and applicable surface for the exact attempt and is set once only
+after all originals and tombstones are absent. One completed operation appends
+at most one content-free success audit; it never claims deletion from backups
+or historical audit.
 
 ## Isolation and deployment
 

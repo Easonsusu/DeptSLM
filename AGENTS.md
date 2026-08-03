@@ -163,9 +163,12 @@ publication is not transactionally atomic.
   never changes source or adapter purge state, releases an upstream dependency,
   touches Phase 10/11 artifacts, or exposes a public route. Durable PostgreSQL
   operation/item rows own exact resource/attempt/version snapshots. The
-  descriptor-bound store verifies private UID/mode/no-follow identity, moves
-  through a no-replace `.deleting` tombstone, verifies every unlink and parent
-  entry, and supports crash-resumable progress. Partial markers and payloads
+  descriptor-bound store verifies private UID/mode/no-follow identity. It
+  persists a closed observed identity and plan before a separate move-intent
+  transaction; only then may the exact original be reopened for a no-replace
+  `.deleting` tombstone. Tombstone identity is committed before unlink, every
+  unlink and parent entry is verified, and progress is crash-resumable. Partial
+  markers and payloads
   are never parsed or logged; incomplete markers are recoverable under exact
   metadata/path authority, while complete finals still require closed manifests
   and exact digests. The maintenance Compose profile receives only PostgreSQL

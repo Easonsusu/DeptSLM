@@ -132,14 +132,18 @@ versions, surface, and optional closed final manifest. Composite restrictive
 foreign keys prevent cross-department or cross-attempt ownership.
 
 Items move through `registered`, `verified`, `tombstone_bound`, `deleting`,
-`completed`, or `blocked`. JSON fields contain only descriptor identities,
-allowlisted entry names, digests/sizes for complete finals, and crash-resume
-progress; they never contain adapter bytes, manifests from partial stages,
-paths, credentials, tensor values, or dependency data. A terminal item can set
-the source/registry attempt's `cleanup_confirmed_at` only after every sibling
-surface for that exact attempt is complete. The operation appends one safe
-success audit only after all items close, and a blocked item cannot starve a
-later item.
+`completed`, or `blocked`. `verified` stores the closed observed identity and
+deletion plan; a separate `move_authorized_at` plus the exact item-scoped
+`expected_tombstone_namespace` must be committed before rename. `tombstone_bound`
+stores the post-rename identity and is the only state that may unlink. JSON
+fields contain only descriptor identities, allowlisted entry names,
+digests/sizes for complete finals, and crash-resume progress; they never
+contain adapter bytes, manifests from partial stages, paths, credentials,
+tensor values, or dependency data. A terminal item can set the source/registry
+attempt's `cleanup_confirmed_at` only after every applicable surface and
+tombstone for that exact attempt is absent across all operations and no
+authoritative sibling exists. The operation appends one safe success audit only
+after all items close, and a blocked item cannot starve a later item.
 - `documents`: department-owned source metadata with an internal uploader relation, normalized filename, canonical media type, positive size, SHA-256 digest, lifecycle state, version, and timestamps. It stores no body or path, and public document schemas do not expose internal identity IDs; see [document-model.md](document-model.md).
 - `document_extractions`: immutable attempt history and PostgreSQL queue state, including source/pipeline identity, claim lease, safe result metadata, and an allowlisted error code. It stores no content, path, filename, stderr, or exception.
 - `document_chunks`: department/document/extraction-scoped offsets, byte size, internal digest, and mutually exclusive page/line provenance. Chunk text remains external.

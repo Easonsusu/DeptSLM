@@ -89,9 +89,12 @@ This roadmap separates foundational safety work from product implementation. A l
 - Phase 12.1E-A (current; under review): adds a bounded, administrator-only,
   dry-run-by-default reconciliation foundation for source stages, failed or
   abandoned source finals, terminal registry stages, and failed or validation-
-  failed registry finals. It records durable operation/item authority, uses
-  exact descriptor-bound tombstones and crash-resumable unlink, and never
-  changes purge state or releases dependencies.
+  failed registry finals. It separates descriptor-bound inspection from rename,
+  persists verified identity and pre-move intent before no-replace tombstone
+  binding, refuses unbound tombstone adoption, verifies each committed unlink,
+  and confirms cleanup only after every applicable surface is absent across all
+  operations. The limit selects complete attempt groups; it never changes purge
+  state or releases dependencies.
 - Phase 12.1E-B/C (not started): adapter purge and later lifecycle hardening.
 - Phase 12.2 (not started): adapter-target evaluation, baseline/candidate evidence, and fixed numeric quality and safety gates; no automatic promotion.
 - Phase 12.3 (not started): review, approval, promotion, supersession, rollback, and deployment event history; no silent fallback.

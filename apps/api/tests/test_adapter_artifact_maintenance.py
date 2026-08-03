@@ -183,3 +183,107 @@ def test_final_surface_requires_closed_manifest_and_exact_digests(tmp_path: Path
             "source_final", department, source, attempt, item, expected_manifest=manifest
         )
         assert bound is not None
+
+
+def test_inspection_is_read_only_and_move_requires_explicit_namespace(tmp_path: Path) -> None:
+    root = _runtime_root(tmp_path)
+    department, source, attempt, item = (uuid4() for _ in range(4))
+    stage = _source_stage(root, str(department), str(source), str(attempt))
+    _file(stage / "adapter_config.json", b"partial")
+    with AdapterMaintenanceArtifactStore(root) as store:
+        inspected = store.inspect_surface(
+            "source_stage", department, source, attempt, item, expected_manifest=None
+        )
+        assert inspected is not None
+        assert stage.exists()
+        assert not store.tombstone_exists("source_stage", department, source, item)
+        with pytest.raises(AdapterMaintenanceArtifactError) as error:
+            store.move_verified_surface_to_tombstone(
+                inspected,
+                expected_tombstone_namespace={"item_id": str(item)},
+            )
+        assert error.value.code == "artifact_ownership_mismatch"
+        bound = store.move_verified_surface_to_tombstone(
+            inspected,
+            expected_tombstone_namespace={
+                "surface_type": "source_stage",
+                "department_id": str(department),
+                "resource_id": str(source),
+                "item_id": str(item),
+            },
+        )
+        assert bound is not None
+        assert not stage.exists()
+        store.open_committed_tombstone(bound)
+
+
+def test_valid_looking_unbound_tombstone_is_refused_and_preserved(tmp_path: Path) -> None:
+    root = _runtime_root(tmp_path)
+    department, source, attempt, item = (uuid4() for _ in range(4))
+    stage = _source_stage(root, str(department), str(source), str(attempt))
+    _file(stage / "adapter_config.json", b"original")
+    tombstone = (
+        root / "adapters" / ".deleting" / "source_stage" / str(department) / str(source) / str(item)
+    )
+    tombstone.mkdir(mode=0o700, parents=True)
+    for path in (
+        tombstone.parent.parent.parent,
+        tombstone.parent.parent,
+        tombstone.parent,
+        tombstone,
+    ):
+        path.chmod(0o700)
+    _file(tombstone / "adapter_config.json", b"looks-owned")
+    with AdapterMaintenanceArtifactStore(root) as store:
+        inspected = store.inspect_surface(
+            "source_stage", department, source, attempt, item, expected_manifest=None
+        )
+        assert inspected is not None
+        with pytest.raises(AdapterMaintenanceArtifactError) as error:
+            store.move_verified_surface_to_tombstone(
+                inspected,
+                expected_tombstone_namespace={
+                    "surface_type": "source_stage",
+                    "department_id": str(department),
+                    "resource_id": str(source),
+                    "item_id": str(item),
+                },
+            )
+        assert error.value.code == "artifact_tombstone_conflict"
+    assert stage.exists()
+    assert tombstone.exists()
+
+
+def test_authorized_move_recovery_does_not_rebuild_plan(tmp_path: Path) -> None:
+    root = _runtime_root(tmp_path)
+    department, source, attempt, item = (uuid4() for _ in range(4))
+    stage = _source_stage(root, str(department), str(source), str(attempt))
+    _file(stage / ".deptslm-adapter-stage-owner", b"partial")
+    with AdapterMaintenanceArtifactStore(root) as store:
+        inspected = store.inspect_surface(
+            "source_stage", department, source, attempt, item, expected_manifest=None
+        )
+        assert inspected is not None
+        bound = store.move_verified_surface_to_tombstone(
+            inspected,
+            expected_tombstone_namespace={
+                "surface_type": "source_stage",
+                "department_id": str(department),
+                "resource_id": str(source),
+                "item_id": str(item),
+            },
+        )
+        assert bound is not None
+        recovered = store.recover_authorized_move(
+            inspected,
+            expected_tombstone_namespace={
+                "surface_type": "source_stage",
+                "department_id": str(department),
+                "resource_id": str(source),
+                "item_id": str(item),
+            },
+        )
+        assert recovered.deletion_plan == inspected.deletion_plan
+        assert recovered.tombstone_identity["entries"] == [
+            entry["identity"] for entry in inspected.deletion_plan
+        ]

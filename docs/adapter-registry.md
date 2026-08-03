@@ -122,8 +122,10 @@ the artifact is safe, compatible, or useful.
   source finals, terminal registry stages, and failed or validation-failed
   registry finals through the separate administrator-only maintenance command.
 - Use durable operation/item authority, exact PostgreSQL status/version checks,
-  descriptor-relative no-follow storage, tombstone-before-unlink, and
-  crash-resumable bounded cleanup.
+  descriptor-relative no-follow storage, read-only inspection followed by a
+  committed move intent, no-replace tombstone binding, and crash-resumable
+  bounded cleanup. Unbound item-scoped tombstones are blocked rather than
+  adopted, and cleanup confirmation spans every operation for the exact attempt.
 - Never reconcile authoritative finals, purge states, upstream dependencies,
   Phase 10/11 artifacts, or adapter runtime state. Phase 12.1E-B/C remains
   unstarted.
@@ -685,11 +687,14 @@ adapters/.deleting/registry_final/<department_id>/<adapter_id>/<operation_item_i
 
 The Phase 12.1E-A command is dry-run by default. Before apply mutation it
 durably registers the operation and exact source-bundle/attempt or adapter/
-registry-attempt item, proves ownership through descriptor-relative no-follow
-handles, binds exact tombstone identities before unlink, and remains
-crash-resumable. It emits one operation-level success audit only after every
-active item is complete. Phase 12.1E-B/C will define later purge and lifecycle
-work and is not started.
+registry-attempt item, inspects the original through descriptor-relative
+no-follow handles, persists the verified identity and pre-rename move intent,
+then reopens and compares the exact original before a no-replace tombstone move
+and parent fsync. It commits exact tombstone identities before unlink, never
+adopts an unbound tombstone, and remains crash-resumable. It emits one
+operation-level success audit only after every applicable surface and tombstone
+is absent for the exact attempt across all operations. Phase 12.1E-B/C will
+define later purge and lifecycle work and is not started.
 
 Source cleanup must not delete a source still required by an active intake,
 retry, or reconciliation operation; must never delete registry artifacts through

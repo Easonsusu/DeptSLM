@@ -3833,6 +3833,11 @@ class AdapterArtifactOperationItem(Base):
             name="ck_adapter_artifact_item_in_flight_json",
         ),
         CheckConstraint(
+            "expected_tombstone_namespace IS NULL OR "
+            "json_typeof(expected_tombstone_namespace) = 'object'",
+            name="ck_adapter_artifact_item_move_namespace_json",
+        ),
+        CheckConstraint(
             "next_entry_index >= 0",
             name="ck_adapter_artifact_item_progress",
         ),
@@ -3845,18 +3850,24 @@ class AdapterArtifactOperationItem(Base):
         CheckConstraint(
             "((status = 'registered' AND observed_identity IS NULL AND tombstone_identity IS NULL "
             "AND deletion_plan IS NULL AND next_entry_index = 0 AND in_flight_entry IS NULL "
-            "AND verified_at IS NULL AND tombstone_bound_at IS NULL "
+            "AND verified_at IS NULL AND move_authorized_at IS NULL "
+            "AND expected_tombstone_namespace IS NULL AND tombstone_bound_at IS NULL "
             "AND deletion_started_at IS NULL AND directory_unlink_started_at IS NULL "
             "AND completed_at IS NULL AND blocked_at IS NULL "
             "AND blocked_reason_code IS NULL) OR "
             "(status = 'verified' AND observed_identity IS NOT NULL AND deletion_plan IS NOT NULL "
-            "AND tombstone_identity IS NULL AND verified_at IS NOT NULL AND completed_at IS NULL "
+            "AND tombstone_identity IS NULL AND verified_at IS NOT NULL "
+            "AND ((move_authorized_at IS NULL AND expected_tombstone_namespace IS NULL) OR "
+            "(move_authorized_at IS NOT NULL AND expected_tombstone_namespace IS NOT NULL)) "
+            "AND completed_at IS NULL "
             "AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR "
             "(status = 'tombstone_bound' AND observed_identity IS NOT NULL "
             "AND deletion_plan IS NOT NULL "
             "AND tombstone_identity IS NOT NULL AND tombstone_bound_at IS NOT NULL "
+            "AND move_authorized_at IS NOT NULL AND expected_tombstone_namespace IS NOT NULL "
             "AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR "
             "(status = 'deleting' AND tombstone_identity IS NOT NULL "
+            "AND move_authorized_at IS NOT NULL AND expected_tombstone_namespace IS NOT NULL "
             "AND deletion_started_at IS NOT NULL "
             "AND completed_at IS NULL AND blocked_at IS NULL AND blocked_reason_code IS NULL) OR "
             "(status = 'completed' AND completed_at IS NOT NULL AND blocked_at IS NULL "
@@ -3911,12 +3922,14 @@ class AdapterArtifactOperationItem(Base):
     observed_identity: Mapped[dict[str, object] | list[object] | None] = mapped_column(JSON)
     tombstone_identity: Mapped[dict[str, object] | list[object] | None] = mapped_column(JSON)
     deletion_plan: Mapped[dict[str, object] | list[object] | None] = mapped_column(JSON)
+    expected_tombstone_namespace: Mapped[dict[str, object] | None] = mapped_column(JSON)
     next_entry_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     in_flight_entry: Mapped[dict[str, object] | list[object] | None] = mapped_column(JSON)
     directory_unlink_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="registered")
     blocked_reason_code: Mapped[str | None] = mapped_column(String(64))
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    move_authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     tombstone_bound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     deletion_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

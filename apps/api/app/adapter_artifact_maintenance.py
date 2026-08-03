@@ -118,6 +118,7 @@ class _Candidate:
     expected_resource_version: int
     expected_attempt_version: int
     ownership_manifest: dict[str, object] | None
+    expected_item_version: int = 1
 
 
 def _limit(value: object) -> None:
@@ -296,6 +297,7 @@ def _select_candidates(
         raise ServiceError(503, "Database unavailable")
     cutoff = cutoff - timedelta(seconds=minimum_age_seconds)
     result: list[_Candidate] = []
+    selected_attempts = 0
     # Terminal source attempts are safe to inspect even when their source is
     # abandoned/rejected; protected source states are explicitly excluded.
     source_rows = session.execute(
@@ -323,6 +325,19 @@ def _select_candidates(
         .limit(limit),
     ).all()
     for attempt, source in source_rows:
+        if selected_attempts >= limit:
+            break
+        committed_sibling = session.scalar(
+            select(AdapterImportAttempt.id)
+            .where(
+                AdapterImportAttempt.department_id == department_id,
+                AdapterImportAttempt.source_bundle_id == source.id,
+                AdapterImportAttempt.status == "committed",
+            )
+            .limit(1)
+        )
+        if committed_sibling is not None:
+            continue
         stale = attempt.status not in TERMINAL_SOURCE_ATTEMPT_STATUSES
         if stale and (source.status != "staging" or source.authoritative_attempt_id is not None):
             continue
@@ -360,8 +375,10 @@ def _select_candidates(
                     dict(attempt.ownership_manifest),
                 )
             )
-        if len(result) >= limit:
-            return tuple(result[:limit])
+        selected_attempts += 1
+    remaining_attempts = max(0, limit - selected_attempts)
+    if remaining_attempts == 0:
+        return tuple(result)
     registry_rows = session.execute(
         select(AdapterRegistryAttempt, Adapter)
         .join(
@@ -377,9 +394,31 @@ def _select_candidates(
         )
         .order_by(AdapterRegistryAttempt.created_at, AdapterRegistryAttempt.id)
         .with_for_update(skip_locked=True)
-        .limit(max(0, limit - len(result))),
+        .limit(remaining_attempts),
     ).all()
     for attempt, adapter in registry_rows:
+        if selected_attempts >= limit:
+            break
+        succeeded_sibling = session.scalar(
+            select(AdapterRegistryAttempt.id)
+            .where(
+                AdapterRegistryAttempt.department_id == department_id,
+                AdapterRegistryAttempt.adapter_id == adapter.id,
+                AdapterRegistryAttempt.status == "succeeded",
+            )
+            .limit(1)
+        )
+        active_sibling = session.scalar(
+            select(AdapterRegistryAttempt.id)
+            .where(
+                AdapterRegistryAttempt.department_id == department_id,
+                AdapterRegistryAttempt.adapter_id == adapter.id,
+                AdapterRegistryAttempt.status.in_(("registered", "running", "staged", "published")),
+            )
+            .limit(1)
+        )
+        if succeeded_sibling is not None or active_sibling is not None:
+            continue
         result.append(
             _Candidate(
                 "registry_stage",
@@ -414,9 +453,8 @@ def _select_candidates(
                     dict(attempt.ownership_manifest),
                 )
             )
-        if len(result) >= limit:
-            break
-    return tuple(result[:limit])
+        selected_attempts += 1
+    return tuple(result)
 
 
 def _abandon_stale_source_if_needed(session: Session, candidate: _Candidate) -> _Candidate:
@@ -501,11 +539,18 @@ def _candidate_from_item(item: AdapterArtifactOperationItem) -> _Candidate:
         item.expected_resource_version,
         item.expected_attempt_version,
         dict(item.ownership_manifest) if isinstance(item.ownership_manifest, dict) else None,
+        item.version,
     )
 
 
 def _load_item(
-    session: Session, operation_id: UUID, candidate: _Candidate, issuer: str, subject: str
+    session: Session,
+    operation_id: UUID,
+    candidate: _Candidate,
+    issuer: str,
+    subject: str,
+    *,
+    expected_item_version: int | None = None,
 ) -> AdapterArtifactOperationItem:
     authorization = _authorize(session, candidate.department_id, issuer, subject, lock=True)
     operation = session.execute(
@@ -532,6 +577,8 @@ def _load_item(
     ).scalar_one_or_none()
     if operation is None or item is None:
         raise ServiceError(409, "Adapter reconciliation operation is unavailable")
+    if expected_item_version is not None and item.version != expected_item_version:
+        raise ServiceError(409, "Adapter reconciliation authority changed")
     _check_authority(session, item)
     del authorization
     return item
@@ -570,6 +617,17 @@ def _check_authority(session: Session, item: AdapterArtifactOperationItem) -> No
             or attempt.status not in TERMINAL_SOURCE_ATTEMPT_STATUSES
         ):
             raise ServiceError(409, "Adapter reconciliation authority changed")
+        committed_sibling = session.scalar(
+            select(AdapterImportAttempt.id)
+            .where(
+                AdapterImportAttempt.department_id == item.department_id,
+                AdapterImportAttempt.source_bundle_id == item.source_bundle_id,
+                AdapterImportAttempt.status == "committed",
+            )
+            .limit(1)
+        )
+        if committed_sibling is not None:
+            raise ServiceError(409, "Adapter reconciliation authority changed")
         if item.surface_type == "source_final" and not isinstance(item.ownership_manifest, dict):
             raise ServiceError(409, "Adapter reconciliation authority changed")
         return
@@ -604,6 +662,26 @@ def _check_authority(session: Session, item: AdapterArtifactOperationItem) -> No
         or adapter.status in PROTECTED_ADAPTER_STATUSES
     ):
         raise ServiceError(409, "Adapter reconciliation authority changed")
+    succeeded_sibling = session.scalar(
+        select(AdapterRegistryAttempt.id)
+        .where(
+            AdapterRegistryAttempt.department_id == item.department_id,
+            AdapterRegistryAttempt.adapter_id == item.adapter_id,
+            AdapterRegistryAttempt.status == "succeeded",
+        )
+        .limit(1)
+    )
+    active_sibling = session.scalar(
+        select(AdapterRegistryAttempt.id)
+        .where(
+            AdapterRegistryAttempt.department_id == item.department_id,
+            AdapterRegistryAttempt.adapter_id == item.adapter_id,
+            AdapterRegistryAttempt.status.in_(("registered", "running", "staged", "published")),
+        )
+        .limit(1)
+    )
+    if succeeded_sibling is not None or active_sibling is not None:
+        raise ServiceError(409, "Adapter reconciliation authority changed")
     if item.surface_type == "registry_final" and not isinstance(item.ownership_manifest, dict):
         raise ServiceError(409, "Adapter reconciliation authority changed")
 
@@ -613,7 +691,11 @@ def _bound_from_item(item: AdapterArtifactOperationItem) -> BoundSurface:
         not isinstance(item.observed_identity, dict)
         or not isinstance(item.deletion_plan, list)
         or not isinstance(item.tombstone_identity, dict)
+        or not isinstance(item.expected_tombstone_namespace, dict)
     ):
+        raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+    namespace = _tombstone_namespace(item)
+    if item.expected_tombstone_namespace != namespace:
         raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
     return BoundSurface(
         item.surface_type,
@@ -627,6 +709,50 @@ def _bound_from_item(item: AdapterArtifactOperationItem) -> BoundSurface:
     )
 
 
+def _inspection_from_item(item: AdapterArtifactOperationItem):
+    from app.adapter_maintenance_artifacts import InspectedSurface
+
+    if (
+        not isinstance(item.observed_identity, dict)
+        or not isinstance(item.deletion_plan, list)
+        or not all(
+            isinstance(entry, dict)
+            and isinstance(entry.get("name"), str)
+            and isinstance(entry.get("identity"), dict)
+            for entry in item.deletion_plan
+        )
+    ):
+        raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+    resource_id = item.source_bundle_id or item.adapter_id
+    attempt_id = item.import_attempt_id or item.publication_attempt_id
+    if resource_id is None or attempt_id is None:
+        raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+    return InspectedSurface(
+        item.surface_type,
+        item.department_id,
+        resource_id,
+        attempt_id,
+        item.id,
+        dict(item.observed_identity),
+        [
+            {"name": entry["name"], "identity": dict(entry["identity"])}
+            for entry in item.deletion_plan
+        ],
+    )
+
+
+def _tombstone_namespace(item: AdapterArtifactOperationItem) -> dict[str, object]:
+    resource_id = item.source_bundle_id or item.adapter_id
+    if resource_id is None:
+        raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+    return {
+        "surface_type": item.surface_type,
+        "department_id": str(item.department_id),
+        "resource_id": str(resource_id),
+        "item_id": str(item.id),
+    }
+
+
 def _execute_item(
     factory: sessionmaker[Session],
     *,
@@ -638,24 +764,38 @@ def _execute_item(
     actor_subject: str,
 ) -> bool:
     try:
+        inspected = None
+        bound = None
+        verified_version: int | None = None
+        move_version: int | None = None
         with factory.begin() as session:
             item = _load_item(session, operation_id, candidate, actor_issuer, actor_subject)
             item_id = item.id
             if item.status in {"tombstone_bound", "deleting"}:
                 bound = _bound_from_item(item)
-            else:
-                bound = None
+            elif item.status == "verified":
+                inspected = _inspection_from_item(item)
+                verified_version = item.version
+            elif item.status != "registered":
+                return item.status == "completed"
+        resource_id = candidate.source_bundle_id or candidate.adapter_id
+        path_attempt_id = (
+            candidate.import_attempt_id
+            if candidate.surface_type == "source_stage"
+            else candidate.publication_attempt_id
+        )
+        if resource_id is None or path_attempt_id is None:
+            raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
         with AdapterMaintenanceArtifactStore(data_dir) as store:
-            if bound is None:
-                resource_id = candidate.source_bundle_id or candidate.adapter_id
-                path_attempt_id = (
-                    candidate.import_attempt_id
-                    if candidate.surface_type.startswith("source_")
-                    else candidate.publication_attempt_id
-                )
-                if resource_id is None or path_attempt_id is None:
-                    raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
-                bound = store.bind_tombstone(
+            if inspected is None and bound is None:
+                # A marker or partial payload is never an ownership boundary;
+                # only exact metadata and the item-scoped tombstone namespace
+                # can authorize this check.
+                if store.tombstone_exists(
+                    candidate.surface_type, department_id, resource_id, item_id
+                ):
+                    raise AdapterMaintenanceArtifactError("artifact_tombstone_conflict")
+                inspected = store.inspect_surface(
                     candidate.surface_type,
                     department_id,
                     resource_id,
@@ -663,19 +803,120 @@ def _execute_item(
                     item_id,
                     expected_manifest=candidate.ownership_manifest,
                 )
-                if bound is None:
-                    _mark_completed(factory, operation_id, candidate, actor_issuer, actor_subject)
+                if inspected is None:
+                    _mark_completed(
+                        factory,
+                        data_dir=data_dir,
+                        operation_id=operation_id,
+                        candidate=candidate,
+                        issuer=actor_issuer,
+                        subject=actor_subject,
+                    )
                     return True
                 with factory.begin() as session:
                     item = _load_item(session, operation_id, candidate, actor_issuer, actor_subject)
-                    item.observed_identity = bound.observed_identity
-                    item.deletion_plan = bound.deletion_plan
+                    if item.status != "registered":
+                        raise ServiceError(409, "Adapter reconciliation authority changed")
+                    item.observed_identity = inspected.observed_identity
+                    item.deletion_plan = inspected.deletion_plan
+                    item.status = "verified"
+                    item.verified_at = session.scalar(select(func.clock_timestamp()))
+                    item.version += 1
+                    verified_version = item.version
+                # The short transaction above is the durable verification
+                # boundary.  The move intent is a separate transaction so a
+                # crash can distinguish an unbound tombstone from a move that
+                # was authorized before rename.
+                with factory.begin() as session:
+                    item = _load_item(
+                        session,
+                        operation_id,
+                        candidate,
+                        actor_issuer,
+                        actor_subject,
+                        expected_item_version=verified_version,
+                    )
+                    if item.status != "verified":
+                        raise ServiceError(409, "Adapter reconciliation authority changed")
+                    inspected = _inspection_from_item(item)
+                    namespace = _tombstone_namespace(item)
+                    item.move_authorized_at = session.scalar(select(func.clock_timestamp()))
+                    item.expected_tombstone_namespace = namespace
+                    item.version += 1
+                    move_version = item.version
+            if inspected is not None and bound is None:
+                preexisting_tombstone = store.tombstone_exists(
+                    candidate.surface_type, department_id, resource_id, item_id
+                )
+                if preexisting_tombstone and item.move_authorized_at is None:
+                    raise AdapterMaintenanceArtifactError("artifact_tombstone_conflict")
+                with factory.begin() as session:
+                    expected_verified = (
+                        verified_version if item.move_authorized_at is None else None
+                    )
+                    item = _load_item(
+                        session,
+                        operation_id,
+                        candidate,
+                        actor_issuer,
+                        actor_subject,
+                        expected_item_version=expected_verified,
+                    )
+                    if item.status != "verified":
+                        raise ServiceError(409, "Adapter reconciliation authority changed")
+                    inspected = _inspection_from_item(item)
+                    namespace = item.expected_tombstone_namespace
+                    if not isinstance(namespace, dict):
+                        item.move_authorized_at = session.scalar(select(func.clock_timestamp()))
+                        namespace = _tombstone_namespace(item)
+                        item.expected_tombstone_namespace = namespace
+                        item.version += 1
+                    move_version = item.version
+                if preexisting_tombstone:
+                    # A committed move intent permits only exact recovery when
+                    # the original is absent.  If it is still present, this is
+                    # an unbound conflict and neither surface is touched.
+                    if store.surface_exists(
+                        candidate.surface_type, department_id, resource_id, path_attempt_id
+                    ):
+                        raise AdapterMaintenanceArtifactError("artifact_tombstone_conflict")
+                    bound = store.recover_authorized_move(
+                        inspected, expected_tombstone_namespace=namespace
+                    )
+                else:
+                    bound = store.move_verified_surface_to_tombstone(
+                        inspected, expected_tombstone_namespace=namespace
+                    )
+                    if bound is None:
+                        raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+                with factory.begin() as session:
+                    item = _load_item(
+                        session,
+                        operation_id,
+                        candidate,
+                        actor_issuer,
+                        actor_subject,
+                        expected_item_version=move_version,
+                    )
+                    if item.status != "verified" or item.tombstone_identity is not None:
+                        raise ServiceError(409, "Adapter reconciliation authority changed")
+                    if (
+                        item.observed_identity != bound.observed_identity
+                        or item.deletion_plan != bound.deletion_plan
+                    ):
+                        raise ServiceError(409, "Adapter reconciliation authority changed")
                     item.tombstone_identity = bound.tombstone_identity
                     item.status = "tombstone_bound"
                     item.tombstone_bound_at = session.scalar(select(func.clock_timestamp()))
                     item.version += 1
+            if bound is not None:
+                if item.status == "tombstone_bound" and item.next_entry_index == 0:
+                    store.open_committed_tombstone(bound)
             with factory.begin() as session:
                 item = _load_item(session, operation_id, candidate, actor_issuer, actor_subject)
+                if item.status == "verified":
+                    raise ServiceError(409, "Adapter reconciliation authority changed")
+                bound = _bound_from_item(item)
                 start_index = item.next_entry_index
             for index, entry in enumerate(bound.deletion_plan[start_index:], start=start_index):
                 name = str(entry["name"])
@@ -702,7 +943,9 @@ def _execute_item(
                     item.in_flight_entry = {"name": name}
                     item.version += 1
                 try:
-                    store.unlink_tombstone_entry(bound, name, allow_missing=resumed_unlink)
+                    store.unlink_committed_tombstone_entry(
+                        bound, name, allow_missing=resumed_unlink
+                    )
                 except AdapterMaintenanceArtifactError:
                     raise
                 with factory.begin() as session:
@@ -715,18 +958,55 @@ def _execute_item(
                 already_started = item.directory_unlink_started_at is not None
                 item.directory_unlink_started_at = session.scalar(select(func.clock_timestamp()))
                 item.version += 1
-            store.remove_tombstone_directory(bound, allow_missing=already_started)
-            _mark_completed(factory, operation_id, candidate, actor_issuer, actor_subject)
+            store.remove_committed_tombstone_directory(bound, allow_missing=already_started)
+            _mark_completed(
+                factory,
+                data_dir=data_dir,
+                operation_id=operation_id,
+                candidate=candidate,
+                issuer=actor_issuer,
+                subject=actor_subject,
+            )
             return True
     except AdapterMaintenanceArtifactError as error:
-        _mark_blocked(factory, operation_id, candidate, actor_issuer, actor_subject, error.code)
+        if not _retain_active_after_artifact_error(factory, operation_id, candidate):
+            _mark_blocked(factory, operation_id, candidate, actor_issuer, actor_subject, error.code)
         return False
+    except SQLAlchemyError as error:
+        raise ServiceError(503, "Database unavailable") from error
+
+
+def _retain_active_after_artifact_error(
+    factory: sessionmaker[Session], operation_id: UUID, candidate: _Candidate
+) -> bool:
+    """Keep a durable move/tombstone state resumable after a filesystem error."""
+
+    try:
+        with factory.begin() as session:
+            row = session.execute(
+                select(AdapterArtifactOperationItem)
+                .where(
+                    AdapterArtifactOperationItem.operation_id == operation_id,
+                    AdapterArtifactOperationItem.department_id == candidate.department_id,
+                    AdapterArtifactOperationItem.surface_type == candidate.surface_type,
+                    AdapterArtifactOperationItem.publication_attempt_id
+                    == candidate.publication_attempt_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if row is None:
+                return False
+            return row.status in {"tombstone_bound", "deleting"} or (
+                row.status == "verified" and row.move_authorized_at is not None
+            )
     except SQLAlchemyError as error:
         raise ServiceError(503, "Database unavailable") from error
 
 
 def _mark_completed(
     factory: sessionmaker[Session],
+    *,
+    data_dir: Path,
     operation_id: UUID,
     candidate: _Candidate,
     issuer: str,
@@ -738,7 +1018,7 @@ def _mark_completed(
         item.completed_at = session.scalar(select(func.clock_timestamp()))
         item.in_flight_entry = None
         item.version += 1
-        _confirm_attempt_cleanup(session, item)
+        _confirm_attempt_cleanup(session, item, data_dir=data_dir)
 
 
 def _mark_blocked(
@@ -757,20 +1037,20 @@ def _mark_blocked(
         item.version += 1
 
 
-def _confirm_attempt_cleanup(session: Session, item: AdapterArtifactOperationItem) -> None:
-    siblings = session.scalars(
-        select(AdapterArtifactOperationItem)
-        .where(
-            AdapterArtifactOperationItem.operation_id == item.operation_id,
-            AdapterArtifactOperationItem.department_id == item.department_id,
-            AdapterArtifactOperationItem.publication_attempt_id == item.publication_attempt_id,
-        )
-        .with_for_update()
-    ).all()
-    if not siblings or any(sibling.status != "completed" for sibling in siblings):
-        return
-    now = session.scalar(select(func.clock_timestamp()))
+def _confirm_attempt_cleanup(
+    session: Session, item: AdapterArtifactOperationItem, *, data_dir: Path
+) -> None:
+    """Confirm an exact attempt only after every surface and tombstone is absent."""
+
     if item.import_attempt_id is not None:
+        source = session.execute(
+            select(AdapterImportSource)
+            .where(
+                AdapterImportSource.id == item.source_bundle_id,
+                AdapterImportSource.department_id == item.department_id,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
         attempt = session.execute(
             select(AdapterImportAttempt)
             .where(
@@ -782,7 +1062,58 @@ def _confirm_attempt_cleanup(session: Session, item: AdapterArtifactOperationIte
             )
             .with_for_update()
         ).scalar_one_or_none()
+        if (
+            source is None
+            or attempt is None
+            or attempt.status not in TERMINAL_SOURCE_ATTEMPT_STATUSES
+            or source.status in PROTECTED_SOURCE_STATUSES
+            or source.authoritative_attempt_id is not None
+        ):
+            return
+        committed_sibling = session.scalar(
+            select(AdapterImportAttempt.id)
+            .where(
+                AdapterImportAttempt.department_id == item.department_id,
+                AdapterImportAttempt.source_bundle_id == item.source_bundle_id,
+                AdapterImportAttempt.status == "committed",
+            )
+            .limit(1)
+        )
+        active_sibling = session.scalar(
+            select(AdapterImportAttempt.id)
+            .where(
+                AdapterImportAttempt.department_id == item.department_id,
+                AdapterImportAttempt.source_bundle_id == item.source_bundle_id,
+                ~AdapterImportAttempt.status.in_(tuple(TERMINAL_SOURCE_ATTEMPT_STATUSES)),
+            )
+            .limit(1)
+        )
+        if committed_sibling is not None or active_sibling is not None:
+            return
+        resource_id = item.source_bundle_id
+        final_applicable = isinstance(attempt.ownership_manifest, dict)
+        expected_surfaces = ("source_stage",) + (("source_final",) if final_applicable else ())
+        item_rows = session.scalars(
+            select(AdapterArtifactOperationItem)
+            .where(
+                AdapterArtifactOperationItem.department_id == item.department_id,
+                AdapterArtifactOperationItem.source_bundle_id == resource_id,
+                AdapterArtifactOperationItem.import_attempt_id == attempt.id,
+                AdapterArtifactOperationItem.publication_attempt_id
+                == attempt.publication_attempt_id,
+                AdapterArtifactOperationItem.attempt_number == attempt.attempt_number,
+            )
+            .with_for_update()
+        ).all()
     else:
+        adapter = session.execute(
+            select(Adapter)
+            .where(
+                Adapter.id == item.adapter_id,
+                Adapter.department_id == item.department_id,
+            )
+            .with_for_update()
+        ).scalar_one_or_none()
         attempt = session.execute(
             select(AdapterRegistryAttempt)
             .where(
@@ -794,12 +1125,77 @@ def _confirm_attempt_cleanup(session: Session, item: AdapterArtifactOperationIte
             )
             .with_for_update()
         ).scalar_one_or_none()
-    if (
-        attempt is not None
-        and attempt.cleanup_confirmed_at is None
-        and attempt.status
-        in (TERMINAL_SOURCE_ATTEMPT_STATUSES | TERMINAL_REGISTRY_ATTEMPT_STATUSES)
-    ):
+        if (
+            adapter is None
+            or attempt is None
+            or attempt.status not in TERMINAL_REGISTRY_ATTEMPT_STATUSES
+            or adapter.status in PROTECTED_ADAPTER_STATUSES
+        ):
+            return
+        succeeded_sibling = session.scalar(
+            select(AdapterRegistryAttempt.id)
+            .where(
+                AdapterRegistryAttempt.department_id == item.department_id,
+                AdapterRegistryAttempt.adapter_id == item.adapter_id,
+                AdapterRegistryAttempt.status == "succeeded",
+            )
+            .limit(1)
+        )
+        active_sibling = session.scalar(
+            select(AdapterRegistryAttempt.id)
+            .where(
+                AdapterRegistryAttempt.department_id == item.department_id,
+                AdapterRegistryAttempt.adapter_id == item.adapter_id,
+                AdapterRegistryAttempt.status.in_(("registered", "running", "staged", "published")),
+            )
+            .limit(1)
+        )
+        if succeeded_sibling is not None or active_sibling is not None:
+            return
+        resource_id = item.adapter_id
+        final_applicable = isinstance(attempt.ownership_manifest, dict)
+        expected_surfaces = ("registry_stage",) + (("registry_final",) if final_applicable else ())
+        item_rows = session.scalars(
+            select(AdapterArtifactOperationItem)
+            .where(
+                AdapterArtifactOperationItem.department_id == item.department_id,
+                AdapterArtifactOperationItem.adapter_id == resource_id,
+                AdapterArtifactOperationItem.registry_attempt_id == attempt.id,
+                AdapterArtifactOperationItem.publication_attempt_id
+                == attempt.publication_attempt_id,
+                AdapterArtifactOperationItem.attempt_number == attempt.attempt_number,
+            )
+            .with_for_update()
+        ).all()
+    if attempt.cleanup_confirmed_at is not None:
+        return
+    if any(row.status != "completed" for row in item_rows):
+        return
+    by_surface = {row.surface_type: row for row in item_rows}
+    if any(surface not in by_surface for surface in expected_surfaces):
+        return
+    try:
+        with AdapterMaintenanceArtifactStore(data_dir) as store:
+            all_surfaces = (
+                ("source_stage", "source_final")
+                if item.import_attempt_id is not None
+                else ("registry_stage", "registry_final")
+            )
+            for surface in all_surfaces:
+                path_attempt = (
+                    attempt.id if surface.endswith("_stage") else attempt.publication_attempt_id
+                )
+                if store.surface_exists(surface, item.department_id, resource_id, path_attempt):
+                    return
+            for row in item_rows:
+                if store.tombstone_exists(
+                    row.surface_type, item.department_id, resource_id, row.id
+                ):
+                    return
+    except AdapterMaintenanceArtifactError:
+        return
+    now = session.scalar(select(func.clock_timestamp()))
+    if attempt.cleanup_confirmed_at is None:
         attempt.cleanup_confirmed_at = now
         attempt.version += 1
 
