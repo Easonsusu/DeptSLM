@@ -1013,6 +1013,9 @@ def test_blocked_final_sibling_history_progresses_before_retry(
     first_result = _reconcile(factory, authority, root, apply=True)
     assert first_result.blocked_count == 1
     final.chmod(0o700)
+    matching_raw = canonical_json_bytes(second_manifest)
+    parse_registry_manifest(matching_raw)
+    _file(final / "manifest.json", matching_raw)
     second_result = _reconcile(factory, authority, root, apply=True)
     assert second_result.blocked_count == 0
     assert not final.exists()
