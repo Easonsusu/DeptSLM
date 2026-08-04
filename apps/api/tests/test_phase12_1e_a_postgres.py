@@ -991,6 +991,7 @@ def test_blocked_final_sibling_history_progresses_before_retry(
             )
         )
         assert first is not None and isinstance(first.ownership_manifest, dict)
+        first_id = first.id
         second_manifest = dict(first.ownership_manifest)
         second_manifest["publication_attempt_id"] = str(uuid4())
         second_manifest["attempt_number"] = 2
@@ -1009,6 +1010,7 @@ def test_blocked_final_sibling_history_progresses_before_retry(
             version=1,
         )
         session.add(second)
+        second_id = second.id
     final.chmod(0o755)
     first_result = _reconcile(factory, authority, root, apply=True)
     assert first_result.blocked_count == 1
@@ -1028,7 +1030,7 @@ def test_blocked_final_sibling_history_progresses_before_retry(
             )
             .order_by(AdapterArtifactOperationItem.created_at, AdapterArtifactOperationItem.id)
         ).all()
-        assert [row.registry_attempt_id for row in rows] == [first.id, second.id]
+        assert [row.registry_attempt_id for row in rows] == [first_id, second_id]
         assert [row.status for row in rows] == ["blocked", "completed"]
 
 
