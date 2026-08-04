@@ -11,11 +11,11 @@ from __future__ import annotations
 import hashlib
 import os
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -64,6 +64,12 @@ PROTECTED_ADAPTER_STATUSES = frozenset({"validated", "purge_pending", "purged"})
 TERMINAL_SOURCE_ATTEMPT_STATUSES = frozenset({"failed", "abandoned"})
 TERMINAL_REGISTRY_ATTEMPT_STATUSES = frozenset({"validation_failed", "failed", "reclaimed"})
 ACTIVE_ITEM_STATUSES = frozenset({"registered", "verified", "tombstone_bound", "deleting"})
+# Candidate selection is intentionally bounded at the database boundary. A
+# caller may request at most 1,000 attempts; each surface scans no more than
+# that limit or eight times the limit, whichever is smaller. History is then
+# aggregated only for those locked rows, never for the whole department.
+RECONCILIATION_SCAN_MULTIPLIER = 8
+RECONCILIATION_MAX_SCAN_ROWS = 1000
 
 
 class AdapterArtifactMaintenanceConfigurationError(RuntimeError):
@@ -140,6 +146,13 @@ class _Candidate:
     expected_item_version: int = 1
 
 
+@dataclass(frozen=True, slots=True)
+class _SurfaceHistory:
+    statuses: frozenset[str]
+    blocked_count: int
+    latest_blocked_at: datetime | None
+
+
 def _candidate_surface_address(candidate: _Candidate) -> PhysicalSurfaceIdentifier:
     """Resolve the one physical surface address used by every storage call."""
 
@@ -190,38 +203,78 @@ def _persisted_manifest_authority(surface_type: str, ownership_manifest: object)
     return hashlib.sha256(raw).hexdigest(), len(raw)
 
 
-def _surface_item_history(
+def _surface_item_history_for_rows(
     session: Session,
     *,
     department_id: UUID,
     surface_type: str,
     resource_column,
     attempt_column,
-) -> dict[tuple[UUID, UUID], frozenset[str]]:
-    """Return immutable status history keyed by the exact resource/attempt."""
+    rows: list[tuple[object, object]],
+) -> dict[tuple[UUID, UUID], _SurfaceHistory]:
+    """Aggregate exact status history for a bounded set of candidates."""
 
-    history: dict[tuple[UUID, UUID], set[str]] = {}
-    rows = session.execute(
-        select(resource_column, attempt_column, AdapterArtifactOperationItem.status).where(
+    keys = {
+        (resource_id, attempt_id)
+        for resource_id, attempt_id in rows
+        if resource_id is not None and attempt_id is not None
+    }
+    if not keys:
+        return {}
+    key_filter = or_(
+        *(
+            and_(resource_column == resource_id, attempt_column == attempt_id)
+            for resource_id, attempt_id in keys
+        )
+    )
+    grouped = session.execute(
+        select(
+            resource_column,
+            attempt_column,
+            AdapterArtifactOperationItem.status,
+            func.count(AdapterArtifactOperationItem.id),
+            func.max(AdapterArtifactOperationItem.created_at),
+        )
+        .where(
             AdapterArtifactOperationItem.department_id == department_id,
             AdapterArtifactOperationItem.surface_type == surface_type,
+            key_filter,
         )
+        .group_by(resource_column, attempt_column, AdapterArtifactOperationItem.status)
     ).all()
-    for resource_id, attempt_id, status in rows:
-        if resource_id is None or attempt_id is None:
-            continue
-        history.setdefault((resource_id, attempt_id), set()).add(status)
-    return {key: frozenset(statuses) for key, statuses in history.items()}
+    history: dict[tuple[UUID, UUID], dict[str, object]] = {}
+    for resource_id, attempt_id, status, count, latest_at in grouped:
+        entry = history.setdefault(
+            (resource_id, attempt_id),
+            {"statuses": set(), "blocked_count": 0, "latest_blocked_at": None},
+        )
+        statuses = entry["statuses"]
+        assert isinstance(statuses, set)
+        statuses.add(status)
+        if status == "blocked":
+            entry["blocked_count"] = int(entry["blocked_count"]) + int(count)
+            previous = entry["latest_blocked_at"]
+            if previous is None or (latest_at is not None and latest_at > previous):
+                entry["latest_blocked_at"] = latest_at
+    return {
+        key: _SurfaceHistory(
+            frozenset(value["statuses"]),
+            int(value["blocked_count"]),
+            value["latest_blocked_at"],
+        )
+        for key, value in history.items()
+    }
 
 
 def _surface_item_state(
-    history: dict[tuple[UUID, UUID], frozenset[str]],
+    history: dict[tuple[UUID, UUID], _SurfaceHistory],
     resource_id: UUID,
     attempt_id: UUID,
 ) -> str:
     """Classify one exact surface without mutating historical rows."""
 
-    statuses = history.get((resource_id, attempt_id), frozenset())
+    record = history.get((resource_id, attempt_id))
+    statuses = record.statuses if record is not None else frozenset()
     if not statuses:
         return "untried"
     if "completed" in statuses:
@@ -241,42 +294,77 @@ def _prioritize_final_siblings(
     *,
     resource_id_for,
     attempt_id_for,
-    final_history: dict[tuple[UUID, UUID], frozenset[str]],
+    final_history: dict[tuple[UUID, UUID], _SurfaceHistory],
     valid_final_keys: set[tuple[UUID, UUID]],
 ) -> tuple[tuple[object, object], ...]:
-    """Prefer the first untried final sibling, then the first blocked retry."""
+    """Prefer untried finals, then rotate blocked generations fairly."""
+
+    def rank(row: tuple[object, object]) -> tuple[object, ...]:
+        resource_id = resource_id_for(row)
+        attempt_id = attempt_id_for(row)
+        record = final_history.get((resource_id, attempt_id))
+        state = _surface_item_state(final_history, resource_id, attempt_id)
+        if state == "untried":
+            return (0, 0, 0.0, str(attempt_id))
+        if state == "blocked" and record is not None:
+            latest = (
+                record.latest_blocked_at.timestamp()
+                if record.latest_blocked_at is not None
+                else 0.0
+            )
+            # Lowest retry count wins. Equal counts prefer the newest blocked
+            # generation so a repaired newer sibling can win immediately.
+            return (1, record.blocked_count, -latest, str(attempt_id))
+        return (2, 0, 0.0, str(attempt_id))
 
     grouped: dict[UUID, list[tuple[object, object]]] = {}
     for row in rows:
         grouped.setdefault(resource_id_for(row), []).append(row)
     ordered: list[tuple[object, object]] = []
     for group in grouped.values():
-        preferred = None
         valid = [
             row for row in group if (resource_id_for(row), attempt_id_for(row)) in valid_final_keys
         ]
-        for desired_state in ("untried", "blocked"):
-            preferred = next(
-                (
-                    row
-                    for row in valid
-                    if _surface_item_state(
-                        final_history,
-                        resource_id_for(row),
-                        attempt_id_for(row),
-                    )
-                    == desired_state
-                ),
-                None,
-            )
-            if preferred is not None:
-                break
-        if preferred is not None:
-            ordered.append(preferred)
-            ordered.extend(row for row in group if row is not preferred)
-        else:
-            ordered.extend(group)
+        valid.sort(key=rank)
+        ordered.extend(valid)
+        ordered.extend(row for row in group if row not in valid)
     return tuple(ordered)
+
+
+def _bounded_scan_limit(limit: int) -> int:
+    return min(RECONCILIATION_MAX_SCAN_ROWS, limit * RECONCILIATION_SCAN_MULTIPLIER)
+
+
+def _row_fairness_key(
+    row: tuple[object, object],
+    *,
+    resource_id_for,
+    attempt_id_for,
+    stage_history: dict[tuple[UUID, UUID], _SurfaceHistory],
+    final_history: dict[tuple[UUID, UUID], _SurfaceHistory],
+) -> tuple[object, ...]:
+    """Order untried stage work before bounded blocked retries."""
+
+    resource_id = resource_id_for(row)
+    attempt_id = attempt_id_for(row)
+
+    def rank(history: dict[tuple[UUID, UUID], _SurfaceHistory]) -> tuple[object, ...]:
+        record = history.get((resource_id, attempt_id))
+        state = _surface_item_state(history, resource_id, attempt_id)
+        if state == "untried":
+            return (0, 0, 0.0)
+        if state == "blocked" and record is not None:
+            latest = (
+                record.latest_blocked_at.timestamp()
+                if record.latest_blocked_at is not None
+                else 0.0
+            )
+            return (1, record.blocked_count, -latest)
+        return (2, 0, 0.0)
+
+    created_at = getattr(row[0], "created_at", None)
+    created_key = created_at.timestamp() if created_at is not None else 0.0
+    return (*rank(stage_history), *rank(final_history), created_key, str(attempt_id))
 
 
 def reconcile_adapter_artifacts(
@@ -448,20 +536,7 @@ def _select_candidates(
     selected_attempts = 0
     selected_source_finals: set[UUID] = set()
     selected_registry_finals: set[UUID] = set()
-    source_stage_history = _surface_item_history(
-        session,
-        department_id=department_id,
-        surface_type="source_stage",
-        resource_column=AdapterArtifactOperationItem.source_bundle_id,
-        attempt_column=AdapterArtifactOperationItem.import_attempt_id,
-    )
-    source_final_history = _surface_item_history(
-        session,
-        department_id=department_id,
-        surface_type="source_final",
-        resource_column=AdapterArtifactOperationItem.source_bundle_id,
-        attempt_column=AdapterArtifactOperationItem.import_attempt_id,
-    )
+    scan_limit = _bounded_scan_limit(limit)
     # Terminal source attempts are safe to inspect even when their source is
     # abandoned/rejected; protected source states are explicitly excluded.
     source_rows = session.execute(
@@ -485,21 +560,27 @@ def _select_candidates(
             ),
         )
         .order_by(AdapterImportAttempt.created_at, AdapterImportAttempt.id)
+        .limit(scan_limit)
         .with_for_update(skip_locked=True)
     ).all()
+    source_ids = {source.id for _attempt, source in source_rows}
+    committed_source_ids = (
+        set(
+            session.scalars(
+                select(AdapterImportAttempt.source_bundle_id).where(
+                    AdapterImportAttempt.department_id == department_id,
+                    AdapterImportAttempt.source_bundle_id.in_(source_ids),
+                    AdapterImportAttempt.status == "committed",
+                )
+            ).all()
+        )
+        if source_ids
+        else set()
+    )
     eligible_source_rows: list[tuple[AdapterImportAttempt, AdapterImportSource]] = []
     source_final_manifests: dict[tuple[UUID, UUID], dict[str, object]] = {}
     for attempt, source in source_rows:
-        committed_sibling = session.scalar(
-            select(AdapterImportAttempt.id)
-            .where(
-                AdapterImportAttempt.department_id == department_id,
-                AdapterImportAttempt.source_bundle_id == source.id,
-                AdapterImportAttempt.status == "committed",
-            )
-            .limit(1)
-        )
-        if committed_sibling is not None:
+        if source.id in committed_source_ids:
             continue
         stale = attempt.status not in TERMINAL_SOURCE_ATTEMPT_STATUSES
         if stale and (source.status != "staging" or source.authoritative_attempt_id is not None):
@@ -514,6 +595,23 @@ def _select_candidates(
             except AdapterMaintenanceArtifactError:
                 continue
             source_final_manifests[(source.id, attempt.id)] = dict(attempt.ownership_manifest)
+    source_key_rows = [(source.id, attempt.id) for attempt, source in eligible_source_rows]
+    source_stage_history = _surface_item_history_for_rows(
+        session,
+        department_id=department_id,
+        surface_type="source_stage",
+        resource_column=AdapterArtifactOperationItem.source_bundle_id,
+        attempt_column=AdapterArtifactOperationItem.import_attempt_id,
+        rows=source_key_rows,
+    )
+    source_final_history = _surface_item_history_for_rows(
+        session,
+        department_id=department_id,
+        surface_type="source_final",
+        resource_column=AdapterArtifactOperationItem.source_bundle_id,
+        attempt_column=AdapterArtifactOperationItem.import_attempt_id,
+        rows=source_key_rows,
+    )
     ordered_source_rows = _prioritize_final_siblings(
         eligible_source_rows,
         resource_id_for=lambda row: row[1].id,
@@ -521,13 +619,24 @@ def _select_candidates(
         final_history=source_final_history,
         valid_final_keys=set(source_final_manifests),
     )
+    ordered_source_rows = tuple(
+        sorted(
+            ordered_source_rows,
+            key=lambda row: _row_fairness_key(
+                row,
+                resource_id_for=lambda value: value[1].id,
+                attempt_id_for=lambda value: value[0].id,
+                stage_history=source_stage_history,
+                final_history=source_final_history,
+            ),
+        )
+    )
     source_final_untried_by_resource: dict[UUID, bool] = {}
     for resource_id, attempt_id in source_final_manifests:
         source_final_untried_by_resource[resource_id] = (
             source_final_untried_by_resource.get(resource_id, False)
             or _surface_item_state(source_final_history, resource_id, attempt_id) == "untried"
         )
-    source_final_blocked_retries: set[UUID] = set()
     for attempt, source in ordered_source_rows:
         if selected_attempts >= limit:
             break
@@ -535,13 +644,7 @@ def _select_candidates(
         final_key = (source.id, attempt.id)
         final_state = _surface_item_state(source_final_history, source.id, attempt.id)
         stage_state = _surface_item_state(source_stage_history, source.id, attempt.id)
-        stage_retryable = stage_state == "untried" or (
-            stage_state == "blocked"
-            and (
-                final_state == "untried"
-                or not source_final_untried_by_resource.get(source.id, False)
-            )
-        )
+        stage_retryable = stage_state in {"untried", "blocked"}
         if stage_retryable:
             result.append(
                 _Candidate(
@@ -564,7 +667,6 @@ def _select_candidates(
             or (
                 final_state == "blocked"
                 and not source_final_untried_by_resource.get(source.id, False)
-                and source.id not in source_final_blocked_retries
             )
         )
         if source.id not in selected_source_finals and preferred_final:
@@ -585,27 +687,12 @@ def _select_candidates(
             )
             selected_source_finals.add(source.id)
             selected_this_attempt = True
-            if final_state == "blocked":
-                source_final_blocked_retries.add(source.id)
         if selected_this_attempt:
             selected_attempts += 1
     remaining_attempts = max(0, limit - selected_attempts)
     if remaining_attempts == 0:
         return tuple(result)
-    registry_stage_history = _surface_item_history(
-        session,
-        department_id=department_id,
-        surface_type="registry_stage",
-        resource_column=AdapterArtifactOperationItem.adapter_id,
-        attempt_column=AdapterArtifactOperationItem.registry_attempt_id,
-    )
-    registry_final_history = _surface_item_history(
-        session,
-        department_id=department_id,
-        surface_type="registry_final",
-        resource_column=AdapterArtifactOperationItem.adapter_id,
-        attempt_column=AdapterArtifactOperationItem.registry_attempt_id,
-    )
+    registry_scan_limit = _bounded_scan_limit(remaining_attempts)
     registry_rows = session.execute(
         select(AdapterRegistryAttempt, Adapter)
         .join(
@@ -620,30 +707,33 @@ def _select_candidates(
             Adapter.status.in_(("failed", "validation_failed")),
         )
         .order_by(AdapterRegistryAttempt.created_at, AdapterRegistryAttempt.id)
+        .limit(registry_scan_limit)
         .with_for_update(skip_locked=True)
     ).all()
+    registry_ids = {adapter.id for _attempt, adapter in registry_rows}
+    registry_sibling_statuses = (
+        session.execute(
+            select(AdapterRegistryAttempt.adapter_id, AdapterRegistryAttempt.status).where(
+                AdapterRegistryAttempt.department_id == department_id,
+                AdapterRegistryAttempt.adapter_id.in_(registry_ids),
+                AdapterRegistryAttempt.status.in_(
+                    ("succeeded", "registered", "running", "staged", "published")
+                ),
+            )
+        ).all()
+        if registry_ids
+        else []
+    )
+    succeeded_registry_ids = {
+        adapter_id for adapter_id, status in registry_sibling_statuses if status == "succeeded"
+    }
+    active_registry_ids = {
+        adapter_id for adapter_id, status in registry_sibling_statuses if status != "succeeded"
+    }
     eligible_registry_rows: list[tuple[AdapterRegistryAttempt, Adapter]] = []
     registry_final_manifests: dict[tuple[UUID, UUID], dict[str, object]] = {}
     for attempt, adapter in registry_rows:
-        succeeded_sibling = session.scalar(
-            select(AdapterRegistryAttempt.id)
-            .where(
-                AdapterRegistryAttempt.department_id == department_id,
-                AdapterRegistryAttempt.adapter_id == adapter.id,
-                AdapterRegistryAttempt.status == "succeeded",
-            )
-            .limit(1)
-        )
-        active_sibling = session.scalar(
-            select(AdapterRegistryAttempt.id)
-            .where(
-                AdapterRegistryAttempt.department_id == department_id,
-                AdapterRegistryAttempt.adapter_id == adapter.id,
-                AdapterRegistryAttempt.status.in_(("registered", "running", "staged", "published")),
-            )
-            .limit(1)
-        )
-        if succeeded_sibling is not None or active_sibling is not None:
+        if adapter.id in succeeded_registry_ids or adapter.id in active_registry_ids:
             continue
         eligible_registry_rows.append((attempt, adapter))
         if isinstance(attempt.ownership_manifest, dict) and adapter.status in {
@@ -655,6 +745,23 @@ def _select_candidates(
             except AdapterMaintenanceArtifactError:
                 continue
             registry_final_manifests[(adapter.id, attempt.id)] = dict(attempt.ownership_manifest)
+    registry_key_rows = [(adapter.id, attempt.id) for attempt, adapter in eligible_registry_rows]
+    registry_stage_history = _surface_item_history_for_rows(
+        session,
+        department_id=department_id,
+        surface_type="registry_stage",
+        resource_column=AdapterArtifactOperationItem.adapter_id,
+        attempt_column=AdapterArtifactOperationItem.registry_attempt_id,
+        rows=registry_key_rows,
+    )
+    registry_final_history = _surface_item_history_for_rows(
+        session,
+        department_id=department_id,
+        surface_type="registry_final",
+        resource_column=AdapterArtifactOperationItem.adapter_id,
+        attempt_column=AdapterArtifactOperationItem.registry_attempt_id,
+        rows=registry_key_rows,
+    )
     ordered_registry_rows = _prioritize_final_siblings(
         eligible_registry_rows,
         resource_id_for=lambda row: row[1].id,
@@ -662,13 +769,24 @@ def _select_candidates(
         final_history=registry_final_history,
         valid_final_keys=set(registry_final_manifests),
     )
+    ordered_registry_rows = tuple(
+        sorted(
+            ordered_registry_rows,
+            key=lambda row: _row_fairness_key(
+                row,
+                resource_id_for=lambda value: value[1].id,
+                attempt_id_for=lambda value: value[0].id,
+                stage_history=registry_stage_history,
+                final_history=registry_final_history,
+            ),
+        )
+    )
     registry_final_untried_by_resource: dict[UUID, bool] = {}
     for resource_id, attempt_id in registry_final_manifests:
         registry_final_untried_by_resource[resource_id] = (
             registry_final_untried_by_resource.get(resource_id, False)
             or _surface_item_state(registry_final_history, resource_id, attempt_id) == "untried"
         )
-    registry_final_blocked_retries: set[UUID] = set()
     for attempt, adapter in ordered_registry_rows:
         if selected_attempts >= limit:
             break
@@ -676,13 +794,7 @@ def _select_candidates(
         final_key = (adapter.id, attempt.id)
         final_state = _surface_item_state(registry_final_history, adapter.id, attempt.id)
         stage_state = _surface_item_state(registry_stage_history, adapter.id, attempt.id)
-        stage_retryable = stage_state == "untried" or (
-            stage_state == "blocked"
-            and (
-                final_state == "untried"
-                or not registry_final_untried_by_resource.get(adapter.id, False)
-            )
-        )
+        stage_retryable = stage_state in {"untried", "blocked"}
         if stage_retryable:
             result.append(
                 _Candidate(
@@ -705,7 +817,6 @@ def _select_candidates(
             or (
                 final_state == "blocked"
                 and not registry_final_untried_by_resource.get(adapter.id, False)
-                and adapter.id not in registry_final_blocked_retries
             )
         )
         if adapter.id not in selected_registry_finals and preferred_final:
@@ -726,8 +837,6 @@ def _select_candidates(
             )
             selected_registry_finals.add(adapter.id)
             selected_this_attempt = True
-            if final_state == "blocked":
-                registry_final_blocked_retries.add(adapter.id)
         if selected_this_attempt:
             selected_attempts += 1
     return tuple(result)
@@ -1654,7 +1763,10 @@ def _finalize_operation(
         operation.status = "completed_with_blocks" if operation.blocked_count else "completed"
         operation.completed_at = session.scalar(select(func.clock_timestamp()))
         operation.version += 1
-        if operation.blocked_count == 0:
+        # A mixed operation still has a durable success whenever at least one
+        # exact surface completed.  Only an all-blocked operation is denied a
+        # deletion-success audit; each operation can finalize only once.
+        if operation.completed_count > 0:
             scope = DepartmentRequestScope(DepartmentScope(department_id))
             append_mutation_audit(
                 session,

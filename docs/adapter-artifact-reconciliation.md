@@ -42,14 +42,20 @@ Every applied operation is a durable retry generation. Historical `blocked`
 items are immutable evidence and are never reopened or mutated. After an
 administrator repairs the reviewed external condition, a later authorized
 operation may register a fresh item for the same exact resource, attempt, and
-surface. At most one generation is active for a physical surface. For shared
-finals, candidate ordering tries the first valid untried attempt before any
-historically blocked sibling; only after all valid siblings have been tried
-may one deterministic blocked attempt be retried. This keeps a mismatched
-historical sibling from starving a matching sibling and keeps each invocation
-bounded. A blocked-only generation is `completed_with_blocks` and emits no
-deletion-success audit; a later generation emits one success audit only after
-all applicable surfaces and tombstones are confirmed absent.
+surface. At most one generation is active for a physical surface. For every
+surface, valid untried work is ordered before blocked retries. Among blocked
+siblings, the scheduler uses the exact bounded blocked-attempt count and most
+recent blocked generation to rotate deterministically; a repaired newer
+generation can therefore progress without being starved by an older mismatch.
+Stage retries use the same ordering and never depend on a final manifest being
+present. Candidate selection locks at most `min(limit * 8, 1000)` source or
+registry attempt rows per surface, where the public limit is fixed to
+`1..1000`; history is grouped only for those exact locked rows and sibling
+status checks are bulk queries, not department-wide history scans or N+1
+queries. A blocked-only generation is `completed_with_blocks` and emits no
+deletion-success audit. A mixed generation emits exactly one content-free
+success audit when at least one exact surface closes, while a later retry never
+duplicates that earlier audit.
 
 ## Descriptor and tombstone contract
 
