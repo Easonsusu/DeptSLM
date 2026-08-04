@@ -63,6 +63,7 @@ PROTECTED_SOURCE_STATUSES = frozenset(
 PROTECTED_ADAPTER_STATUSES = frozenset({"validated", "purge_pending", "purged"})
 TERMINAL_SOURCE_ATTEMPT_STATUSES = frozenset({"failed", "abandoned"})
 TERMINAL_REGISTRY_ATTEMPT_STATUSES = frozenset({"validation_failed", "failed", "reclaimed"})
+ACTIVE_ITEM_STATUSES = frozenset({"registered", "verified", "tombstone_bound", "deleting"})
 
 
 class AdapterArtifactMaintenanceConfigurationError(RuntimeError):
@@ -189,30 +190,93 @@ def _persisted_manifest_authority(surface_type: str, ownership_manifest: object)
     return hashlib.sha256(raw).hexdigest(), len(raw)
 
 
-def _attempt_has_blocked_item(
+def _surface_item_history(
     session: Session,
     *,
     department_id: UUID,
     surface_type: str,
     resource_column,
-    resource_id: UUID,
     attempt_column,
-    attempt_id: UUID,
-) -> bool:
-    return (
-        session.scalar(
-            select(AdapterArtifactOperationItem.id)
-            .where(
-                AdapterArtifactOperationItem.department_id == department_id,
-                AdapterArtifactOperationItem.surface_type == surface_type,
-                resource_column == resource_id,
-                attempt_column == attempt_id,
-                AdapterArtifactOperationItem.status == "blocked",
-            )
-            .limit(1)
+) -> dict[tuple[UUID, UUID], frozenset[str]]:
+    """Return immutable status history keyed by the exact resource/attempt."""
+
+    history: dict[tuple[UUID, UUID], set[str]] = {}
+    rows = session.execute(
+        select(resource_column, attempt_column, AdapterArtifactOperationItem.status).where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == surface_type,
         )
-        is not None
-    )
+    ).all()
+    for resource_id, attempt_id, status in rows:
+        if resource_id is None or attempt_id is None:
+            continue
+        history.setdefault((resource_id, attempt_id), set()).add(status)
+    return {key: frozenset(statuses) for key, statuses in history.items()}
+
+
+def _surface_item_state(
+    history: dict[tuple[UUID, UUID], frozenset[str]],
+    resource_id: UUID,
+    attempt_id: UUID,
+) -> str:
+    """Classify one exact surface without mutating historical rows."""
+
+    statuses = history.get((resource_id, attempt_id), frozenset())
+    if not statuses:
+        return "untried"
+    if "completed" in statuses:
+        return "completed"
+    if statuses & ACTIVE_ITEM_STATUSES:
+        return "active"
+    if statuses == frozenset({"blocked"}):
+        return "blocked"
+    # Unknown mixtures are treated conservatively as active/unsafe.  The
+    # historical row remains immutable and a later explicit review can retry
+    # it only after the operation is no longer active.
+    return "active"
+
+
+def _prioritize_final_siblings(
+    rows: list[tuple[object, object]],
+    *,
+    resource_id_for,
+    attempt_id_for,
+    final_history: dict[tuple[UUID, UUID], frozenset[str]],
+    valid_final_keys: set[tuple[UUID, UUID]],
+) -> tuple[tuple[object, object], ...]:
+    """Prefer the first untried final sibling, then the first blocked retry."""
+
+    grouped: dict[UUID, list[tuple[object, object]]] = {}
+    for row in rows:
+        grouped.setdefault(resource_id_for(row), []).append(row)
+    ordered: list[tuple[object, object]] = []
+    for group in grouped.values():
+        preferred = None
+        valid = [
+            row for row in group if (resource_id_for(row), attempt_id_for(row)) in valid_final_keys
+        ]
+        for desired_state in ("untried", "blocked"):
+            preferred = next(
+                (
+                    row
+                    for row in valid
+                    if _surface_item_state(
+                        final_history,
+                        resource_id_for(row),
+                        attempt_id_for(row),
+                    )
+                    == desired_state
+                ),
+                None,
+            )
+            if preferred is not None:
+                break
+        if preferred is not None:
+            ordered.append(preferred)
+            ordered.extend(row for row in group if row is not preferred)
+        else:
+            ordered.extend(group)
+    return tuple(ordered)
 
 
 def reconcile_adapter_artifacts(
@@ -384,6 +448,20 @@ def _select_candidates(
     selected_attempts = 0
     selected_source_finals: set[UUID] = set()
     selected_registry_finals: set[UUID] = set()
+    source_stage_history = _surface_item_history(
+        session,
+        department_id=department_id,
+        surface_type="source_stage",
+        resource_column=AdapterArtifactOperationItem.source_bundle_id,
+        attempt_column=AdapterArtifactOperationItem.import_attempt_id,
+    )
+    source_final_history = _surface_item_history(
+        session,
+        department_id=department_id,
+        surface_type="source_final",
+        resource_column=AdapterArtifactOperationItem.source_bundle_id,
+        attempt_column=AdapterArtifactOperationItem.import_attempt_id,
+    )
     # Terminal source attempts are safe to inspect even when their source is
     # abandoned/rejected; protected source states are explicitly excluded.
     source_rows = session.execute(
@@ -409,18 +487,9 @@ def _select_candidates(
         .order_by(AdapterImportAttempt.created_at, AdapterImportAttempt.id)
         .with_for_update(skip_locked=True)
     ).all()
+    eligible_source_rows: list[tuple[AdapterImportAttempt, AdapterImportSource]] = []
+    source_final_manifests: dict[tuple[UUID, UUID], dict[str, object]] = {}
     for attempt, source in source_rows:
-        if selected_attempts >= limit:
-            break
-        stage_blocked = _attempt_has_blocked_item(
-            session,
-            department_id=department_id,
-            surface_type="source_stage",
-            resource_column=AdapterArtifactOperationItem.source_bundle_id,
-            resource_id=source.id,
-            attempt_column=AdapterArtifactOperationItem.import_attempt_id,
-            attempt_id=attempt.id,
-        )
         committed_sibling = session.scalar(
             select(AdapterImportAttempt.id)
             .where(
@@ -435,7 +504,45 @@ def _select_candidates(
         stale = attempt.status not in TERMINAL_SOURCE_ATTEMPT_STATUSES
         if stale and (source.status != "staging" or source.authoritative_attempt_id is not None):
             continue
-        if not stage_blocked:
+        eligible_source_rows.append((attempt, source))
+        if (
+            isinstance(attempt.ownership_manifest, dict)
+            and source.status not in PROTECTED_SOURCE_STATUSES
+        ):
+            try:
+                _persisted_manifest_authority("source_final", attempt.ownership_manifest)
+            except AdapterMaintenanceArtifactError:
+                continue
+            source_final_manifests[(source.id, attempt.id)] = dict(attempt.ownership_manifest)
+    ordered_source_rows = _prioritize_final_siblings(
+        eligible_source_rows,
+        resource_id_for=lambda row: row[1].id,
+        attempt_id_for=lambda row: row[0].id,
+        final_history=source_final_history,
+        valid_final_keys=set(source_final_manifests),
+    )
+    source_final_untried_by_resource: dict[UUID, bool] = {}
+    for resource_id, attempt_id in source_final_manifests:
+        source_final_untried_by_resource[resource_id] = (
+            source_final_untried_by_resource.get(resource_id, False)
+            or _surface_item_state(source_final_history, resource_id, attempt_id) == "untried"
+        )
+    source_final_blocked_retries: set[UUID] = set()
+    for attempt, source in ordered_source_rows:
+        if selected_attempts >= limit:
+            break
+        selected_this_attempt = False
+        final_key = (source.id, attempt.id)
+        final_state = _surface_item_state(source_final_history, source.id, attempt.id)
+        stage_state = _surface_item_state(source_stage_history, source.id, attempt.id)
+        stage_retryable = stage_state == "untried" or (
+            stage_state == "blocked"
+            and (
+                final_state == "untried"
+                or not source_final_untried_by_resource.get(source.id, False)
+            )
+        )
+        if stage_retryable:
             result.append(
                 _Candidate(
                     "source_stage",
@@ -451,46 +558,54 @@ def _select_candidates(
                     None,
                 )
             )
-        if (
-            isinstance(attempt.ownership_manifest, dict)
-            and source.status not in PROTECTED_SOURCE_STATUSES
-        ):
-            try:
-                _persisted_manifest_authority("source_final", attempt.ownership_manifest)
-            except AdapterMaintenanceArtifactError:
-                pass
-            else:
-                final_blocked = _attempt_has_blocked_item(
-                    session,
-                    department_id=department_id,
-                    surface_type="source_final",
-                    resource_column=AdapterArtifactOperationItem.source_bundle_id,
-                    resource_id=source.id,
-                    attempt_column=AdapterArtifactOperationItem.import_attempt_id,
-                    attempt_id=attempt.id,
+            selected_this_attempt = True
+        preferred_final = final_key in source_final_manifests and (
+            final_state == "untried"
+            or (
+                final_state == "blocked"
+                and not source_final_untried_by_resource.get(source.id, False)
+                and source.id not in source_final_blocked_retries
+            )
+        )
+        if source.id not in selected_source_finals and preferred_final:
+            result.append(
+                _Candidate(
+                    "source_final",
+                    department_id,
+                    source.id,
+                    None,
+                    attempt.id,
+                    None,
+                    attempt.publication_attempt_id,
+                    attempt.attempt_number,
+                    source.version,
+                    attempt.version,
+                    source_final_manifests[final_key],
                 )
-                if source.id not in selected_source_finals and not final_blocked:
-                    result.append(
-                        _Candidate(
-                            "source_final",
-                            department_id,
-                            source.id,
-                            None,
-                            attempt.id,
-                            None,
-                            attempt.publication_attempt_id,
-                            attempt.attempt_number,
-                            source.version,
-                            attempt.version,
-                            dict(attempt.ownership_manifest),
-                        )
-                    )
-                    selected_source_finals.add(source.id)
-        if not stage_blocked or source.id in selected_source_finals:
+            )
+            selected_source_finals.add(source.id)
+            selected_this_attempt = True
+            if final_state == "blocked":
+                source_final_blocked_retries.add(source.id)
+        if selected_this_attempt:
             selected_attempts += 1
     remaining_attempts = max(0, limit - selected_attempts)
     if remaining_attempts == 0:
         return tuple(result)
+    registry_stage_history = _surface_item_history(
+        session,
+        department_id=department_id,
+        surface_type="registry_stage",
+        resource_column=AdapterArtifactOperationItem.adapter_id,
+        attempt_column=AdapterArtifactOperationItem.registry_attempt_id,
+    )
+    registry_final_history = _surface_item_history(
+        session,
+        department_id=department_id,
+        surface_type="registry_final",
+        resource_column=AdapterArtifactOperationItem.adapter_id,
+        attempt_column=AdapterArtifactOperationItem.registry_attempt_id,
+    )
     registry_rows = session.execute(
         select(AdapterRegistryAttempt, Adapter)
         .join(
@@ -507,27 +622,9 @@ def _select_candidates(
         .order_by(AdapterRegistryAttempt.created_at, AdapterRegistryAttempt.id)
         .with_for_update(skip_locked=True)
     ).all()
+    eligible_registry_rows: list[tuple[AdapterRegistryAttempt, Adapter]] = []
+    registry_final_manifests: dict[tuple[UUID, UUID], dict[str, object]] = {}
     for attempt, adapter in registry_rows:
-        if selected_attempts >= limit:
-            break
-        stage_blocked = _attempt_has_blocked_item(
-            session,
-            department_id=department_id,
-            surface_type="registry_stage",
-            resource_column=AdapterArtifactOperationItem.adapter_id,
-            resource_id=adapter.id,
-            attempt_column=AdapterArtifactOperationItem.registry_attempt_id,
-            attempt_id=attempt.id,
-        )
-        final_blocked = _attempt_has_blocked_item(
-            session,
-            department_id=department_id,
-            surface_type="registry_final",
-            resource_column=AdapterArtifactOperationItem.adapter_id,
-            resource_id=adapter.id,
-            attempt_column=AdapterArtifactOperationItem.registry_attempt_id,
-            attempt_id=attempt.id,
-        )
         succeeded_sibling = session.scalar(
             select(AdapterRegistryAttempt.id)
             .where(
@@ -548,7 +645,45 @@ def _select_candidates(
         )
         if succeeded_sibling is not None or active_sibling is not None:
             continue
-        if not stage_blocked:
+        eligible_registry_rows.append((attempt, adapter))
+        if isinstance(attempt.ownership_manifest, dict) and adapter.status in {
+            "failed",
+            "validation_failed",
+        }:
+            try:
+                _persisted_manifest_authority("registry_final", attempt.ownership_manifest)
+            except AdapterMaintenanceArtifactError:
+                continue
+            registry_final_manifests[(adapter.id, attempt.id)] = dict(attempt.ownership_manifest)
+    ordered_registry_rows = _prioritize_final_siblings(
+        eligible_registry_rows,
+        resource_id_for=lambda row: row[1].id,
+        attempt_id_for=lambda row: row[0].id,
+        final_history=registry_final_history,
+        valid_final_keys=set(registry_final_manifests),
+    )
+    registry_final_untried_by_resource: dict[UUID, bool] = {}
+    for resource_id, attempt_id in registry_final_manifests:
+        registry_final_untried_by_resource[resource_id] = (
+            registry_final_untried_by_resource.get(resource_id, False)
+            or _surface_item_state(registry_final_history, resource_id, attempt_id) == "untried"
+        )
+    registry_final_blocked_retries: set[UUID] = set()
+    for attempt, adapter in ordered_registry_rows:
+        if selected_attempts >= limit:
+            break
+        selected_this_attempt = False
+        final_key = (adapter.id, attempt.id)
+        final_state = _surface_item_state(registry_final_history, adapter.id, attempt.id)
+        stage_state = _surface_item_state(registry_stage_history, adapter.id, attempt.id)
+        stage_retryable = stage_state == "untried" or (
+            stage_state == "blocked"
+            and (
+                final_state == "untried"
+                or not registry_final_untried_by_resource.get(adapter.id, False)
+            )
+        )
+        if stage_retryable:
             result.append(
                 _Candidate(
                     "registry_stage",
@@ -564,33 +699,36 @@ def _select_candidates(
                     None,
                 )
             )
-        if isinstance(attempt.ownership_manifest, dict) and adapter.status in {
-            "failed",
-            "validation_failed",
-        }:
-            try:
-                _persisted_manifest_authority("registry_final", attempt.ownership_manifest)
-            except AdapterMaintenanceArtifactError:
-                pass
-            else:
-                if adapter.id not in selected_registry_finals and not final_blocked:
-                    result.append(
-                        _Candidate(
-                            "registry_final",
-                            department_id,
-                            None,
-                            adapter.id,
-                            None,
-                            attempt.id,
-                            attempt.publication_attempt_id,
-                            attempt.attempt_number,
-                            adapter.version,
-                            attempt.version,
-                            dict(attempt.ownership_manifest),
-                        )
-                    )
-                    selected_registry_finals.add(adapter.id)
-        if not stage_blocked or adapter.id in selected_registry_finals:
+            selected_this_attempt = True
+        preferred_final = final_key in registry_final_manifests and (
+            final_state == "untried"
+            or (
+                final_state == "blocked"
+                and not registry_final_untried_by_resource.get(adapter.id, False)
+                and adapter.id not in registry_final_blocked_retries
+            )
+        )
+        if adapter.id not in selected_registry_finals and preferred_final:
+            result.append(
+                _Candidate(
+                    "registry_final",
+                    department_id,
+                    None,
+                    adapter.id,
+                    None,
+                    attempt.id,
+                    attempt.publication_attempt_id,
+                    attempt.attempt_number,
+                    adapter.version,
+                    attempt.version,
+                    registry_final_manifests[final_key],
+                )
+            )
+            selected_registry_finals.add(adapter.id)
+            selected_this_attempt = True
+            if final_state == "blocked":
+                registry_final_blocked_retries.add(adapter.id)
+        if selected_this_attempt:
             selected_attempts += 1
     return tuple(result)
 
@@ -1425,9 +1563,19 @@ def _confirm_attempt_cleanup(
         ).all()
     if attempt.cleanup_confirmed_at is not None:
         return
-    if any(row.status != "completed" for row in item_rows):
-        return
-    by_surface = {row.surface_type: row for row in item_rows}
+    by_surface: dict[str, list[AdapterArtifactOperationItem]] = {}
+    for row in item_rows:
+        by_surface.setdefault(row.surface_type, []).append(row)
+    # A blocked row is immutable history, not a permanent denylist.  A later
+    # operation records a fresh item for the same surface; cleanup is
+    # confirmed once every applicable surface has a completed generation and
+    # no generation is still active.
+    for surface in expected_surfaces:
+        rows = by_surface.get(surface, [])
+        if not rows or any(row.status in ACTIVE_ITEM_STATUSES for row in rows):
+            return
+        if not any(row.status == "completed" for row in rows):
+            return
     if any(surface not in by_surface for surface in expected_surfaces):
         return
     try:
@@ -1506,16 +1654,17 @@ def _finalize_operation(
         operation.status = "completed_with_blocks" if operation.blocked_count else "completed"
         operation.completed_at = session.scalar(select(func.clock_timestamp()))
         operation.version += 1
-        scope = DepartmentRequestScope(DepartmentScope(department_id))
-        append_mutation_audit(
-            session,
-            actor=authorization.identity,
-            actor_subject=actor_subject,
-            request_scope=scope,
-            action="adapter.artifact.reconcile",
-            resource_type="adapter_artifact_operation",
-            resource_id=operation.id,
-        )
+        if operation.blocked_count == 0:
+            scope = DepartmentRequestScope(DepartmentScope(department_id))
+            append_mutation_audit(
+                session,
+                actor=authorization.identity,
+                actor_subject=actor_subject,
+                request_scope=scope,
+                action="adapter.artifact.reconcile",
+                resource_type="adapter_artifact_operation",
+                resource_id=operation.id,
+            )
 
 
 __all__ = [

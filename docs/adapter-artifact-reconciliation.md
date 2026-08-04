@@ -38,6 +38,19 @@ purge-pending/purged adapters; authoritative finals; Phase 10 datasets; Phase
 11 bundles; and every upstream dependency are excluded. No transition to a
 purge state occurs and no dependency is released.
 
+Every applied operation is a durable retry generation. Historical `blocked`
+items are immutable evidence and are never reopened or mutated. After an
+administrator repairs the reviewed external condition, a later authorized
+operation may register a fresh item for the same exact resource, attempt, and
+surface. At most one generation is active for a physical surface. For shared
+finals, candidate ordering tries the first valid untried attempt before any
+historically blocked sibling; only after all valid siblings have been tried
+may one deterministic blocked attempt be retried. This keeps a mismatched
+historical sibling from starving a matching sibling and keeps each invocation
+bounded. A blocked-only generation is `completed_with_blocks` and emits no
+deletion-success audit; a later generation emits one success audit only after
+all applicable surfaces and tombstones are confirmed absent.
+
 ## Descriptor and tombstone contract
 
 The store opens the exact `adapters` root, department, resource, and stage or

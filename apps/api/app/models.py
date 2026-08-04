@@ -3731,7 +3731,12 @@ class AdapterArtifactOperation(Base):
 
 
 class AdapterArtifactOperationItem(Base):
-    """One exact adapter stage/final surface owned by a reconciliation operation."""
+    """One exact surface generation owned by a reconciliation operation.
+
+    Blocked rows are immutable history; a reviewed retry is represented by a
+    fresh item in a later operation and remains subject to the active-surface
+    uniqueness indexes below.
+    """
 
     __tablename__ = "adapter_artifact_operation_items"
     __table_args__ = (

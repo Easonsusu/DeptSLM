@@ -143,7 +143,9 @@ tensor values, or dependency data. A terminal item can set the source/registry
 attempt's `cleanup_confirmed_at` only after every applicable surface and
 tombstone for that exact attempt is absent across all operations and no
 authoritative sibling exists. The operation appends one safe success audit only
-after all items close, and a blocked item cannot starve a later item.
+after all items close. Blocked item rows remain immutable history; a later
+authorized operation records a fresh retry generation after repair, and a
+blocked item cannot starve a later untried sibling.
 - `documents`: department-owned source metadata with an internal uploader relation, normalized filename, canonical media type, positive size, SHA-256 digest, lifecycle state, version, and timestamps. It stores no body or path, and public document schemas do not expose internal identity IDs; see [document-model.md](document-model.md).
 - `document_extractions`: immutable attempt history and PostgreSQL queue state, including source/pipeline identity, claim lease, safe result metadata, and an allowlisted error code. It stores no content, path, filename, stderr, or exception.
 - `document_chunks`: department/document/extraction-scoped offsets, byte size, internal digest, and mutually exclusive page/line provenance. Chunk text remains external.
