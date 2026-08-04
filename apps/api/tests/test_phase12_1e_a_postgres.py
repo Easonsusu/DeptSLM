@@ -521,21 +521,21 @@ def _add_failed_source_attempt(
     publication_attempt_id = publication_attempt_id or uuid4()
     now = datetime.now(UTC)
     with factory.begin() as session:
-        session.add(
-            AdapterImportAttempt(
-                id=attempt_id,
-                department_id=authority.department_id,
-                source_bundle_id=authority.source_id,
-                attempt_number=attempt_number,
-                publication_attempt_id=publication_attempt_id,
-                status="failed",
-                ownership_manifest=manifest,
-                code_revision=authority.code_revision,
-                error_code="adapter_source_publication_failed",
-                finished_at=now,
-                version=1,
-            )
-        )
+        values = {
+            "id": attempt_id,
+            "department_id": authority.department_id,
+            "source_bundle_id": authority.source_id,
+            "attempt_number": attempt_number,
+            "publication_attempt_id": publication_attempt_id,
+            "status": "failed",
+            "code_revision": authority.code_revision,
+            "error_code": "adapter_source_publication_failed",
+            "finished_at": now,
+            "version": 1,
+        }
+        if manifest is not None:
+            values["ownership_manifest"] = manifest
+        session.add(AdapterImportAttempt(**values))
     return attempt_id
 
 
@@ -552,22 +552,22 @@ def _add_failed_registry_attempt(
     publication_attempt_id = publication_attempt_id or uuid4()
     now = datetime.now(UTC)
     with factory.begin() as session:
-        session.add(
-            AdapterRegistryAttempt(
-                id=attempt_id,
-                department_id=authority.department_id,
-                adapter_id=adapter_id,
-                attempt_number=attempt_number,
-                publication_attempt_id=publication_attempt_id,
-                execution_scope_id=uuid4(),
-                status="failed",
-                ownership_manifest=manifest,
-                code_revision=authority.code_revision,
-                error_code="adapter_registry_publication_failed",
-                finished_at=now,
-                version=1,
-            )
-        )
+        values = {
+            "id": attempt_id,
+            "department_id": authority.department_id,
+            "adapter_id": adapter_id,
+            "attempt_number": attempt_number,
+            "publication_attempt_id": publication_attempt_id,
+            "execution_scope_id": uuid4(),
+            "status": "failed",
+            "code_revision": authority.code_revision,
+            "error_code": "adapter_registry_publication_failed",
+            "finished_at": now,
+            "version": 1,
+        }
+        if manifest is not None:
+            values["ownership_manifest"] = manifest
+        session.add(AdapterRegistryAttempt(**values))
     return attempt_id
 
 
@@ -1235,6 +1235,22 @@ def test_mixed_reconciliation_emits_one_success_audit_with_blocked_item(
             )
         )
         assert blocked is not None and blocked.status == "blocked"
+
+    blocked_stage.chmod(0o700)
+    retry = _reconcile(factory, authority, root, apply=True, limit=10)
+    assert retry.completed_count == 1
+    assert retry.blocked_count == 0
+    assert not blocked_stage.exists()
+    with factory() as session:
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.artifact.reconcile",
+                )
+            )
+            == 1
+        )
 
 
 def test_blocked_final_sibling_history_progresses_before_retry(

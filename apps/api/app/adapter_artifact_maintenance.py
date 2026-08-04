@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -50,6 +50,7 @@ from app.models import (
     AdapterImportAttempt,
     AdapterImportSource,
     AdapterRegistryAttempt,
+    PersistentAuditEvent,
 )
 from app.services import ServiceError, append_mutation_audit, authorize_transaction
 
@@ -1765,8 +1766,12 @@ def _finalize_operation(
         operation.version += 1
         # A mixed operation still has a durable success whenever at least one
         # exact surface completed.  Only an all-blocked operation is denied a
-        # deletion-success audit; each operation can finalize only once.
-        if operation.completed_count > 0:
+        # deletion-success audit.  A later retry of another surface for the
+        # same exact resource/attempt does not duplicate an earlier operation
+        # audit.
+        if operation.completed_count > 0 and _has_unaudited_completion(
+            session, operation_id, department_id, items
+        ):
             scope = DepartmentRequestScope(DepartmentScope(department_id))
             append_mutation_audit(
                 session,
@@ -1777,6 +1782,74 @@ def _finalize_operation(
                 resource_type="adapter_artifact_operation",
                 resource_id=operation.id,
             )
+
+
+def _has_unaudited_completion(
+    session: Session,
+    operation_id: UUID,
+    department_id: UUID,
+    items: list[AdapterArtifactOperationItem],
+) -> bool:
+    """Return whether this operation closes an exact attempt without prior audit.
+
+    Reconciliation audits are operation-level, while one operation may contain
+    multiple surfaces.  Match prior successful cleanup by the exact resource
+    and publication attempt rather than by operation ID alone.  The predicate
+    list is bounded by this operation's item limit and the query does not load
+    historical rows into Python.
+    """
+
+    completed_items = [item for item in items if item.status == "completed"]
+    predicates = []
+    for item in completed_items:
+        exact_attempt = [
+            AdapterArtifactOperationItem.publication_attempt_id == item.publication_attempt_id,
+            AdapterArtifactOperationItem.attempt_number == item.attempt_number,
+        ]
+        if item.source_bundle_id is not None and item.import_attempt_id is not None:
+            predicates.append(
+                and_(
+                    AdapterArtifactOperationItem.source_bundle_id == item.source_bundle_id,
+                    AdapterArtifactOperationItem.import_attempt_id == item.import_attempt_id,
+                    *exact_attempt,
+                )
+            )
+        elif item.adapter_id is not None and item.registry_attempt_id is not None:
+            predicates.append(
+                and_(
+                    AdapterArtifactOperationItem.adapter_id == item.adapter_id,
+                    AdapterArtifactOperationItem.registry_attempt_id == item.registry_attempt_id,
+                    *exact_attempt,
+                )
+            )
+    if not predicates:
+        return False
+    statement = (
+        select(AdapterArtifactOperationItem.id)
+        .join(
+            AdapterArtifactOperation,
+            AdapterArtifactOperation.id == AdapterArtifactOperationItem.operation_id,
+        )
+        .join(
+            PersistentAuditEvent,
+            and_(
+                PersistentAuditEvent.resource_id == cast(AdapterArtifactOperation.id, String),
+                PersistentAuditEvent.department_id == AdapterArtifactOperation.department_id,
+            ),
+        )
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.status == "completed",
+            AdapterArtifactOperation.id != operation_id,
+            AdapterArtifactOperation.department_id == department_id,
+            PersistentAuditEvent.action == "adapter.artifact.reconcile",
+            PersistentAuditEvent.resource_type == "adapter_artifact_operation",
+            PersistentAuditEvent.result == "allowed",
+            or_(*predicates),
+        )
+        .limit(1)
+    )
+    return session.scalar(statement) is None
 
 
 __all__ = [
