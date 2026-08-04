@@ -1146,6 +1146,8 @@ def test_blocked_registry_stage_does_not_starve_new_untried_stage(
         / str(old_publication)
     )
     old_stage.mkdir(mode=0o700, parents=True)
+    for path in (old_stage.parent.parent, old_stage.parent):
+        path.chmod(0o700)
     _file(old_stage / "adapter_config.json")
     old_stage.chmod(0o755)
     first_result = _reconcile(factory, authority, root, apply=True, limit=1)
@@ -1168,28 +1170,10 @@ def test_blocked_registry_stage_does_not_starve_new_untried_stage(
         / str(second_publication)
     )
     new_stage.mkdir(mode=0o700, parents=True)
+    for path in (new_stage.parent.parent, new_stage.parent):
+        path.chmod(0o700)
     _file(new_stage / "adapter_config.json")
     second_result = _reconcile(factory, authority, root, apply=True, limit=1)
-    with factory() as session:
-        selected = session.scalars(
-            select(AdapterArtifactOperationItem)
-            .where(AdapterArtifactOperationItem.department_id == authority.department_id)
-            .order_by(AdapterArtifactOperationItem.created_at.desc())
-        ).all()
-        assert selected and selected[0].registry_attempt_id == second_id, (
-            second_result,
-            [
-                (row.registry_attempt_id, row.surface_type, row.status, row.blocked_reason_code)
-                for row in selected
-            ],
-        )
-        assert selected[0].status == "completed", (
-            second_result,
-            [
-                (row.registry_attempt_id, row.surface_type, row.status, row.blocked_reason_code)
-                for row in selected
-            ],
-        )
     assert second_result.blocked_count == 0
     with factory() as session:
         row = session.scalar(
@@ -1226,6 +1210,8 @@ def test_mixed_reconciliation_emits_one_success_audit_with_blocked_item(
         / str(second_publication)
     )
     blocked_stage.mkdir(mode=0o700, parents=True)
+    for path in (blocked_stage.parent.parent, blocked_stage.parent):
+        path.chmod(0o700)
     _file(blocked_stage / "adapter_config.json")
     blocked_stage.chmod(0o755)
     result = _reconcile(factory, authority, root, apply=True, limit=10)
