@@ -1183,6 +1183,13 @@ def test_blocked_registry_stage_does_not_starve_new_untried_stage(
                 for row in selected
             ],
         )
+        assert selected[0].status == "completed", (
+            second_result,
+            [
+                (row.registry_attempt_id, row.surface_type, row.status, row.blocked_reason_code)
+                for row in selected
+            ],
+        )
     assert second_result.blocked_count == 0
     with factory() as session:
         row = session.scalar(
