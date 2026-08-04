@@ -17,7 +17,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session, aliased, sessionmaker
 
 from app.adapter_maintenance_artifacts import (
     AdapterMaintenanceArtifactError,
@@ -1790,36 +1790,32 @@ def _has_unaudited_completion(
     department_id: UUID,
     items: list[AdapterArtifactOperationItem],
 ) -> bool:
-    """Return whether this operation closes an exact attempt without prior audit.
+    """Return whether this operation closes a resource already mixed-audited.
 
     Reconciliation audits are operation-level, while one operation may contain
-    multiple surfaces.  Match prior successful cleanup by the exact resource
-    and publication attempt rather than by operation ID alone.  The predicate
-    list is bounded by this operation's item limit and the query does not load
+    multiple surfaces.  A later retry of a blocked surface must not duplicate a
+    prior mixed-operation audit for the same department-scoped resource, while
+    an unrelated resource must still receive its own audit.  The predicate list
+    is bounded by this operation's item limit and the query does not load
     historical rows into Python.
     """
 
     completed_items = [item for item in items if item.status == "completed"]
     predicates = []
+    blocked_item = aliased(AdapterArtifactOperationItem)
     for item in completed_items:
-        exact_attempt = [
-            AdapterArtifactOperationItem.publication_attempt_id == item.publication_attempt_id,
-            AdapterArtifactOperationItem.attempt_number == item.attempt_number,
-        ]
         if item.source_bundle_id is not None and item.import_attempt_id is not None:
             predicates.append(
                 and_(
                     AdapterArtifactOperationItem.source_bundle_id == item.source_bundle_id,
-                    AdapterArtifactOperationItem.import_attempt_id == item.import_attempt_id,
-                    *exact_attempt,
+                    blocked_item.source_bundle_id == item.source_bundle_id,
                 )
             )
         elif item.adapter_id is not None and item.registry_attempt_id is not None:
             predicates.append(
                 and_(
                     AdapterArtifactOperationItem.adapter_id == item.adapter_id,
-                    AdapterArtifactOperationItem.registry_attempt_id == item.registry_attempt_id,
-                    *exact_attempt,
+                    blocked_item.adapter_id == item.adapter_id,
                 )
             )
     if not predicates:
@@ -1829,6 +1825,14 @@ def _has_unaudited_completion(
         .join(
             AdapterArtifactOperation,
             AdapterArtifactOperation.id == AdapterArtifactOperationItem.operation_id,
+        )
+        .join(
+            blocked_item,
+            and_(
+                blocked_item.operation_id == AdapterArtifactOperation.id,
+                blocked_item.department_id == department_id,
+                blocked_item.status == "blocked",
+            ),
         )
         .join(
             PersistentAuditEvent,
