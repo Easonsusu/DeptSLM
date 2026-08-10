@@ -734,6 +734,191 @@ def test_substituted_tombstone_after_crash_is_blocked_and_preserved(
         )
 
 
+def test_unknown_registry_sibling_before_rename_is_resumable(
+    factory, authority: Authority, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pre-rename sibling keeps the committed E-B move intent resumable."""
+
+    root = _storage(tmp_path)
+    adapter_id = _prepare_authority(factory, authority, root)
+    original = AdapterPurgeArtifactStore.move_verified_surface_to_tombstone
+    injected = False
+    source_started_after_registry = False
+    captured: dict[str, object] = {}
+    unknown_paths: list[Path] = []
+
+    def inject_before_registry_move(self, inspected, *, expected_tombstone_namespace):
+        nonlocal injected, source_started_after_registry
+        if inspected.surface_type == "registry_final" and not injected:
+            injected = True
+            with factory() as session:
+                registry_item = session.get(AdapterPurgeItem, inspected.item_id)
+                assert registry_item is not None and registry_item.status == "verified"
+                reservation = session.get(AdapterPurgeReservation, registry_item.reservation_id)
+                assert reservation is not None and reservation.status == "deletion_authorized"
+                operation = session.get(AdapterPurgeOperation, registry_item.operation_id)
+                assert operation is not None and operation.status == "deleting"
+                captured.update(
+                    {
+                        "operation_id": operation.id,
+                        "registry_item_id": registry_item.id,
+                        "reservation_id": reservation.id,
+                        "observed_identity": dict(registry_item.observed_identity or {}),
+                        "deletion_plan": list(registry_item.deletion_plan or []),
+                        "namespace": dict(registry_item.expected_tombstone_namespace or {}),
+                        "move_authorized_at": registry_item.move_authorized_at,
+                        "reservation_identity": {
+                            "observed_identity": dict(reservation.observed_identity or {}),
+                            "deletion_plan": list(reservation.deletion_plan or []),
+                            "namespace": dict(reservation.expected_tombstone_namespace or {}),
+                            "deletion_authorized_at": reservation.deletion_authorized_at,
+                        },
+                    }
+                )
+            resource = (
+                root
+                / "adapters"
+                / ".purge-deleting"
+                / "registry_final"
+                / str(authority.department_id)
+                / str(adapter_id)
+            )
+            resource.mkdir(mode=0o700, parents=True, exist_ok=True)
+            resource.parent.chmod(0o700)
+            resource.chmod(0o700)
+            sibling = resource / str(uuid4())
+            sibling.mkdir(mode=0o700)
+            sibling.chmod(0o700)
+            payload = sibling / "opaque.bin"
+            payload.write_bytes(b"unowned")
+            payload.chmod(0o600)
+            unknown_paths.extend((sibling, payload))
+        elif inspected.surface_type == "source_final":
+            with factory() as session:
+                registry_item = session.get(AdapterPurgeItem, captured["registry_item_id"])
+                assert registry_item is not None and registry_item.status == "completed"
+            source_started_after_registry = True
+        return original(
+            self,
+            inspected,
+            expected_tombstone_namespace=expected_tombstone_namespace,
+        )
+
+    monkeypatch.setattr(
+        AdapterPurgeArtifactStore,
+        "move_verified_surface_to_tombstone",
+        inject_before_registry_move,
+    )
+    with pytest.raises(ServiceError, match="external conflict resolution"):
+        _purge(factory, authority, root)
+
+    operation_id = captured["operation_id"]
+    registry_item_id = captured["registry_item_id"]
+    assert isinstance(operation_id, UUID)
+    assert isinstance(registry_item_id, UUID)
+    sibling, payload = unknown_paths
+    registry_final = root / "adapters" / "registry" / str(authority.department_id) / str(adapter_id)
+    source_final = (
+        root / "adapters" / "imports" / str(authority.department_id) / str(authority.source_id)
+    )
+    expected = sibling.with_name(str(registry_item_id))
+    assert registry_final.is_dir()
+    assert source_final.is_dir()
+    assert not expected.exists()
+    assert sibling.is_dir() and payload.read_bytes() == b"unowned"
+
+    with factory() as session:
+        operation = session.get(AdapterPurgeOperation, operation_id)
+        registry_item = session.get(AdapterPurgeItem, registry_item_id)
+        source_item = session.scalar(
+            select(AdapterPurgeItem).where(
+                AdapterPurgeItem.operation_id == operation_id,
+                AdapterPurgeItem.surface_type == "source_final",
+            )
+        )
+        registry_reservation = session.get(AdapterPurgeReservation, captured["reservation_id"])
+        source_reservation = session.scalar(
+            select(AdapterPurgeReservation).where(
+                AdapterPurgeReservation.operation_id == operation_id,
+                AdapterPurgeReservation.surface_type == "source_final",
+            )
+        )
+        adapter = session.get(Adapter, adapter_id)
+        source = session.get(AdapterImportSource, authority.source_id)
+        assert operation is not None and operation.status == "deleting"
+        assert registry_item is not None and registry_item.status == "verified"
+        assert source_item is not None and source_item.status == "registered"
+        assert registry_reservation is not None
+        assert registry_reservation.status == "deletion_authorized"
+        assert source_reservation is not None and source_reservation.status == "registered"
+        assert adapter is not None and adapter.status == "purge_pending"
+        assert source is not None and source.status == "purge_pending"
+        assert registry_item.id == registry_item_id
+        assert registry_item.observed_identity == captured["observed_identity"]
+        assert registry_item.deletion_plan == captured["deletion_plan"]
+        assert registry_item.expected_tombstone_namespace == captured["namespace"]
+        assert registry_item.move_authorized_at == captured["move_authorized_at"]
+        reservation_identity = captured["reservation_identity"]
+        assert isinstance(reservation_identity, dict)
+        assert registry_reservation.id == captured["reservation_id"]
+        assert registry_reservation.observed_identity == reservation_identity["observed_identity"]
+        assert registry_reservation.deletion_plan == reservation_identity["deletion_plan"]
+        assert (
+            registry_reservation.expected_tombstone_namespace == reservation_identity["namespace"]
+        )
+        assert (
+            registry_reservation.deletion_authorized_at
+            == reservation_identity["deletion_authorized_at"]
+        )
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.purge",
+                )
+            )
+            == 0
+        )
+
+    # Model the narrow reviewed external action. The durable operation and
+    # item resume only after removing the unrelated sibling.
+    payload.unlink()
+    sibling.rmdir()
+    resumed = _purge(factory, authority, root)
+    assert resumed.applied_count == 2
+    assert source_started_after_registry
+    with factory() as session:
+        operation = session.get(AdapterPurgeOperation, operation_id)
+        registry_item = session.get(AdapterPurgeItem, registry_item_id)
+        item_count = session.scalar(
+            select(func.count(AdapterPurgeItem.id)).where(
+                AdapterPurgeItem.operation_id == operation_id
+            )
+        )
+        operation_count = session.scalar(
+            select(func.count(AdapterPurgeOperation.id)).where(
+                AdapterPurgeOperation.department_id == authority.department_id
+            )
+        )
+        adapter = session.get(Adapter, adapter_id)
+        source = session.get(AdapterImportSource, authority.source_id)
+        assert operation is not None and operation.status == "completed"
+        assert registry_item is not None and registry_item.status == "completed"
+        assert item_count == 2
+        assert operation_count == 1
+        assert adapter is not None and adapter.status == "purged"
+        assert source is not None and source.status == "purged"
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.purge",
+                )
+            )
+            == 1
+        )
+
+
 def test_unknown_registry_sibling_after_post_rename_crash_is_resumable(
     factory, authority: Authority, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

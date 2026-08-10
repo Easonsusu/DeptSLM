@@ -216,6 +216,120 @@ def test_purge_rebinds_a_tombstone_after_original_move(tmp_path: Path) -> None:
         assert recovered.tombstone_identity == bound.tombstone_identity
 
 
+def test_purge_pre_move_unknown_private_sibling_is_retryable_and_resumable(
+    tmp_path: Path,
+) -> None:
+    """A valid unknown sibling before rename preserves one durable move intent."""
+
+    root = _runtime_root(tmp_path)
+    department, source, attempt, item, unknown = (uuid4() for _ in range(5))
+    final, manifest = _source_final(root, department, source, attempt)
+    address = physical_surface_identifier("source_final", department, source, None)
+    raw = canonical_manifest_bytes(manifest)
+    namespace = {
+        "surface_type": "source_final",
+        "department_id": str(department),
+        "resource_id": str(source),
+        "item_id": str(item),
+    }
+    original_identity = final.stat()
+    original_files = {path.name: path.read_bytes() for path in final.iterdir()}
+    tombstone_parent = (
+        root / "adapters" / ".purge-deleting" / "source_final" / str(department) / str(source)
+    )
+    tombstone_parent.mkdir(mode=0o700, parents=True)
+    tombstone_parent.parent.chmod(0o700)
+    tombstone_parent.chmod(0o700)
+    expected = tombstone_parent / str(item)
+    sibling = tombstone_parent / str(unknown)
+    sibling.mkdir(mode=0o700)
+    sibling.chmod(0o700)
+    payload = sibling / "opaque.bin"
+    _file(payload, b"unowned")
+    with AdapterPurgeArtifactStore(root) as store:
+        inspected = store.inspect_surface(
+            address,
+            item,
+            expected_manifest=manifest,
+            expected_manifest_sha256=hashlib.sha256(raw).hexdigest(),
+            expected_manifest_byte_size=len(raw),
+        )
+        assert inspected is not None
+        with pytest.raises(RetryablePurgeTombstoneNamespaceConflict):
+            store.move_verified_surface_to_tombstone(
+                inspected,
+                expected_tombstone_namespace=namespace,
+            )
+        assert final.is_dir()
+        assert (final.stat().st_dev, final.stat().st_ino) == (
+            original_identity.st_dev,
+            original_identity.st_ino,
+        )
+        assert {path.name: path.read_bytes() for path in final.iterdir()} == original_files
+        assert not expected.exists()
+        assert sibling.is_dir() and payload.read_bytes() == b"unowned"
+
+        # Model reviewed external conflict resolution. The exact inspection,
+        # item ID, and durable deletion plan remain unchanged.
+        payload.unlink()
+        sibling.rmdir()
+        bound = store.move_verified_surface_to_tombstone(
+            inspected,
+            expected_tombstone_namespace=namespace,
+        )
+        assert bound is not None
+        assert bound.item_id == item
+        assert bound.observed_identity == inspected.observed_identity
+        assert bound.deletion_plan == [
+            {"name": entry["name"], "identity": dict(entry["identity"])}
+            for entry in inspected.deletion_plan
+        ]
+    assert not final.exists()
+    assert expected.is_dir()
+
+
+def test_purge_pre_move_expected_tombstone_is_terminal(tmp_path: Path) -> None:
+    """An expected tombstone beside an original is never a retryable sibling."""
+
+    root = _runtime_root(tmp_path)
+    department, source, attempt, item = (uuid4() for _ in range(4))
+    final, manifest = _source_final(root, department, source, attempt)
+    address = physical_surface_identifier("source_final", department, source, None)
+    raw = canonical_manifest_bytes(manifest)
+    namespace = {
+        "surface_type": "source_final",
+        "department_id": str(department),
+        "resource_id": str(source),
+        "item_id": str(item),
+    }
+    tombstone_parent = (
+        root / "adapters" / ".purge-deleting" / "source_final" / str(department) / str(source)
+    )
+    tombstone_parent.mkdir(mode=0o700, parents=True)
+    tombstone_parent.parent.chmod(0o700)
+    tombstone_parent.chmod(0o700)
+    expected = tombstone_parent / str(item)
+    expected.mkdir(mode=0o700)
+    expected.chmod(0o700)
+    with AdapterPurgeArtifactStore(root) as store:
+        inspected = store.inspect_surface(
+            address,
+            item,
+            expected_manifest=manifest,
+            expected_manifest_sha256=hashlib.sha256(raw).hexdigest(),
+            expected_manifest_byte_size=len(raw),
+        )
+        assert inspected is not None
+        with pytest.raises(AdapterMaintenanceArtifactError) as raised:
+            store.move_verified_surface_to_tombstone(
+                inspected,
+                expected_tombstone_namespace=namespace,
+            )
+    assert not isinstance(raised.value, RetryablePurgeTombstoneNamespaceConflict)
+    assert final.is_dir()
+    assert expected.is_dir()
+
+
 def test_purge_recovery_rejects_unknown_private_sibling_without_mutation(tmp_path: Path) -> None:
     """An unbound expected tombstone cannot coexist with an unknown sibling."""
 

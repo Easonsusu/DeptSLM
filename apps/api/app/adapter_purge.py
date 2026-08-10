@@ -990,6 +990,11 @@ def _execute_item(
                     inspected,
                     expected_tombstone_namespace=expected_namespace,
                 )
+            except RetryablePurgeTombstoneNamespaceConflict:
+                # A valid external sibling existed before the initial rename.
+                # It is not evidence that the expected move happened, so do
+                # not send this retryable conflict into post-rename recovery.
+                raise
             except AdapterMaintenanceArtifactError:
                 # A move may have completed before a process crash or a
                 # post-rename storage error. Recovery never uses a boolean

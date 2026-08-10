@@ -836,6 +836,23 @@ class AdapterMaintenanceArtifactStore:
             os.close(descriptor)
         return True
 
+    def _reject_pre_move_tombstone_namespace(
+        self,
+        existing_items: tuple[UUID, ...],
+        *,
+        expected_item_id: UUID,
+    ) -> None:
+        """Apply the surface owner's policy for an occupied move namespace.
+
+        The base maintenance flow retains its terminal E-A behavior. E-B
+        overrides this narrow policy hook so a valid unknown sibling around a
+        durable purge move intent can remain safely resumable without
+        weakening descriptor-bound namespace validation.
+        """
+
+        del existing_items, expected_item_id
+        raise AdapterMaintenanceArtifactError("artifact_tombstone_conflict")
+
     def move_verified_surface_to_tombstone(
         self,
         inspected: InspectedSurface,
@@ -897,7 +914,10 @@ class AdapterMaintenanceArtifactStore:
             deleting_parent = _ensure_private_dir(resource_parent, str(inspected.resource_id))
             existing_items = self._enumerate_item_ids(deleting_parent)
             if existing_items:
-                raise AdapterMaintenanceArtifactError("artifact_tombstone_conflict")
+                self._reject_pre_move_tombstone_namespace(
+                    existing_items,
+                    expected_item_id=inspected.item_id,
+                )
             if inspected.address.path_attempt_id is None:
                 source_name = str(inspected.resource_id)
             else:
@@ -1140,6 +1160,24 @@ class AdapterPurgeArtifactStore(AdapterMaintenanceArtifactStore):
 
     def __init__(self, data_dir: Path) -> None:
         super().__init__(data_dir, tombstone_root_name=".purge-deleting")
+
+    def _reject_pre_move_tombstone_namespace(
+        self,
+        existing_items: tuple[UUID, ...],
+        *,
+        expected_item_id: UUID,
+    ) -> None:
+        """Keep a valid unknown E-B sibling resumable before initial rename.
+
+        ``_enumerate_item_ids`` already rejects malformed, symlinked, or
+        non-private entries. An expected ID while the original remains is an
+        authority/substitution failure; only canonical private unknown IDs are
+        an operator-resolvable conflict around the durable move intent.
+        """
+
+        if expected_item_id not in existing_items:
+            raise RetryablePurgeTombstoneNamespaceConflict()
+        raise AdapterMaintenanceArtifactError("artifact_authority_changed")
 
     @staticmethod
     def _require_exact_recovery_namespace(resource: int, item_id: UUID) -> None:

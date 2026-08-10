@@ -181,11 +181,13 @@ publication is not transactionally atomic.
   registry final bytes before source final bytes, and uses the private
   `.purge-deleting` namespace with no-follow descriptors, no-replace moves,
   fsync, exact tombstone identities, per-file in-flight progress, and durable
-  directory-unlink intent. Unbound post-rename recovery requires an exact
-  singleton item namespace; a canonical private unknown sibling is preserved
-  as a retryable operator-resolved conflict, while expected-item substitution
-  is terminal. Both exact namespaces are rechecked empty before `purged` and
-  its success audit. Only exact same-department administrators may apply it;
+  directory-unlink intent. Initial rename requires an empty exact namespace;
+  a canonical private unknown sibling around a durable move intent before or
+  after rename is preserved as a retryable operator-resolved conflict, while
+  expected-item substitution and unsafe state are terminal. Unbound
+  post-rename recovery requires an exact singleton item namespace. Both exact
+  namespaces are rechecked empty before `purged` and its success audit. Only
+  exact same-department administrators may apply it;
   `system_admin` has no cross-department bypass. It never deletes Phase 10/11
   artifacts, lineage, review/deployment history, audit rows, backups, or other
   retained copies, and it adds no public route, model, Qdrant, RAG, evaluation,

@@ -44,11 +44,15 @@ and item-scoped tombstone namespace are committed in a short
 `deletion_authorized` transaction before filesystem mutation. The move is
 then same-filesystem and no-replace, followed by parent and tombstone-directory
 fsync. A separate short transaction commits the exact `tombstone_bound`
-identity before any unlink. An existing or unknown tombstone is never adopted.
+identity before any unlink. The initial rename requires an empty exact resource
+namespace, and an existing or unknown tombstone is never adopted. Once the
+move intent is durable, a canonical private unknown sibling found before the
+initial rename is preserved and causes a retryable operator-resolved conflict;
+the same item can resume only after reviewed external removal of that sibling.
 For unbound post-rename recovery, the exact resource namespace must contain
-only the one durable item UUID. A canonical private unknown sibling is
-preserved and causes a retryable operator-resolved conflict; replacement of
-the expected item itself remains a terminal authority mismatch.
+only the one durable item UUID. The same retryable rule applies to a canonical
+private unknown sibling after rename; replacement of the expected item itself,
+or malformed or unsafe namespace state, remains a terminal authority mismatch.
 
 All pathname components are opened descriptor-relatively with no-follow
 semantics. The original directory and each fixed file are identity-checked
@@ -62,10 +66,12 @@ deletion.
 
 ## Crash recovery and retention
 
-The move-intent commit is the retry authority after a process crash: a retry
-may recover only the exact committed observation and tombstone namespace, and
-must reject a substituted original or tombstone. PostgreSQL and filesystem
-operations remain non-atomic, so an already in-flight rename cannot be fenced
+The move-intent commit is the retry authority after a process crash: before
+rename, a valid unknown sibling keeps that exact durable item active without
+moving either directory; after rename, recovery may use only the exact
+committed observation and singleton tombstone namespace. A retry must reject a
+substituted original or expected tombstone. PostgreSQL and filesystem operations
+remain non-atomic, so an already in-flight rename cannot be fenced
 retroactively; the committed move intent and post-move identity checks keep
 such state bounded and untrusted. Each file deletion records `in_flight_entry` and `next_entry_index`; each
 directory deletion records `directory_unlink_started_at`. A crash before an
