@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 from test_phase12_1c_integration import (
     Authority,
@@ -32,6 +32,8 @@ from app.adapter_source_artifacts import canonical_manifest_bytes
 from app.database import create_database_engine
 from app.models import (
     Adapter,
+    AdapterArtifactOperation,
+    AdapterArtifactReconciliationCursor,
     AdapterImportAttempt,
     AdapterImportSource,
     AdapterPurgeItem,
@@ -317,6 +319,153 @@ def _adapter_id(factory: sessionmaker[Session], authority: Authority) -> UUID:
         )
         assert value is not None
         return value
+
+
+def _migration_config() -> Config:
+    return Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+
+
+def _migration_version(factory: sessionmaker[Session]) -> str:
+    with factory() as session:
+        value = session.scalar(text("SELECT version_num FROM alembic_version"))
+        assert isinstance(value, str)
+        return value
+
+
+def test_phase12_1e_b_migration_chain_preserves_ea_cursor(factory, authority: Authority) -> None:
+    """The E-B revision is layered on the merged E-A cursor revision."""
+
+    config = _migration_config()
+    cursor_id = uuid4()
+    command.downgrade(config, "0012_phase12_adapter_reconciliation")
+    try:
+        assert _migration_version(factory) == "0012_phase12_adapter_reconciliation"
+        command.upgrade(config, "0013_phase12_adapter_reconciliation_cursor")
+        assert _migration_version(factory) == "0013_phase12_adapter_reconciliation_cursor"
+        cursor_created_at = datetime(2026, 1, 1, tzinfo=UTC)
+        with factory.begin() as session:
+            session.add(
+                AdapterArtifactReconciliationCursor(
+                    department_id=authority.department_id,
+                    family="source",
+                    status="failed",
+                    cursor_created_at=cursor_created_at,
+                    cursor_attempt_id=cursor_id,
+                    version=4,
+                )
+            )
+        command.upgrade(config, "0014_phase12_adapter_purge")
+        assert _migration_version(factory) == "0014_phase12_adapter_purge"
+        command.downgrade(config, "0013_phase12_adapter_reconciliation_cursor")
+        assert _migration_version(factory) == "0013_phase12_adapter_reconciliation_cursor"
+        with factory() as session:
+            cursor = session.get(
+                AdapterArtifactReconciliationCursor,
+                (authority.department_id, "source", "failed"),
+            )
+            assert cursor is not None
+            assert (cursor.cursor_created_at, cursor.cursor_attempt_id, cursor.version) == (
+                cursor_created_at,
+                cursor_id,
+                4,
+            )
+        command.upgrade(config, "0014_phase12_adapter_purge")
+        command.upgrade(config, "head")
+        assert _migration_version(factory) == "0014_phase12_adapter_purge"
+        with factory() as session:
+            cursor = session.get(
+                AdapterArtifactReconciliationCursor,
+                (authority.department_id, "source", "failed"),
+            )
+            assert cursor is not None
+            assert (cursor.cursor_created_at, cursor.cursor_attempt_id, cursor.version) == (
+                cursor_created_at,
+                cursor_id,
+                4,
+            )
+    finally:
+        command.upgrade(config, "head")
+        with factory.begin() as session:
+            session.execute(
+                delete(AdapterArtifactReconciliationCursor).where(
+                    AdapterArtifactReconciliationCursor.department_id == authority.department_id
+                )
+            )
+
+
+def test_purge_preserves_ea_cursor_history_and_audit(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    """Purge owns only its exact surfaces, never E-A scheduler/history rows."""
+
+    root = _storage(tmp_path)
+    _prepare_authority(factory, authority, root)
+    now = datetime.now(UTC)
+    cursor_attempt_id = uuid4()
+    operation_id = uuid4()
+    audit_id = uuid4()
+    with factory.begin() as session:
+        session.add(
+            AdapterArtifactReconciliationCursor(
+                department_id=authority.department_id,
+                family="registry",
+                status="failed",
+                cursor_created_at=now,
+                cursor_attempt_id=cursor_attempt_id,
+                version=7,
+            )
+        )
+        session.add(
+            AdapterArtifactOperation(
+                id=operation_id,
+                department_id=authority.department_id,
+                requested_by_user_id=authority.admin_id,
+                operation_type="reconcile",
+                status="completed",
+                limit_value=1,
+                minimum_age_seconds=300,
+                eligible_count=0,
+                completed_count=0,
+                blocked_count=0,
+                completed_at=now,
+                version=3,
+            )
+        )
+        session.add(
+            PersistentAuditEvent(
+                id=audit_id,
+                actor_subject=authority.subject,
+                actor_user_id=authority.admin_id,
+                department_id=authority.department_id,
+                action="adapter.artifact.reconcile",
+                resource_type="adapter_artifact_operation",
+                resource_id=str(operation_id),
+                result="allowed",
+                reason_code="completed",
+                created_at=now,
+            )
+        )
+    result = _purge(factory, authority, root)
+    assert result.applied_count == 2
+    with factory() as session:
+        cursor = session.get(
+            AdapterArtifactReconciliationCursor,
+            (authority.department_id, "registry", "failed"),
+        )
+        operation = session.get(AdapterArtifactOperation, operation_id)
+        audit = session.get(PersistentAuditEvent, audit_id)
+        assert cursor is not None and operation is not None and audit is not None
+        assert (cursor.cursor_attempt_id, cursor.version) == (cursor_attempt_id, 7)
+        assert (operation.status, operation.version, operation.completed_at) == (
+            "completed",
+            3,
+            now,
+        )
+        assert (audit.action, audit.result, audit.reason_code) == (
+            "adapter.artifact.reconcile",
+            "allowed",
+            "completed",
+        )
 
 
 def _purge(factory, authority: Authority, root: Path, *, apply: bool = True, department_id=None):
