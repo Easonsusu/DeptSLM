@@ -38,6 +38,47 @@ purge-pending/purged adapters; authoritative finals; Phase 10 datasets; Phase
 11 bundles; and every upstream dependency are excluded. No transition to a
 purge state occurs and no dependency is released.
 
+Every applied operation is a durable retry generation. Historical `blocked`
+items are immutable evidence and are never reopened or mutated. After an
+administrator repairs the reviewed external condition, a later authorized
+operation may register a fresh item for the same exact resource, attempt, and
+surface. At most one generation is active for a physical surface. For every
+surface, valid untried work is ordered before blocked retries across both
+source and registry lanes. Committed, succeeded, active, protected, and
+sibling-authority filters are applied in bulk after each bounded keyset
+window, so a persistent source retry cannot consume every operation while an
+untried registry attempt waits. Among blocked siblings, the scheduler uses
+exact retry counts and the latest blocked generation to rotate deterministically;
+a repaired newer generation can therefore progress without being starved by an
+older mismatch. Stage retries use the same ordering and never depend on a final
+manifest being present. Each family first reads a deterministic keyset window
+of at most `min(limit * 8, 1000)` attempt rows. The per-status queries use the
+full `(department_id, status, created_at, id)` indexes and fixed quotas whose
+sum is that bound; they do not rank an unbounded eligible relation with
+correlated history expressions. A separate content-free PostgreSQL cursor
+records the last inspected `(created_at, id)` boundary for each department,
+family, and lifecycle status. Apply mode advances each status cursor even when
+every row in its window is structurally ineligible, so repeated operations
+cannot rescan the same blocked prefix forever or jump over an uninspected row
+from another status; dry-run mode never creates or updates cursor rows. When a
+status suffix is exhausted, that bounded keyset stream wraps deterministically
+to the beginning and persists its new bounded boundary; it does not append the
+prior cursor row, so an adjacent older row cannot remain outside the circular
+scan.
+Only that window is materialized for structural checks and detailed fairness.
+Sibling authority uses bounded grouped aggregate results for the resources in
+the window rather than materializing every historical sibling row or issuing
+N+1 queries. History aggregation receives at most the window keys per surface.
+The final merged selection
+locks only the distinct attempt/resource rows (at most the requested limit)
+with `FOR UPDATE SKIP LOCKED`, and no more than that many attempts are
+registered in an operation. A blocked-only generation is
+`completed_with_blocks` and emits no deletion-success audit. A mixed generation
+emits at most one content-free success audit only after an exact attempt
+commits `cleanup_confirmed_at`; a completed item with another blocked applicable
+surface is not sufficient. A later retry emits an audit only for a newly
+confirmed resource not already covered by an earlier mixed-operation audit.
+
 ## Descriptor and tombstone contract
 
 The store opens the exact `adapters` root, department, resource, and stage or
@@ -92,6 +133,14 @@ PostgreSQL authority and external filesystem publication are compensating
 controls, not a distributed transaction. An in-flight filesystem operation
 cannot be fenced atomically by PostgreSQL; exact descriptors, tombstones, and
 subsequent authority checks keep unknown or orphaned bytes untrusted.
+
+Migration `0013_phase12_adapter_reconciliation_cursor` adds the independent
+cursor table and the complete attempt keyset indexes. The cursor identity is
+`(department_id, family, lifecycle_status)`: each independently quota-limited
+status stream advances and wraps on its own, so a later key in one status can
+never jump over an uninspected key in another status. PR #19 has a different
+`0013` migration on its branch; it must be rebased and renumbered to `0014`
+after this hotfix merges, before the branches are combined.
 
 Phase 12.1E-B/C, evaluation, approval, promotion, loading, runtime routing,
 and later Phase 12/13 work remain separate future phases.

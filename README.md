@@ -89,10 +89,14 @@ The validated-byte authority is bound by complete digest passes before and
 after child validation, digest-checked descriptor-relative staging, and
 post-rename identity verification. Every PostgreSQL transition compares a
 complete frozen authority snapshot and both row versions; static contract
-errors remain distinct from fixed descriptor/operational errors. Migration
-Migrations `0010_phase12_adapter_sources`, `0011_phase12_adapter_registry`, and
-`0012_phase12_adapter_reconciliation` are self-contained and CI validates that
-head with a private temporary adapters root; CI downloads no model weights.
+errors remain distinct from fixed descriptor/operational errors. Migrations
+`0010_phase12_adapter_sources`, `0011_phase12_adapter_registry`,
+`0012_phase12_adapter_reconciliation`, and
+`0013_phase12_adapter_reconciliation_cursor` are self-contained and CI
+validates that head with a private temporary adapters root; CI downloads no
+model weights. The 0013 cursor revision stores independent per-status scan
+positions on this hotfix branch; PR #19's separate 0013 must be renumbered to
+0014 after this branch merges.
 
 Phase 12.1A fixes the compatible package references, closed configuration and
 tensor grammar, bounded header/file limits, and model-free validation rules in a
@@ -101,7 +105,7 @@ lineage and declared external training association, not proven dataset use or
 trusted training execution. See the [Phase 12.1A static adapter contract](docs/adapter-static-contract.md)
 and [Phase 12 adapter registry contract](docs/adapter-registry.md).
 
-Each evaluation publication has a server-generated attempt UUID and a positive run attempt number. Final suite/result manifests are closed schemas and removal requires descriptor-verified exact department, resource, ownership UUID, run attempt, code revision, payload digests, and sizes. Staging has a separate private UUID-path ownership contract so a supervised child killed during directory or payload creation can be removed without parsing partial content. The exact descriptor chain is opened once through deletion; a staging marker is housekeeping only, so missing, zero-byte, truncated, or partial marker states remain recoverable. Reconciliation registers a resumable content-free batch before deletion. Unsafe entries terminalize as fixed-code blocked items and cannot starve later valid items; completed batches write one audit only when deletion succeeded. It is dry-run by default, department-scoped, restricted to system or department administrators, and accepts a strict limit of 1 through 1000. PostgreSQL and external storage are not transactionally atomic: an orphaned external result after a crash is never retrieval or evaluation authority. Reconciliation does not delete backups or persistent audit history.
+Each evaluation publication has a server-generated attempt UUID and a positive run attempt number. Final suite/result manifests are closed schemas and removal requires descriptor-verified exact department, resource, ownership UUID, run attempt, code revision, payload digests, and sizes. Staging has a separate private UUID-path ownership contract so a supervised child killed during directory or payload creation can be removed without parsing partial content. The exact descriptor chain is opened once through deletion; a staging marker is housekeeping only, so missing, zero-byte, truncated, or partial marker states remain recoverable. Reconciliation registers a resumable content-free batch before deletion. Unsafe entries terminalize as fixed-code blocked items and cannot starve later valid items; globally fair source and registry lanes preserve bounded progress, and completed batches write at most one audit only after an exact attempt commits cleanup confirmation. It is dry-run by default, department-scoped, restricted to system or department administrators, and accepts a strict limit of 1 through 1000. PostgreSQL and external storage are not transactionally atomic: an orphaned external result after a crash is never retrieval or evaluation authority. Reconciliation does not delete backups or persistent audit history.
 
 Phase 12.1E-A applies the same boundary to adapter source and registry
 artifacts. It reconciles only `source_stage`, failed/abandoned `source_final`,

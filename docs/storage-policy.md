@@ -293,7 +293,16 @@ closed inspection plus pre-rename move intent before a no-replace move into
 `.deleting`. Exact tombstone identity is committed before any unlink. Entries
 are unlinked only through the exact committed tombstone descriptor and the
 parent entry is rechecked before `rmdir`; an unbound tombstone is blocked, not
-adopted.
+adopted. Revision `0013_phase12_adapter_reconciliation_cursor` adds one
+content-free scan cursor per department, reconciliation family, and lifecycle
+status plus the complete `(department_id, status, created_at, id)` source/
+registry keyset indexes. Each fixed-quota status stream advances and wraps
+independently; a merged family window therefore cannot skip an uninspected row
+from another status. Apply mode advances each cursor to its inspected boundary,
+including a structurally empty window; dry-run does not write cursors. Cursor
+rows are not surface history or deletion authority. Structural sibling checks
+return one aggregate result per resource in the bounded attempt window, while
+history keys, final locks, and operation items remain bounded separately.
 
 Partial markers and payloads are not parsed or logged; missing, zero-byte,
 truncated, or interrupted markers remain recoverable when exact metadata and

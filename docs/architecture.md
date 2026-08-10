@@ -279,7 +279,14 @@ atomic. A filesystem rename without a committed succeeded row is not runtime,
 evaluation, or promotion authority; future reconciliation must handle that
 surface explicitly. Claim loss, timeout, shutdown, and database failure prevent
 success publication and completion audit, while a later worker may reclaim only
-the exact prior attempt.
+the exact prior attempt. E-A scan progress is separate content-free PostgreSQL
+state for each department/family; apply mode advances the inspected
+`(created_at, id)` boundary even for a structurally empty window, while dry-run
+leaves it unchanged. Source and registry keyset access uses the complete
+`(department_id, status, created_at, id)` indexes, grouped sibling authority
+results bounded to the current resource window, history keys bounded to that
+window, and final locks/items bounded by the requested limit. A cursor is not
+an operation item and never authorizes deletion by itself.
 
 ## Isolation and trust boundaries
 

@@ -2572,10 +2572,11 @@ class AdapterImportAttempt(Base):
             name="ck_adapter_import_attempt_error_code",
         ),
         Index(
-            "ix_adapter_import_attempt_department_status_created",
+            "ix_adapter_import_attempt_department_status_created_id",
             "department_id",
             "status",
             "created_at",
+            "id",
         ),
         Index(
             "uq_adapter_import_attempt_active",
@@ -3075,7 +3076,11 @@ class AdapterRegistryAttempt(Base):
             name="ck_adapter_registry_attempt_exact_lifecycle",
         ),
         Index(
-            "ix_adapter_registry_attempt_department_status", "department_id", "status", "created_at"
+            "ix_adapter_registry_attempt_department_status_created_id",
+            "department_id",
+            "status",
+            "created_at",
+            "id",
         ),
         Index(
             "uq_adapter_registry_attempt_active",
@@ -3730,8 +3735,61 @@ class AdapterArtifactOperation(Base):
     )
 
 
+class AdapterArtifactReconciliationCursor(Base):
+    """Content-free durable scan progress for one family/status stream."""
+
+    __tablename__ = "adapter_artifact_reconciliation_cursors"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["department_id"],
+            ["departments.id"],
+            name="fk_adapter_artifact_reconciliation_cursor_department",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "family IN ('source','registry')",
+            name="ck_adapter_artifact_reconciliation_cursor_family",
+        ),
+        CheckConstraint(
+            "(family = 'source' AND status IN "
+            "('failed','abandoned','registered','validated','staged','published')) OR "
+            "(family = 'registry' AND status IN "
+            "('validation_failed','failed','reclaimed'))",
+            name="ck_adapter_artifact_reconciliation_cursor_status",
+        ),
+        CheckConstraint(
+            "((cursor_created_at IS NULL AND cursor_attempt_id IS NULL) OR "
+            "(cursor_created_at IS NOT NULL AND cursor_attempt_id IS NOT NULL))",
+            name="ck_adapter_artifact_reconciliation_cursor_pair",
+        ),
+        CheckConstraint("version > 0", name="ck_adapter_artifact_reconciliation_cursor_version"),
+        UniqueConstraint(
+            "department_id",
+            "family",
+            "status",
+            name="uq_adapter_artifact_reconciliation_cursor_scope",
+        ),
+    )
+
+    department_id: Mapped[UUID] = mapped_column(primary_key=True)
+    family: Mapped[str] = mapped_column(String(16), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), primary_key=True)
+    cursor_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cursor_attempt_id: Mapped[UUID | None] = mapped_column()
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class AdapterArtifactOperationItem(Base):
-    """One exact adapter stage/final surface owned by a reconciliation operation."""
+    """One exact surface generation owned by a reconciliation operation.
+
+    Blocked rows are immutable history; a reviewed retry is represented by a
+    fresh item in a later operation and remains subject to the active-surface
+    uniqueness indexes below.
+    """
 
     __tablename__ = "adapter_artifact_operation_items"
     __table_args__ = (
