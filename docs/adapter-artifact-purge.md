@@ -39,9 +39,12 @@ adapters/.purge-deleting/registry_final/<department_id>/<adapter_id>/<item_id>/
 The source and registry finals remain in their canonical external locations
 until a complete closed manifest, exact file digests and sizes, private
 permissions, current-service ownership, UUID-derived path, and PostgreSQL
-authority have been verified. The move is same-filesystem and no-replace,
-followed by parent and tombstone-directory fsync. An existing or unknown
-tombstone is never adopted.
+authority have been verified. The verified observation, exact deletion plan,
+and item-scoped tombstone namespace are committed in a short
+`deletion_authorized` transaction before filesystem mutation. The move is
+then same-filesystem and no-replace, followed by parent and tombstone-directory
+fsync. A separate short transaction commits the exact `tombstone_bound`
+identity before any unlink. An existing or unknown tombstone is never adopted.
 
 All pathname components are opened descriptor-relatively with no-follow
 semantics. The original directory and each fixed file are identity-checked
@@ -55,7 +58,12 @@ deletion.
 
 ## Crash recovery and retention
 
-Each file deletion records `in_flight_entry` and `next_entry_index`; each
+The move-intent commit is the retry authority after a process crash: a retry
+may recover only the exact committed observation and tombstone namespace, and
+must reject a substituted original or tombstone. PostgreSQL and filesystem
+operations remain non-atomic, so an already in-flight rename cannot be fenced
+retroactively; the committed move intent and post-move identity checks keep
+such state bounded and untrusted. Each file deletion records `in_flight_entry` and `next_entry_index`; each
 directory deletion records `directory_unlink_started_at`. A crash before an
 unlink leaves an active reservation that can retry the exact identity. A crash
 after an unlink or directory removal is accepted only for the matching durable

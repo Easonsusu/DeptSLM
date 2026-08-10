@@ -26,6 +26,7 @@ from test_phase12_1e_a_postgres import (
 )
 
 from alembic import command
+from app.adapter_maintenance_artifacts import AdapterPurgeArtifactStore
 from app.adapter_purge import purge_adapter_artifacts
 from app.adapter_registry_queue import claim_next_adapter
 from app.adapter_source_artifacts import canonical_manifest_bytes
@@ -573,3 +574,132 @@ def test_registry_failure_blocks_source_without_deleting_it(
         source_row = session.get(AdapterImportSource, authority.source_id)
         assert adapter is not None and adapter.status == "purge_pending"
         assert source_row is not None and source_row.status == "purge_pending"
+
+
+def test_committed_move_intent_recovers_after_post_rename_crash(
+    factory, authority: Authority, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crash after rename leaves durable move intent for exact recovery."""
+
+    root = _storage(tmp_path)
+    _prepare_authority(factory, authority, root)
+    original = AdapterPurgeArtifactStore.move_verified_surface_to_tombstone
+    raised = False
+
+    def crash_after_move(self, inspected, *, expected_tombstone_namespace):
+        nonlocal raised
+        bound = original(
+            self,
+            inspected,
+            expected_tombstone_namespace=expected_tombstone_namespace,
+        )
+        if not raised:
+            raised = True
+            raise RuntimeError("simulated process failure after rename")
+        return bound
+
+    monkeypatch.setattr(
+        AdapterPurgeArtifactStore,
+        "move_verified_surface_to_tombstone",
+        crash_after_move,
+    )
+    with pytest.raises(RuntimeError, match="simulated process failure"):
+        _purge(factory, authority, root)
+    registry_tombstone = (
+        root
+        / "adapters"
+        / ".purge-deleting"
+        / "registry_final"
+        / str(authority.department_id)
+        / str(_adapter_id(factory, authority))
+    )
+    with factory() as session:
+        registry_item = session.scalar(
+            select(AdapterPurgeItem).where(
+                AdapterPurgeItem.department_id == authority.department_id,
+                AdapterPurgeItem.surface_type == "registry_final",
+            )
+        )
+        assert registry_item is not None
+        assert registry_item.status == "verified"
+        reservation = session.scalar(
+            select(AdapterPurgeReservation).where(
+                AdapterPurgeReservation.id == registry_item.reservation_id
+            )
+        )
+        assert reservation is not None and reservation.status == "deletion_authorized"
+    assert registry_tombstone.is_dir()
+    resumed = _purge(factory, authority, root)
+    assert resumed.applied_count == 2
+    with factory() as session:
+        adapter = session.scalar(
+            select(Adapter).where(Adapter.department_id == authority.department_id)
+        )
+        source = session.get(AdapterImportSource, authority.source_id)
+        assert adapter is not None and adapter.status == "purged"
+        assert source is not None and source.status == "purged"
+
+
+def test_substituted_tombstone_after_crash_is_blocked_and_preserved(
+    factory, authority: Authority, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recovery never adopts a substituted item-scoped tombstone."""
+
+    root = _storage(tmp_path)
+    _prepare_authority(factory, authority, root)
+    original = AdapterPurgeArtifactStore.move_verified_surface_to_tombstone
+    raised = False
+
+    def crash_after_move(self, inspected, *, expected_tombstone_namespace):
+        nonlocal raised
+        bound = original(
+            self,
+            inspected,
+            expected_tombstone_namespace=expected_tombstone_namespace,
+        )
+        if not raised:
+            raised = True
+            raise RuntimeError("simulated process failure after rename")
+        return bound
+
+    monkeypatch.setattr(
+        AdapterPurgeArtifactStore,
+        "move_verified_surface_to_tombstone",
+        crash_after_move,
+    )
+    with pytest.raises(RuntimeError, match="simulated process failure"):
+        _purge(factory, authority, root)
+    adapter_id = _adapter_id(factory, authority)
+    tombstone = (
+        root
+        / "adapters"
+        / ".purge-deleting"
+        / "registry_final"
+        / str(authority.department_id)
+        / str(adapter_id)
+        / next(
+            path.name
+            for path in (
+                root
+                / "adapters"
+                / ".purge-deleting"
+                / "registry_final"
+                / str(authority.department_id)
+                / str(adapter_id)
+            ).iterdir()
+        )
+    )
+    parked = tombstone.with_name(f"{tombstone.name}.parked")
+    tombstone.rename(parked)
+    tombstone.mkdir(mode=0o700)
+    tombstone.chmod(0o700)
+    result = _purge(factory, authority, root)
+    assert result.blocked_count >= 1
+    assert tombstone.is_dir() and parked.is_dir()
+    with factory() as session:
+        adapter = session.scalar(
+            select(Adapter).where(Adapter.department_id == authority.department_id)
+        )
+        source = session.get(AdapterImportSource, authority.source_id)
+        assert adapter is not None and adapter.status == "purge_pending"
+        assert source is not None and source.status == "purge_pending"

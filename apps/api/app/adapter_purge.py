@@ -115,6 +115,22 @@ class _Authority:
     registry_attempt: AdapterRegistryAttempt
 
 
+@dataclass(frozen=True, slots=True)
+class _MoveContext:
+    """Immutable in-memory context captured around one filesystem inspection."""
+
+    scope: PhysicalSurfaceIdentifier
+    authority_snapshot: dict[str, object]
+    expected_manifest: dict[str, object]
+    expected_manifest_sha256: str | None
+    expected_manifest_byte_size: int | None
+    expected_tombstone_namespace: dict[str, object]
+    expected_resource_version: int
+    expected_attempt_version: int
+    item_version: int
+    reservation_version: int
+
+
 def _bounded_int(raw: object, minimum: int, maximum: int) -> int:
     if not isinstance(raw, str) or not raw or not raw.isascii() or not raw.isdecimal():
         raise ValueError
@@ -704,6 +720,222 @@ def _load_item(
         return item, reservation
 
 
+def _move_context_for(
+    current: AdapterPurgeItem,
+    reservation: AdapterPurgeReservation,
+    authority: _Authority,
+    department_id: UUID,
+) -> _MoveContext:
+    resource_id = (
+        current.source_bundle_id if current.surface_type == "source_final" else current.adapter_id
+    )
+    scope = physical_surface_identifier(current.surface_type, department_id, resource_id, None)
+    expected_sha, expected_size = _manifest_digest_fields(current.surface_type, authority)
+    return _MoveContext(
+        scope=scope,
+        authority_snapshot=_authority_snapshot(authority),
+        expected_manifest=_manifest_for(current.surface_type, authority),
+        expected_manifest_sha256=expected_sha,
+        expected_manifest_byte_size=expected_size,
+        expected_tombstone_namespace={
+            "surface_type": current.surface_type,
+            "department_id": str(department_id),
+            "resource_id": str(resource_id),
+            "item_id": str(current.id),
+        },
+        expected_resource_version=(
+            authority.source.version
+            if current.surface_type == "source_final"
+            else authority.adapter.version
+        ),
+        expected_attempt_version=(
+            authority.source_attempt.version
+            if current.surface_type == "source_final"
+            else authority.registry_attempt.version
+        ),
+        item_version=current.version,
+        reservation_version=reservation.version,
+    )
+
+
+def _assert_move_context(
+    session: Session,
+    current: AdapterPurgeItem,
+    reservation: AdapterPurgeReservation,
+    authority: _Authority,
+    context: _MoveContext,
+    department_id: UUID,
+) -> None:
+    """Prove the short authorization transaction still owns the inspected state."""
+
+    _assert_eligible(session, authority, department_id)
+    if (
+        current.status != "registered"
+        or reservation.status != "registered"
+        or current.version != context.item_version
+        or reservation.version != context.reservation_version
+        or _authority_snapshot(authority) != context.authority_snapshot
+        or (
+            authority.source.version
+            if current.surface_type == "source_final"
+            else authority.adapter.version
+        )
+        != context.expected_resource_version
+        or (
+            authority.source_attempt.version
+            if current.surface_type == "source_final"
+            else authority.registry_attempt.version
+        )
+        != context.expected_attempt_version
+    ):
+        raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+
+
+def _capture_registered_context(
+    factory: sessionmaker[Session],
+    operation_id: UUID,
+    item_id: UUID,
+    department_id: UUID,
+) -> _MoveContext:
+    """Capture exact authority while holding only the short row locks."""
+
+    with factory.begin() as session:
+        current = session.execute(
+            select(AdapterPurgeItem)
+            .where(
+                AdapterPurgeItem.id == item_id,
+                AdapterPurgeItem.operation_id == operation_id,
+                AdapterPurgeItem.department_id == department_id,
+            )
+            .with_for_update()
+        ).scalar_one()
+        reservation = session.execute(
+            select(AdapterPurgeReservation)
+            .where(
+                AdapterPurgeReservation.operation_id == operation_id,
+                AdapterPurgeReservation.department_id == department_id,
+                AdapterPurgeReservation.surface_type == current.surface_type,
+            )
+            .with_for_update()
+        ).scalar_one()
+        authority = _load_authority(session, department_id, current.adapter_id)
+        if current.status != "registered" or reservation.status != "registered":
+            raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+        return _move_context_for(current, reservation, authority, department_id)
+
+
+def _persist_move_intent(
+    factory: sessionmaker[Session],
+    *,
+    operation_id: UUID,
+    item_id: UUID,
+    department_id: UUID,
+    inspected: InspectedSurface,
+    context: _MoveContext,
+) -> AdapterPurgeItem:
+    """Commit the verified observation before any filesystem rename."""
+
+    if inspected.address != context.scope or inspected.item_id != item_id:
+        raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+    with factory.begin() as session:
+        current = session.execute(
+            select(AdapterPurgeItem)
+            .where(
+                AdapterPurgeItem.id == item_id,
+                AdapterPurgeItem.operation_id == operation_id,
+                AdapterPurgeItem.department_id == department_id,
+            )
+            .with_for_update()
+        ).scalar_one()
+        reservation = session.execute(
+            select(AdapterPurgeReservation)
+            .where(
+                AdapterPurgeReservation.operation_id == operation_id,
+                AdapterPurgeReservation.department_id == department_id,
+                AdapterPurgeReservation.surface_type == current.surface_type,
+            )
+            .with_for_update()
+        ).scalar_one()
+        authority = _load_authority(session, department_id, current.adapter_id)
+        _assert_move_context(session, current, reservation, authority, context, department_id)
+        current.observed_identity = dict(inspected.observed_identity)
+        current.deletion_plan = list(inspected.deletion_plan)
+        current.expected_tombstone_namespace = dict(context.expected_tombstone_namespace)
+        current.status = "verified"
+        current.verified_at = session.scalar(select(func.clock_timestamp()))
+        current.move_authorized_at = current.verified_at
+        current.version += 1
+        reservation.status = "deletion_authorized"
+        reservation.deletion_authorized_at = current.verified_at
+        reservation.expected_tombstone_namespace = dict(context.expected_tombstone_namespace)
+        reservation.observed_identity = dict(current.observed_identity)
+        reservation.deletion_plan = list(current.deletion_plan)
+        reservation.version += 1
+        session.flush()
+        session.expunge(current)
+        return current
+
+
+def _bind_move_intent(
+    factory: sessionmaker[Session],
+    *,
+    operation_id: UUID,
+    item_id: UUID,
+    department_id: UUID,
+    bound: BoundSurface,
+) -> AdapterPurgeItem:
+    """Commit the exact tombstone identity in a transaction after the move."""
+
+    with factory.begin() as session:
+        current = session.execute(
+            select(AdapterPurgeItem)
+            .where(
+                AdapterPurgeItem.id == item_id,
+                AdapterPurgeItem.operation_id == operation_id,
+                AdapterPurgeItem.department_id == department_id,
+            )
+            .with_for_update()
+        ).scalar_one()
+        reservation = session.execute(
+            select(AdapterPurgeReservation)
+            .where(
+                AdapterPurgeReservation.operation_id == operation_id,
+                AdapterPurgeReservation.department_id == department_id,
+                AdapterPurgeReservation.surface_type == current.surface_type,
+            )
+            .with_for_update()
+        ).scalar_one()
+        if current.status == "tombstone_bound":
+            if current.tombstone_identity != bound.tombstone_identity:
+                raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+            session.expunge(current)
+            return current
+        if current.status != "verified" or reservation.status != "deletion_authorized":
+            raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+        authority = _load_authority(session, department_id, current.adapter_id)
+        expected_snapshot = reservation.authority_snapshot
+        if (
+            not isinstance(expected_snapshot, dict)
+            or _authority_snapshot(authority) != expected_snapshot
+            or current.expected_tombstone_namespace != reservation.expected_tombstone_namespace
+            or bound.tombstone_identity is None
+        ):
+            raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+        current.tombstone_identity = dict(bound.tombstone_identity)
+        current.status = "tombstone_bound"
+        current.tombstone_bound_at = session.scalar(select(func.clock_timestamp()))
+        current.deletion_started_at = current.tombstone_bound_at
+        current.version += 1
+        reservation.tombstone_identity = dict(bound.tombstone_identity)
+        reservation.status = "tombstone_bound"
+        reservation.tombstone_bound_at = current.tombstone_bound_at
+        reservation.deletion_started_at = current.deletion_started_at
+        reservation.version += 1
+        session.flush()
+        session.expunge(current)
+        return current
+
+
 def _execute_item(
     factory: sessionmaker[Session],
     *,
@@ -717,119 +949,60 @@ def _execute_item(
     item, reservation = _load_item(factory, operation_id, item_id, department_id)
     if item.status == "completed":
         return False
-    if item.status in {"registered", "verified"}:
-        with factory.begin() as session:
-            current = session.execute(
-                select(AdapterPurgeItem)
-                .where(
-                    AdapterPurgeItem.id == item_id, AdapterPurgeItem.department_id == department_id
+    if item.status == "registered":
+        context = _capture_registered_context(factory, operation_id, item_id, department_id)
+        with AdapterPurgeArtifactStore(data_dir) as store:
+            inspected = store.inspect_surface(
+                context.scope,
+                item_id,
+                expected_manifest=context.expected_manifest,
+                expected_manifest_sha256=context.expected_manifest_sha256,
+                expected_manifest_byte_size=context.expected_manifest_byte_size,
+            )
+        if inspected is None:
+            raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+        _persist_move_intent(
+            factory,
+            operation_id=operation_id,
+            item_id=item_id,
+            department_id=department_id,
+            inspected=inspected,
+            context=context,
+        )
+        item, reservation = _load_item(factory, operation_id, item_id, department_id)
+    if item.status == "verified":
+        inspected = _item_inspection(item)
+        scope = inspected.address
+        expected_namespace = item.expected_tombstone_namespace or {}
+        with AdapterPurgeArtifactStore(data_dir) as store:
+            try:
+                bound = store.move_verified_surface_to_tombstone(
+                    inspected,
+                    expected_tombstone_namespace=expected_namespace,
                 )
-                .with_for_update()
-            ).scalar_one()
-            reservation = session.execute(
-                select(AdapterPurgeReservation)
-                .where(
-                    AdapterPurgeReservation.operation_id == operation_id,
-                    AdapterPurgeReservation.department_id == department_id,
-                    AdapterPurgeReservation.surface_type == current.surface_type,
-                )
-                .with_for_update()
-            ).scalar_one()
-            authority = _load_authority(session, department_id, current.adapter_id)
-            expected_resource_version = (
-                authority.adapter.version
-                if current.surface_type == "registry_final"
-                else authority.source.version
-            )
-            if current.status == "registered" and (
-                reservation.status != "registered"
-                or expected_resource_version != reservation.expected_resource_version
-            ):
-                raise ServiceError(409, "Adapter purge authority changed")
-            expected_attempt_version = (
-                authority.registry_attempt.version
-                if current.surface_type == "registry_final"
-                else authority.source_attempt.version
-            )
-            if expected_attempt_version != reservation.expected_attempt_version:
-                raise ServiceError(409, "Adapter purge authority changed")
-            manifest = _manifest_for(current.surface_type, authority)
-            expected_sha, expected_size = _manifest_digest_fields(current.surface_type, authority)
-            scope = physical_surface_identifier(
-                current.surface_type,
-                department_id,
-                authority.source.id
-                if current.surface_type == "source_final"
-                else authority.adapter.id,
-                None,
-            )
-            with AdapterPurgeArtifactStore(data_dir) as store:
-                if current.status == "registered":
-                    inspected = store.inspect_surface(
-                        scope,
-                        current.id,
-                        expected_manifest=manifest,
-                        expected_manifest_sha256=expected_sha,
-                        expected_manifest_byte_size=expected_size,
-                    )
-                    if inspected is None:
-                        raise AdapterMaintenanceArtifactError("artifact_authority_changed")
-                    current.observed_identity = inspected.observed_identity
-                    current.deletion_plan = inspected.deletion_plan
-                    current.expected_tombstone_namespace = {
-                        "surface_type": inspected.surface_type,
-                        "department_id": str(inspected.department_id),
-                        "resource_id": str(inspected.resource_id),
-                        "item_id": str(inspected.item_id),
-                    }
-                    current.status = "verified"
-                    current.verified_at = session.scalar(select(func.clock_timestamp()))
-                    current.move_authorized_at = current.verified_at
-                    current.version += 1
-                    reservation.status = "deletion_authorized"
-                    reservation.deletion_authorized_at = current.verified_at
-                    reservation.expected_tombstone_namespace = dict(
-                        current.expected_tombstone_namespace
-                    )
-                    reservation.observed_identity = dict(current.observed_identity)
-                    reservation.deletion_plan = list(current.deletion_plan)
-                    reservation.version += 1
-                    session.flush()
-                inspected = _item_inspection(current)
-                try:
-                    bound = store.move_verified_surface_to_tombstone(
+            except AdapterMaintenanceArtifactError:
+                if store.tombstone_exists(scope, item.id):
+                    bound = store.recover_authorized_move(
                         inspected,
-                        expected_tombstone_namespace=current.expected_tombstone_namespace or {},
+                        expected_tombstone_namespace=expected_namespace,
                     )
-                except AdapterMaintenanceArtifactError:
-                    if current.status == "verified" and store.tombstone_exists(scope, current.id):
-                        bound = store.recover_authorized_move(
-                            inspected,
-                            expected_tombstone_namespace=current.expected_tombstone_namespace or {},
-                        )
-                    else:
-                        raise
-                if bound is None:
-                    if current.status == "verified" and store.tombstone_exists(scope, current.id):
-                        bound = store.recover_authorized_move(
-                            inspected,
-                            expected_tombstone_namespace=current.expected_tombstone_namespace or {},
-                        )
-                    else:
-                        raise AdapterMaintenanceArtifactError("artifact_authority_changed")
-            current.tombstone_identity = bound.tombstone_identity
-            current.status = "tombstone_bound"
-            current.tombstone_bound_at = session.scalar(select(func.clock_timestamp()))
-            current.deletion_started_at = current.tombstone_bound_at
-            current.version += 1
-            reservation.tombstone_identity = dict(bound.tombstone_identity)
-            reservation.status = "tombstone_bound"
-            reservation.tombstone_bound_at = current.tombstone_bound_at
-            reservation.deletion_started_at = current.deletion_started_at
-            reservation.version += 1
-            session.flush()
-            session.expunge(current)
-            item = current
+                else:
+                    raise
+            if bound is None:
+                if store.tombstone_exists(scope, item.id):
+                    bound = store.recover_authorized_move(
+                        inspected,
+                        expected_tombstone_namespace=expected_namespace,
+                    )
+                else:
+                    raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+        item = _bind_move_intent(
+            factory,
+            operation_id=operation_id,
+            item_id=item_id,
+            department_id=department_id,
+            bound=bound,
+        )
     bound = _bound_surface(item)
     plan = list(item.deletion_plan or [])
     for index, entry in enumerate(plan):

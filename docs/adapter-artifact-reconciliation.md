@@ -85,14 +85,15 @@ The store opens the exact `adapters` root, department, resource, and stage or
 final chain with `O_NOFOLLOW`, private `0700` directories, current service UID,
 and identity checks. Inspection is a read-only descriptor operation: it returns
 only a closed identity and deletion plan. PostgreSQL persists that observation
-as `registered -> verified`, then commits `move_authorized_at` and the exact
-item-scoped tombstone namespace before the worker reopens the original chain.
-The move compares every path, descriptor, digest, size, mode, UID, link count,
-`mtime_ns`, and `ctime_ns`, performs a no-replace rename, fsyncs both parents,
-and persists the resulting tombstone identity as `tombstone_bound` before any
-unlink. Entries are removed only through the committed tombstone descriptor;
-parent entry identity is checked immediately before both the move and final
-`rmdir`.
+as `registered -> verified`, then commits `move_authorized_at`, the exact
+item-scoped tombstone namespace, and `deletion_authorized` in a short
+transaction before the worker reopens the original chain. The move compares
+every path, descriptor, digest, size, mode, UID, link count, `mtime_ns`, and
+`ctime_ns`, performs a no-replace rename, and fsyncs both parents. A separate
+short transaction then commits the resulting tombstone identity as
+`tombstone_bound` before any unlink. Entries are removed only through the
+committed tombstone descriptor; parent entry identity is checked immediately
+before both the move and final `rmdir`.
 
 Partial stages are owned by durable metadata plus the exact UUID path. Marker,
 manifest, and payload contents are never parsed or logged during partial-stage
@@ -103,7 +104,10 @@ unknown entries, substituted parents, wrong UID or mode, foreign scope, and
 non-directories fail closed as fixed blocked item codes.
 
 The item records the observed identity and deletion plan before rename, then
-records tombstone identity before unlink. An unbound item-scoped tombstone is
+records tombstone identity before unlink. The committed move intent is the
+only recovery authority after a post-rename crash; PostgreSQL cannot fence an
+already in-flight filesystem request, so a retry accepts only the exact
+previously committed namespace and identity. An unbound item-scoped tombstone is
 never adopted or parsed: it blocks with `artifact_tombstone_conflict` and keeps
 both surfaces untouched. A post-rename/pre-commit crash is resumable only when
 the durable move intent exists, the original is absent, and the tombstone

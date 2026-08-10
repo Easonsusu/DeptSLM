@@ -151,8 +151,10 @@ cursor rows.
 Items move through `registered`, `verified`, `tombstone_bound`, `deleting`,
 `completed`, or `blocked`. `verified` stores the closed observed identity and
 deletion plan; a separate `move_authorized_at` plus the exact item-scoped
-`expected_tombstone_namespace` must be committed before rename. `tombstone_bound`
-stores the post-rename identity and is the only state that may unlink. JSON
+`expected_tombstone_namespace` and `deletion_authorized` must be committed in a
+short move-intent transaction before rename. A separate committed
+`tombstone_bound` state stores the post-rename identity and is the only state
+that may unlink. JSON
 fields contain only descriptor identities, allowlisted entry names,
 digests/sizes for complete finals, and crash-resume progress; they never
 contain adapter bytes, manifests from partial stages, paths, credentials,
