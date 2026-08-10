@@ -142,16 +142,22 @@ contain adapter bytes, manifests from partial stages, paths, credentials,
 tensor values, or dependency data. A terminal item can set the source/registry
 attempt's `cleanup_confirmed_at` only after every applicable surface and
 tombstone for that exact attempt is absent across all operations and no
-authoritative sibling exists. Candidate selection is database-bounded: each
-surface locks at most `min(limit * 8, 1000)` rows, aggregates history only for
-those exact rows, and uses bulk sibling checks rather than unbounded
-department-wide or N+1 queries. Untried stages and finals precede blocked
-retries; blocked siblings rotate by their exact retry counts and most recent
-blocked generation. The operation appends one safe success audit when at least
-one item completes, including a `completed_with_blocks` operation, while an
-all-blocked operation appends none. Blocked item rows remain immutable history;
-a later authorized operation records a fresh retry generation after repair,
-and a blocked item cannot starve a later untried sibling.
+authoritative sibling exists. Candidate selection applies authority filters
+before each bounded source/registry scan, preselects at most
+`min(limit * 8, 1000)` rows per family without locks, merges global fairness,
+and locks only the final distinct attempt/resource rows with
+`FOR UPDATE SKIP LOCKED`. History is grouped only for those exact rows, with
+bulk sibling checks rather than unbounded department-wide or N+1 queries.
+Untried stages and finals precede blocked retries across both families;
+blocked siblings rotate by exact retry counts and most recent blocked
+generation, so an outside-window untried item and the other family cannot be
+starved. The operation appends at most one safe success audit only when an
+exact attempt has committed `cleanup_confirmed_at`, including a
+`completed_with_blocks` operation; a completed item with another blocked
+surface and an all-blocked operation append none. Blocked item rows remain
+immutable history; a later authorized operation records a fresh retry
+generation after repair and emits only for a newly confirmed resource not
+already covered by a prior mixed-operation audit.
 - `documents`: department-owned source metadata with an internal uploader relation, normalized filename, canonical media type, positive size, SHA-256 digest, lifecycle state, version, and timestamps. It stores no body or path, and public document schemas do not expose internal identity IDs; see [document-model.md](document-model.md).
 - `document_extractions`: immutable attempt history and PostgreSQL queue state, including source/pipeline identity, claim lease, safe result metadata, and an allowlisted error code. It stores no content, path, filename, stderr, or exception.
 - `document_chunks`: department/document/extraction-scoped offsets, byte size, internal digest, and mutually exclusive page/line provenance. Chunk text remains external.

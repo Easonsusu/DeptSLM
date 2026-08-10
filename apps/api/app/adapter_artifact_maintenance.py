@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from sqlalchemy import String, and_, cast, func, or_, select
+from sqlalchemy import String, and_, case, cast, func, literal, or_, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, aliased, sessionmaker
 
@@ -65,10 +65,12 @@ PROTECTED_ADAPTER_STATUSES = frozenset({"validated", "purge_pending", "purged"})
 TERMINAL_SOURCE_ATTEMPT_STATUSES = frozenset({"failed", "abandoned"})
 TERMINAL_REGISTRY_ATTEMPT_STATUSES = frozenset({"validation_failed", "failed", "reclaimed"})
 ACTIVE_ITEM_STATUSES = frozenset({"registered", "verified", "tombstone_bound", "deleting"})
-# Candidate selection is intentionally bounded at the database boundary. A
-# caller may request at most 1,000 attempts; each surface scans no more than
-# that limit or eight times the limit, whichever is smaller. History is then
-# aggregated only for those locked rows, never for the whole department.
+# Candidate selection has two bounded phases.  Each source/registry lane may
+# inspect at most this many rows using indexed SQL predicates and grouped
+# history.  The final ``FOR UPDATE SKIP LOCKED`` query locks only the selected
+# attempt/resource rows (at most ``limit`` distinct attempts); the preselection
+# rows are never locked.  This lets untried work outside an old blocked prefix
+# enter the next bounded window without widening the lock footprint.
 RECONCILIATION_SCAN_MULTIPLIER = 8
 RECONCILIATION_MAX_SCAN_ROWS = 1000
 
@@ -344,28 +346,51 @@ def _row_fairness_key(
     stage_history: dict[tuple[UUID, UUID], _SurfaceHistory],
     final_history: dict[tuple[UUID, UUID], _SurfaceHistory],
 ) -> tuple[object, ...]:
-    """Order untried stage work before bounded blocked retries."""
+    """Order any untried surface before bounded blocked retries.
+
+    The row represents both a stage and (when its manifest is valid) a final.
+    Ranking stage state before final state would let a blocked stage on one
+    attempt outrank an untried final on another attempt, so the aggregate lane
+    rank is computed first and only then uses the applicable surface history.
+    """
 
     resource_id = resource_id_for(row)
     attempt_id = attempt_id_for(row)
 
-    def rank(history: dict[tuple[UUID, UUID], _SurfaceHistory]) -> tuple[object, ...]:
+    def state_and_record(
+        history: dict[tuple[UUID, UUID], _SurfaceHistory],
+    ) -> tuple[str, _SurfaceHistory | None]:
         record = history.get((resource_id, attempt_id))
         state = _surface_item_state(history, resource_id, attempt_id)
-        if state == "untried":
-            return (0, 0, 0.0)
-        if state == "blocked" and record is not None:
-            latest = (
-                record.latest_blocked_at.timestamp()
-                if record.latest_blocked_at is not None
-                else 0.0
+        return state, record
+
+    stage_state, stage_record = state_and_record(stage_history)
+    final_state, final_record = state_and_record(final_history)
+    if stage_state == "untried" or final_state == "untried":
+        lane_rank = (0, 0, 0.0)
+    else:
+        blocked_records = [
+            record
+            for state, record in (
+                (stage_state, stage_record),
+                (final_state, final_record),
             )
-            return (1, record.blocked_count, -latest)
-        return (2, 0, 0.0)
+            if state == "blocked" and record is not None
+        ]
+        if blocked_records:
+            retry_count = min(record.blocked_count for record in blocked_records)
+            latest_values = [
+                record.latest_blocked_at.timestamp()
+                for record in blocked_records
+                if record.latest_blocked_at is not None
+            ]
+            lane_rank = (1, retry_count, min(latest_values) if latest_values else 0.0)
+        else:
+            lane_rank = (2, 0, 0.0)
 
     created_at = getattr(row[0], "created_at", None)
     created_key = created_at.timestamp() if created_at is not None else 0.0
-    return (*rank(stage_history), *rank(final_history), created_key, str(attempt_id))
+    return (*lane_rank, created_key, str(attempt_id))
 
 
 def reconcile_adapter_artifacts(
@@ -538,8 +563,104 @@ def _select_candidates(
     selected_source_finals: set[UUID] = set()
     selected_registry_finals: set[UUID] = set()
     scan_limit = _bounded_scan_limit(limit)
+    source_sibling = aliased(AdapterImportAttempt)
+    source_stage_seen = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "source_stage",
+            AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
+            AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
+        )
+        .correlate(AdapterImportAttempt, AdapterImportSource)
+        .exists()
+    )
+    source_final_seen = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "source_final",
+            AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
+            AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
+        )
+        .correlate(AdapterImportAttempt, AdapterImportSource)
+        .exists()
+    )
+    source_stage_blocked_count = (
+        select(func.count(AdapterArtifactOperationItem.id))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "source_stage",
+            AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
+            AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
+            AdapterArtifactOperationItem.status == "blocked",
+        )
+        .correlate(AdapterImportAttempt, AdapterImportSource)
+        .scalar_subquery()
+    )
+    source_final_blocked_count = (
+        select(func.count(AdapterArtifactOperationItem.id))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "source_final",
+            AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
+            AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
+            AdapterArtifactOperationItem.status == "blocked",
+        )
+        .correlate(AdapterImportAttempt, AdapterImportSource)
+        .scalar_subquery()
+    )
+    source_stage_latest_blocked = (
+        select(func.max(AdapterArtifactOperationItem.created_at))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "source_stage",
+            AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
+            AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
+            AdapterArtifactOperationItem.status == "blocked",
+        )
+        .correlate(AdapterImportAttempt, AdapterImportSource)
+        .scalar_subquery()
+    )
+    source_final_latest_blocked = (
+        select(func.max(AdapterArtifactOperationItem.created_at))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "source_final",
+            AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
+            AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
+            AdapterArtifactOperationItem.status == "blocked",
+        )
+        .correlate(AdapterImportAttempt, AdapterImportSource)
+        .scalar_subquery()
+    )
+    source_stage_completed = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "source_stage",
+            AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
+            AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
+            AdapterArtifactOperationItem.status == "completed",
+        )
+        .correlate(AdapterImportAttempt, AdapterImportSource)
+        .exists()
+    )
+    source_has_untried = or_(
+        ~source_stage_seen,
+        and_(AdapterImportAttempt.ownership_manifest.is_not(None), ~source_final_seen),
+    )
+    source_blocked_rank = case(
+        (source_stage_completed, source_final_blocked_count),
+        else_=source_stage_blocked_count,
+    )
+    source_latest_blocked_rank = case(
+        (source_stage_completed, source_final_latest_blocked),
+        else_=source_stage_latest_blocked,
+    )
     # Terminal source attempts are safe to inspect even when their source is
-    # abandoned/rejected; protected source states are explicitly excluded.
+    # abandoned/rejected; protected source states and ineligible siblings are
+    # excluded before the bounded scan limit is applied.
     source_rows = session.execute(
         select(AdapterImportAttempt, AdapterImportSource)
         .join(
@@ -555,14 +676,43 @@ def _select_candidates(
                 + ("registered", "validated", "staged", "published")
             ),
             AdapterImportSource.status.not_in(tuple(PROTECTED_SOURCE_STATUSES)),
-            (
-                (AdapterImportAttempt.status.in_(tuple(TERMINAL_SOURCE_ATTEMPT_STATUSES)))
-                | (AdapterImportAttempt.created_at <= cutoff)
+            AdapterImportSource.authoritative_attempt_id.is_(None),
+            or_(
+                AdapterImportAttempt.status.in_(tuple(TERMINAL_SOURCE_ATTEMPT_STATUSES)),
+                and_(
+                    AdapterImportAttempt.status.not_in(tuple(TERMINAL_SOURCE_ATTEMPT_STATUSES)),
+                    AdapterImportSource.status == "staging",
+                    AdapterImportSource.authoritative_attempt_id.is_(None),
+                    AdapterImportAttempt.created_at <= cutoff,
+                ),
             ),
+            ~select(literal(1))
+            .where(
+                source_sibling.department_id == AdapterImportAttempt.department_id,
+                source_sibling.source_bundle_id == AdapterImportAttempt.source_bundle_id,
+                source_sibling.id != AdapterImportAttempt.id,
+                source_sibling.status == "committed",
+            )
+            .correlate(AdapterImportAttempt)
+            .exists(),
+            ~select(literal(1))
+            .where(
+                source_sibling.department_id == AdapterImportAttempt.department_id,
+                source_sibling.source_bundle_id == AdapterImportAttempt.source_bundle_id,
+                source_sibling.id != AdapterImportAttempt.id,
+                ~source_sibling.status.in_(tuple(TERMINAL_SOURCE_ATTEMPT_STATUSES)),
+            )
+            .correlate(AdapterImportAttempt)
+            .exists(),
         )
-        .order_by(AdapterImportAttempt.created_at, AdapterImportAttempt.id)
+        .order_by(
+            case((source_has_untried, 0), else_=1),
+            source_blocked_rank,
+            source_latest_blocked_rank.asc().nullsfirst(),
+            AdapterImportAttempt.created_at,
+            AdapterImportAttempt.id,
+        )
         .limit(scan_limit)
-        .with_for_update(skip_locked=True)
     ).all()
     source_ids = {source.id for _attempt, source in source_rows}
     committed_source_ids = (
@@ -638,62 +788,106 @@ def _select_candidates(
             source_final_untried_by_resource.get(resource_id, False)
             or _surface_item_state(source_final_history, resource_id, attempt_id) == "untried"
         )
-    for attempt, source in ordered_source_rows:
-        if selected_attempts >= limit:
-            break
-        selected_this_attempt = False
-        final_key = (source.id, attempt.id)
-        final_state = _surface_item_state(source_final_history, source.id, attempt.id)
-        stage_state = _surface_item_state(source_stage_history, source.id, attempt.id)
-        stage_retryable = stage_state in {"untried", "blocked"}
-        if stage_retryable:
-            result.append(
-                _Candidate(
-                    "source_stage",
-                    department_id,
-                    source.id,
-                    None,
-                    attempt.id,
-                    None,
-                    attempt.publication_attempt_id,
-                    attempt.attempt_number,
-                    source.version,
-                    attempt.version,
-                    None,
-                )
-            )
-            selected_this_attempt = True
-        preferred_final = final_key in source_final_manifests and (
-            final_state == "untried"
-            or (
-                final_state == "blocked"
-                and not source_final_untried_by_resource.get(source.id, False)
-            )
+    # Source and registry rows are merged only after each bounded SQL lane has
+    # applied its eligibility predicates.  This is the cross-family fairness
+    # boundary: a persistent source retry cannot consume every operation while
+    # an untried registry attempt is available.
+    registry_scan_limit = _bounded_scan_limit(limit)
+    registry_sibling = aliased(AdapterRegistryAttempt)
+    registry_stage_seen = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "registry_stage",
+            AdapterArtifactOperationItem.adapter_id == Adapter.id,
+            AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
         )
-        if source.id not in selected_source_finals and preferred_final:
-            result.append(
-                _Candidate(
-                    "source_final",
-                    department_id,
-                    source.id,
-                    None,
-                    attempt.id,
-                    None,
-                    attempt.publication_attempt_id,
-                    attempt.attempt_number,
-                    source.version,
-                    attempt.version,
-                    source_final_manifests[final_key],
-                )
-            )
-            selected_source_finals.add(source.id)
-            selected_this_attempt = True
-        if selected_this_attempt:
-            selected_attempts += 1
-    remaining_attempts = max(0, limit - selected_attempts)
-    if remaining_attempts == 0:
-        return tuple(result)
-    registry_scan_limit = _bounded_scan_limit(remaining_attempts)
+        .correlate(AdapterRegistryAttempt, Adapter)
+        .exists()
+    )
+    registry_final_seen = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "registry_final",
+            AdapterArtifactOperationItem.adapter_id == Adapter.id,
+            AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
+        )
+        .correlate(AdapterRegistryAttempt, Adapter)
+        .exists()
+    )
+    registry_stage_blocked_count = (
+        select(func.count(AdapterArtifactOperationItem.id))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "registry_stage",
+            AdapterArtifactOperationItem.adapter_id == Adapter.id,
+            AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
+            AdapterArtifactOperationItem.status == "blocked",
+        )
+        .correlate(AdapterRegistryAttempt, Adapter)
+        .scalar_subquery()
+    )
+    registry_final_blocked_count = (
+        select(func.count(AdapterArtifactOperationItem.id))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "registry_final",
+            AdapterArtifactOperationItem.adapter_id == Adapter.id,
+            AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
+            AdapterArtifactOperationItem.status == "blocked",
+        )
+        .correlate(AdapterRegistryAttempt, Adapter)
+        .scalar_subquery()
+    )
+    registry_stage_latest_blocked = (
+        select(func.max(AdapterArtifactOperationItem.created_at))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "registry_stage",
+            AdapterArtifactOperationItem.adapter_id == Adapter.id,
+            AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
+            AdapterArtifactOperationItem.status == "blocked",
+        )
+        .correlate(AdapterRegistryAttempt, Adapter)
+        .scalar_subquery()
+    )
+    registry_final_latest_blocked = (
+        select(func.max(AdapterArtifactOperationItem.created_at))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "registry_final",
+            AdapterArtifactOperationItem.adapter_id == Adapter.id,
+            AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
+            AdapterArtifactOperationItem.status == "blocked",
+        )
+        .correlate(AdapterRegistryAttempt, Adapter)
+        .scalar_subquery()
+    )
+    registry_stage_completed = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "registry_stage",
+            AdapterArtifactOperationItem.adapter_id == Adapter.id,
+            AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
+            AdapterArtifactOperationItem.status == "completed",
+        )
+        .correlate(AdapterRegistryAttempt, Adapter)
+        .exists()
+    )
+    registry_has_untried = or_(
+        ~registry_stage_seen,
+        and_(AdapterRegistryAttempt.ownership_manifest.is_not(None), ~registry_final_seen),
+    )
+    registry_blocked_rank = case(
+        (registry_stage_completed, registry_final_blocked_count),
+        else_=registry_stage_blocked_count,
+    )
+    registry_latest_blocked_rank = case(
+        (registry_stage_completed, registry_final_latest_blocked),
+        else_=registry_stage_latest_blocked,
+    )
     registry_rows = session.execute(
         select(AdapterRegistryAttempt, Adapter)
         .join(
@@ -706,10 +900,26 @@ def _select_candidates(
             AdapterRegistryAttempt.cleanup_confirmed_at.is_(None),
             AdapterRegistryAttempt.status.in_(tuple(TERMINAL_REGISTRY_ATTEMPT_STATUSES)),
             Adapter.status.in_(("failed", "validation_failed")),
+            ~select(literal(1))
+            .where(
+                registry_sibling.department_id == AdapterRegistryAttempt.department_id,
+                registry_sibling.adapter_id == AdapterRegistryAttempt.adapter_id,
+                registry_sibling.id != AdapterRegistryAttempt.id,
+                registry_sibling.status.in_(
+                    ("succeeded", "registered", "running", "staged", "published")
+                ),
+            )
+            .correlate(AdapterRegistryAttempt)
+            .exists(),
         )
-        .order_by(AdapterRegistryAttempt.created_at, AdapterRegistryAttempt.id)
+        .order_by(
+            case((registry_has_untried, 0), else_=1),
+            registry_blocked_rank,
+            registry_latest_blocked_rank.asc().nullsfirst(),
+            AdapterRegistryAttempt.created_at,
+            AdapterRegistryAttempt.id,
+        )
         .limit(registry_scan_limit)
-        .with_for_update(skip_locked=True)
     ).all()
     registry_ids = {adapter.id for _attempt, adapter in registry_rows}
     registry_sibling_statuses = (
@@ -788,59 +998,151 @@ def _select_candidates(
             registry_final_untried_by_resource.get(resource_id, False)
             or _surface_item_state(registry_final_history, resource_id, attempt_id) == "untried"
         )
-    for attempt, adapter in ordered_registry_rows:
+    # Merge source and registry lanes only after each bounded SQL query has
+    # applied its eligibility predicates.  A persistent retry in one family
+    # therefore cannot consume every operation while the other family has
+    # untried work available.
+    family_rows: list[tuple[str, object, object]] = [
+        *(("source", attempt, source) for attempt, source in ordered_source_rows),
+        *(("registry", attempt, adapter) for attempt, adapter in ordered_registry_rows),
+    ]
+
+    def family_row_rank(row: tuple[str, object, object]) -> tuple[object, ...]:
+        family, attempt, resource = row
+        if family == "source":
+            return _row_fairness_key(
+                (attempt, resource),
+                resource_id_for=lambda value: value[1].id,
+                attempt_id_for=lambda value: value[0].id,
+                stage_history=source_stage_history,
+                final_history=source_final_history,
+            )
+        return _row_fairness_key(
+            (attempt, resource),
+            resource_id_for=lambda value: value[1].id,
+            attempt_id_for=lambda value: value[0].id,
+            stage_history=registry_stage_history,
+            final_history=registry_final_history,
+        )
+
+    family_rows.sort(key=family_row_rank)
+    selected_source_attempts: set[UUID] = set()
+    selected_registry_attempts: set[UUID] = set()
+    for family, attempt, resource in family_rows:
         if selected_attempts >= limit:
             break
+        resource_id = resource.id
+        final_key = (resource_id, attempt.id)
+        if family == "source":
+            stage_history = source_stage_history
+            final_history = source_final_history
+            final_manifests = source_final_manifests
+            final_untried_by_resource = source_final_untried_by_resource
+            selected_finals = selected_source_finals
+            stage_surface = "source_stage"
+            final_surface = "source_final"
+        else:
+            stage_history = registry_stage_history
+            final_history = registry_final_history
+            final_manifests = registry_final_manifests
+            final_untried_by_resource = registry_final_untried_by_resource
+            selected_finals = selected_registry_finals
+            stage_surface = "registry_stage"
+            final_surface = "registry_final"
         selected_this_attempt = False
-        final_key = (adapter.id, attempt.id)
-        final_state = _surface_item_state(registry_final_history, adapter.id, attempt.id)
-        stage_state = _surface_item_state(registry_stage_history, adapter.id, attempt.id)
-        stage_retryable = stage_state in {"untried", "blocked"}
-        if stage_retryable:
+        stage_state = _surface_item_state(stage_history, resource_id, attempt.id)
+        final_state = _surface_item_state(final_history, resource_id, attempt.id)
+        if stage_state in {"untried", "blocked"}:
             result.append(
                 _Candidate(
-                    "registry_stage",
+                    stage_surface,
                     department_id,
-                    None,
-                    adapter.id,
-                    None,
-                    attempt.id,
+                    resource_id if family == "source" else None,
+                    resource_id if family == "registry" else None,
+                    attempt.id if family == "source" else None,
+                    attempt.id if family == "registry" else None,
                     attempt.publication_attempt_id,
                     attempt.attempt_number,
-                    adapter.version,
+                    resource.version,
                     attempt.version,
                     None,
                 )
             )
             selected_this_attempt = True
-        preferred_final = final_key in registry_final_manifests and (
+        preferred_final = final_key in final_manifests and (
             final_state == "untried"
-            or (
-                final_state == "blocked"
-                and not registry_final_untried_by_resource.get(adapter.id, False)
-            )
+            or (final_state == "blocked" and not final_untried_by_resource.get(resource_id, False))
         )
-        if adapter.id not in selected_registry_finals and preferred_final:
+        if resource_id not in selected_finals and preferred_final:
             result.append(
                 _Candidate(
-                    "registry_final",
+                    final_surface,
                     department_id,
-                    None,
-                    adapter.id,
-                    None,
-                    attempt.id,
+                    resource_id if family == "source" else None,
+                    resource_id if family == "registry" else None,
+                    attempt.id if family == "source" else None,
+                    attempt.id if family == "registry" else None,
                     attempt.publication_attempt_id,
                     attempt.attempt_number,
-                    adapter.version,
+                    resource.version,
                     attempt.version,
-                    registry_final_manifests[final_key],
+                    final_manifests[final_key],
                 )
             )
-            selected_registry_finals.add(adapter.id)
+            selected_finals.add(resource_id)
             selected_this_attempt = True
         if selected_this_attempt:
             selected_attempts += 1
-    return tuple(result)
+            (selected_source_attempts if family == "source" else selected_registry_attempts).add(
+                attempt.id
+            )
+
+    # Preselection never locks.  Lock only the exact distinct attempts that
+    # survived global fairness; rows skipped by a concurrent operation are
+    # omitted instead of widening this operation's lock footprint.
+    locked_source_attempts: set[UUID] = set()
+    if selected_source_attempts:
+        locked_source_attempts = set(
+            session.scalars(
+                select(AdapterImportAttempt.id)
+                .join(
+                    AdapterImportSource,
+                    (AdapterImportSource.id == AdapterImportAttempt.source_bundle_id)
+                    & (AdapterImportSource.department_id == AdapterImportAttempt.department_id),
+                )
+                .where(
+                    AdapterImportAttempt.department_id == department_id,
+                    AdapterImportAttempt.id.in_(selected_source_attempts),
+                )
+                .with_for_update(skip_locked=True)
+            ).all()
+        )
+    locked_registry_attempts: set[UUID] = set()
+    if selected_registry_attempts:
+        locked_registry_attempts = set(
+            session.scalars(
+                select(AdapterRegistryAttempt.id)
+                .join(
+                    Adapter,
+                    (Adapter.id == AdapterRegistryAttempt.adapter_id)
+                    & (Adapter.department_id == AdapterRegistryAttempt.department_id),
+                )
+                .where(
+                    AdapterRegistryAttempt.department_id == department_id,
+                    AdapterRegistryAttempt.id.in_(selected_registry_attempts),
+                )
+                .with_for_update(skip_locked=True)
+            ).all()
+        )
+    return tuple(
+        candidate
+        for candidate in result
+        if (
+            candidate.import_attempt_id in locked_source_attempts
+            if candidate.import_attempt_id is not None
+            else candidate.registry_attempt_id in locked_registry_attempts
+        )
+    )
 
 
 def _abandon_stale_source_if_needed(session: Session, candidate: _Candidate) -> _Candidate:
@@ -1000,6 +1302,7 @@ def _check_authority(session: Session, item: AdapterArtifactOperationItem) -> No
             raise ServiceError(409, "Adapter reconciliation authority changed")
         if (
             source.status in PROTECTED_SOURCE_STATUSES
+            or source.authoritative_attempt_id is not None
             or attempt.status not in TERMINAL_SOURCE_ATTEMPT_STATUSES
         ):
             raise ServiceError(409, "Adapter reconciliation authority changed")
@@ -1764,14 +2067,10 @@ def _finalize_operation(
         operation.status = "completed_with_blocks" if operation.blocked_count else "completed"
         operation.completed_at = session.scalar(select(func.clock_timestamp()))
         operation.version += 1
-        # A mixed operation still has a durable success whenever at least one
-        # exact surface completed.  Only an all-blocked operation is denied a
-        # deletion-success audit.  A later retry of another surface for the
-        # same exact resource/attempt does not duplicate an earlier operation
-        # audit.
-        if operation.completed_count > 0 and _has_unaudited_completion(
-            session, operation_id, department_id, items
-        ):
+        # A completed item is only progress.  A success audit requires a
+        # durable exact-attempt cleanup_confirmed_at row; a mixed operation
+        # may still contain blocked work for another attempt/resource.
+        if _has_unaudited_completion(session, operation_id, department_id, items):
             scope = DepartmentRequestScope(DepartmentScope(department_id))
             append_mutation_audit(
                 session,
@@ -1790,70 +2089,126 @@ def _has_unaudited_completion(
     department_id: UUID,
     items: list[AdapterArtifactOperationItem],
 ) -> bool:
-    """Return whether this operation closes a resource already mixed-audited.
+    """Return whether this operation has an uncovered confirmed resource.
 
-    Reconciliation audits are operation-level, while one operation may contain
-    multiple surfaces.  A later retry of a blocked surface must not duplicate a
-    prior mixed-operation audit for the same department-scoped resource, while
-    an unrelated resource must still receive its own audit.  The predicate list
-    is bounded by this operation's item limit and the query does not load
-    historical rows into Python.
+    ``completed`` item rows are only progress records.  The durable attempt
+    ``cleanup_confirmed_at`` timestamp is the success authority.  Resource
+    keys stay at the reviewed department/resource-family scope so a later
+    retry of the same resource does not duplicate an earlier mixed-operation
+    audit, while a different source or registry resource remains auditable.
+    Every ``IN`` set comes from this bounded operation's items.
     """
 
-    completed_items = [item for item in items if item.status == "completed"]
-    predicates = []
-    blocked_item = aliased(AdapterArtifactOperationItem)
-    for item in completed_items:
-        if item.source_bundle_id is not None and item.import_attempt_id is not None:
-            predicates.append(
-                and_(
-                    AdapterArtifactOperationItem.source_bundle_id == item.source_bundle_id,
-                    blocked_item.source_bundle_id == item.source_bundle_id,
+    source_attempt_ids = {
+        item.import_attempt_id
+        for item in items
+        if item.status == "completed"
+        and item.import_attempt_id is not None
+        and item.source_bundle_id is not None
+    }
+    registry_attempt_ids = {
+        item.registry_attempt_id
+        for item in items
+        if item.status == "completed"
+        and item.registry_attempt_id is not None
+        and item.adapter_id is not None
+    }
+    confirmed_keys: set[tuple[str, UUID]] = set()
+    if source_attempt_ids:
+        confirmed_keys.update(
+            (source_id, "source")
+            for (source_id,) in session.execute(
+                select(AdapterImportAttempt.source_bundle_id).where(
+                    AdapterImportAttempt.department_id == department_id,
+                    AdapterImportAttempt.id.in_(source_attempt_ids),
+                    AdapterImportAttempt.cleanup_confirmed_at.is_not(None),
                 )
-            )
-        elif item.adapter_id is not None and item.registry_attempt_id is not None:
-            predicates.append(
-                and_(
-                    AdapterArtifactOperationItem.adapter_id == item.adapter_id,
-                    blocked_item.adapter_id == item.adapter_id,
+            ).all()
+        )
+    if registry_attempt_ids:
+        confirmed_keys.update(
+            (adapter_id, "registry")
+            for (adapter_id,) in session.execute(
+                select(AdapterRegistryAttempt.adapter_id).where(
+                    AdapterRegistryAttempt.department_id == department_id,
+                    AdapterRegistryAttempt.id.in_(registry_attempt_ids),
+                    AdapterRegistryAttempt.cleanup_confirmed_at.is_not(None),
                 )
-            )
-    if not predicates:
+            ).all()
+        )
+    if not confirmed_keys:
         return False
-    statement = (
-        select(AdapterArtifactOperationItem.id)
-        .join(
-            AdapterArtifactOperation,
-            AdapterArtifactOperation.id == AdapterArtifactOperationItem.operation_id,
+
+    prior_operation = aliased(AdapterArtifactOperation)
+    prior_completed = aliased(AdapterArtifactOperationItem)
+    prior_blocked = aliased(AdapterArtifactOperationItem)
+    prior_audit = aliased(PersistentAuditEvent)
+
+    def covered_resources(
+        resource_column,
+        resource_ids: set[UUID],
+        blocked_column,
+    ) -> set[UUID]:
+        if not resource_ids:
+            return set()
+        statement = (
+            select(resource_column)
+            .select_from(prior_completed)
+            .join(
+                prior_operation,
+                and_(
+                    prior_operation.id == prior_completed.operation_id,
+                    prior_operation.department_id == department_id,
+                ),
+            )
+            .join(
+                prior_blocked,
+                and_(
+                    prior_blocked.operation_id == prior_operation.id,
+                    prior_blocked.department_id == department_id,
+                    prior_blocked.status == "blocked",
+                    blocked_column == resource_column,
+                ),
+            )
+            .join(
+                prior_audit,
+                and_(
+                    prior_audit.resource_id == cast(prior_operation.id, String),
+                    prior_audit.department_id == department_id,
+                ),
+            )
+            .where(
+                prior_completed.department_id == department_id,
+                prior_completed.status == "completed",
+                prior_operation.id != operation_id,
+                prior_audit.action == "adapter.artifact.reconcile",
+                prior_audit.resource_type == "adapter_artifact_operation",
+                prior_audit.result == "allowed",
+                resource_column.in_(resource_ids),
+            )
+            .distinct()
         )
-        .join(
-            blocked_item,
-            and_(
-                blocked_item.operation_id == AdapterArtifactOperation.id,
-                blocked_item.department_id == department_id,
-                blocked_item.status == "blocked",
-            ),
+        return set(session.scalars(statement).all())
+
+    source_ids = {resource_id for resource_id, family in confirmed_keys if family == "source"}
+    registry_ids = {resource_id for resource_id, family in confirmed_keys if family == "registry"}
+    covered = {
+        (resource_id, "source")
+        for resource_id in covered_resources(
+            prior_completed.source_bundle_id,
+            source_ids,
+            prior_blocked.source_bundle_id,
         )
-        .join(
-            PersistentAuditEvent,
-            and_(
-                PersistentAuditEvent.resource_id == cast(AdapterArtifactOperation.id, String),
-                PersistentAuditEvent.department_id == AdapterArtifactOperation.department_id,
-            ),
+    }
+    covered.update(
+        (resource_id, "registry")
+        for resource_id in covered_resources(
+            prior_completed.adapter_id,
+            registry_ids,
+            prior_blocked.adapter_id,
         )
-        .where(
-            AdapterArtifactOperationItem.department_id == department_id,
-            AdapterArtifactOperationItem.status == "completed",
-            AdapterArtifactOperation.id != operation_id,
-            AdapterArtifactOperation.department_id == department_id,
-            PersistentAuditEvent.action == "adapter.artifact.reconcile",
-            PersistentAuditEvent.resource_type == "adapter_artifact_operation",
-            PersistentAuditEvent.result == "allowed",
-            or_(*predicates),
-        )
-        .limit(1)
     )
-    return session.scalar(statement) is None
+    return bool(confirmed_keys - covered)
 
 
 __all__ = [

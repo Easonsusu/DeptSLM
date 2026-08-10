@@ -21,6 +21,7 @@ from test_phase12_1d_postgres import _cleanup as cleanup_seed
 
 from alembic import command
 from app.adapter_artifact_maintenance import (
+    RECONCILIATION_SCAN_MULTIPLIER,
     _manifest_authority,
     reconcile_adapter_artifacts,
 )
@@ -247,6 +248,23 @@ def _source_stage(root: Path, authority: Authority) -> Path:
         / str(authority.department_id)
         / str(authority.source_id)
         / str(authority.source_attempt_id)
+    )
+    stage.mkdir(mode=0o700, parents=True)
+    for path in (stage.parent.parent, stage.parent, stage):
+        path.chmod(0o700)
+    _file(stage / "adapter_config.json")
+    return stage
+
+
+def _source_stage_for_attempt(root: Path, authority: Authority, attempt_id: UUID) -> Path:
+    stage = (
+        root
+        / "adapters"
+        / ".staging"
+        / "imports"
+        / str(authority.department_id)
+        / str(authority.source_id)
+        / str(attempt_id)
     )
     stage.mkdir(mode=0o700, parents=True)
     for path in (stage.parent.parent, stage.parent, stage):
@@ -1122,6 +1140,102 @@ def test_blocked_source_stage_does_not_starve_new_untried_stage(
         assert row is not None and row.status == "completed"
 
 
+def test_untried_source_stage_progresses_past_bounded_blocked_window(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    root = _storage(tmp_path)
+    _abandon_source(factory, authority)
+    old_stages = [_source_stage(root, authority)]
+    old_stages[0].chmod(0o755)
+    old_attempt_ids: list[UUID] = []
+    for attempt_number in range(2, 2 + RECONCILIATION_SCAN_MULTIPLIER):
+        attempt_id = _add_failed_source_attempt(factory, authority, attempt_number=attempt_number)
+        old_attempt_ids.append(attempt_id)
+        stage = _source_stage_for_attempt(root, authority, attempt_id)
+        stage.chmod(0o755)
+    for _ in range(1 + RECONCILIATION_SCAN_MULTIPLIER):
+        result = _reconcile(factory, authority, root, apply=True, limit=1)
+        assert result.blocked_count == 1
+
+    fresh_id = _add_failed_source_attempt(
+        factory, authority, attempt_number=2 + RECONCILIATION_SCAN_MULTIPLIER
+    )
+    fresh_stage = _source_stage_for_attempt(root, authority, fresh_id)
+    result = _reconcile(factory, authority, root, apply=True, limit=1)
+    assert result.blocked_count == 0
+    assert result.completed_count == 1
+    with factory() as session:
+        item = session.scalar(
+            select(AdapterArtifactOperationItem).where(
+                AdapterArtifactOperationItem.department_id == authority.department_id,
+                AdapterArtifactOperationItem.surface_type == "source_stage",
+                AdapterArtifactOperationItem.import_attempt_id == fresh_id,
+            )
+        )
+        assert item is not None and item.status == "completed"
+        old_items = session.scalars(
+            select(AdapterArtifactOperationItem).where(
+                AdapterArtifactOperationItem.department_id == authority.department_id,
+                AdapterArtifactOperationItem.surface_type == "source_stage",
+                AdapterArtifactOperationItem.import_attempt_id.in_(old_attempt_ids),
+            )
+        ).all()
+        assert old_items and all(item.status == "blocked" for item in old_items)
+    assert not fresh_stage.exists()
+
+
+def test_untried_registry_stage_progresses_past_source_retry_backlog(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    root = _storage(tmp_path)
+    _final, adapter_id = _prepare_registry_crash(factory, authority, root, "published")
+    _abandon_source(factory, authority)
+    source_stage = _source_stage(root, authority)
+    source_stage.chmod(0o755)
+    with factory() as session:
+        registry_attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
+            )
+        )
+        assert registry_attempt is not None
+        registry_stage = (
+            root
+            / "adapters"
+            / ".staging"
+            / "registry"
+            / str(authority.department_id)
+            / str(adapter_id)
+            / str(registry_attempt.publication_attempt_id)
+        )
+    registry_stage.mkdir(mode=0o700, parents=True)
+    for path in (registry_stage.parent.parent, registry_stage.parent, registry_stage):
+        path.chmod(0o700)
+    _file(registry_stage / "adapter_config.json")
+    registry_stage.chmod(0o755)
+
+    first = _reconcile(factory, authority, root, apply=True, limit=1)
+    assert first.blocked_count == 1
+    second = _reconcile(factory, authority, root, apply=True, limit=1)
+    assert second.blocked_count == 1
+    with factory() as session:
+        source_item = session.scalar(
+            select(AdapterArtifactOperationItem).where(
+                AdapterArtifactOperationItem.department_id == authority.department_id,
+                AdapterArtifactOperationItem.surface_type == "source_stage",
+            )
+        )
+        registry_item = session.scalar(
+            select(AdapterArtifactOperationItem).where(
+                AdapterArtifactOperationItem.department_id == authority.department_id,
+                AdapterArtifactOperationItem.surface_type == "registry_stage",
+            )
+        )
+        assert source_item is not None and source_item.status == "blocked"
+        assert registry_item is not None and registry_item.status == "blocked"
+
+
 def test_blocked_registry_stage_does_not_starve_new_untried_stage(
     factory, authority: Authority, tmp_path: Path
 ) -> None:
@@ -1231,8 +1345,16 @@ def test_mixed_reconciliation_emits_one_success_audit_with_blocked_item(
                     PersistentAuditEvent.action == "adapter.artifact.reconcile",
                 )
             )
-            == 1
+            == 0
         )
+        attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
+                AdapterRegistryAttempt.attempt_number == 1,
+            )
+        )
+        assert attempt is not None and attempt.cleanup_confirmed_at is None
         blocked = session.scalar(
             select(AdapterArtifactOperationItem).where(
                 AdapterArtifactOperationItem.department_id == authority.department_id,
@@ -1248,6 +1370,14 @@ def test_mixed_reconciliation_emits_one_success_audit_with_blocked_item(
     assert retry.blocked_count == 0
     assert not blocked_stage.exists()
     with factory() as session:
+        attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
+                AdapterRegistryAttempt.attempt_number == 2,
+            )
+        )
+        assert attempt is not None and attempt.cleanup_confirmed_at is not None
         assert (
             session.scalar(
                 select(func.count(PersistentAuditEvent.id)).where(

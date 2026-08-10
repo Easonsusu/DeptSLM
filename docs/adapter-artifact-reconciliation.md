@@ -43,19 +43,25 @@ items are immutable evidence and are never reopened or mutated. After an
 administrator repairs the reviewed external condition, a later authorized
 operation may register a fresh item for the same exact resource, attempt, and
 surface. At most one generation is active for a physical surface. For every
-surface, valid untried work is ordered before blocked retries. Among blocked
-siblings, the scheduler uses the exact bounded blocked-attempt count and most
-recent blocked generation to rotate deterministically; a repaired newer
-generation can therefore progress without being starved by an older mismatch.
-Stage retries use the same ordering and never depend on a final manifest being
-present. Candidate selection locks at most `min(limit * 8, 1000)` source or
-registry attempt rows per surface, where the public limit is fixed to
-`1..1000`; history is grouped only for those exact locked rows and sibling
-status checks are bulk queries, not department-wide history scans or N+1
-queries. A blocked-only generation is `completed_with_blocks` and emits no
-deletion-success audit. A mixed generation emits exactly one content-free
-success audit when at least one exact surface closes, while a later retry never
-duplicates that earlier audit.
+surface, valid untried work is ordered before blocked retries across both
+source and registry lanes. Committed, succeeded, active, protected, and
+sibling-authority filters are applied before each bounded SQL scan, so a
+persistent source retry cannot consume every operation while an untried
+registry attempt waits. Among blocked siblings, the scheduler uses exact retry
+counts and the latest blocked generation to rotate deterministically; a
+repaired newer generation can therefore progress without being starved by an
+older mismatch. Stage retries use the same ordering and never depend on a final
+manifest being present. Each family preselects at most `min(limit * 8, 1000)`
+rows without locking, then the merged fair selection locks only the final
+distinct attempt/resource rows (at most the requested limit) with
+`FOR UPDATE SKIP LOCKED`. History is grouped only for those bounded rows and
+sibling status checks are bulk queries, not department-wide history scans or
+N+1 queries. A blocked-only generation is `completed_with_blocks` and emits no
+deletion-success audit. A mixed generation emits at most one content-free
+success audit only after an exact attempt commits `cleanup_confirmed_at`; a
+completed item with another blocked applicable surface is not sufficient. A
+later retry emits an audit only for a newly confirmed resource not already
+covered by an earlier mixed-operation audit.
 
 ## Descriptor and tombstone contract
 
