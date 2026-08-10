@@ -345,6 +345,7 @@ def _row_fairness_key(
     attempt_id_for,
     stage_history: dict[tuple[UUID, UUID], _SurfaceHistory],
     final_history: dict[tuple[UUID, UUID], _SurfaceHistory],
+    final_applicable_keys: set[tuple[UUID, UUID]],
 ) -> tuple[object, ...]:
     """Order any untried surface before bounded blocked retries.
 
@@ -365,7 +366,13 @@ def _row_fairness_key(
         return state, record
 
     stage_state, stage_record = state_and_record(stage_history)
-    final_state, final_record = state_and_record(final_history)
+    if (resource_id, attempt_id) in final_applicable_keys:
+        final_state, final_record = state_and_record(final_history)
+    else:
+        # A missing ownership manifest means the final surface is not part of
+        # this attempt's cleanup contract.  It must not be treated as an
+        # untried final and thereby make a blocked stage look fresh forever.
+        final_state, final_record = "not_applicable", None
     if stage_state == "untried" or final_state == "untried":
         lane_rank = (0, 0, 0.0)
     else:
@@ -779,6 +786,7 @@ def _select_candidates(
                 attempt_id_for=lambda value: value[0].id,
                 stage_history=source_stage_history,
                 final_history=source_final_history,
+                final_applicable_keys=set(source_final_manifests),
             ),
         )
     )
@@ -989,6 +997,7 @@ def _select_candidates(
                 attempt_id_for=lambda value: value[0].id,
                 stage_history=registry_stage_history,
                 final_history=registry_final_history,
+                final_applicable_keys=set(registry_final_manifests),
             ),
         )
     )
@@ -1016,6 +1025,7 @@ def _select_candidates(
                 attempt_id_for=lambda value: value[0].id,
                 stage_history=source_stage_history,
                 final_history=source_final_history,
+                final_applicable_keys=set(source_final_manifests),
             )
         return _row_fairness_key(
             (attempt, resource),
@@ -1023,6 +1033,7 @@ def _select_candidates(
             attempt_id_for=lambda value: value[0].id,
             stage_history=registry_stage_history,
             final_history=registry_final_history,
+            final_applicable_keys=set(registry_final_manifests),
         )
 
     family_rows.sort(key=family_row_rank)

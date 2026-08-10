@@ -973,10 +973,12 @@ def test_blocked_source_final_gets_a_fresh_retry_generation(
     assert not final.exists()
     with factory() as session:
         rows = session.scalars(
-            select(AdapterArtifactOperationItem).where(
+            select(AdapterArtifactOperationItem)
+            .where(
                 AdapterArtifactOperationItem.department_id == authority.department_id,
                 AdapterArtifactOperationItem.surface_type == "source_final",
             )
+            .order_by(AdapterArtifactOperationItem.created_at, AdapterArtifactOperationItem.id)
         ).all()
         assert [row.status for row in rows] == ["blocked", "completed"]
         attempt = session.get(AdapterImportAttempt, authority.source_attempt_id)
@@ -1020,10 +1022,12 @@ def test_blocked_registry_stage_gets_a_fresh_retry_generation(
     assert not stage.exists()
     with factory() as session:
         rows = session.scalars(
-            select(AdapterArtifactOperationItem).where(
+            select(AdapterArtifactOperationItem)
+            .where(
                 AdapterArtifactOperationItem.department_id == authority.department_id,
                 AdapterArtifactOperationItem.surface_type == "registry_stage",
             )
+            .order_by(AdapterArtifactOperationItem.created_at, AdapterArtifactOperationItem.id)
         ).all()
         assert [row.status for row in rows] == ["blocked", "completed"]
 
@@ -1044,10 +1048,12 @@ def test_blocked_registry_final_gets_a_fresh_retry_generation(
     assert not final.exists()
     with factory() as session:
         rows = session.scalars(
-            select(AdapterArtifactOperationItem).where(
+            select(AdapterArtifactOperationItem)
+            .where(
                 AdapterArtifactOperationItem.department_id == authority.department_id,
                 AdapterArtifactOperationItem.surface_type == "registry_final",
             )
+            .order_by(AdapterArtifactOperationItem.created_at, AdapterArtifactOperationItem.id)
         ).all()
         assert [row.status for row in rows] == ["blocked", "completed"]
         attempt = session.scalar(
@@ -1345,7 +1351,7 @@ def test_mixed_reconciliation_emits_one_success_audit_with_blocked_item(
                     PersistentAuditEvent.action == "adapter.artifact.reconcile",
                 )
             )
-            == 0
+            == 1
         )
         attempt = session.scalar(
             select(AdapterRegistryAttempt).where(
@@ -1354,7 +1360,7 @@ def test_mixed_reconciliation_emits_one_success_audit_with_blocked_item(
                 AdapterRegistryAttempt.attempt_number == 1,
             )
         )
-        assert attempt is not None and attempt.cleanup_confirmed_at is None
+        assert attempt is not None and attempt.cleanup_confirmed_at is not None
         blocked = session.scalar(
             select(AdapterArtifactOperationItem).where(
                 AdapterArtifactOperationItem.department_id == authority.department_id,
@@ -1375,6 +1381,78 @@ def test_mixed_reconciliation_emits_one_success_audit_with_blocked_item(
                 AdapterRegistryAttempt.department_id == authority.department_id,
                 AdapterRegistryAttempt.adapter_id == adapter_id,
                 AdapterRegistryAttempt.attempt_number == 2,
+            )
+        )
+        assert attempt is not None and attempt.cleanup_confirmed_at is not None
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.artifact.reconcile",
+                )
+            )
+            == 1
+        )
+
+
+def test_partial_attempt_cleanup_does_not_emit_premature_success_audit(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    root = _storage(tmp_path)
+    final, adapter_id = _prepare_registry_crash(factory, authority, root, "published")
+    with factory() as session:
+        attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
+            )
+        )
+        assert attempt is not None
+        stage = (
+            root
+            / "adapters"
+            / ".staging"
+            / "registry"
+            / str(authority.department_id)
+            / str(adapter_id)
+            / str(attempt.publication_attempt_id)
+        )
+    stage.mkdir(mode=0o700, parents=True)
+    for path in (stage.parent.parent, stage.parent, stage):
+        path.chmod(0o700)
+    _file(stage / "adapter_config.json")
+    final.chmod(0o755)
+
+    first = _reconcile(factory, authority, root, apply=True, limit=10)
+    assert first.completed_count == 1
+    assert first.blocked_count == 1
+    with factory() as session:
+        attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
+            )
+        )
+        assert attempt is not None and attempt.cleanup_confirmed_at is None
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.artifact.reconcile",
+                )
+            )
+            == 0
+        )
+
+    final.chmod(0o700)
+    second = _reconcile(factory, authority, root, apply=True, limit=10)
+    assert second.completed_count == 1
+    assert second.blocked_count == 0
+    with factory() as session:
+        attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
             )
         )
         assert attempt is not None and attempt.cleanup_confirmed_at is not None
