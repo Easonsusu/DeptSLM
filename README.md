@@ -56,6 +56,13 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > deployment, evaluation, or training behavior. Phase 12.1E-C, Phase 12.2
 > through Phase 12.4, and runtime routing remain unstarted.
 
+> **Phase 12.1E-B recovery:** An unbound post-rename purge recovery accepts
+> only its one exact durable tombstone UUID. A canonical private unknown
+> sibling is preserved as an operator-resolved retryable conflict, while an
+> expected-item substitution remains terminal. Before `purged` and its success
+> audit, both exact purge namespaces are rechecked as empty; no unknown state
+> is adopted, deleted, or quarantined automatically.
+
 > **Phase 12.1C hardening:** The registry binds exact composite source, Phase 11
 > attempt, and Phase 10 attempt identities and carries evolving versions for
 > every authority row, the registry attempt, and the active retention fence.

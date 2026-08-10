@@ -45,6 +45,10 @@ and item-scoped tombstone namespace are committed in a short
 then same-filesystem and no-replace, followed by parent and tombstone-directory
 fsync. A separate short transaction commits the exact `tombstone_bound`
 identity before any unlink. An existing or unknown tombstone is never adopted.
+For unbound post-rename recovery, the exact resource namespace must contain
+only the one durable item UUID. A canonical private unknown sibling is
+preserved and causes a retryable operator-resolved conflict; replacement of
+the expected item itself remains a terminal authority mismatch.
 
 All pathname components are opened descriptor-relatively with no-follow
 semantics. The original directory and each fixed file are identity-checked
@@ -67,9 +71,15 @@ such state bounded and untrusted. Each file deletion records `in_flight_entry` a
 directory deletion records `directory_unlink_started_at`. A crash before an
 unlink leaves an active reservation that can retry the exact identity. A crash
 after an unlink or directory removal is accepted only for the matching durable
-step. Partial state is never parsed or logged. The operation remains blocked
-when the stored identity, manifest, authority, or tombstone namespace no longer
-matches.
+step. Partial state is never parsed or logged. The operation remains terminally
+blocked when the stored identity, manifest, or authority no longer matches;
+the exact unknown-sibling namespace conflict above remains resumable only with
+the same durable item after external reviewed removal.
+
+Immediately before the final PostgreSQL transition, both exact source and
+registry purge namespaces must be empty. A remaining unknown tombstone is not
+deleted, quarantined, or adopted, and prevents the `purged` lifecycle change
+and success audit until an external reviewed recovery removes only that state.
 
 Purge removes only the exact source and registry artifact bytes. It never
 deletes Phase 10 datasets, Phase 11 training-job bundles, PostgreSQL lineage,

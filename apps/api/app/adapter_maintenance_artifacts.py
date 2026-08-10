@@ -66,6 +66,19 @@ class AdapterMaintenanceArtifactError(RuntimeError):
         super().__init__(self.code)
 
 
+class RetryablePurgeTombstoneNamespaceConflict(AdapterMaintenanceArtifactError):
+    """A valid but unowned E-B tombstone sibling requires operator recovery.
+
+    This is deliberately distinct from an expected tombstone substitution.
+    The latter is an authority mismatch and remains terminal; a canonical,
+    private unknown sibling is preserved untouched so the same durable move
+    intent can resume after a reviewed operator removes only that sibling.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("artifact_tombstone_conflict")
+
+
 @dataclass(frozen=True, slots=True)
 class SurfaceIdentity:
     device: int
@@ -799,7 +812,13 @@ class AdapterMaintenanceArtifactStore:
                 os.close(descriptor)
 
     def tombstone_exists(self, address: PhysicalSurfaceIdentifier, item_id: UUID) -> bool:
-        """Return whether an item-scoped tombstone exists, without adopting it."""
+        """Return discovery-only item presence without authorizing recovery.
+
+        Existing reconciliation callers use this predicate to locate work, but
+        a membership result is never sufficient to adopt a purge tombstone.
+        E-B recovery uses ``open_exact_authorized_recovery_tombstone`` instead
+        so it can require an exclusive exact resource namespace.
+        """
 
         address = _checked_surface_address(address)
         _safe_uuid(item_id)
@@ -1122,6 +1141,117 @@ class AdapterPurgeArtifactStore(AdapterMaintenanceArtifactStore):
     def __init__(self, data_dir: Path) -> None:
         super().__init__(data_dir, tombstone_root_name=".purge-deleting")
 
+    @staticmethod
+    def _require_exact_recovery_namespace(resource: int, item_id: UUID) -> None:
+        """Require the only canonical/private item to be the durable item."""
+
+        item_ids = AdapterMaintenanceArtifactStore._enumerate_item_ids(resource)
+        if item_ids == (item_id,):
+            return
+        if item_id in item_ids:
+            raise RetryablePurgeTombstoneNamespaceConflict()
+        raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+
+    def open_exact_authorized_recovery_tombstone(
+        self,
+        inspected: InspectedSurface,
+        *,
+        expected_tombstone_namespace: dict[str, object],
+    ) -> BoundSurface:
+        """Rebind one unbound E-B move only from its exclusive namespace.
+
+        The resource chain is opened once through no-follow descriptors.  It
+        remains open while every sibling is enumerated, the exact expected
+        item is opened and verified against the durable move intent, and the
+        namespace is rechecked before returning.  No path in this method is
+        deleted, renamed, adopted, or otherwise mutated.
+        """
+
+        if not isinstance(inspected, InspectedSurface):
+            raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+        expected = {
+            "surface_type": inspected.surface_type,
+            "department_id": str(inspected.department_id),
+            "resource_id": str(inspected.resource_id),
+            "item_id": str(inspected.item_id),
+        }
+        if expected_tombstone_namespace != expected:
+            raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+        # A recovery tombstone is authoritative only when the original exact
+        # surface is absent.  Do not adopt a sibling while both paths exist.
+        if self.surface_exists(inspected.address):
+            raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+        expected_entries = [
+            dict(entry["identity"])
+            for entry in inspected.deletion_plan
+            if isinstance(entry, dict) and isinstance(entry.get("identity"), dict)
+        ]
+        if len(expected_entries) != len(inspected.deletion_plan):
+            raise AdapterMaintenanceArtifactError("artifact_ownership_mismatch")
+        address = _checked_surface_address(inspected.address)
+        parent = self._deleting_fds[address.surface_type]
+        opened: list[int] = []
+        try:
+            department = _open_dir(parent, str(address.department_id))
+            opened.append(department)
+            resource = _open_dir(department, str(address.resource_id))
+            opened.append(resource)
+            self._require_exact_recovery_namespace(resource, inspected.item_id)
+            directory = _open_dir(resource, str(inspected.item_id))
+            opened.append(directory)
+            current_entry = os.stat(str(inspected.item_id), dir_fd=resource, follow_symlinks=False)
+            if not _same(current_entry, os.fstat(directory)):
+                raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+            current_directory = SurfaceIdentity.from_stat(os.fstat(directory)).as_json()
+            expected_original_directory = inspected.observed_identity.get("directory")
+            if not isinstance(expected_original_directory, dict) or not _same_directory_identity(
+                SurfaceIdentity.from_json(current_directory),
+                SurfaceIdentity.from_json(expected_original_directory),
+            ):
+                raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+            self._verify_entries(
+                directory,
+                expected_entries,
+                stage=inspected.surface_type.endswith("_stage"),
+                expected_directory=current_directory,
+            )
+            # A same-UID writer cannot be transactionally fenced with the
+            # filesystem. Re-enumerate while holding the parent descriptor to
+            # reject a sibling that arrived during item verification.
+            self._require_exact_recovery_namespace(resource, inspected.item_id)
+            current_entry = os.stat(str(inspected.item_id), dir_fd=resource, follow_symlinks=False)
+            if not _same(current_entry, os.fstat(directory)):
+                raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+            return BoundSurface(
+                inspected.surface_type,
+                inspected.department_id,
+                inspected.resource_id,
+                inspected.attempt_id,
+                inspected.item_id,
+                dict(inspected.observed_identity),
+                [
+                    {"name": entry["name"], "identity": dict(entry["identity"])}
+                    for entry in inspected.deletion_plan
+                ],
+                {"directory": current_directory, "entries": expected_entries},
+            )
+        except FileNotFoundError as error:
+            raise AdapterMaintenanceArtifactError("artifact_authority_changed") from error
+        finally:
+            for descriptor in reversed(opened):
+                os.close(descriptor)
+
+    def assert_tombstone_namespace_empty(self, address: PhysicalSurfaceIdentifier) -> None:
+        """Reject finalization when an exact E-B resource namespace is nonempty.
+
+        This is read-only and descriptor-relative.  Unknown state is never
+        adopted or removed; an operator must resolve it before the same
+        durable operation can transition its adapter and source to ``purged``.
+        """
+
+        if self.enumerate_tombstones(address):
+            raise RetryablePurgeTombstoneNamespaceConflict()
+
 
 __all__ = [
     "AdapterMaintenanceArtifactError",
@@ -1136,4 +1266,5 @@ __all__ = [
     "SOURCE_FINAL_FILES",
     "REGISTRY_FINAL_FILES",
     "SURFACES",
+    "RetryablePurgeTombstoneNamespaceConflict",
 ]

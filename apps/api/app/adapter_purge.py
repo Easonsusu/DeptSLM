@@ -25,6 +25,7 @@ from app.adapter_maintenance_artifacts import (
     BoundSurface,
     InspectedSurface,
     PhysicalSurfaceIdentifier,
+    RetryablePurgeTombstoneNamespaceConflict,
     physical_surface_identifier,
 )
 from app.adapter_registry_domain import canonical_json_bytes
@@ -574,6 +575,15 @@ def purge_adapter_artifacts(
                     actor_subject=actor_subject,
                 ):
                     applied += 1
+            except RetryablePurgeTombstoneNamespaceConflict as error:
+                # The expected item and its durable move intent remain valid,
+                # but an external canonical/private sibling exists in the
+                # exact namespace. Do not terminalize the item or start
+                # source deletion; an operator must remove only that sibling
+                # before this same operation can resume.
+                raise ServiceError(
+                    409, "Adapter purge recovery requires external conflict resolution"
+                ) from error
             except AdapterMaintenanceArtifactError as error:
                 _block_item(factory, operation_id, item_id, department_id, error.code)
                 blocked += 1
@@ -581,6 +591,7 @@ def purge_adapter_artifacts(
                 raise
     _finalize_operation(
         factory,
+        data_dir=data_dir,
         operation_id=operation_id,
         department_id=department_id,
         actor_issuer=actor_issuer,
@@ -972,7 +983,6 @@ def _execute_item(
         item, reservation = _load_item(factory, operation_id, item_id, department_id)
     if item.status == "verified":
         inspected = _item_inspection(item)
-        scope = inspected.address
         expected_namespace = item.expected_tombstone_namespace or {}
         with AdapterPurgeArtifactStore(data_dir) as store:
             try:
@@ -981,21 +991,19 @@ def _execute_item(
                     expected_tombstone_namespace=expected_namespace,
                 )
             except AdapterMaintenanceArtifactError:
-                if store.tombstone_exists(scope, item.id):
-                    bound = store.recover_authorized_move(
-                        inspected,
-                        expected_tombstone_namespace=expected_namespace,
-                    )
-                else:
-                    raise
+                # A move may have completed before a process crash or a
+                # post-rename storage error. Recovery never uses a boolean
+                # membership probe: it opens the exact resource namespace and
+                # requires the durable item to be its sole tombstone.
+                bound = store.open_exact_authorized_recovery_tombstone(
+                    inspected,
+                    expected_tombstone_namespace=expected_namespace,
+                )
             if bound is None:
-                if store.tombstone_exists(scope, item.id):
-                    bound = store.recover_authorized_move(
-                        inspected,
-                        expected_tombstone_namespace=expected_namespace,
-                    )
-                else:
-                    raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+                bound = store.open_exact_authorized_recovery_tombstone(
+                    inspected,
+                    expected_tombstone_namespace=expected_namespace,
+                )
         item = _bind_move_intent(
             factory,
             operation_id=operation_id,
@@ -1180,6 +1188,7 @@ def _block_item(
 def _finalize_operation(
     factory: sessionmaker[Session],
     *,
+    data_dir: Path,
     operation_id: UUID,
     department_id: UUID,
     actor_issuer: str,
@@ -1208,6 +1217,31 @@ def _finalize_operation(
             blocked = [item for item in items if item.status == "blocked"]
             if any(item.status not in {"completed", "blocked"} for item in items):
                 return
+            if not blocked:
+                try:
+                    with AdapterPurgeArtifactStore(data_dir) as store:
+                        for item in items:
+                            resource_id = (
+                                item.source_bundle_id
+                                if item.surface_type == "source_final"
+                                else item.adapter_id
+                            )
+                            store.assert_tombstone_namespace_empty(
+                                physical_surface_identifier(
+                                    item.surface_type,
+                                    item.department_id,
+                                    resource_id,
+                                    None,
+                                )
+                            )
+                except AdapterMaintenanceArtifactError as error:
+                    # Filesystem and PostgreSQL are not atomically fenced.
+                    # Keep the completed item state and exact operation
+                    # authority active so an operator can remove only the
+                    # unexpected tombstone and rerun finalization.
+                    raise ServiceError(
+                        409, "Adapter purge finalization requires external conflict resolution"
+                    ) from error
             operation.completed_item_count = sum(item.status == "completed" for item in items)
             operation.blocked_item_count = len(blocked)
             operation.status = "completed_with_blocks" if blocked else "completed"
