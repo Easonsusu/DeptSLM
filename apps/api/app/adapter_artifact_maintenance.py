@@ -66,6 +66,11 @@ PROTECTED_SOURCE_STATUSES = frozenset(
 PROTECTED_ADAPTER_STATUSES = frozenset({"validated", "purge_pending", "purged"})
 TERMINAL_SOURCE_ATTEMPT_STATUSES = frozenset({"failed", "abandoned"})
 TERMINAL_REGISTRY_ATTEMPT_STATUSES = frozenset({"validation_failed", "failed", "reclaimed"})
+TERMINAL_REGISTRY_ATTEMPT_STATUSES_ORDERED = (
+    "validation_failed",
+    "failed",
+    "reclaimed",
+)
 ACTIVE_ITEM_STATUSES = frozenset({"registered", "verified", "tombstone_bound", "deleting"})
 # A stage item with this closed, content-free marker is a confirmation-only
 # retry.  It is never a final-manifest authority and therefore cannot trigger
@@ -564,36 +569,22 @@ def _bounded_keyset_attempt_window(
     if cursor is not None:
         # The suffix is exhausted.  A fresh keyset window at the beginning is
         # the deterministic wrap-around that keeps older repaired work
-        # reachable without an OFFSET or a department-wide count.  Retain the
-        # cursor row in the bounded window so a just-selected item can be
-        # retried immediately after an authority repair.
+        # reachable without an OFFSET or a department-wide count.  Do not
+        # append the cursor row: doing so would consume one slot and could
+        # leave an uninspected row permanently outside the circular scan.
         start_window = _bounded_keyset_attempt_window(
             session,
             model=model,
             department_id=department_id,
             statuses=statuses,
             cursor=None,
-            scan_limit=max(1, scan_limit - 1),
+            scan_limit=scan_limit,
         )
         start_rows = tuple(start_window.rows)
-        cursor_row = session.scalar(
-            select(model).where(
-                model.department_id == department_id,
-                model.id == cursor.attempt_id,
-                model.status.in_(statuses),
-                model.cleanup_confirmed_at.is_(None),
-            )
-        )
-        if (
-            cursor_row is not None
-            and len(start_rows) < scan_limit
-            and all(attempt.id != cursor_row.id for attempt in start_rows)
-        ):
-            start_rows = (*start_rows, cursor_row)
         ordered_rows = tuple(
             sorted(start_rows, key=lambda attempt: (attempt.created_at, attempt.id))
         )
-        boundary_row = ordered_rows[-1] if ordered_rows else cursor_row
+        boundary_row = ordered_rows[-1] if ordered_rows else None
         boundary = (
             _AttemptCursor(boundary_row.created_at, boundary_row.id)
             if boundary_row is not None
@@ -1136,7 +1127,7 @@ def _select_candidates(
             session,
             model=AdapterRegistryAttempt,
             department_id=department_id,
-            statuses=tuple(TERMINAL_REGISTRY_ATTEMPT_STATUSES),
+            statuses=TERMINAL_REGISTRY_ATTEMPT_STATUSES_ORDERED,
             cursor=registry_cursor,
             scan_limit=scan_limit,
         ),

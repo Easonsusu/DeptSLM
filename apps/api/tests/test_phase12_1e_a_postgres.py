@@ -2385,16 +2385,46 @@ def test_invalid_source_manifests_do_not_fill_bounded_selection_window(
         _seed_completed_stage_item(factory, authority, attempt_id, family="source")
 
     # Materialize one durable invalid-final quarantine for every old row.
-    # Subsequent bounded scans must skip those unchanged attempt versions.
-    for _ in old_attempt_ids:
+    # A scan cursor may inspect a bounded prefix without producing a candidate;
+    # keep retrying until the full old set has been reached without allowing an
+    # unbounded selection window.
+    for _ in range(len(old_attempt_ids) * 3 + RECONCILIATION_SCAN_MULTIPLIER):
         result = _reconcile(factory, authority, root, apply=True, limit=1)
-        assert result.blocked_count == 1
+        assert result.eligible_count <= 1
+        assert result.blocked_count in {0, 1}
+        with factory() as session:
+            blocked_count = session.scalar(
+                select(func.count(AdapterArtifactOperationItem.id)).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id,
+                    AdapterArtifactOperationItem.surface_type == "source_final",
+                    AdapterArtifactOperationItem.import_attempt_id.in_(old_attempt_ids),
+                    AdapterArtifactOperationItem.status == "blocked",
+                    AdapterArtifactOperationItem.blocked_reason_code == "artifact_manifest_invalid",
+                )
+            )
+        if blocked_count == len(old_attempt_ids):
+            break
+    else:
+        pytest.fail("bounded source cursor did not reach every invalid final")
     fresh_id = _add_failed_source_attempt(
         factory, authority, attempt_number=2 + RECONCILIATION_SCAN_MULTIPLIER
     )
-    result = _reconcile(factory, authority, root, apply=True, limit=1)
-    assert result.completed_count == 1
-    assert result.blocked_count == 0
+    for _ in range(RECONCILIATION_SCAN_MULTIPLIER * 3):
+        result = _reconcile(factory, authority, root, apply=True, limit=1)
+        assert result.eligible_count <= 1
+        with factory() as session:
+            fresh = session.scalar(
+                select(AdapterArtifactOperationItem).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id,
+                    AdapterArtifactOperationItem.surface_type == "source_stage",
+                    AdapterArtifactOperationItem.import_attempt_id == fresh_id,
+                    AdapterArtifactOperationItem.status == "completed",
+                )
+            )
+        if fresh is not None:
+            break
+    else:
+        pytest.fail("bounded source cursor did not reach the fresh stage")
     with factory() as session:
         fresh = session.scalar(
             select(AdapterArtifactOperationItem).where(
@@ -2468,18 +2498,46 @@ def test_invalid_registry_manifests_do_not_fill_bounded_selection_window(
             factory, authority, attempt_id, family="registry", adapter_id=claim.id
         )
 
-    for _ in old_attempt_ids:
+    for _ in range(len(old_attempt_ids) * 3 + RECONCILIATION_SCAN_MULTIPLIER):
         result = _reconcile(factory, authority, root, apply=True, limit=1)
-        assert result.blocked_count == 1
+        assert result.eligible_count <= 1
+        assert result.blocked_count in {0, 1}
+        with factory() as session:
+            blocked_count = session.scalar(
+                select(func.count(AdapterArtifactOperationItem.id)).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id,
+                    AdapterArtifactOperationItem.surface_type == "registry_final",
+                    AdapterArtifactOperationItem.registry_attempt_id.in_(old_attempt_ids),
+                    AdapterArtifactOperationItem.status == "blocked",
+                    AdapterArtifactOperationItem.blocked_reason_code == "artifact_manifest_invalid",
+                )
+            )
+        if blocked_count == len(old_attempt_ids):
+            break
+    else:
+        pytest.fail("bounded registry cursor did not reach every invalid final")
     fresh_id = _add_failed_registry_attempt(
         factory,
         authority,
         claim.id,
         attempt_number=2 + RECONCILIATION_SCAN_MULTIPLIER,
     )
-    result = _reconcile(factory, authority, root, apply=True, limit=1)
-    assert result.completed_count == 1
-    assert result.blocked_count == 0
+    for _ in range(RECONCILIATION_SCAN_MULTIPLIER * 3):
+        result = _reconcile(factory, authority, root, apply=True, limit=1)
+        assert result.eligible_count <= 1
+        with factory() as session:
+            fresh = session.scalar(
+                select(AdapterArtifactOperationItem).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id,
+                    AdapterArtifactOperationItem.surface_type == "registry_stage",
+                    AdapterArtifactOperationItem.registry_attempt_id == fresh_id,
+                    AdapterArtifactOperationItem.status == "completed",
+                )
+            )
+        if fresh is not None:
+            break
+    else:
+        pytest.fail("bounded registry cursor did not reach the fresh stage")
     with factory() as session:
         fresh = session.scalar(
             select(AdapterArtifactOperationItem).where(
@@ -2862,10 +2920,23 @@ def test_persistent_source_confirmation_backlog_is_fair_and_repairable(
         )
 
     unknown = _unknown_tombstone(root, "source_stage", authority.department_id)
-    for _ in old_attempt_ids:
+    for _ in range(len(old_attempt_ids) * 3 + RECONCILIATION_SCAN_MULTIPLIER):
         result = _reconcile(factory, authority, root, apply=True, limit=1)
         assert result.completed_count == 0
-        assert result.blocked_count == 1
+        assert result.blocked_count in {0, 1}
+        with factory() as session:
+            marker_count = session.scalar(
+                select(func.count(AdapterArtifactOperationItem.id)).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id,
+                    AdapterArtifactOperationItem.surface_type == "source_stage",
+                    AdapterArtifactOperationItem.import_attempt_id.in_(old_attempt_ids),
+                    AdapterArtifactOperationItem.status == "blocked",
+                )
+            )
+        if marker_count == len(old_attempt_ids):
+            break
+    else:
+        pytest.fail("bounded source cursor did not reach every confirmation item")
     with factory() as session:
         markers = session.scalars(
             select(AdapterArtifactOperationItem).where(
@@ -2897,21 +2968,29 @@ def test_persistent_source_confirmation_backlog_is_fair_and_repairable(
         )
 
     # A second fenced pass rotates by durable marker count/time instead of
-    # repeatedly selecting one oldest attempt.
-    assert _reconcile(factory, authority, root, apply=True, limit=1).blocked_count == 1
-    with factory() as session:
-        marker_counts = {
-            attempt_id: session.scalar(
-                select(func.count(AdapterArtifactOperationItem.id)).where(
-                    AdapterArtifactOperationItem.department_id == authority.department_id,
-                    AdapterArtifactOperationItem.surface_type == "source_stage",
-                    AdapterArtifactOperationItem.import_attempt_id == attempt_id,
-                    AdapterArtifactOperationItem.status == "blocked",
+    # repeatedly selecting one oldest attempt.  The cursor may spend a pass
+    # inspecting an already-blocked prefix before the next retry is reached.
+    for _ in range(len(old_attempt_ids) * 3 + RECONCILIATION_SCAN_MULTIPLIER):
+        result = _reconcile(factory, authority, root, apply=True, limit=1)
+        assert result.completed_count == 0
+        assert result.blocked_count in {0, 1}
+        with factory() as session:
+            marker_counts = {
+                attempt_id: session.scalar(
+                    select(func.count(AdapterArtifactOperationItem.id)).where(
+                        AdapterArtifactOperationItem.department_id == authority.department_id,
+                        AdapterArtifactOperationItem.surface_type == "source_stage",
+                        AdapterArtifactOperationItem.import_attempt_id == attempt_id,
+                        AdapterArtifactOperationItem.status == "blocked",
+                    )
                 )
-            )
-            for attempt_id in old_attempt_ids
-        }
-        assert sorted(marker_counts.values()) == [1] * (len(old_attempt_ids) - 1) + [2]
+                for attempt_id in old_attempt_ids
+            }
+        if max(marker_counts.values()) >= 2:
+            break
+    else:
+        pytest.fail("bounded source cursor did not rotate confirmation retries")
+    assert sorted(marker_counts.values()) == [1] * (len(old_attempt_ids) - 1) + [2]
 
     new_id = uuid4()
     new_publication_id = uuid4()
@@ -2940,22 +3019,56 @@ def test_persistent_source_confirmation_backlog_is_fair_and_repairable(
         attempt.version += 1
     _seed_completed_stage_item(factory, authority, new_id, family="source")
     final.chmod(0o755)
-    blocked_final = _reconcile(factory, authority, root, apply=True, limit=1)
-    assert blocked_final.blocked_count == 1
+    for _ in range(RECONCILIATION_SCAN_MULTIPLIER * 3):
+        blocked_final = _reconcile(factory, authority, root, apply=True, limit=1)
+        assert blocked_final.eligible_count <= 1
+        with factory() as session:
+            item = session.scalar(
+                select(AdapterArtifactOperationItem).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id,
+                    AdapterArtifactOperationItem.surface_type == "source_final",
+                    AdapterArtifactOperationItem.import_attempt_id == new_id,
+                    AdapterArtifactOperationItem.status == "blocked",
+                )
+            )
+        if item is not None:
+            break
+    else:
+        pytest.fail("bounded source cursor did not reach the new final")
     final.chmod(0o700)
-    repaired_final = _reconcile(factory, authority, root, apply=True, limit=1)
-    assert repaired_final.completed_count == 1
-    assert repaired_final.blocked_count == 0
+    for _ in range(RECONCILIATION_SCAN_MULTIPLIER * 3):
+        repaired_final = _reconcile(factory, authority, root, apply=True, limit=1)
+        assert repaired_final.eligible_count <= 1
+        with factory() as session:
+            item = session.scalar(
+                select(AdapterArtifactOperationItem).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id,
+                    AdapterArtifactOperationItem.surface_type == "source_final",
+                    AdapterArtifactOperationItem.import_attempt_id == new_id,
+                    AdapterArtifactOperationItem.status == "completed",
+                )
+            )
+        if item is not None:
+            break
+    else:
+        pytest.fail("bounded source cursor did not reach the repaired final")
     assert not final.exists()
 
     # Once the reviewed fence is removed, every confirmation remains
     # retryable and completes without a second success audit for the resource.
     shutil.rmtree(unknown.parent.parent)
-    for _ in range(len(old_attempt_ids) + 2):
+    for _ in range(len(old_attempt_ids) * 4 + RECONCILIATION_SCAN_MULTIPLIER * 2):
         result = _reconcile(factory, authority, root, apply=True, limit=1)
-        if result.eligible_count == 0:
+        assert result.eligible_count <= 1
+        with factory() as session:
+            confirmed = all(
+                session.get(AdapterImportAttempt, attempt_id).cleanup_confirmed_at is not None
+                for attempt_id in (*old_attempt_ids, new_id)
+            )
+        if confirmed:
             break
-        assert result.completed_count == 1
+    else:
+        pytest.fail("bounded source cursor did not finish confirmation cleanup")
     with factory() as session:
         assert all(
             session.get(AdapterImportAttempt, attempt_id).cleanup_confirmed_at is not None
@@ -3034,10 +3147,23 @@ def test_persistent_registry_confirmation_backlog_is_fair_and_repairable(
         )
 
     unknown = _unknown_tombstone(root, "registry_stage", authority.department_id)
-    for _ in old_attempt_ids:
+    for _ in range(len(old_attempt_ids) * 3 + RECONCILIATION_SCAN_MULTIPLIER):
         result = _reconcile(factory, authority, root, apply=True, limit=1)
         assert result.completed_count == 0
-        assert result.blocked_count == 1
+        assert result.blocked_count in {0, 1}
+        with factory() as session:
+            marker_count = session.scalar(
+                select(func.count(AdapterArtifactOperationItem.id)).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id,
+                    AdapterArtifactOperationItem.surface_type == "registry_stage",
+                    AdapterArtifactOperationItem.registry_attempt_id.in_(old_attempt_ids),
+                    AdapterArtifactOperationItem.status == "blocked",
+                )
+            )
+        if marker_count == len(old_attempt_ids):
+            break
+    else:
+        pytest.fail("bounded registry cursor did not reach every confirmation item")
     with factory() as session:
         markers = session.scalars(
             select(AdapterArtifactOperationItem).where(
@@ -3068,20 +3194,27 @@ def test_persistent_registry_confirmation_backlog_is_fair_and_repairable(
             == 0
         )
 
-    assert _reconcile(factory, authority, root, apply=True, limit=1).blocked_count == 1
-    with factory() as session:
-        marker_counts = {
-            attempt_id: session.scalar(
-                select(func.count(AdapterArtifactOperationItem.id)).where(
-                    AdapterArtifactOperationItem.department_id == authority.department_id,
-                    AdapterArtifactOperationItem.surface_type == "registry_stage",
-                    AdapterArtifactOperationItem.registry_attempt_id == attempt_id,
-                    AdapterArtifactOperationItem.status == "blocked",
+    for _ in range(len(old_attempt_ids) * 3 + RECONCILIATION_SCAN_MULTIPLIER):
+        result = _reconcile(factory, authority, root, apply=True, limit=1)
+        assert result.completed_count == 0
+        assert result.blocked_count in {0, 1}
+        with factory() as session:
+            marker_counts = {
+                attempt_id: session.scalar(
+                    select(func.count(AdapterArtifactOperationItem.id)).where(
+                        AdapterArtifactOperationItem.department_id == authority.department_id,
+                        AdapterArtifactOperationItem.surface_type == "registry_stage",
+                        AdapterArtifactOperationItem.registry_attempt_id == attempt_id,
+                        AdapterArtifactOperationItem.status == "blocked",
+                    )
                 )
-            )
-            for attempt_id in old_attempt_ids
-        }
-        assert sorted(marker_counts.values()) == [1] * (len(old_attempt_ids) - 1) + [2]
+                for attempt_id in old_attempt_ids
+            }
+        if max(marker_counts.values()) >= 2:
+            break
+    else:
+        pytest.fail("bounded registry cursor did not rotate confirmation retries")
+    assert sorted(marker_counts.values()) == [1] * (len(old_attempt_ids) - 1) + [2]
 
     new_id = uuid4()
     new_publication_id = uuid4()
@@ -3117,20 +3250,54 @@ def test_persistent_registry_confirmation_backlog_is_fair_and_repairable(
         attempt.version += 1
     _seed_completed_stage_item(factory, authority, new_id, family="registry", adapter_id=adapter_id)
     final.chmod(0o755)
-    blocked_final = _reconcile(factory, authority, root, apply=True, limit=1)
-    assert blocked_final.blocked_count == 1
+    for _ in range(RECONCILIATION_SCAN_MULTIPLIER * 3):
+        blocked_final = _reconcile(factory, authority, root, apply=True, limit=1)
+        assert blocked_final.eligible_count <= 1
+        with factory() as session:
+            item = session.scalar(
+                select(AdapterArtifactOperationItem).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id,
+                    AdapterArtifactOperationItem.surface_type == "registry_final",
+                    AdapterArtifactOperationItem.registry_attempt_id == new_id,
+                    AdapterArtifactOperationItem.status == "blocked",
+                )
+            )
+        if item is not None:
+            break
+    else:
+        pytest.fail("bounded registry cursor did not reach the new final")
     final.chmod(0o700)
-    repaired_final = _reconcile(factory, authority, root, apply=True, limit=1)
-    assert repaired_final.completed_count == 1
-    assert repaired_final.blocked_count == 0
+    for _ in range(RECONCILIATION_SCAN_MULTIPLIER * 3):
+        repaired_final = _reconcile(factory, authority, root, apply=True, limit=1)
+        assert repaired_final.eligible_count <= 1
+        with factory() as session:
+            item = session.scalar(
+                select(AdapterArtifactOperationItem).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id,
+                    AdapterArtifactOperationItem.surface_type == "registry_final",
+                    AdapterArtifactOperationItem.registry_attempt_id == new_id,
+                    AdapterArtifactOperationItem.status == "completed",
+                )
+            )
+        if item is not None:
+            break
+    else:
+        pytest.fail("bounded registry cursor did not reach the repaired final")
     assert not final.exists()
 
     shutil.rmtree(unknown.parent.parent)
-    for _ in range(len(old_attempt_ids) + 2):
+    for _ in range(len(old_attempt_ids) * 4 + RECONCILIATION_SCAN_MULTIPLIER * 2):
         result = _reconcile(factory, authority, root, apply=True, limit=1)
-        if result.eligible_count == 0:
+        assert result.eligible_count <= 1
+        with factory() as session:
+            confirmed = all(
+                session.get(AdapterRegistryAttempt, attempt_id).cleanup_confirmed_at is not None
+                for attempt_id in (*old_attempt_ids, new_id)
+            )
+        if confirmed:
             break
-        assert result.completed_count == 1
+    else:
+        pytest.fail("bounded registry cursor did not finish confirmation cleanup")
     with factory() as session:
         assert all(
             session.get(AdapterRegistryAttempt, attempt_id).cleanup_confirmed_at is not None

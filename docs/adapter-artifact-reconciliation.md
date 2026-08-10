@@ -61,7 +61,9 @@ family. Apply mode advances it even when every row in the window is
 structurally ineligible, so repeated operations cannot rescan the same blocked
 prefix forever; dry-run mode never creates or updates cursor rows. When the
 suffix is exhausted, the same bounded keyset scan wraps deterministically to
-the beginning and retains the prior boundary so older work remains reachable.
+the beginning and persists that new bounded boundary; it does not append the
+prior cursor row, so an adjacent older row cannot remain outside the circular
+scan.
 Only that window is materialized for structural checks and detailed fairness.
 Sibling authority uses bounded grouped aggregate results for the resources in
 the window rather than materializing every historical sibling row or issuing
