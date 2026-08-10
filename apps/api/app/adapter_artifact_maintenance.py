@@ -65,6 +65,10 @@ PROTECTED_ADAPTER_STATUSES = frozenset({"validated", "purge_pending", "purged"})
 TERMINAL_SOURCE_ATTEMPT_STATUSES = frozenset({"failed", "abandoned"})
 TERMINAL_REGISTRY_ATTEMPT_STATUSES = frozenset({"validation_failed", "failed", "reclaimed"})
 ACTIVE_ITEM_STATUSES = frozenset({"registered", "verified", "tombstone_bound", "deleting"})
+# A stage item with this closed, content-free marker is a confirmation-only
+# retry.  It is never a final-manifest authority and therefore cannot trigger
+# filesystem deletion or be confused with a persisted final manifest.
+_CONFIRMATION_ONLY_MARKER = {"phase12_1e_a_confirmation_only": True}
 # Candidate selection has two bounded phases.  Each source/registry lane may
 # inspect at most this many rows using indexed SQL predicates and grouped
 # history.  The final ``FOR UPDATE SKIP LOCKED`` query locks only the selected
@@ -147,6 +151,7 @@ class _Candidate:
     expected_attempt_version: int
     ownership_manifest: dict[str, object] | None
     expected_item_version: int = 1
+    confirmation_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +295,19 @@ def _surface_item_state(
     # historical row remains immutable and a later explicit review can retry
     # it only after the operation is no longer active.
     return "active"
+
+
+def _surface_is_fully_completed(
+    history: dict[tuple[UUID, UUID], _SurfaceHistory],
+    resource_id: UUID,
+    attempt_id: UUID,
+) -> bool:
+    """Return whether an exact surface has completed work and no live row."""
+
+    record = history.get((resource_id, attempt_id))
+    if record is None or "completed" not in record.statuses:
+        return False
+    return not record.statuses.intersection(ACTIVE_ITEM_STATUSES)
 
 
 def _prioritize_final_siblings(
@@ -582,17 +600,6 @@ def _select_candidates(
         .correlate(AdapterImportAttempt, AdapterImportSource)
         .exists()
     )
-    source_final_seen = (
-        select(literal(1))
-        .where(
-            AdapterArtifactOperationItem.department_id == department_id,
-            AdapterArtifactOperationItem.surface_type == "source_final",
-            AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
-            AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
-        )
-        .correlate(AdapterImportAttempt, AdapterImportSource)
-        .exists()
-    )
     source_stage_blocked_count = (
         select(func.count(AdapterArtifactOperationItem.id))
         .where(
@@ -653,10 +660,11 @@ def _select_candidates(
         .correlate(AdapterImportAttempt, AdapterImportSource)
         .exists()
     )
-    source_has_untried = or_(
-        ~source_stage_seen,
-        and_(AdapterImportAttempt.ownership_manifest.is_not(None), ~source_final_seen),
-    )
+    # SQL cannot be the canonical final-manifest parser.  Only an unseen
+    # stage receives the high preselection rank; final applicability is
+    # validated below and malformed non-null manifests are quarantined through
+    # bounded durable item history instead of consuming every future window.
+    source_has_untried = ~source_stage_seen
     source_blocked_rank = case(
         (source_stage_completed, source_final_blocked_count),
         else_=source_stage_blocked_count,
@@ -737,6 +745,7 @@ def _select_candidates(
     )
     eligible_source_rows: list[tuple[AdapterImportAttempt, AdapterImportSource]] = []
     source_final_manifests: dict[tuple[UUID, UUID], dict[str, object]] = {}
+    source_invalid_final_keys: set[tuple[UUID, UUID]] = set()
     for attempt, source in source_rows:
         if source.id in committed_source_ids:
             continue
@@ -745,14 +754,16 @@ def _select_candidates(
             continue
         eligible_source_rows.append((attempt, source))
         if (
-            isinstance(attempt.ownership_manifest, dict)
+            attempt.ownership_manifest is not None
             and source.status not in PROTECTED_SOURCE_STATUSES
         ):
             try:
                 _persisted_manifest_authority("source_final", attempt.ownership_manifest)
             except AdapterMaintenanceArtifactError:
+                source_invalid_final_keys.add((source.id, attempt.id))
                 continue
-            source_final_manifests[(source.id, attempt.id)] = dict(attempt.ownership_manifest)
+            if isinstance(attempt.ownership_manifest, dict):
+                source_final_manifests[(source.id, attempt.id)] = dict(attempt.ownership_manifest)
     source_key_rows = [(source.id, attempt.id) for attempt, source in eligible_source_rows]
     source_stage_history = _surface_item_history_for_rows(
         session,
@@ -807,17 +818,6 @@ def _select_candidates(
         .where(
             AdapterArtifactOperationItem.department_id == department_id,
             AdapterArtifactOperationItem.surface_type == "registry_stage",
-            AdapterArtifactOperationItem.adapter_id == Adapter.id,
-            AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
-        )
-        .correlate(AdapterRegistryAttempt, Adapter)
-        .exists()
-    )
-    registry_final_seen = (
-        select(literal(1))
-        .where(
-            AdapterArtifactOperationItem.department_id == department_id,
-            AdapterArtifactOperationItem.surface_type == "registry_final",
             AdapterArtifactOperationItem.adapter_id == Adapter.id,
             AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
         )
@@ -884,10 +884,8 @@ def _select_candidates(
         .correlate(AdapterRegistryAttempt, Adapter)
         .exists()
     )
-    registry_has_untried = or_(
-        ~registry_stage_seen,
-        and_(AdapterRegistryAttempt.ownership_manifest.is_not(None), ~registry_final_seen),
-    )
+    # See the source lane above: a JSON non-null check is not final authority.
+    registry_has_untried = ~registry_stage_seen
     registry_blocked_rank = case(
         (registry_stage_completed, registry_final_blocked_count),
         else_=registry_stage_blocked_count,
@@ -951,19 +949,24 @@ def _select_candidates(
     }
     eligible_registry_rows: list[tuple[AdapterRegistryAttempt, Adapter]] = []
     registry_final_manifests: dict[tuple[UUID, UUID], dict[str, object]] = {}
+    registry_invalid_final_keys: set[tuple[UUID, UUID]] = set()
     for attempt, adapter in registry_rows:
         if adapter.id in succeeded_registry_ids or adapter.id in active_registry_ids:
             continue
         eligible_registry_rows.append((attempt, adapter))
-        if isinstance(attempt.ownership_manifest, dict) and adapter.status in {
+        if attempt.ownership_manifest is not None and adapter.status in {
             "failed",
             "validation_failed",
         }:
             try:
                 _persisted_manifest_authority("registry_final", attempt.ownership_manifest)
             except AdapterMaintenanceArtifactError:
+                registry_invalid_final_keys.add((adapter.id, attempt.id))
                 continue
-            registry_final_manifests[(adapter.id, attempt.id)] = dict(attempt.ownership_manifest)
+            if isinstance(attempt.ownership_manifest, dict):
+                registry_final_manifests[(adapter.id, attempt.id)] = dict(
+                    attempt.ownership_manifest
+                )
     registry_key_rows = [(adapter.id, attempt.id) for attempt, adapter in eligible_registry_rows]
     registry_stage_history = _surface_item_history_for_rows(
         session,
@@ -1048,6 +1051,7 @@ def _select_candidates(
             stage_history = source_stage_history
             final_history = source_final_history
             final_manifests = source_final_manifests
+            invalid_final_keys = source_invalid_final_keys
             final_untried_by_resource = source_final_untried_by_resource
             selected_finals = selected_source_finals
             stage_surface = "source_stage"
@@ -1056,6 +1060,7 @@ def _select_candidates(
             stage_history = registry_stage_history
             final_history = registry_final_history
             final_manifests = registry_final_manifests
+            invalid_final_keys = registry_invalid_final_keys
             final_untried_by_resource = registry_final_untried_by_resource
             selected_finals = selected_registry_finals
             stage_surface = "registry_stage"
@@ -1080,10 +1085,17 @@ def _select_candidates(
                 )
             )
             selected_this_attempt = True
-        preferred_final = final_key in final_manifests and (
-            final_state == "untried"
-            or (final_state == "blocked" and not final_untried_by_resource.get(resource_id, False))
-        )
+        invalid_final = final_key in invalid_final_keys and final_state == "untried"
+        preferred_final = (
+            final_key in final_manifests
+            and (
+                final_state == "untried"
+                or (
+                    final_state == "blocked"
+                    and not final_untried_by_resource.get(resource_id, False)
+                )
+            )
+        ) or invalid_final
         if resource_id not in selected_finals and preferred_final:
             result.append(
                 _Candidate(
@@ -1097,10 +1109,36 @@ def _select_candidates(
                     attempt.attempt_number,
                     resource.version,
                     attempt.version,
-                    final_manifests[final_key],
+                    final_manifests.get(final_key, {}),
                 )
             )
             selected_finals.add(resource_id)
+            selected_this_attempt = True
+        confirmation_ready = (
+            final_key not in invalid_final_keys
+            and _surface_is_fully_completed(stage_history, resource_id, attempt.id)
+            and (
+                final_key not in final_manifests
+                or _surface_is_fully_completed(final_history, resource_id, attempt.id)
+            )
+        )
+        if not selected_this_attempt and confirmation_ready:
+            result.append(
+                _Candidate(
+                    stage_surface,
+                    department_id,
+                    resource_id if family == "source" else None,
+                    resource_id if family == "registry" else None,
+                    attempt.id if family == "source" else None,
+                    attempt.id if family == "registry" else None,
+                    attempt.publication_attempt_id,
+                    attempt.attempt_number,
+                    resource.version,
+                    attempt.version,
+                    dict(_CONFIRMATION_ONLY_MARKER),
+                    confirmation_only=True,
+                )
+            )
             selected_this_attempt = True
         if selected_this_attempt:
             selected_attempts += 1
@@ -1226,6 +1264,10 @@ def _abandon_stale_source_if_needed(session: Session, candidate: _Candidate) -> 
 
 
 def _candidate_from_item(item: AdapterArtifactOperationItem) -> _Candidate:
+    confirmation_only = (
+        item.surface_type in {"source_stage", "registry_stage"}
+        and item.ownership_manifest == _CONFIRMATION_ONLY_MARKER
+    )
     return _Candidate(
         item.surface_type,
         item.department_id,
@@ -1237,8 +1279,13 @@ def _candidate_from_item(item: AdapterArtifactOperationItem) -> _Candidate:
         item.attempt_number,
         item.expected_resource_version,
         item.expected_attempt_version,
-        dict(item.ownership_manifest) if isinstance(item.ownership_manifest, dict) else None,
+        None
+        if confirmation_only
+        else dict(item.ownership_manifest)
+        if isinstance(item.ownership_manifest, dict)
+        else None,
         item.version,
+        confirmation_only,
     )
 
 
@@ -1536,9 +1583,14 @@ def _execute_item(
         expected_manifest_sha256: str | None = None
         expected_manifest_byte_size: int | None = None
         move_authorized = False
+        confirmation_only = False
         with factory.begin() as session:
             item = _load_item(session, operation_id, candidate, actor_issuer, actor_subject)
             item_id = item.id
+            if candidate.confirmation_only:
+                if item.ownership_manifest != _CONFIRMATION_ONLY_MARKER:
+                    raise ServiceError(409, "Adapter reconciliation authority changed")
+                confirmation_only = True
             address = _candidate_surface_address(candidate)
             move_authorized = item.move_authorized_at is not None
             if candidate.surface_type.endswith("_final"):
@@ -1552,6 +1604,16 @@ def _execute_item(
                 verified_version = item.version
             elif item.status != "registered":
                 return item.status == "completed"
+        if confirmation_only:
+            _mark_confirmation_completed(
+                factory,
+                data_dir=data_dir,
+                operation_id=operation_id,
+                candidate=candidate,
+                issuer=actor_issuer,
+                subject=actor_subject,
+            )
+            return True
         with AdapterMaintenanceArtifactStore(data_dir) as store:
             if inspected is None and bound is None:
                 # A marker or partial payload is never an ownership boundary;
@@ -1812,6 +1874,27 @@ def _mark_completed(
         item.status = "completed"
         item.completed_at = session.scalar(select(func.clock_timestamp()))
         item.in_flight_entry = None
+        item.version += 1
+        _confirm_attempt_cleanup(session, item, data_dir=data_dir)
+
+
+def _mark_confirmation_completed(
+    factory: sessionmaker[Session],
+    *,
+    data_dir: Path,
+    operation_id: UUID,
+    candidate: _Candidate,
+    issuer: str,
+    subject: str,
+) -> None:
+    """Complete confirmation work without reopening a physical surface."""
+
+    with factory.begin() as session:
+        item = _load_item(session, operation_id, candidate, issuer, subject)
+        if item.ownership_manifest != _CONFIRMATION_ONLY_MARKER:
+            raise ServiceError(409, "Adapter reconciliation authority changed")
+        item.status = "completed"
+        item.completed_at = session.scalar(select(func.clock_timestamp()))
         item.version += 1
         _confirm_attempt_cleanup(session, item, data_dir=data_dir)
 
@@ -2152,16 +2235,24 @@ def _has_unaudited_completion(
 
     prior_operation = aliased(AdapterArtifactOperation)
     prior_completed = aliased(AdapterArtifactOperationItem)
-    prior_blocked = aliased(AdapterArtifactOperationItem)
     prior_audit = aliased(PersistentAuditEvent)
+    prior_source_attempt = aliased(AdapterImportAttempt)
+    prior_registry_attempt = aliased(AdapterRegistryAttempt)
 
     def covered_resources(
         resource_column,
         resource_ids: set[UUID],
-        blocked_column,
+        attempt_model,
+        attempt_column,
+        resource_attempt_column,
     ) -> set[UUID]:
         if not resource_ids:
             return set()
+        prior_attempt = (
+            prior_source_attempt
+            if attempt_model is AdapterImportAttempt
+            else prior_registry_attempt
+        )
         statement = (
             select(resource_column)
             .select_from(prior_completed)
@@ -2173,12 +2264,12 @@ def _has_unaudited_completion(
                 ),
             )
             .join(
-                prior_blocked,
+                prior_attempt,
                 and_(
-                    prior_blocked.operation_id == prior_operation.id,
-                    prior_blocked.department_id == department_id,
-                    prior_blocked.status == "blocked",
-                    blocked_column == resource_column,
+                    prior_attempt.id == attempt_column,
+                    prior_attempt.department_id == department_id,
+                    resource_attempt_column == resource_column,
+                    prior_attempt.cleanup_confirmed_at.is_not(None),
                 ),
             )
             .join(
@@ -2196,6 +2287,8 @@ def _has_unaudited_completion(
                 prior_audit.resource_type == "adapter_artifact_operation",
                 prior_audit.result == "allowed",
                 resource_column.in_(resource_ids),
+                prior_operation.completed_at.is_not(None),
+                prior_attempt.cleanup_confirmed_at <= prior_operation.completed_at,
             )
             .distinct()
         )
@@ -2208,7 +2301,9 @@ def _has_unaudited_completion(
         for resource_id in covered_resources(
             prior_completed.source_bundle_id,
             source_ids,
-            prior_blocked.source_bundle_id,
+            AdapterImportAttempt,
+            prior_completed.import_attempt_id,
+            prior_source_attempt.source_bundle_id,
         )
     }
     covered.update(
@@ -2216,7 +2311,9 @@ def _has_unaudited_completion(
         for resource_id in covered_resources(
             prior_completed.adapter_id,
             registry_ids,
-            prior_blocked.adapter_id,
+            AdapterRegistryAttempt,
+            prior_completed.registry_attempt_id,
+            prior_registry_attempt.adapter_id,
         )
     )
     return bool(confirmed_keys - covered)

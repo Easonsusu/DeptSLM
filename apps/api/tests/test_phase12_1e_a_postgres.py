@@ -602,6 +602,130 @@ def _reconcile(factory, authority: Authority, root: Path, *, apply: bool, limit:
     )
 
 
+def _seed_completed_stage_item(
+    factory: sessionmaker[Session],
+    authority: Authority,
+    attempt_id: UUID,
+    *,
+    family: str,
+    adapter_id: UUID | None = None,
+) -> UUID:
+    """Install only completed stage history for bounded-selection regressions."""
+
+    now = datetime.now(UTC)
+    with factory.begin() as session:
+        if family == "source":
+            attempt = session.get(AdapterImportAttempt, attempt_id)
+            source = session.get(AdapterImportSource, authority.source_id)
+            assert attempt is not None and source is not None
+            resource_id = authority.source_id
+            operation = AdapterArtifactOperation(
+                id=uuid4(),
+                department_id=authority.department_id,
+                requested_by_user_id=authority.admin_id,
+                operation_type="reconcile",
+                status="completed",
+                limit_value=1,
+                minimum_age_seconds=300,
+                eligible_count=1,
+                completed_count=1,
+                completed_at=now,
+                version=1,
+            )
+            item = AdapterArtifactOperationItem(
+                id=uuid4(),
+                operation_id=operation.id,
+                department_id=authority.department_id,
+                surface_type="source_stage",
+                source_bundle_id=resource_id,
+                import_attempt_id=attempt.id,
+                publication_attempt_id=attempt.publication_attempt_id,
+                attempt_number=attempt.attempt_number,
+                expected_resource_version=source.version,
+                expected_attempt_version=attempt.version,
+                status="completed",
+                completed_at=now,
+                version=1,
+            )
+        else:
+            assert adapter_id is not None
+            attempt = session.get(AdapterRegistryAttempt, attempt_id)
+            adapter = session.get(Adapter, adapter_id)
+            assert attempt is not None and adapter is not None
+            resource_id = adapter.id
+            operation = AdapterArtifactOperation(
+                id=uuid4(),
+                department_id=authority.department_id,
+                requested_by_user_id=authority.admin_id,
+                operation_type="reconcile",
+                status="completed",
+                limit_value=1,
+                minimum_age_seconds=300,
+                eligible_count=1,
+                completed_count=1,
+                completed_at=now,
+                version=1,
+            )
+            item = AdapterArtifactOperationItem(
+                id=uuid4(),
+                operation_id=operation.id,
+                department_id=authority.department_id,
+                surface_type="registry_stage",
+                adapter_id=resource_id,
+                registry_attempt_id=attempt.id,
+                publication_attempt_id=attempt.publication_attempt_id,
+                attempt_number=attempt.attempt_number,
+                expected_resource_version=adapter.version,
+                expected_attempt_version=attempt.version,
+                status="completed",
+                completed_at=now,
+                version=1,
+            )
+        session.add(operation)
+        session.flush()
+        session.add(item)
+        item_id = item.id
+    return item_id
+
+
+def _source_retry_manifest(
+    factory: sessionmaker[Session],
+    authority: Authority,
+    attempt_id: UUID,
+    attempt_number: int,
+    publication_attempt_id: UUID,
+) -> dict[str, object]:
+    with factory() as session:
+        original = session.get(AdapterImportAttempt, authority.source_attempt_id)
+        assert original is not None and isinstance(original.ownership_manifest, dict)
+        manifest = dict(original.ownership_manifest)
+    manifest.update(
+        {
+            "import_attempt_id": str(attempt_id),
+            "publication_attempt_id": str(publication_attempt_id),
+            "attempt_number": attempt_number,
+        }
+    )
+    parse_source_manifest(canonical_manifest_bytes(manifest))
+    return manifest
+
+
+def _unknown_tombstone(root: Path, surface_type: str, department_id: UUID) -> Path:
+    item = (
+        root
+        / "adapters"
+        / ".deleting"
+        / surface_type
+        / str(department_id)
+        / str(uuid4())
+        / str(uuid4())
+    )
+    item.mkdir(mode=0o700, parents=True)
+    for path in (item.parent.parent, item.parent, item):
+        path.chmod(0o700)
+    return item
+
+
 def test_real_dry_run_is_read_only(factory, authority: Authority, tmp_path: Path) -> None:
     root = _storage(tmp_path)
     _abandon_source(factory, authority)
@@ -1845,3 +1969,460 @@ def test_physical_surface_indexes_reject_sibling_final_attempts(
                     )
                 )
                 session.flush()
+
+
+def test_invalid_source_manifests_do_not_fill_bounded_selection_window(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    root = _storage(tmp_path)
+    _abandon_source(factory, authority)
+    malformed = {"malformed": True}
+    with factory.begin() as session:
+        original = session.get(AdapterImportAttempt, authority.source_attempt_id)
+        assert original is not None
+        original.ownership_manifest = malformed
+        original.version += 1
+    old_attempt_ids = [authority.source_attempt_id]
+    _seed_completed_stage_item(factory, authority, authority.source_attempt_id, family="source")
+    for attempt_number in range(2, 2 + RECONCILIATION_SCAN_MULTIPLIER):
+        attempt_id = _add_failed_source_attempt(
+            factory, authority, attempt_number=attempt_number, manifest=malformed
+        )
+        old_attempt_ids.append(attempt_id)
+        _seed_completed_stage_item(factory, authority, attempt_id, family="source")
+
+    fresh_id = _add_failed_source_attempt(
+        factory, authority, attempt_number=2 + RECONCILIATION_SCAN_MULTIPLIER
+    )
+    result = _reconcile(factory, authority, root, apply=True, limit=1)
+    assert result.completed_count == 1
+    assert result.blocked_count == 0
+    with factory() as session:
+        fresh = session.scalar(
+            select(AdapterArtifactOperationItem).where(
+                AdapterArtifactOperationItem.department_id == authority.department_id,
+                AdapterArtifactOperationItem.surface_type == "source_stage",
+                AdapterArtifactOperationItem.import_attempt_id == fresh_id,
+                AdapterArtifactOperationItem.status == "completed",
+            )
+        )
+        assert fresh is not None
+        old_attempts = session.scalars(
+            select(AdapterImportAttempt).where(
+                AdapterImportAttempt.department_id == authority.department_id,
+                AdapterImportAttempt.id.in_(old_attempt_ids),
+            )
+        ).all()
+        assert all(attempt.cleanup_confirmed_at is None for attempt in old_attempts)
+        old_final_items = session.scalars(
+            select(AdapterArtifactOperationItem).where(
+                AdapterArtifactOperationItem.department_id == authority.department_id,
+                AdapterArtifactOperationItem.surface_type == "source_final",
+                AdapterArtifactOperationItem.import_attempt_id.in_(old_attempt_ids),
+            )
+        ).all()
+        assert not old_final_items
+
+
+def test_invalid_registry_manifests_do_not_fill_bounded_selection_window(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    root = _storage(tmp_path)
+    enqueue = _enqueue(factory, authority, apply=True)
+    claim = claim_next_adapter(factory, uuid4(), 30, authority.code_revision)
+    assert claim is not None and enqueue.adapter_id == claim.id
+    terminal_failure(factory, claim, "adapter_registry_publication_failed")
+    malformed = {"malformed": True}
+    with factory.begin() as session:
+        original = session.get(AdapterRegistryAttempt, claim.registry_attempt_id)
+        assert original is not None
+        original.ownership_manifest = malformed
+        original.version += 1
+    old_attempt_ids = [claim.registry_attempt_id]
+    _seed_completed_stage_item(
+        factory, authority, claim.registry_attempt_id, family="registry", adapter_id=claim.id
+    )
+    for attempt_number in range(2, 2 + RECONCILIATION_SCAN_MULTIPLIER):
+        attempt_id = _add_failed_registry_attempt(
+            factory,
+            authority,
+            claim.id,
+            attempt_number=attempt_number,
+            manifest=malformed,
+        )
+        old_attempt_ids.append(attempt_id)
+        _seed_completed_stage_item(
+            factory, authority, attempt_id, family="registry", adapter_id=claim.id
+        )
+
+    fresh_id = _add_failed_registry_attempt(
+        factory,
+        authority,
+        claim.id,
+        attempt_number=2 + RECONCILIATION_SCAN_MULTIPLIER,
+    )
+    result = _reconcile(factory, authority, root, apply=True, limit=1)
+    assert result.completed_count == 1
+    assert result.blocked_count == 0
+    with factory() as session:
+        fresh = session.scalar(
+            select(AdapterArtifactOperationItem).where(
+                AdapterArtifactOperationItem.department_id == authority.department_id,
+                AdapterArtifactOperationItem.surface_type == "registry_stage",
+                AdapterArtifactOperationItem.registry_attempt_id == fresh_id,
+                AdapterArtifactOperationItem.status == "completed",
+            )
+        )
+        assert fresh is not None
+        old_attempts = session.scalars(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.id.in_(old_attempt_ids),
+            )
+        ).all()
+        assert all(attempt.cleanup_confirmed_at is None for attempt in old_attempts)
+        old_final_items = session.scalars(
+            select(AdapterArtifactOperationItem).where(
+                AdapterArtifactOperationItem.department_id == authority.department_id,
+                AdapterArtifactOperationItem.surface_type == "registry_final",
+                AdapterArtifactOperationItem.registry_attempt_id.in_(old_attempt_ids),
+            )
+        ).all()
+        assert not old_final_items
+
+
+def test_source_confirmation_retry_is_read_only_and_idempotent(
+    factory, authority: Authority, tmp_path: Path, monkeypatch
+) -> None:
+    root = _storage(tmp_path)
+    _abandon_source(factory, authority)
+    _source_stage(root, authority)
+    unknown = _unknown_tombstone(root, "source_stage", authority.department_id)
+    first = _reconcile(factory, authority, root, apply=True, limit=10)
+    assert first.completed_count == 2
+    assert first.blocked_count == 0
+    with factory() as session:
+        attempt = session.get(AdapterImportAttempt, authority.source_attempt_id)
+        assert attempt is not None and attempt.cleanup_confirmed_at is None
+        item_statuses = [
+            row.status
+            for row in session.scalars(
+                select(AdapterArtifactOperationItem).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id
+                )
+            ).all()
+        ]
+        operation_count = session.scalar(
+            select(func.count(AdapterArtifactOperation.id)).where(
+                AdapterArtifactOperation.department_id == authority.department_id
+            )
+        )
+        item_count = session.scalar(
+            select(func.count(AdapterArtifactOperationItem.id)).where(
+                AdapterArtifactOperationItem.department_id == authority.department_id
+            )
+        )
+        audit_count = session.scalar(
+            select(func.count(PersistentAuditEvent.id)).where(
+                PersistentAuditEvent.department_id == authority.department_id,
+                PersistentAuditEvent.action == "adapter.artifact.reconcile",
+            )
+        )
+        assert item_statuses == ["completed", "completed"]
+        assert audit_count == 0
+    shutil.rmtree(unknown.parent.parent)
+
+    dry_run = _reconcile(factory, authority, root, apply=False, limit=1)
+    assert dry_run.eligible_count == 1
+    with factory() as session:
+        assert (
+            session.scalar(
+                select(func.count(AdapterArtifactOperation.id)).where(
+                    AdapterArtifactOperation.department_id == authority.department_id
+                )
+            )
+            == operation_count
+        )
+        assert (
+            session.scalar(
+                select(func.count(AdapterArtifactOperationItem.id)).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id
+                )
+            )
+            == item_count
+        )
+        attempt = session.get(AdapterImportAttempt, authority.source_attempt_id)
+        assert attempt is not None and attempt.cleanup_confirmed_at is None
+
+    from app import adapter_maintenance_artifacts as storage
+
+    def fail_if_called(*_args, **_kwargs):
+        pytest.fail("confirmation-only retry must not mutate the filesystem")
+
+    for method in (
+        "move_verified_surface_to_tombstone",
+        "unlink_committed_tombstone_entry",
+        "remove_committed_tombstone_directory",
+    ):
+        monkeypatch.setattr(storage.AdapterMaintenanceArtifactStore, method, fail_if_called)
+    confirmed = _reconcile(factory, authority, root, apply=True, limit=1)
+    assert confirmed.completed_count == 1
+    assert confirmed.blocked_count == 0
+    with factory() as session:
+        attempt = session.get(AdapterImportAttempt, authority.source_attempt_id)
+        assert attempt is not None and attempt.cleanup_confirmed_at is not None
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.artifact.reconcile",
+                )
+            )
+            == 1
+        )
+    repeated = _reconcile(factory, authority, root, apply=True, limit=1)
+    assert repeated.eligible_count == 0
+
+
+def test_registry_confirmation_retry_is_read_only_and_idempotent(
+    factory, authority: Authority, tmp_path: Path, monkeypatch
+) -> None:
+    root = _storage(tmp_path)
+    final, adapter_id = _prepare_registry_crash(factory, authority, root, "published")
+    with factory() as session:
+        attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
+            )
+        )
+        assert attempt is not None
+        stage = (
+            root
+            / "adapters"
+            / ".staging"
+            / "registry"
+            / str(authority.department_id)
+            / str(adapter_id)
+            / str(attempt.publication_attempt_id)
+        )
+    stage.mkdir(mode=0o700, parents=True)
+    for path in (stage.parent.parent, stage.parent, stage):
+        path.chmod(0o700)
+    _file(stage / "adapter_config.json")
+    unknown = _unknown_tombstone(root, "registry_stage", authority.department_id)
+    first = _reconcile(factory, authority, root, apply=True, limit=10)
+    assert first.completed_count == 2
+    assert first.blocked_count == 0
+    with factory() as session:
+        attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
+            )
+        )
+        assert attempt is not None and attempt.cleanup_confirmed_at is None
+        operation_count = session.scalar(
+            select(func.count(AdapterArtifactOperation.id)).where(
+                AdapterArtifactOperation.department_id == authority.department_id
+            )
+        )
+        item_count = session.scalar(
+            select(func.count(AdapterArtifactOperationItem.id)).where(
+                AdapterArtifactOperationItem.department_id == authority.department_id
+            )
+        )
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.artifact.reconcile",
+                )
+            )
+            == 0
+        )
+    shutil.rmtree(unknown.parent.parent)
+    dry_run = _reconcile(factory, authority, root, apply=False, limit=1)
+    assert dry_run.eligible_count == 1
+    with factory() as session:
+        assert (
+            session.scalar(
+                select(func.count(AdapterArtifactOperation.id)).where(
+                    AdapterArtifactOperation.department_id == authority.department_id
+                )
+            )
+            == operation_count
+        )
+        assert (
+            session.scalar(
+                select(func.count(AdapterArtifactOperationItem.id)).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id
+                )
+            )
+            == item_count
+        )
+
+    from app import adapter_maintenance_artifacts as storage
+
+    def fail_if_called(*_args, **_kwargs):
+        pytest.fail("confirmation-only retry must not mutate the filesystem")
+
+    for method in (
+        "move_verified_surface_to_tombstone",
+        "unlink_committed_tombstone_entry",
+        "remove_committed_tombstone_directory",
+    ):
+        monkeypatch.setattr(storage.AdapterMaintenanceArtifactStore, method, fail_if_called)
+    confirmed = _reconcile(factory, authority, root, apply=True, limit=1)
+    assert confirmed.completed_count == 1
+    assert confirmed.blocked_count == 0
+    with factory() as session:
+        attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
+            )
+        )
+        assert attempt is not None and attempt.cleanup_confirmed_at is not None
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.artifact.reconcile",
+                )
+            )
+            == 1
+        )
+    assert not final.exists()
+    assert not stage.exists()
+    repeated = _reconcile(factory, authority, root, apply=True, limit=1)
+    assert repeated.eligible_count == 0
+
+
+def test_cross_family_audit_coverage_deduplicates_covered_source_and_audits_registry(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    root = _storage(tmp_path)
+    registry_final, adapter_id = _prepare_registry_crash(factory, authority, root, "published")
+    _abandon_source(factory, authority)
+    _source_stage(root, authority)
+    registry_final.chmod(0o755)
+    first = _reconcile(factory, authority, root, apply=True, limit=10)
+    assert first.blocked_count == 1
+    with factory() as session:
+        source_attempt = session.get(AdapterImportAttempt, authority.source_attempt_id)
+        registry_attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
+            )
+        )
+        assert source_attempt is not None and source_attempt.cleanup_confirmed_at is not None
+        assert registry_attempt is not None and registry_attempt.cleanup_confirmed_at is None
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.artifact.reconcile",
+                )
+            )
+            == 1
+        )
+
+    retry_publication = uuid4()
+    retry_id = uuid4()
+    retry_manifest = _source_retry_manifest(factory, authority, retry_id, 2, retry_publication)
+    retry_id = _add_failed_source_attempt(
+        factory,
+        authority,
+        attempt_number=2,
+        manifest=retry_manifest,
+        publication_attempt_id=retry_publication,
+    )
+    registry_final.chmod(0o700)
+    second = _reconcile(factory, authority, root, apply=True, limit=10)
+    assert second.blocked_count == 0
+    with factory() as session:
+        retry_attempt = session.get(AdapterImportAttempt, retry_id)
+        registry_attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
+            )
+        )
+        assert retry_attempt is not None and retry_attempt.cleanup_confirmed_at is not None
+        assert registry_attempt is not None and registry_attempt.cleanup_confirmed_at is not None
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.artifact.reconcile",
+                )
+            )
+            == 2
+        )
+    assert not registry_final.exists()
+
+
+def test_cross_family_audit_coverage_deduplicates_registry_and_later_audits_source(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    root = _storage(tmp_path)
+    registry_final, adapter_id = _prepare_registry_crash(factory, authority, root, "published")
+    _abandon_source(factory, authority)
+    source_stage = _source_stage(root, authority)
+    source_stage.chmod(0o755)
+    first = _reconcile(factory, authority, root, apply=True, limit=10)
+    assert first.blocked_count == 1
+    with factory() as session:
+        registry_attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
+            )
+        )
+        source_attempt = session.get(AdapterImportAttempt, authority.source_attempt_id)
+        assert registry_attempt is not None and registry_attempt.cleanup_confirmed_at is not None
+        assert source_attempt is not None and source_attempt.cleanup_confirmed_at is None
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.artifact.reconcile",
+                )
+            )
+            == 1
+        )
+
+    retry_id = _add_failed_registry_attempt(factory, authority, adapter_id, attempt_number=2)
+    retry = _reconcile(factory, authority, root, apply=True, limit=1)
+    assert retry.blocked_count == 0
+    with factory() as session:
+        retry_attempt = session.get(AdapterRegistryAttempt, retry_id)
+        assert retry_attempt is not None and retry_attempt.cleanup_confirmed_at is not None
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.artifact.reconcile",
+                )
+            )
+            == 1
+        )
+
+    source_stage.chmod(0o700)
+    repaired = _reconcile(factory, authority, root, apply=True, limit=10)
+    assert repaired.blocked_count == 0
+    with factory() as session:
+        source_attempt = session.get(AdapterImportAttempt, authority.source_attempt_id)
+        assert source_attempt is not None and source_attempt.cleanup_confirmed_at is not None
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.artifact.reconcile",
+                )
+            )
+            == 2
+        )
+    assert not registry_final.exists()
