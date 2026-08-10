@@ -53,14 +53,20 @@ a repaired newer generation can therefore progress without being starved by an
 older mismatch. Stage retries use the same ordering and never depend on a final
 manifest being present. Each family first reads a deterministic keyset window
 of at most `min(limit * 8, 1000)` attempt rows. The per-status queries use the
-existing `(department_id, status, created_at)` indexes and fixed quotas whose
+full `(department_id, status, created_at, id)` indexes and fixed quotas whose
 sum is that bound; they do not rank an unbounded eligible relation with
-correlated history expressions. The latest selected attempt item is the
-durable family cursor, and an exhausted suffix wraps to the beginning while
-retaining the cursor row in the same bounded window. Only that window is
-materialized for structural checks and detailed fairness. History aggregation
-receives at most the window keys per surface; sibling checks are bulk queries,
-not department-wide history scans or N+1 queries. The final merged selection
+correlated history expressions. A separate content-free PostgreSQL cursor
+records the last inspected `(created_at, id)` boundary for each department and
+family. Apply mode advances it even when every row in the window is
+structurally ineligible, so repeated operations cannot rescan the same blocked
+prefix forever; dry-run mode never creates or updates cursor rows. When the
+suffix is exhausted, the same bounded keyset scan wraps deterministically to
+the beginning and retains the prior boundary so older work remains reachable.
+Only that window is materialized for structural checks and detailed fairness.
+Sibling authority uses bounded grouped aggregate results for the resources in
+the window rather than materializing every historical sibling row or issuing
+N+1 queries. History aggregation receives at most the window keys per surface.
+The final merged selection
 locks only the distinct attempt/resource rows (at most the requested limit)
 with `FOR UPDATE SKIP LOCKED`, and no more than that many attempts are
 registered in an operation. A blocked-only generation is
@@ -124,6 +130,11 @@ PostgreSQL authority and external filesystem publication are compensating
 controls, not a distributed transaction. An in-flight filesystem operation
 cannot be fenced atomically by PostgreSQL; exact descriptors, tombstones, and
 subsequent authority checks keep unknown or orphaned bytes untrusted.
+
+Migration `0013_phase12_adapter_reconciliation_cursor` adds the independent
+cursor table and the complete attempt keyset indexes. PR #19 has a different
+`0013` migration on its branch; it must be rebased and renumbered to `0014`
+after this hotfix merges, before the branches are combined.
 
 Phase 12.1E-B/C, evaluation, approval, promotion, loading, runtime routing,
 and later Phase 12/13 work remain separate future phases.

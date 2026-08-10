@@ -16,6 +16,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from sqlalchemy import String, and_, cast, func, or_, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, aliased, sessionmaker
 
@@ -47,6 +48,7 @@ from app.models import (
     Adapter,
     AdapterArtifactOperation,
     AdapterArtifactOperationItem,
+    AdapterArtifactReconciliationCursor,
     AdapterImportAttempt,
     AdapterImportSource,
     AdapterRegistryAttempt,
@@ -70,13 +72,15 @@ ACTIVE_ITEM_STATUSES = frozenset({"registered", "verified", "tombstone_bound", "
 # filesystem deletion or be confused with a persisted final manifest.
 _CONFIRMATION_ONLY_MARKER = {"phase12_1e_a_confirmation_only": True}
 _CONFIRMATION_ONLY_MARKER_KEY = "phase12_1e_a_confirmation_only"
-# Candidate selection has two bounded phases.  Each source/registry lane first
+# Candidate selection has two bounded phases. Each source/registry lane first
 # reads at most this many attempt rows through fixed per-status keyset quotas;
-# structural checks and grouped history are limited to that window.  The final
+# structural rows and history keys are limited to that window, while grouped
+# sibling authority returns one bounded result per resource. The final
 # ``FOR UPDATE SKIP LOCKED`` query locks only the selected attempt/resource rows
 # (at most ``limit`` distinct attempts); preselection rows are never locked.
-# The latest selected item is the durable family cursor and an exhausted suffix
-# wraps to the beginning without a global history-ranking query.
+# A separate content-free family cursor records the last inspected key, even
+# when structural checks produce no candidate. An exhausted suffix wraps to
+# the beginning without a global history-ranking query.
 RECONCILIATION_SCAN_MULTIPLIER = 8
 RECONCILIATION_MAX_SCAN_ROWS = 1000
 
@@ -178,10 +182,28 @@ class _SurfaceHistory:
 
 @dataclass(frozen=True, slots=True)
 class _AttemptCursor:
-    """The last attempt key selected for one reconciliation family."""
+    """One durable attempt key in the circular family scan order."""
 
     created_at: datetime
     attempt_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class _AttemptWindow:
+    """One bounded keyset window and the exact boundary inspected."""
+
+    rows: tuple[object, ...]
+    boundary: _AttemptCursor | None
+    wrapped: bool
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        return self.rows[index]
 
 
 def _candidate_surface_address(candidate: _Candidate) -> PhysicalSurfaceIdentifier:
@@ -406,46 +428,76 @@ def _bounded_scan_limit(limit: int) -> int:
     return min(RECONCILIATION_MAX_SCAN_ROWS, limit * RECONCILIATION_SCAN_MULTIPLIER)
 
 
-def _family_cursor(session: Session, department_id: UUID, family: str) -> _AttemptCursor | None:
-    """Read the durable keyset cursor from the latest family item.
+def _family_cursor(
+    session: Session,
+    department_id: UUID,
+    family: str,
+    *,
+    lock: bool = False,
+    create: bool = False,
+) -> _AttemptCursor | None:
+    """Read one indexed, content-free family scan cursor.
 
-    Reconciliation items already record the exact attempt selected by each
-    applied operation.  Reusing the latest item as the cursor avoids a new
-    scheduler table while keeping dry-runs read-only.  The cursor is only a
-    starting point; an exhausted suffix wraps to the deterministic beginning.
+    Cursor rows are separate from physical-surface operation items.  They do
+    not contribute to surface history, active-item uniqueness, eligible
+    counts, or audit coverage.  ``create`` is used only by apply mode; dry-run
+    selection remains read-only.
     """
 
-    if family == "source":
-        attempt_model = AdapterImportAttempt
-        attempt_column = AdapterArtifactOperationItem.import_attempt_id
-        surfaces = ("source_stage", "source_final")
-    else:
-        attempt_model = AdapterRegistryAttempt
-        attempt_column = AdapterArtifactOperationItem.registry_attempt_id
-        surfaces = ("registry_stage", "registry_final")
-    row = session.execute(
-        select(attempt_model.created_at, attempt_model.id)
-        .join(
-            AdapterArtifactOperationItem,
-            and_(
-                attempt_column == attempt_model.id,
-                AdapterArtifactOperationItem.department_id == attempt_model.department_id,
-            ),
+    if family not in {"source", "registry"}:
+        raise ValueError("invalid reconciliation family")
+    if create:
+        session.execute(
+            pg_insert(AdapterArtifactReconciliationCursor)
+            .values(department_id=department_id, family=family, version=1)
+            .on_conflict_do_nothing(index_elements=["department_id", "family"])
         )
-        .where(
-            AdapterArtifactOperationItem.department_id == department_id,
-            AdapterArtifactOperationItem.surface_type.in_(surfaces),
-            attempt_model.department_id == department_id,
-        )
-        .order_by(
-            AdapterArtifactOperationItem.created_at.desc(),
-            AdapterArtifactOperationItem.id.desc(),
-        )
-        .limit(1)
-    ).first()
-    if row is None:
+    statement = select(AdapterArtifactReconciliationCursor).where(
+        AdapterArtifactReconciliationCursor.department_id == department_id,
+        AdapterArtifactReconciliationCursor.family == family,
+    )
+    if lock:
+        statement = statement.with_for_update()
+    row = session.scalar(statement)
+    if row is None or row.cursor_created_at is None or row.cursor_attempt_id is None:
         return None
-    return _AttemptCursor(row[0], row[1])
+    return _AttemptCursor(row.cursor_created_at, row.cursor_attempt_id)
+
+
+def _advance_family_cursor(
+    session: Session,
+    department_id: UUID,
+    family: str,
+    boundary: _AttemptCursor | None,
+    *,
+    apply: bool,
+) -> None:
+    """Persist the inspected keyset boundary only for apply mode."""
+
+    if not apply or boundary is None:
+        return
+    row = session.scalar(
+        select(AdapterArtifactReconciliationCursor)
+        .where(
+            AdapterArtifactReconciliationCursor.department_id == department_id,
+            AdapterArtifactReconciliationCursor.family == family,
+        )
+        .with_for_update()
+    )
+    if row is None:
+        row = AdapterArtifactReconciliationCursor(
+            department_id=department_id,
+            family=family,
+            cursor_created_at=boundary.created_at,
+            cursor_attempt_id=boundary.attempt_id,
+            version=1,
+        )
+        session.add(row)
+        return
+    row.cursor_created_at = boundary.created_at
+    row.cursor_attempt_id = boundary.attempt_id
+    row.version += 1
+    row.updated_at = func.clock_timestamp()
 
 
 def _keyset_after(model, cursor: _AttemptCursor | None):
@@ -465,10 +517,11 @@ def _bounded_keyset_attempt_window(
     statuses: tuple[str, ...],
     cursor: _AttemptCursor | None,
     scan_limit: int,
-) -> tuple[object, ...]:
+) -> _AttemptWindow:
     """Read one fixed-size, index-shaped keyset window.
 
-    The Phase 12.1E-A indexes are ``(department_id, status, created_at)``.
+    The Phase 12.1E-A indexes are
+    ``(department_id, status, created_at, id)``.
     One limited query is issued per lifecycle status, with a deterministic
     quota whose sum is exactly ``scan_limit``.  There is deliberately no
     correlated history predicate, fairness expression, global ``ORDER BY``
@@ -477,7 +530,7 @@ def _bounded_keyset_attempt_window(
     """
 
     if not statuses or scan_limit < 1:
-        return ()
+        return _AttemptWindow((), None, False)
     ordered_statuses = tuple(statuses)
     status_count = len(ordered_statuses)
     base, remainder = divmod(scan_limit, status_count)
@@ -499,13 +552,22 @@ def _bounded_keyset_attempt_window(
                 select(model).where(*predicates).order_by(model.created_at, model.id).limit(quota)
             ).all()
         )
-    if not rows and cursor is not None:
+    if rows:
+        rows.sort(key=lambda attempt: (attempt.created_at, attempt.id))
+        bounded_rows = tuple(rows[:scan_limit])
+        boundary = bounded_rows[-1]
+        return _AttemptWindow(
+            bounded_rows,
+            _AttemptCursor(boundary.created_at, boundary.id),
+            False,
+        )
+    if cursor is not None:
         # The suffix is exhausted.  A fresh keyset window at the beginning is
         # the deterministic wrap-around that keeps older repaired work
         # reachable without an OFFSET or a department-wide count.  Retain the
         # cursor row in the bounded window so a just-selected item can be
         # retried immediately after an authority repair.
-        start_rows = _bounded_keyset_attempt_window(
+        start_window = _bounded_keyset_attempt_window(
             session,
             model=model,
             department_id=department_id,
@@ -513,18 +575,48 @@ def _bounded_keyset_attempt_window(
             cursor=None,
             scan_limit=max(1, scan_limit - 1),
         )
+        start_rows = tuple(start_window.rows)
         cursor_row = session.scalar(
             select(model).where(
                 model.department_id == department_id,
                 model.id == cursor.attempt_id,
+                model.status.in_(statuses),
                 model.cleanup_confirmed_at.is_(None),
             )
         )
-        if cursor_row is not None and all(attempt.id != cursor_row.id for attempt in start_rows):
+        if (
+            cursor_row is not None
+            and len(start_rows) < scan_limit
+            and all(attempt.id != cursor_row.id for attempt in start_rows)
+        ):
             start_rows = (*start_rows, cursor_row)
-        return tuple(sorted(start_rows, key=lambda attempt: (attempt.created_at, attempt.id)))
-    rows.sort(key=lambda attempt: (attempt.created_at, attempt.id))
-    return tuple(rows[:scan_limit])
+        ordered_rows = tuple(
+            sorted(start_rows, key=lambda attempt: (attempt.created_at, attempt.id))
+        )
+        boundary_row = ordered_rows[-1] if ordered_rows else cursor_row
+        boundary = (
+            _AttemptCursor(boundary_row.created_at, boundary_row.id)
+            if boundary_row is not None
+            else None
+        )
+        return _AttemptWindow(ordered_rows, boundary, True)
+    return _AttemptWindow((), None, False)
+
+
+def _coerce_attempt_window(value, cursor: _AttemptCursor | None) -> _AttemptWindow:
+    """Keep instrumentation/legacy test hooks compatible with window objects."""
+
+    if isinstance(value, _AttemptWindow):
+        return value
+    rows = tuple(value)
+    if not rows:
+        return _AttemptWindow((), None, False)
+    boundary = rows[-1]
+    wrapped = cursor is not None and (boundary.created_at, boundary.id) < (
+        cursor.created_at,
+        cursor.attempt_id,
+    )
+    return _AttemptWindow(rows, _AttemptCursor(boundary.created_at, boundary.id), wrapped)
 
 
 def _source_structural_window(
@@ -548,19 +640,25 @@ def _source_structural_window(
             )
         ).all()
     }
-    sibling_rows = session.execute(
-        select(
-            AdapterImportAttempt.source_bundle_id,
-            AdapterImportAttempt.id,
-            AdapterImportAttempt.status,
-        ).where(
-            AdapterImportAttempt.department_id == department_id,
-            AdapterImportAttempt.source_bundle_id.in_(source_ids),
-        )
-    ).all()
-    siblings: dict[UUID, list[tuple[UUID, str]]] = {}
-    for source_id, attempt_id, status in sibling_rows:
-        siblings.setdefault(source_id, []).append((attempt_id, status))
+    sibling_authority = {
+        source_id: (committed_count, nonterminal_count)
+        for source_id, committed_count, nonterminal_count in session.execute(
+            select(
+                AdapterImportAttempt.source_bundle_id,
+                func.count()
+                .filter(AdapterImportAttempt.status == "committed")
+                .label("committed_count"),
+                func.count()
+                .filter(~AdapterImportAttempt.status.in_(TERMINAL_SOURCE_ATTEMPT_STATUSES))
+                .label("nonterminal_count"),
+            )
+            .where(
+                AdapterImportAttempt.department_id == department_id,
+                AdapterImportAttempt.source_bundle_id.in_(source_ids),
+            )
+            .group_by(AdapterImportAttempt.source_bundle_id)
+        ).all()
+    }
     quarantine_rows = session.execute(
         select(
             AdapterArtifactOperationItem.source_bundle_id,
@@ -585,12 +683,12 @@ def _source_structural_window(
             continue
         if source.authoritative_attempt_id is not None:
             continue
-        sibling_statuses = [
-            status for sibling_id, status in siblings.get(source.id, ()) if sibling_id != attempt.id
-        ]
-        if "committed" in sibling_statuses:
+        committed_count, nonterminal_count = sibling_authority.get(source.id, (0, 0))
+        if committed_count > 0:
             continue
-        if any(status not in TERMINAL_SOURCE_ATTEMPT_STATUSES for status in sibling_statuses):
+        if attempt.status not in TERMINAL_SOURCE_ATTEMPT_STATUSES:
+            nonterminal_count -= 1
+        if nonterminal_count > 0:
             continue
         if attempt.status not in TERMINAL_SOURCE_ATTEMPT_STATUSES and (
             source.status != "staging" or attempt.created_at > cutoff
@@ -620,19 +718,22 @@ def _registry_structural_window(
             )
         ).all()
     }
-    sibling_rows = session.execute(
-        select(
-            AdapterRegistryAttempt.adapter_id,
-            AdapterRegistryAttempt.id,
-            AdapterRegistryAttempt.status,
-        ).where(
-            AdapterRegistryAttempt.department_id == department_id,
-            AdapterRegistryAttempt.adapter_id.in_(adapter_ids),
-        )
-    ).all()
-    siblings: dict[UUID, list[tuple[UUID, str]]] = {}
-    for adapter_id, attempt_id, status in sibling_rows:
-        siblings.setdefault(adapter_id, []).append((attempt_id, status))
+    sibling_authority = {
+        adapter_id: nonterminal_count
+        for adapter_id, nonterminal_count in session.execute(
+            select(
+                AdapterRegistryAttempt.adapter_id,
+                func.count()
+                .filter(~AdapterRegistryAttempt.status.in_(TERMINAL_REGISTRY_ATTEMPT_STATUSES))
+                .label("nonterminal_count"),
+            )
+            .where(
+                AdapterRegistryAttempt.department_id == department_id,
+                AdapterRegistryAttempt.adapter_id.in_(adapter_ids),
+            )
+            .group_by(AdapterRegistryAttempt.adapter_id)
+        ).all()
+    }
     quarantine_rows = session.execute(
         select(
             AdapterArtifactOperationItem.adapter_id,
@@ -655,12 +756,10 @@ def _registry_structural_window(
         adapter = adapters.get(attempt.adapter_id)
         if adapter is None or adapter.status not in {"failed", "validation_failed"}:
             continue
-        sibling_statuses = [
-            status
-            for sibling_id, status in siblings.get(adapter.id, ())
-            if sibling_id != attempt.id
-        ]
-        if any(status not in TERMINAL_REGISTRY_ATTEMPT_STATUSES for status in sibling_statuses):
+        nonterminal_count = sibling_authority.get(adapter.id, 0)
+        if attempt.status not in TERMINAL_REGISTRY_ATTEMPT_STATUSES:
+            nonterminal_count -= 1
+        if nonterminal_count > 0:
             continue
         eligible.append((attempt, adapter))
     return eligible, quarantined
@@ -851,7 +950,13 @@ def _register_or_resume(
                 return tuple(
                     _candidate_from_item(item) for item in items
                 ), existing.id if apply else None
-            candidates = _select_candidates(session, department_id, minimum_age_seconds, limit)
+            candidates = _select_candidates(
+                session,
+                department_id,
+                minimum_age_seconds,
+                limit,
+                apply=apply,
+            )
             if not apply or not candidates:
                 return candidates, None
             operation = AdapterArtifactOperation(
@@ -899,16 +1004,20 @@ def _register_or_resume(
 
 
 def _select_candidates(
-    session: Session, department_id: UUID, minimum_age_seconds: int, limit: int
+    session: Session,
+    department_id: UUID,
+    minimum_age_seconds: int,
+    limit: int,
+    *,
+    apply: bool = False,
 ) -> tuple[_Candidate, ...]:
     """Select bounded reconciliation work through per-family keyset windows.
 
-    The keyset queries deliberately return only attempt rows.  Structural
+    The keyset queries deliberately return only attempt rows. Structural
     eligibility, manifest parsing, and all detailed fairness/history probes
-    happen after that fixed window is materialized.  The latest selected item
-    is the durable cursor; an exhausted suffix wraps to the beginning, which
-    keeps repaired or older retryable work reachable without a global ranking
-    query.
+    happen after that fixed window is materialized. Apply mode persists the
+    inspected boundary for each family, including a zero-candidate structural
+    window; dry-run mode never creates or updates cursor rows.
     """
 
     cutoff = session.scalar(select(func.clock_timestamp()))
@@ -921,26 +1030,44 @@ def _select_candidates(
     selected_source_finals: set[UUID] = set()
     selected_registry_finals: set[UUID] = set()
 
-    source_attempts = _bounded_keyset_attempt_window(
+    source_cursor = _family_cursor(
         session,
-        model=AdapterImportAttempt,
-        department_id=department_id,
-        statuses=(
-            "failed",
-            "abandoned",
-            "registered",
-            "validated",
-            "staged",
-            "published",
-        ),
-        cursor=_family_cursor(session, department_id, "source"),
-        scan_limit=scan_limit,
+        department_id,
+        "source",
+        lock=apply,
+        create=apply,
     )
+    source_window = _coerce_attempt_window(
+        _bounded_keyset_attempt_window(
+            session,
+            model=AdapterImportAttempt,
+            department_id=department_id,
+            statuses=(
+                "failed",
+                "abandoned",
+                "registered",
+                "validated",
+                "staged",
+                "published",
+            ),
+            cursor=source_cursor,
+            scan_limit=scan_limit,
+        ),
+        source_cursor,
+    )
+    source_attempts = tuple(source_window.rows)
     eligible_source_rows, source_quarantined = _source_structural_window(
         session,
         department_id=department_id,
         cutoff=cutoff,
         attempts=source_attempts,
+    )
+    _advance_family_cursor(
+        session,
+        department_id,
+        "source",
+        source_window.boundary,
+        apply=apply,
     )
     source_final_manifests: dict[tuple[UUID, UUID], dict[str, object]] = {}
     source_invalid_final_keys: set[tuple[UUID, UUID]] = set()
@@ -997,18 +1124,36 @@ def _select_candidates(
             or _surface_item_state(source_final_history, resource_id, attempt_id) == "untried"
         )
 
-    registry_attempts = _bounded_keyset_attempt_window(
+    registry_cursor = _family_cursor(
         session,
-        model=AdapterRegistryAttempt,
-        department_id=department_id,
-        statuses=tuple(TERMINAL_REGISTRY_ATTEMPT_STATUSES),
-        cursor=_family_cursor(session, department_id, "registry"),
-        scan_limit=scan_limit,
+        department_id,
+        "registry",
+        lock=apply,
+        create=apply,
     )
+    registry_window = _coerce_attempt_window(
+        _bounded_keyset_attempt_window(
+            session,
+            model=AdapterRegistryAttempt,
+            department_id=department_id,
+            statuses=tuple(TERMINAL_REGISTRY_ATTEMPT_STATUSES),
+            cursor=registry_cursor,
+            scan_limit=scan_limit,
+        ),
+        registry_cursor,
+    )
+    registry_attempts = tuple(registry_window.rows)
     eligible_registry_rows, registry_quarantined = _registry_structural_window(
         session,
         department_id=department_id,
         attempts=registry_attempts,
+    )
+    _advance_family_cursor(
+        session,
+        department_id,
+        "registry",
+        registry_window.boundary,
+        apply=apply,
     )
     registry_final_manifests: dict[tuple[UUID, UUID], dict[str, object]] = {}
     registry_invalid_final_keys: set[tuple[UUID, UUID]] = set()

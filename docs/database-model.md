@@ -1,9 +1,11 @@
 # Database Model Through Phase 12.1E-A
 
 DeptSLM uses PostgreSQL 16, SQLAlchemy 2, psycopg 3, and Alembic. Revision
-`0012_phase12_adapter_reconciliation` is the current head after
-`0011_phase12_adapter_registry`. Alembic is the only schema-creation
-mechanism; runtime never calls `metadata.create_all`.
+`0013_phase12_adapter_reconciliation_cursor` is the current head after
+`0012_phase12_adapter_reconciliation`. Alembic is the only schema-creation
+mechanism; runtime never calls `metadata.create_all`. PR #19 has a separate
+`0013` migration on its branch and must be renumbered to `0014` after this
+hotfix merges.
 
 ## Entities
 
@@ -34,6 +36,7 @@ erDiagram
     ADAPTERS ||--o{ ADAPTER_REGISTRY_ATTEMPTS : attempts
     ADAPTERS ||--o{ ADAPTER_UPSTREAM_DEPENDENCIES : retains
     DEPARTMENTS ||--o{ ADAPTER_ARTIFACT_OPERATIONS : scopes
+    DEPARTMENTS ||--o{ ADAPTER_ARTIFACT_RECONCILIATION_CURSORS : advances
     ADAPTER_ARTIFACT_OPERATIONS ||--o{ ADAPTER_ARTIFACT_OPERATION_ITEMS : contains
 ```
 
@@ -124,12 +127,20 @@ operation/item authority and does not alter these read rows.
 ## Phase 12.1E-A reconciliation metadata
 
 Revision `0012_phase12_adapter_reconciliation` adds
-`adapter_artifact_operations` and `adapter_artifact_operation_items`. An
-operation is a bounded, department-scoped, administrator-authorized,
+`adapter_artifact_operations` and `adapter_artifact_operation_items`. Revision
+`0013_phase12_adapter_reconciliation_cursor` adds the content-free
+`adapter_artifact_reconciliation_cursors` rows and replaces the source and
+registry attempt indexes with `(department_id, status, created_at, id)` tuple
+indexes. An operation is a bounded, department-scoped, administrator-authorized,
 dry-run-by-default batch. Its item rows bind exactly one source or registry
 resource, publication attempt, attempt number, expected resource/attempt
 versions, surface, and optional closed final manifest. Composite restrictive
-foreign keys prevent cross-department or cross-attempt ownership.
+foreign keys prevent cross-department or cross-attempt ownership. A cursor row
+is independent scheduler progress for one department and family (`source` or
+`registry`); it is not a physical-surface item and does not affect history,
+audit coverage, eligible counts, or active-item uniqueness. Apply scans persist
+the inspected key boundary even when structural authority rejects every row;
+dry-runs do not create or update cursor rows.
 
 Items move through `registered`, `verified`, `tombstone_bound`, `deleting`,
 `completed`, or `blocked`. `verified` stores the closed observed identity and
@@ -144,10 +155,14 @@ attempt's `cleanup_confirmed_at` only after every applicable surface and
 tombstone for that exact attempt is absent across all operations and no
 authoritative sibling exists. Candidate selection applies authority filters
 before each bounded source/registry scan, preselects at most
-`min(limit * 8, 1000)` rows per family without locks, merges global fairness,
-and locks only the final distinct attempt/resource rows with
-`FOR UPDATE SKIP LOCKED`. History is grouped only for those exact rows, with
-bulk sibling checks rather than unbounded department-wide or N+1 queries.
+`min(limit * 8, 1000)` rows per family without locks, advances the independent
+family cursor, merges global fairness, and locks only the final distinct
+attempt/resource rows with `FOR UPDATE SKIP LOCKED`. History keys are
+materialized only for those exact rows. Sibling authority is returned by one
+grouped aggregate per family with one result per resource in the bounded
+window, rather than materializing all historical sibling attempts or issuing
+N+1 queries. The operation item count remains bounded by selected surfaces and
+the requested limit.
 Untried stages and finals precede blocked retries across both families;
 blocked siblings rotate by exact retry counts and most recent blocked
 generation, so an outside-window untried item and the other family cannot be

@@ -6,14 +6,14 @@ import hashlib
 import json
 import os
 import shutil
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import delete, func, inspect, select, update
+from sqlalchemy import delete, func, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 from test_phase12_1c_integration import Authority, _enqueue, _seed_authority
@@ -39,6 +39,7 @@ from app.models import (
     Adapter,
     AdapterArtifactOperation,
     AdapterArtifactOperationItem,
+    AdapterArtifactReconciliationCursor,
     AdapterImportAttempt,
     AdapterImportSource,
     AdapterRegistryAttempt,
@@ -138,6 +139,11 @@ def _cleanup_test_rows(factory: sessionmaker[Session], authority: Authority) -> 
                 claimed_adapter_id=None,
                 claimed_at=None,
                 consumed_at=None,
+            )
+        )
+        session.execute(
+            delete(AdapterArtifactReconciliationCursor).where(
+                AdapterArtifactReconciliationCursor.department_id == authority.department_id
             )
         )
         session.execute(
@@ -536,20 +542,23 @@ def _add_failed_source_attempt(
     manifest=None,
     publication_attempt_id: UUID | None = None,
     attempt_id: UUID | None = None,
+    source_id: UUID | None = None,
+    created_at: datetime | None = None,
 ) -> UUID:
     attempt_id = attempt_id or uuid4()
     publication_attempt_id = publication_attempt_id or uuid4()
-    now = datetime.now(UTC)
+    now = created_at or datetime.now(UTC)
     with factory.begin() as session:
         values = {
             "id": attempt_id,
             "department_id": authority.department_id,
-            "source_bundle_id": authority.source_id,
+            "source_bundle_id": source_id or authority.source_id,
             "attempt_number": attempt_number,
             "publication_attempt_id": publication_attempt_id,
             "status": "failed",
             "code_revision": authority.code_revision,
             "error_code": "adapter_source_publication_failed",
+            "created_at": now,
             "finished_at": now,
             "version": 1,
         }
@@ -557,6 +566,34 @@ def _add_failed_source_attempt(
             values["ownership_manifest"] = manifest
         session.add(AdapterImportAttempt(**values))
     return attempt_id
+
+
+def _add_staging_source(factory: sessionmaker[Session], authority: Authority) -> UUID:
+    """Add a metadata-only source whose terminal attempt can be selected."""
+
+    source_id = uuid4()
+    with factory() as session:
+        original = session.get(AdapterImportSource, authority.source_id)
+        assert original is not None
+        source = AdapterImportSource(
+            id=source_id,
+            department_id=authority.department_id,
+            imported_by_user_id=original.imported_by_user_id,
+            status="staging",
+            source_contract_version=original.source_contract_version,
+            intake_contract_version=original.intake_contract_version,
+            config_contract_version=original.config_contract_version,
+            tensor_contract_version=original.tensor_contract_version,
+            base_model_id=original.base_model_id,
+            base_model_revision=original.base_model_revision,
+            base_model_license=original.base_model_license,
+            peft_version=original.peft_version,
+            safetensors_format=original.safetensors_format,
+            code_revision=original.code_revision,
+        )
+        session.add(source)
+        session.commit()
+    return source_id
 
 
 def _add_failed_registry_attempt(
@@ -568,10 +605,11 @@ def _add_failed_registry_attempt(
     manifest=None,
     publication_attempt_id: UUID | None = None,
     attempt_id: UUID | None = None,
+    created_at: datetime | None = None,
 ) -> UUID:
     attempt_id = attempt_id or uuid4()
     publication_attempt_id = publication_attempt_id or uuid4()
-    now = datetime.now(UTC)
+    now = created_at or datetime.now(UTC)
     with factory.begin() as session:
         values = {
             "id": attempt_id,
@@ -583,6 +621,7 @@ def _add_failed_registry_attempt(
             "status": "failed",
             "code_revision": authority.code_revision,
             "error_code": "adapter_registry_publication_failed",
+            "created_at": now,
             "finished_at": now,
             "version": 1,
         }
@@ -1431,6 +1470,209 @@ def test_keyset_window_bounds_history_evaluation_before_fairness(
     seen_attempts = {attempt_id for rows in nonempty for _resource, attempt_id in rows}
     assert len(seen_attempts) <= maintenance._bounded_scan_limit(1)
     assert seen_attempts < set(attempt_ids)
+
+
+def test_apply_source_cursor_advances_through_structural_noop_window(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    """A protected source prefix advances without creating physical items."""
+
+    _storage(tmp_path)
+    base = datetime.now(UTC) - timedelta(days=1)
+    first_id = _add_failed_source_attempt(factory, authority, attempt_number=2, created_at=base)
+    second_id = _add_failed_source_attempt(
+        factory, authority, attempt_number=3, created_at=base + timedelta(seconds=1)
+    )
+    valid_source_id = _add_staging_source(factory, authority)
+    valid_id = _add_failed_source_attempt(
+        factory,
+        authority,
+        attempt_number=1,
+        source_id=valid_source_id,
+        created_at=base + timedelta(seconds=2),
+    )
+
+    with factory.begin() as session:
+        assert not maintenance._select_candidates(
+            session, authority.department_id, 300, 1, apply=True
+        )
+    with factory() as session:
+        cursor = session.get(
+            AdapterArtifactReconciliationCursor,
+            (authority.department_id, "source"),
+        )
+        assert cursor is not None
+        assert cursor.cursor_attempt_id == second_id
+        assert (
+            session.scalar(
+                select(func.count(AdapterArtifactOperationItem.id)).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id
+                )
+            )
+            == 0
+        )
+
+    with factory.begin() as session:
+        candidates = maintenance._select_candidates(
+            session, authority.department_id, 300, 1, apply=True
+        )
+        assert [candidate.import_attempt_id for candidate in candidates] == [valid_id]
+    with factory() as session:
+        cursor = session.get(
+            AdapterArtifactReconciliationCursor,
+            (authority.department_id, "source"),
+        )
+        assert cursor is not None and cursor.cursor_attempt_id == valid_id
+        snapshot = (cursor.cursor_created_at, cursor.cursor_attempt_id, cursor.version)
+
+    with factory.begin() as session:
+        maintenance._select_candidates(session, authority.department_id, 300, 1, apply=False)
+    with factory() as session:
+        cursor = session.get(
+            AdapterArtifactReconciliationCursor,
+            (authority.department_id, "source"),
+        )
+        assert cursor is not None
+        assert (cursor.cursor_created_at, cursor.cursor_attempt_id, cursor.version) == snapshot
+    assert first_id != second_id
+
+
+def test_apply_registry_cursor_advances_through_structural_noop_window(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    """A nonterminal sibling blocks a bounded registry window without items."""
+
+    root = _storage(tmp_path)
+    _final, adapter_id = _prepare_registry_crash(factory, authority, root, "published")
+    base = datetime.now(UTC) - timedelta(days=1)
+    with factory.begin() as session:
+        first_attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
+                AdapterRegistryAttempt.attempt_number == 1,
+            )
+        )
+        assert first_attempt is not None
+        first_attempt.created_at = base - timedelta(seconds=1)
+    _add_failed_registry_attempt(factory, authority, adapter_id, attempt_number=2, created_at=base)
+    _add_failed_registry_attempt(
+        factory,
+        authority,
+        adapter_id,
+        attempt_number=3,
+        created_at=base + timedelta(seconds=1),
+    )
+    with factory.begin() as session:
+        session.add(
+            AdapterRegistryAttempt(
+                id=uuid4(),
+                department_id=authority.department_id,
+                adapter_id=adapter_id,
+                attempt_number=4,
+                publication_attempt_id=uuid4(),
+                execution_scope_id=uuid4(),
+                code_revision=authority.code_revision,
+                status="registered",
+                created_at=base + timedelta(seconds=3),
+            )
+        )
+
+    with factory.begin() as session:
+        assert not maintenance._select_candidates(
+            session, authority.department_id, 300, 1, apply=True
+        )
+    with factory() as session:
+        cursor = session.get(
+            AdapterArtifactReconciliationCursor,
+            (authority.department_id, "registry"),
+        )
+        assert cursor is not None
+        assert cursor.cursor_created_at == base + timedelta(seconds=1)
+        assert (
+            session.scalar(
+                select(func.count(AdapterArtifactOperationItem.id)).where(
+                    AdapterArtifactOperationItem.department_id == authority.department_id
+                )
+            )
+            == 0
+        )
+
+
+def test_keyset_window_wraps_to_oldest_rows_with_exact_boundary(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    """An exhausted suffix wraps without an unbounded history query."""
+
+    _storage(tmp_path)
+    base = datetime.now(UTC) - timedelta(days=1)
+    first_id = _add_failed_source_attempt(factory, authority, attempt_number=2, created_at=base)
+    second_id = _add_failed_source_attempt(
+        factory, authority, attempt_number=3, created_at=base + timedelta(seconds=1)
+    )
+    with factory() as session:
+        cursor = maintenance._AttemptCursor(base + timedelta(seconds=1), second_id)
+        window = maintenance._bounded_keyset_attempt_window(
+            session,
+            model=AdapterImportAttempt,
+            department_id=authority.department_id,
+            statuses=("failed",),
+            cursor=cursor,
+            scan_limit=2,
+        )
+        assert window.wrapped
+        assert [attempt.id for attempt in window.rows] == [first_id, second_id]
+        assert window.boundary is not None
+        assert window.boundary.attempt_id == second_id
+
+
+@pytest.mark.parametrize(
+    ("table_name", "index_name"),
+    [
+        (
+            "adapter_import_attempts",
+            "ix_adapter_import_attempt_department_status_created_id",
+        ),
+        (
+            "adapter_registry_attempts",
+            "ix_adapter_registry_attempt_department_status_created_id",
+        ),
+    ],
+)
+def test_attempt_keyset_indexes_support_tied_created_at_groups(
+    factory, authority: Authority, table_name: str, index_name: str
+) -> None:
+    """The four-column indexes support deterministic tied-timestamp scans."""
+
+    with factory.begin() as session:
+        session.execute(text("SET LOCAL enable_seqscan = off"))
+        plan = session.execute(
+            text(
+                f"""
+                EXPLAIN (FORMAT JSON)
+                SELECT id
+                FROM {table_name}
+                WHERE department_id = :department_id
+                  AND status = 'failed'
+                  AND cleanup_confirmed_at IS NULL
+                ORDER BY created_at, id
+                LIMIT 8
+                """
+            ),
+            {"department_id": str(authority.department_id)},
+        ).scalar_one()
+        assert isinstance(plan, list) and plan
+
+    nodes: list[dict[str, object]] = []
+
+    def collect(node: dict[str, object]) -> None:
+        nodes.append(node)
+        for child in node.get("Plans", ()):
+            if isinstance(child, dict):
+                collect(child)
+
+    collect(plan[0]["Plan"])
+    assert any(node.get("Index Name") == index_name for node in nodes)
 
 
 def test_selection_locks_only_requested_attempts(

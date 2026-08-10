@@ -158,7 +158,7 @@ jobs:
             sleep 1
           done
           python -m alembic upgrade head
-          test "$(python -m alembic current | awk '{print $1}')" = "0012_phase12_adapter_reconciliation"
+          test "$(python -m alembic current | awk '{print $1}')" = "0013_phase12_adapter_reconciliation_cursor"
           python -m pytest
       - name: Run one-shot worker smoke test
         working-directory: apps/api
@@ -281,6 +281,7 @@ jobs:
           assert pathlib.Path("/app/alembic/versions/0010_phase12_adapter_sources.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0011_phase12_adapter_registry.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0012_phase12_adapter_reconciliation.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0013_phase12_adapter_reconciliation_cursor.py").is_file()
           import app.evaluation_admin
           import app.evaluation_services
           import app.sft_services
