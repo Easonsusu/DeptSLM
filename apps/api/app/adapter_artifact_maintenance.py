@@ -69,6 +69,7 @@ ACTIVE_ITEM_STATUSES = frozenset({"registered", "verified", "tombstone_bound", "
 # retry.  It is never a final-manifest authority and therefore cannot trigger
 # filesystem deletion or be confused with a persisted final manifest.
 _CONFIRMATION_ONLY_MARKER = {"phase12_1e_a_confirmation_only": True}
+_CONFIRMATION_ONLY_MARKER_KEY = "phase12_1e_a_confirmation_only"
 # Candidate selection has two bounded phases.  Each source/registry lane may
 # inspect at most this many rows using indexed SQL predicates and grouped
 # history.  The final ``FOR UPDATE SKIP LOCKED`` query locks only the selected
@@ -81,6 +82,17 @@ RECONCILIATION_MAX_SCAN_ROWS = 1000
 
 class AdapterArtifactMaintenanceConfigurationError(RuntimeError):
     pass
+
+
+def _confirmation_marker_clause(column):
+    """Match the closed confirmation marker without JSON equality.
+
+    PostgreSQL's ``json`` type deliberately has no equality operator.  The
+    marker is a boolean field in a closed, content-free object, so use the
+    JSON scalar extraction operator instead of binding the whole dictionary.
+    """
+
+    return column[_CONFIRMATION_ONLY_MARKER_KEY].as_boolean().is_(True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,6 +171,8 @@ class _SurfaceHistory:
     statuses: frozenset[str]
     blocked_count: int
     latest_blocked_at: datetime | None
+    confirmation_blocked_count: int = 0
+    latest_confirmation_blocked_at: datetime | None = None
 
 
 def _candidate_surface_address(candidate: _Candidate) -> PhysicalSurfaceIdentifier:
@@ -264,11 +278,38 @@ def _surface_item_history_for_rows(
             previous = entry["latest_blocked_at"]
             if previous is None or (latest_at is not None and latest_at > previous):
                 entry["latest_blocked_at"] = latest_at
+    confirmation_grouped = session.execute(
+        select(
+            resource_column,
+            attempt_column,
+            func.count(AdapterArtifactOperationItem.id),
+            func.max(AdapterArtifactOperationItem.created_at),
+        )
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == surface_type,
+            AdapterArtifactOperationItem.status == "blocked",
+            AdapterArtifactOperationItem.blocked_reason_code == "artifact_authority_changed",
+            _confirmation_marker_clause(AdapterArtifactOperationItem.ownership_manifest),
+            key_filter,
+        )
+        .group_by(resource_column, attempt_column)
+    ).all()
+    for resource_id, attempt_id, count, latest_at in confirmation_grouped:
+        entry = history.setdefault(
+            (resource_id, attempt_id),
+            {"statuses": set(), "blocked_count": 0, "latest_blocked_at": None},
+        )
+        entry["blocked_count"] = int(entry["blocked_count"]) - int(count)
+        entry["confirmation_blocked_count"] = int(count)
+        entry["latest_confirmation_blocked_at"] = latest_at
     return {
         key: _SurfaceHistory(
             frozenset(value["statuses"]),
             int(value["blocked_count"]),
             value["latest_blocked_at"],
+            int(value.get("confirmation_blocked_count", 0)),
+            value.get("latest_confirmation_blocked_at"),
         )
         for key, value in history.items()
     }
@@ -365,13 +406,7 @@ def _row_fairness_key(
     final_history: dict[tuple[UUID, UUID], _SurfaceHistory],
     final_applicable_keys: set[tuple[UUID, UUID]],
 ) -> tuple[object, ...]:
-    """Order any untried surface before bounded blocked retries.
-
-    The row represents both a stage and (when its manifest is valid) a final.
-    Ranking stage state before final state would let a blocked stage on one
-    attempt outrank an untried final on another attempt, so the aggregate lane
-    rank is computed first and only then uses the applicable surface history.
-    """
+    """Order actionable surfaces before confirmation-only retry backlog."""
 
     resource_id = resource_id_for(row)
     attempt_id = attempt_id_for(row)
@@ -393,25 +428,43 @@ def _row_fairness_key(
         final_state, final_record = "not_applicable", None
     if stage_state == "untried" or final_state == "untried":
         lane_rank = (0, 0, 0.0)
+    elif final_state == "blocked" and final_record is not None:
+        latest = (
+            final_record.latest_blocked_at.timestamp()
+            if final_record.latest_blocked_at is not None
+            else 0.0
+        )
+        lane_rank = (1, final_record.blocked_count, latest)
+    elif stage_state == "blocked" and stage_record is not None:
+        latest = (
+            stage_record.latest_blocked_at.timestamp()
+            if stage_record.latest_blocked_at is not None
+            else 0.0
+        )
+        lane_rank = (1, stage_record.blocked_count, latest)
+    elif (
+        stage_state == "completed"
+        and stage_record is not None
+        and (
+            final_state in {"not_applicable", "completed"}
+            and stage_record.confirmation_blocked_count > 0
+        )
+    ):
+        # A blocked stage generation paired with a completed/no-final surface
+        # is the durable signal for a fenced confirmation-only retry.  Keep it
+        # below actionable final/stage work while still rotating by count/time.
+        latest = (
+            stage_record.latest_confirmation_blocked_at.timestamp()
+            if stage_record.latest_confirmation_blocked_at is not None
+            else 0.0
+        )
+        lane_rank = (2, stage_record.confirmation_blocked_count, latest)
+    elif stage_state == "completed" and final_state in {"not_applicable", "completed"}:
+        # The first confirmation check has no blocked history yet.  It is
+        # still lower priority than an actionable physical surface.
+        lane_rank = (2, 0, 0.0)
     else:
-        blocked_records = [
-            record
-            for state, record in (
-                (stage_state, stage_record),
-                (final_state, final_record),
-            )
-            if state == "blocked" and record is not None
-        ]
-        if blocked_records:
-            retry_count = min(record.blocked_count for record in blocked_records)
-            latest_values = [
-                record.latest_blocked_at.timestamp()
-                for record in blocked_records
-                if record.latest_blocked_at is not None
-            ]
-            lane_rank = (1, retry_count, min(latest_values) if latest_values else 0.0)
-        else:
-            lane_rank = (2, 0, 0.0)
+        lane_rank = (3, 0, 0.0)
 
     created_at = getattr(row[0], "created_at", None)
     created_key = created_at.timestamp() if created_at is not None else 0.0
@@ -608,6 +661,24 @@ def _select_candidates(
             AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
             AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
             AdapterArtifactOperationItem.status == "blocked",
+            ~and_(
+                AdapterArtifactOperationItem.blocked_reason_code == "artifact_authority_changed",
+                _confirmation_marker_clause(AdapterArtifactOperationItem.ownership_manifest),
+            ),
+        )
+        .correlate(AdapterImportAttempt, AdapterImportSource)
+        .scalar_subquery()
+    )
+    source_stage_confirmation_blocked_count = (
+        select(func.count(AdapterArtifactOperationItem.id))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "source_stage",
+            AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
+            AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
+            AdapterArtifactOperationItem.status == "blocked",
+            AdapterArtifactOperationItem.blocked_reason_code == "artifact_authority_changed",
+            _confirmation_marker_clause(AdapterArtifactOperationItem.ownership_manifest),
         )
         .correlate(AdapterImportAttempt, AdapterImportSource)
         .scalar_subquery()
@@ -660,13 +731,81 @@ def _select_candidates(
         .correlate(AdapterImportAttempt, AdapterImportSource)
         .exists()
     )
+    source_stage_active = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "source_stage",
+            AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
+            AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
+            AdapterArtifactOperationItem.status.in_(tuple(ACTIVE_ITEM_STATUSES)),
+        )
+        .correlate(AdapterImportAttempt, AdapterImportSource)
+        .exists()
+    )
+    source_final_completed = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "source_final",
+            AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
+            AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
+            AdapterArtifactOperationItem.status == "completed",
+        )
+        .correlate(AdapterImportAttempt, AdapterImportSource)
+        .exists()
+    )
+    source_final_active = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "source_final",
+            AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
+            AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
+            AdapterArtifactOperationItem.status.in_(tuple(ACTIVE_ITEM_STATUSES)),
+        )
+        .correlate(AdapterImportAttempt, AdapterImportSource)
+        .exists()
+    )
+    source_invalid_final_quarantine = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "source_final",
+            AdapterArtifactOperationItem.source_bundle_id == AdapterImportSource.id,
+            AdapterArtifactOperationItem.import_attempt_id == AdapterImportAttempt.id,
+            AdapterArtifactOperationItem.status == "blocked",
+            AdapterArtifactOperationItem.blocked_reason_code == "artifact_manifest_invalid",
+            AdapterArtifactOperationItem.expected_attempt_version == AdapterImportAttempt.version,
+        )
+        .correlate(AdapterImportAttempt, AdapterImportSource)
+        .exists()
+    )
+    source_confirmation_ready = and_(
+        source_stage_completed,
+        ~source_stage_active,
+        or_(
+            AdapterImportAttempt.ownership_manifest.is_(None),
+            and_(source_final_completed, ~source_final_active),
+        ),
+    )
     # SQL cannot be the canonical final-manifest parser.  Only an unseen
     # stage receives the high preselection rank; final applicability is
-    # validated below and malformed non-null manifests are quarantined through
-    # bounded durable item history instead of consuming every future window.
+    # validated below.  Once a malformed final has produced a durable blocked
+    # item for this exact attempt version, exclude that unchanged quarantine
+    # from the bounded scan.  An administrator repair increments the attempt
+    # version and makes the row eligible again without erasing history.
     source_has_untried = ~source_stage_seen
+    source_action_priority = case(
+        (source_has_untried, 0),
+        (source_confirmation_ready, 2),
+        else_=1,
+    )
     source_blocked_rank = case(
-        (source_stage_completed, source_final_blocked_count),
+        (
+            source_stage_completed,
+            source_final_blocked_count + (2 * source_stage_confirmation_blocked_count),
+        ),
         else_=source_stage_blocked_count,
     )
     source_latest_blocked_rank = case(
@@ -719,9 +858,10 @@ def _select_candidates(
             )
             .correlate(AdapterImportAttempt)
             .exists(),
+            ~and_(source_stage_completed, source_invalid_final_quarantine),
         )
         .order_by(
-            case((source_has_untried, 0), else_=1),
+            source_action_priority,
             source_blocked_rank,
             source_latest_blocked_rank.asc().nullsfirst(),
             AdapterImportAttempt.created_at,
@@ -832,6 +972,24 @@ def _select_candidates(
             AdapterArtifactOperationItem.adapter_id == Adapter.id,
             AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
             AdapterArtifactOperationItem.status == "blocked",
+            ~and_(
+                AdapterArtifactOperationItem.blocked_reason_code == "artifact_authority_changed",
+                _confirmation_marker_clause(AdapterArtifactOperationItem.ownership_manifest),
+            ),
+        )
+        .correlate(AdapterRegistryAttempt, Adapter)
+        .scalar_subquery()
+    )
+    registry_stage_confirmation_blocked_count = (
+        select(func.count(AdapterArtifactOperationItem.id))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "registry_stage",
+            AdapterArtifactOperationItem.adapter_id == Adapter.id,
+            AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
+            AdapterArtifactOperationItem.status == "blocked",
+            AdapterArtifactOperationItem.blocked_reason_code == "artifact_authority_changed",
+            _confirmation_marker_clause(AdapterArtifactOperationItem.ownership_manifest),
         )
         .correlate(AdapterRegistryAttempt, Adapter)
         .scalar_subquery()
@@ -884,10 +1042,76 @@ def _select_candidates(
         .correlate(AdapterRegistryAttempt, Adapter)
         .exists()
     )
+    registry_stage_active = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "registry_stage",
+            AdapterArtifactOperationItem.adapter_id == Adapter.id,
+            AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
+            AdapterArtifactOperationItem.status.in_(tuple(ACTIVE_ITEM_STATUSES)),
+        )
+        .correlate(AdapterRegistryAttempt, Adapter)
+        .exists()
+    )
+    registry_final_completed = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "registry_final",
+            AdapterArtifactOperationItem.adapter_id == Adapter.id,
+            AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
+            AdapterArtifactOperationItem.status == "completed",
+        )
+        .correlate(AdapterRegistryAttempt, Adapter)
+        .exists()
+    )
+    registry_final_active = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "registry_final",
+            AdapterArtifactOperationItem.adapter_id == Adapter.id,
+            AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
+            AdapterArtifactOperationItem.status.in_(tuple(ACTIVE_ITEM_STATUSES)),
+        )
+        .correlate(AdapterRegistryAttempt, Adapter)
+        .exists()
+    )
+    registry_invalid_final_quarantine = (
+        select(literal(1))
+        .where(
+            AdapterArtifactOperationItem.department_id == department_id,
+            AdapterArtifactOperationItem.surface_type == "registry_final",
+            AdapterArtifactOperationItem.adapter_id == Adapter.id,
+            AdapterArtifactOperationItem.registry_attempt_id == AdapterRegistryAttempt.id,
+            AdapterArtifactOperationItem.status == "blocked",
+            AdapterArtifactOperationItem.blocked_reason_code == "artifact_manifest_invalid",
+            AdapterArtifactOperationItem.expected_attempt_version == AdapterRegistryAttempt.version,
+        )
+        .correlate(AdapterRegistryAttempt, Adapter)
+        .exists()
+    )
+    registry_confirmation_ready = and_(
+        registry_stage_completed,
+        ~registry_stage_active,
+        or_(
+            AdapterRegistryAttempt.ownership_manifest.is_(None),
+            and_(registry_final_completed, ~registry_final_active),
+        ),
+    )
     # See the source lane above: a JSON non-null check is not final authority.
     registry_has_untried = ~registry_stage_seen
+    registry_action_priority = case(
+        (registry_has_untried, 0),
+        (registry_confirmation_ready, 2),
+        else_=1,
+    )
     registry_blocked_rank = case(
-        (registry_stage_completed, registry_final_blocked_count),
+        (
+            registry_stage_completed,
+            registry_final_blocked_count + (2 * registry_stage_confirmation_blocked_count),
+        ),
         else_=registry_stage_blocked_count,
     )
     registry_latest_blocked_rank = case(
@@ -917,9 +1141,10 @@ def _select_candidates(
             )
             .correlate(AdapterRegistryAttempt)
             .exists(),
+            ~and_(registry_stage_completed, registry_invalid_final_quarantine),
         )
         .order_by(
-            case((registry_has_untried, 0), else_=1),
+            registry_action_priority,
             registry_blocked_rank,
             registry_latest_blocked_rank.asc().nullsfirst(),
             AdapterRegistryAttempt.created_at,
@@ -1605,7 +1830,7 @@ def _execute_item(
             elif item.status != "registered":
                 return item.status == "completed"
         if confirmation_only:
-            _mark_confirmation_completed(
+            return _mark_confirmation_completed(
                 factory,
                 data_dir=data_dir,
                 operation_id=operation_id,
@@ -1613,7 +1838,6 @@ def _execute_item(
                 issuer=actor_issuer,
                 subject=actor_subject,
             )
-            return True
         with AdapterMaintenanceArtifactStore(data_dir) as store:
             if inspected is None and bound is None:
                 # A marker or partial payload is never an ownership boundary;
@@ -1851,7 +2075,8 @@ def _retain_active_after_artifact_error(
                     error.code = "artifact_authority_changed"
                     return False
                 if not original_exists:
-                    error.code = "artifact_authority_changed"
+                    if error.code != "artifact_manifest_invalid":
+                        error.code = "artifact_authority_changed"
                 return False
     except AdapterMaintenanceArtifactError as nested:
         error.code = nested.code
@@ -1886,17 +2111,27 @@ def _mark_confirmation_completed(
     candidate: _Candidate,
     issuer: str,
     subject: str,
-) -> None:
+) -> bool:
     """Complete confirmation work without reopening a physical surface."""
 
     with factory.begin() as session:
         item = _load_item(session, operation_id, candidate, issuer, subject)
         if item.ownership_manifest != _CONFIRMATION_ONLY_MARKER:
             raise ServiceError(409, "Adapter reconciliation authority changed")
-        item.status = "completed"
-        item.completed_at = session.scalar(select(func.clock_timestamp()))
+        confirmed = _confirm_attempt_cleanup(
+            session,
+            item,
+            data_dir=data_dir,
+            ignore_item_id=item.id,
+        )
+        now = session.scalar(select(func.clock_timestamp()))
+        item.status = "completed" if confirmed else "blocked"
+        item.completed_at = now if confirmed else None
+        item.blocked_at = None if confirmed else now
+        item.blocked_reason_code = None if confirmed else "artifact_authority_changed"
+        item.in_flight_entry = None
         item.version += 1
-        _confirm_attempt_cleanup(session, item, data_dir=data_dir)
+        return confirmed
 
 
 def _mark_blocked(
@@ -1916,8 +2151,12 @@ def _mark_blocked(
 
 
 def _confirm_attempt_cleanup(
-    session: Session, item: AdapterArtifactOperationItem, *, data_dir: Path
-) -> None:
+    session: Session,
+    item: AdapterArtifactOperationItem,
+    *,
+    data_dir: Path,
+    ignore_item_id: UUID | None = None,
+) -> bool:
     """Confirm an exact attempt only after every surface and tombstone is absent."""
 
     if item.import_attempt_id is not None:
@@ -1947,7 +2186,7 @@ def _confirm_attempt_cleanup(
             or source.status in PROTECTED_SOURCE_STATUSES
             or source.authoritative_attempt_id is not None
         ):
-            return
+            return False
         committed_sibling = session.scalar(
             select(AdapterImportAttempt.id)
             .where(
@@ -1967,7 +2206,7 @@ def _confirm_attempt_cleanup(
             .limit(1)
         )
         if committed_sibling is not None or active_sibling is not None:
-            return
+            return False
         resource_id = item.source_bundle_id
         final_applicable = False
         if isinstance(attempt.ownership_manifest, dict):
@@ -1976,12 +2215,12 @@ def _confirm_attempt_cleanup(
                     "source_final", attempt.ownership_manifest
                 )
             except AdapterMaintenanceArtifactError:
-                return
+                return False
             if source.intake_manifest_sha256 not in (
                 None,
                 expected_sha256,
             ) or source.intake_manifest_byte_size not in (None, expected_size):
-                return
+                return False
             final_applicable = True
         expected_surfaces = ("source_stage",) + (("source_final",) if final_applicable else ())
         item_rows = session.scalars(
@@ -1993,6 +2232,11 @@ def _confirm_attempt_cleanup(
                 AdapterArtifactOperationItem.publication_attempt_id
                 == attempt.publication_attempt_id,
                 AdapterArtifactOperationItem.attempt_number == attempt.attempt_number,
+                (
+                    AdapterArtifactOperationItem.id != ignore_item_id
+                    if ignore_item_id is not None
+                    else True
+                ),
             )
             .with_for_update()
         ).all()
@@ -2022,7 +2266,7 @@ def _confirm_attempt_cleanup(
             or attempt.status not in TERMINAL_REGISTRY_ATTEMPT_STATUSES
             or adapter.status in PROTECTED_ADAPTER_STATUSES
         ):
-            return
+            return False
         succeeded_sibling = session.scalar(
             select(AdapterRegistryAttempt.id)
             .where(
@@ -2042,7 +2286,7 @@ def _confirm_attempt_cleanup(
             .limit(1)
         )
         if succeeded_sibling is not None or active_sibling is not None:
-            return
+            return False
         resource_id = item.adapter_id
         final_applicable = False
         if isinstance(attempt.ownership_manifest, dict):
@@ -2051,9 +2295,9 @@ def _confirm_attempt_cleanup(
                     "registry_final", attempt.ownership_manifest
                 )
             except AdapterMaintenanceArtifactError:
-                return
+                return False
             if adapter.registry_manifest_sha256 not in (None, expected_sha256):
-                return
+                return False
             final_applicable = True
         expected_surfaces = ("registry_stage",) + (("registry_final",) if final_applicable else ())
         item_rows = session.scalars(
@@ -2065,11 +2309,16 @@ def _confirm_attempt_cleanup(
                 AdapterArtifactOperationItem.publication_attempt_id
                 == attempt.publication_attempt_id,
                 AdapterArtifactOperationItem.attempt_number == attempt.attempt_number,
+                (
+                    AdapterArtifactOperationItem.id != ignore_item_id
+                    if ignore_item_id is not None
+                    else True
+                ),
             )
             .with_for_update()
         ).all()
     if attempt.cleanup_confirmed_at is not None:
-        return
+        return True
     by_surface: dict[str, list[AdapterArtifactOperationItem]] = {}
     for row in item_rows:
         by_surface.setdefault(row.surface_type, []).append(row)
@@ -2080,11 +2329,11 @@ def _confirm_attempt_cleanup(
     for surface in expected_surfaces:
         rows = by_surface.get(surface, [])
         if not rows or any(row.status in ACTIVE_ITEM_STATUSES for row in rows):
-            return
+            return False
         if not any(row.status == "completed" for row in rows):
-            return
+            return False
     if any(surface not in by_surface for surface in expected_surfaces):
-        return
+        return False
     try:
         with AdapterMaintenanceArtifactStore(data_dir) as store:
             all_surfaces = (
@@ -2114,13 +2363,14 @@ def _confirm_attempt_cleanup(
                     # unknown resource or sibling attempt tombstone.
                     unsafe_surface = True
             if unsafe_surface:
-                return
+                return False
     except AdapterMaintenanceArtifactError:
-        return
+        return False
     now = session.scalar(select(func.clock_timestamp()))
     if attempt.cleanup_confirmed_at is None:
         attempt.cleanup_confirmed_at = now
         attempt.version += 1
+    return True
 
 
 def _finalize_operation(
