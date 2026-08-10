@@ -56,12 +56,13 @@ of at most `min(limit * 8, 1000)` attempt rows. The per-status queries use the
 full `(department_id, status, created_at, id)` indexes and fixed quotas whose
 sum is that bound; they do not rank an unbounded eligible relation with
 correlated history expressions. A separate content-free PostgreSQL cursor
-records the last inspected `(created_at, id)` boundary for each department and
-family. Apply mode advances it even when every row in the window is
-structurally ineligible, so repeated operations cannot rescan the same blocked
-prefix forever; dry-run mode never creates or updates cursor rows. When the
-suffix is exhausted, the same bounded keyset scan wraps deterministically to
-the beginning and persists that new bounded boundary; it does not append the
+records the last inspected `(created_at, id)` boundary for each department,
+family, and lifecycle status. Apply mode advances each status cursor even when
+every row in its window is structurally ineligible, so repeated operations
+cannot rescan the same blocked prefix forever or jump over an uninspected row
+from another status; dry-run mode never creates or updates cursor rows. When a
+status suffix is exhausted, that bounded keyset stream wraps deterministically
+to the beginning and persists its new bounded boundary; it does not append the
 prior cursor row, so an adjacent older row cannot remain outside the circular
 scan.
 Only that window is materialized for structural checks and detailed fairness.
@@ -134,7 +135,10 @@ cannot be fenced atomically by PostgreSQL; exact descriptors, tombstones, and
 subsequent authority checks keep unknown or orphaned bytes untrusted.
 
 Migration `0013_phase12_adapter_reconciliation_cursor` adds the independent
-cursor table and the complete attempt keyset indexes. PR #19 has a different
+cursor table and the complete attempt keyset indexes. The cursor identity is
+`(department_id, family, lifecycle_status)`: each independently quota-limited
+status stream advances and wraps on its own, so a later key in one status can
+never jump over an uninspected key in another status. PR #19 has a different
 `0013` migration on its branch; it must be rebased and renumbered to `0014`
 after this hotfix merges, before the branches are combined.
 

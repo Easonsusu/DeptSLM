@@ -1,4 +1,4 @@
-"""Add bounded Phase 12.1E-A scan cursors and complete attempt keyset indexes.
+"""Add bounded Phase 12.1E-A per-status scan cursors and keyset indexes.
 
 This revision is intentionally numbered 0013 on the Phase 12.1E-A branch.
 PR #19 currently owns a different 0013 revision; after this branch is merged,
@@ -40,6 +40,7 @@ def upgrade() -> None:
         "adapter_artifact_reconciliation_cursors",
         sa.Column("department_id", sa.Uuid(), nullable=False),
         sa.Column("family", sa.String(length=16), nullable=False),
+        sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("cursor_created_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("cursor_attempt_id", sa.Uuid(), nullable=True),
         sa.Column("version", sa.Integer(), nullable=False, server_default="1"),
@@ -61,15 +62,23 @@ def upgrade() -> None:
             name="fk_adapter_artifact_reconciliation_cursor_department",
             ondelete="RESTRICT",
         ),
-        sa.PrimaryKeyConstraint("department_id", "family"),
+        sa.PrimaryKeyConstraint("department_id", "family", "status"),
         sa.UniqueConstraint(
             "department_id",
             "family",
+            "status",
             name="uq_adapter_artifact_reconciliation_cursor_scope",
         ),
         sa.CheckConstraint(
             "family IN ('source','registry')",
             name="ck_adapter_artifact_reconciliation_cursor_family",
+        ),
+        sa.CheckConstraint(
+            "(family = 'source' AND status IN "
+            "('failed','abandoned','registered','validated','staged','published')) OR "
+            "(family = 'registry' AND status IN "
+            "('validation_failed','failed','reclaimed'))",
+            name="ck_adapter_artifact_reconciliation_cursor_status",
         ),
         sa.CheckConstraint(
             "((cursor_created_at IS NULL AND cursor_attempt_id IS NULL) OR "

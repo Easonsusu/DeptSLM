@@ -1499,7 +1499,7 @@ def test_apply_source_cursor_advances_through_structural_noop_window(
     with factory() as session:
         cursor = session.get(
             AdapterArtifactReconciliationCursor,
-            (authority.department_id, "source"),
+            (authority.department_id, "source", "failed"),
         )
         assert cursor is not None
         assert cursor.cursor_attempt_id == second_id
@@ -1520,7 +1520,7 @@ def test_apply_source_cursor_advances_through_structural_noop_window(
     with factory() as session:
         cursor = session.get(
             AdapterArtifactReconciliationCursor,
-            (authority.department_id, "source"),
+            (authority.department_id, "source", "failed"),
         )
         assert cursor is not None and cursor.cursor_attempt_id == valid_id
         snapshot = (cursor.cursor_created_at, cursor.cursor_attempt_id, cursor.version)
@@ -1530,7 +1530,7 @@ def test_apply_source_cursor_advances_through_structural_noop_window(
     with factory() as session:
         cursor = session.get(
             AdapterArtifactReconciliationCursor,
-            (authority.department_id, "source"),
+            (authority.department_id, "source", "failed"),
         )
         assert cursor is not None
         assert (cursor.cursor_created_at, cursor.cursor_attempt_id, cursor.version) == snapshot
@@ -1585,7 +1585,7 @@ def test_apply_registry_cursor_advances_through_structural_noop_window(
     with factory() as session:
         cursor = session.get(
             AdapterArtifactReconciliationCursor,
-            (authority.department_id, "registry"),
+            (authority.department_id, "registry", "failed"),
         )
         assert cursor is not None
         assert cursor.cursor_created_at == base + timedelta(seconds=1)
@@ -1597,6 +1597,246 @@ def test_apply_registry_cursor_advances_through_structural_noop_window(
             )
             == 0
         )
+
+
+def test_source_mixed_status_cursors_do_not_skip_uninspected_row(
+    factory, authority: Authority, tmp_path: Path, monkeypatch
+) -> None:
+    """Independent source status cursors cannot jump over a failed row."""
+
+    root = _storage(tmp_path)
+    base = datetime.now(UTC) - timedelta(days=1)
+
+    # The seed failed attempt is the first structurally blocked failed row.
+    with factory.begin() as session:
+        seed_attempt = session.get(AdapterImportAttempt, authority.source_attempt_id)
+        source = session.get(AdapterImportSource, authority.source_id)
+        assert seed_attempt is not None and source is not None
+        seed_attempt.status = "failed"
+        seed_attempt.error_code = "adapter_source_publication_failed"
+        seed_attempt.committed_at = None
+        seed_attempt.finished_at = base
+        seed_attempt.created_at = base
+        seed_attempt.cleanup_confirmed_at = None
+
+    blocked_failed_id = _add_failed_source_attempt(
+        factory,
+        authority,
+        attempt_number=2,
+        source_id=authority.source_id,
+        created_at=base + timedelta(seconds=1),
+    )
+
+    valid_source = _add_staging_source(factory, authority)
+    valid_id = _add_failed_source_attempt(
+        factory,
+        authority,
+        attempt_number=1,
+        source_id=valid_source,
+        created_at=base + timedelta(seconds=2),
+    )
+    _source_stage_for_attempt(root, authority, valid_id)
+
+    for offset, status in enumerate(("abandoned", "abandoned"), start=100):
+        attempt_id = _add_failed_source_attempt(
+            factory,
+            authority,
+            attempt_number=offset,
+            source_id=authority.source_id,
+            created_at=base + timedelta(seconds=offset),
+        )
+        with factory.begin() as session:
+            attempt = session.get(AdapterImportAttempt, attempt_id)
+            assert attempt is not None
+            attempt.status = status
+
+    windows: list[tuple[str, tuple[UUID, ...], bool]] = []
+    original_window = maintenance._bounded_keyset_attempt_window
+
+    def capture_window(*args, **kwargs):
+        window = original_window(*args, **kwargs)
+        windows.append(
+            (kwargs["statuses"][0], tuple(attempt.id for attempt in window.rows), window.wrapped)
+        )
+        return window
+
+    monkeypatch.setattr(maintenance, "_bounded_keyset_attempt_window", capture_window)
+    reached = False
+    for _ in range(6):
+        result = _reconcile(factory, authority, root, apply=True, limit=1)
+        if result.completed_count:
+            with factory() as session:
+                reached = (
+                    session.scalar(
+                        select(func.count(AdapterArtifactOperationItem.id)).where(
+                            AdapterArtifactOperationItem.department_id == authority.department_id,
+                            AdapterArtifactOperationItem.import_attempt_id == valid_id,
+                            AdapterArtifactOperationItem.status == "completed",
+                        )
+                    )
+                    > 0
+                )
+    assert reached
+
+    failed_windows = [ids for status, ids, _wrapped in windows if status == "failed"]
+    assert failed_windows and failed_windows[0] == (authority.source_attempt_id, blocked_failed_id)
+    assert any(valid_id in ids for ids in failed_windows)
+    assert any(wrapped for status, _ids, wrapped in windows if status == "failed")
+
+    with factory() as session:
+        cursors = session.scalars(
+            select(AdapterArtifactReconciliationCursor).where(
+                AdapterArtifactReconciliationCursor.department_id == authority.department_id,
+                AdapterArtifactReconciliationCursor.family == "source",
+            )
+        ).all()
+        assert {cursor.status for cursor in cursors} >= {"failed", "abandoned"}
+        for cursor in cursors:
+            if cursor.cursor_attempt_id is None:
+                continue
+            status_windows = [ids for status, ids, _wrapped in windows if status == cursor.status]
+            assert any(cursor.cursor_attempt_id in ids for ids in status_windows)
+
+        snapshot = {
+            cursor.status: (cursor.cursor_created_at, cursor.cursor_attempt_id, cursor.version)
+            for cursor in cursors
+        }
+    with factory.begin() as session:
+        maintenance._select_candidates(session, authority.department_id, 300, 1, apply=False)
+    with factory() as session:
+        after_dry_run = {
+            cursor.status: (cursor.cursor_created_at, cursor.cursor_attempt_id, cursor.version)
+            for cursor in session.scalars(
+                select(AdapterArtifactReconciliationCursor).where(
+                    AdapterArtifactReconciliationCursor.department_id == authority.department_id,
+                    AdapterArtifactReconciliationCursor.family == "source",
+                )
+            ).all()
+        }
+    assert after_dry_run == snapshot
+
+
+def test_registry_mixed_status_cursors_do_not_skip_uninspected_row(
+    factory, authority: Authority, tmp_path: Path, monkeypatch
+) -> None:
+    """Independent registry status cursors cannot jump over a failed row."""
+
+    root = _storage(tmp_path)
+    base = datetime.now(UTC) - timedelta(days=1)
+    final, adapter_id = _prepare_registry_crash(factory, authority, root, "published")
+    assert final.exists()
+    with factory() as session:
+        seed = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.department_id == authority.department_id,
+                AdapterRegistryAttempt.adapter_id == adapter_id,
+            )
+        )
+        adapter = session.get(Adapter, adapter_id)
+        assert seed is not None and adapter is not None
+        assert isinstance(seed.ownership_manifest, dict)
+        seed.ownership_manifest = dict(seed.ownership_manifest)
+        seed.created_at = base + timedelta(seconds=2)
+        seed.cleanup_confirmed_at = None
+        valid_id = seed.id
+
+    failed_rows = [
+        _add_failed_registry_attempt(
+            factory,
+            authority,
+            adapter_id,
+            attempt_number=2,
+            created_at=base,
+        ),
+        _add_failed_registry_attempt(
+            factory,
+            authority,
+            adapter_id,
+            attempt_number=3,
+            created_at=base + timedelta(seconds=1),
+        ),
+    ]
+    reclaimed_rows = [
+        _add_failed_registry_attempt(
+            factory,
+            authority,
+            adapter_id,
+            attempt_number=4,
+            created_at=base + timedelta(seconds=100),
+        ),
+        _add_failed_registry_attempt(
+            factory,
+            authority,
+            adapter_id,
+            attempt_number=5,
+            created_at=base + timedelta(seconds=101),
+        ),
+    ]
+    with factory.begin() as session:
+        for attempt_id in reclaimed_rows:
+            attempt = session.get(AdapterRegistryAttempt, attempt_id)
+            assert attempt is not None
+            attempt.status = "reclaimed"
+
+    windows: list[tuple[str, tuple[UUID, ...], bool]] = []
+    registry_windows: list[tuple[str, tuple[UUID, ...], bool]] = []
+    original_window = maintenance._bounded_keyset_attempt_window
+
+    def capture_window(*args, **kwargs):
+        window = original_window(*args, **kwargs)
+        captured = (
+            kwargs["statuses"][0],
+            tuple(attempt.id for attempt in window.rows),
+            window.wrapped,
+        )
+        windows.append(captured)
+        if kwargs["model"] is AdapterRegistryAttempt:
+            registry_windows.append(captured)
+        return window
+
+    monkeypatch.setattr(maintenance, "_bounded_keyset_attempt_window", capture_window)
+    for _ in range(8):
+        with factory.begin() as session:
+            maintenance._select_candidates(session, authority.department_id, 300, 1, apply=True)
+
+    failed_windows = [ids for status, ids, _wrapped in registry_windows if status == "failed"]
+    assert failed_windows and failed_windows[0] == tuple(failed_rows) + (valid_id,)
+    assert any(valid_id in ids for ids in failed_windows)
+    assert any(wrapped for status, _ids, wrapped in registry_windows if status == "failed")
+
+    with factory() as session:
+        cursors = session.scalars(
+            select(AdapterArtifactReconciliationCursor).where(
+                AdapterArtifactReconciliationCursor.department_id == authority.department_id,
+                AdapterArtifactReconciliationCursor.family == "registry",
+            )
+        ).all()
+        assert {cursor.status for cursor in cursors} >= {"failed", "reclaimed"}
+        for cursor in cursors:
+            if cursor.cursor_attempt_id is None:
+                continue
+            status_windows = [
+                ids for status, ids, _wrapped in registry_windows if status == cursor.status
+            ]
+            assert any(cursor.cursor_attempt_id in ids for ids in status_windows)
+
+        snapshot = {
+            cursor.status: (cursor.cursor_created_at, cursor.cursor_attempt_id, cursor.version)
+            for cursor in cursors
+        }
+    with factory.begin() as session:
+        maintenance._select_candidates(session, authority.department_id, 300, 1, apply=False)
+    with factory() as session:
+        after_dry_run = {
+            cursor.status: (cursor.cursor_created_at, cursor.cursor_attempt_id, cursor.version)
+            for cursor in session.scalars(
+                select(AdapterArtifactReconciliationCursor).where(
+                    AdapterArtifactReconciliationCursor.department_id == authority.department_id,
+                    AdapterArtifactReconciliationCursor.family == "registry",
+                )
+            ).all()
+        }
+    assert after_dry_run == snapshot
 
 
 def test_keyset_window_wraps_to_oldest_rows_with_exact_boundary(

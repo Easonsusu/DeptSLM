@@ -136,11 +136,14 @@ dry-run-by-default batch. Its item rows bind exactly one source or registry
 resource, publication attempt, attempt number, expected resource/attempt
 versions, surface, and optional closed final manifest. Composite restrictive
 foreign keys prevent cross-department or cross-attempt ownership. A cursor row
-is independent scheduler progress for one department and family (`source` or
-`registry`); it is not a physical-surface item and does not affect history,
-audit coverage, eligible counts, or active-item uniqueness. Apply scans persist
-the inspected key boundary even when structural authority rejects every row;
-dry-runs do not create or update cursor rows.
+is independent scheduler progress for one department, family (`source` or
+`registry`), and lifecycle status; it is not a physical-surface item and does
+not affect history, audit coverage, eligible counts, or active-item uniqueness.
+Each fixed-quota status stream persists and wraps its own inspected key
+boundary, so the merged family window never advances past an uninspected row
+from another status. Apply scans persist inspected boundaries even when
+structural authority rejects every row; dry-runs do not create or update
+cursor rows.
 
 Items move through `registered`, `verified`, `tombstone_bound`, `deleting`,
 `completed`, or `blocked`. `verified` stores the closed observed identity and
@@ -155,8 +158,8 @@ attempt's `cleanup_confirmed_at` only after every applicable surface and
 tombstone for that exact attempt is absent across all operations and no
 authoritative sibling exists. Candidate selection applies authority filters
 before each bounded source/registry scan, preselects at most
-`min(limit * 8, 1000)` rows per family without locks, advances the independent
-family cursor, merges global fairness, and locks only the final distinct
+`min(limit * 8, 1000)` rows per family without locks, advances independent
+per-status cursors, merges global fairness, and locks only the final distinct
 attempt/resource rows with `FOR UPDATE SKIP LOCKED`. History keys are
 materialized only for those exact rows. Sibling authority is returned by one
 grouped aggregate per family with one result per resource in the bounded

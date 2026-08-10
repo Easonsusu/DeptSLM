@@ -94,8 +94,9 @@ errors remain distinct from fixed descriptor/operational errors. Migrations
 `0012_phase12_adapter_reconciliation`, and
 `0013_phase12_adapter_reconciliation_cursor` are self-contained and CI
 validates that head with a private temporary adapters root; CI downloads no
-model weights. The 0013 cursor revision is on this hotfix branch; PR #19's
-separate 0013 must be renumbered to 0014 after this branch merges.
+model weights. The 0013 cursor revision stores independent per-status scan
+positions on this hotfix branch; PR #19's separate 0013 must be renumbered to
+0014 after this branch merges.
 
 Phase 12.1A fixes the compatible package references, closed configuration and
 tensor grammar, bounded header/file limits, and model-free validation rules in a
