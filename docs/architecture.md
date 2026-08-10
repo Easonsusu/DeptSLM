@@ -103,7 +103,7 @@ Each source-import authority scan uses a repeatable-read PostgreSQL snapshot and
 
 Phase 11 consumes exactly one succeeded, approved, unpurged Phase 10 dataset in the same department. Enqueue freezes a complete content-free snapshot of its identity, version, publication attempt, contracts, digests, sizes, and counts; worker startup and final locked authority both compare every field. The separate `training-job-worker` leases a PostgreSQL-backed job, verifies the retained dataset through descriptor-relative no-follow handles, and starts a fixed child with only the dataset and fresh staging descriptors. The child validates the closed Phase 10 records, preserves train and validation bytes exactly, and writes a deterministic LlamaFactory 0.9.5 `training.yaml`, `dataset_info.json`, data copies, and closed manifest. No source content, dataset bytes, configuration bytes, paths, hashes, execution token, or model/adaptor output enters PostgreSQL, logs, audit rows, public APIs, or frontend state.
 
-The worker receives only PostgreSQL and `training_datasets`; it has no model, tokenizer, LlamaFactory package, Hugging Face token, Qdrant, RAG runtime, upload, extraction, evaluation, adapter, or cloud configuration. It never runs the generated configuration. Stale cleanup, authority loading, descriptor hashing, stage preparation, child execution, publication steps, and final source reauthorization retain independent parent lease checkpoints. The parent renews a fresh lease guard before, never inside, the final locked transaction; that transaction uses PostgreSQL server time for the final ownership check. Purge uses a durable review-fencing reservation binding the exact succeeded attempt, content-free manifest, and UUID tombstone namespace. Stages must complete before final-deletion authorization; the verified final moves without replacement to private tombstone storage, then a separate committed `tombstone_bound` state records exact parent, directory, and fixed-file identities before cleanup. Retries reject any replacement or unbound partial tombstone; only a durably in-flight exact unlink may be absent. A purge operation records per-job progress and emits at most one success audit after its active reservations close. A pre-move ownership failure leaves the final intact; a post-move cleanup failure leaves the reservation active. PostgreSQL and external storage remain non-atomic: an artifact without committed succeeded PostgreSQL authority is not eligible for review or future adapter use.
+The worker receives only PostgreSQL and `training_datasets`; it has no model, tokenizer, LlamaFactory package, Hugging Face token, Qdrant, RAG runtime, upload, extraction, evaluation, adapter, or cloud configuration. It never runs the generated configuration. Stale cleanup, authority loading, descriptor hashing, stage preparation, child execution, publication steps, and final source reauthorization retain independent parent lease checkpoints. The parent renews a fresh lease guard before, never inside, the final locked transaction; that transaction uses PostgreSQL server time for the final ownership check. Purge uses a durable review-fencing reservation binding the exact succeeded attempt, content-free manifest, and UUID tombstone namespace. Stages must complete before final-deletion authorization; a short committed `deletion_authorized` move-intent transaction precedes the no-replace filesystem move. A separate short transaction records the exact parent, directory, and fixed-file identities as `tombstone_bound` before cleanup. Retries reject any replacement or unbound partial tombstone; only a durably in-flight exact unlink may be absent. A purge operation records per-job progress and emits at most one success audit after its active reservations close. A pre-move ownership failure leaves the final intact; a post-move cleanup failure leaves the reservation active. PostgreSQL and external storage remain non-atomic: an already in-flight rename cannot be fenced retroactively, and an artifact without committed succeeded PostgreSQL authority is not eligible for review or future adapter use.
 
 ## Phase 12 adapter registry boundary (under review)
 
@@ -137,9 +137,10 @@ sources have separate `staging`, `committed`, `claimed`, `consumed`, `rejected`,
 `abandoned`, `purge_pending`, and `purged` states; one committed source can be
 consumed by only one exact adapter version. Registry and source-byte purge are
 separate, bounded, crash-resumable, operation-audited operations. PostgreSQL and
-external storage are non-atomic. Future reconciliation and purge must be fenced
-against active deployments and exact intake/retry ownership; they must not
-delete Phase 10 datasets, Phase 11 job bundles, backups, or audit history. See
+external storage are non-atomic. Phase 12.1E-B fences exact intake/retry
+ownership through independent reservations; it does not delete Phase 10
+datasets, Phase 11 job bundles, backups, or audit history. Future deployment
+fencing remains a later lifecycle requirement. See
 [adapter-registry.md](adapter-registry.md) for the full contract.
 
 The static contract fixes the Qwen3-0.6B/PEFT/safetensors compatibility metadata
@@ -241,14 +242,18 @@ The import source is not runtime, evaluation, promotion, or rollback authority.
 The registry becomes adapter authority only after a successful PostgreSQL
 publication commit. Phase 12.1A validates adapter metadata with the reviewed
 static schema without loading a model or tokenizer; Phase 12.1C publishes only
-the exact content-free registry bundle. Phase 12.1E-A separately provides only
-bounded reconciliation for four non-authoritative artifact surfaces. Evaluation,
-approval, promotion, rollback, purge, and later adapter lifecycle remain future
-reviewed phases.
+the exact content-free registry bundle. Phase 12.1E-A separately provides
+bounded reconciliation for four non-authoritative artifact surfaces. Phase
+12.1E-B adds a separate maintenance-only purge authority: PostgreSQL reserves
+the exact source and registry attempts before mutation, registry bytes are
+deleted before source bytes, and final artifacts use descriptor-bound
+`.purge-deleting` tombstones with crash-resumable identity-fenced unlink.
+Evaluation, approval, promotion, rollback, runtime loading, and later lifecycle
+phases remain future reviewed work.
 
 The exact training scheduler, GPU execution environment, registry schema, and approval workflow are future decisions.
 
-### Adapter artifact reconciliation (Phase 12.1E-A)
+### Adapter artifact reconciliation and purge (Phase 12.1E-A/B)
 
 The manual `adapter-maintenance` Compose profile is the only component allowed
 to reconcile adapter artifact surfaces. It receives PostgreSQL and one external
@@ -262,17 +267,24 @@ finals, terminal registry stages, and failed/validation-failed registry finals
 are eligible. Exact PostgreSQL versions, private UUID paths, no-follow
 descriptor chains, complete final manifests, and per-entry identities are
 required. Inspection persists the closed observation as `verified`; a second
-short transaction persists `move_authorized_at` and the expected item-scoped
-tombstone namespace before rename. The move then reopens and compares the
-exact original descriptors, uses no-replace rename plus parent fsync, and
-commits `tombstone_bound` identity before any unlink. Partial markers and
+short transaction commits `move_authorized_at`, `deletion_authorized`, and the
+expected item-scoped tombstone namespace before rename. The move then reopens
+and compares the exact original descriptors, uses no-replace rename plus
+parent fsync, and a separate short transaction commits `tombstone_bound`
+identity before any unlink. Partial markers and
 payloads are not parsed. Unbound tombstones are never adopted. In-flight
 progress, exact parent identity checks, blocked non-starvation, complete
 attempt-group limits, cross-operation cleanup confirmation, and one
 operation-level audit provide crash recovery without claiming PostgreSQL and
 filesystem atomicity. Authoritative finals, purge states, dependencies, Phase
 10/11 artifacts, evaluation, approval, promotion, loading, and runtime routing
-are outside this phase.
+are outside E-A. E-B is a separate administrator-only, dry-run-by-default
+command in the same isolated maintenance profile. It independently reserves
+source and registry finals, verifies complete manifests and exact digests,
+deletes the registry surface first, then the source surface, and retains all
+PostgreSQL lineage, history, audit rows, backups, and upstream Phase 10/11
+artifacts. It has no public route and no model, Qdrant, RAG, dataset, or
+training-job dependency.
 
 Phase 12.1C PostgreSQL publication and external filesystem publication are not
 atomic. A filesystem rename without a committed succeeded row is not runtime,
@@ -314,6 +326,6 @@ PostgreSQL claims, Qdrant retrieval, Phase 5 artifacts, result publication, and 
 - Production extraction sandbox, malware controls, and additional reviewed formats
 - Hybrid retrieval, reranking, and relevance thresholds beyond the Phase 5 character chunker
 - Production retention, physical purge, reconciliation, and tamper-resistant audit requirements
-- Phase 12.1E-B/C through 12.4 adapter purge, evaluation, registry lifecycle,
-  and runtime deployment
+- Phase 12.1E-C through 12.4 adapter evaluation, registry lifecycle, and runtime
+  deployment
 - Production topology, secrets, observability, backup, and disaster recovery

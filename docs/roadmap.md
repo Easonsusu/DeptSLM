@@ -86,7 +86,7 @@ This roadmap separates foundational safety work from product implementation. A l
   The closed projection exposes lineage, contract, verification, lifecycle,
   and retention metadata; it exposes no artifact bytes, paths, hashes, tensor
   data, identities, or runtime settings, and it performs no mutation or audit.
-- Phase 12.1E-A (current; under review): adds a bounded, administrator-only,
+- Phase 12.1E-A (completed): adds a bounded, administrator-only,
   dry-run-by-default reconciliation foundation for source stages, failed or
   abandoned source finals, terminal registry stages, and failed or validation-
   failed registry finals. It separates descriptor-bound inspection from rename,
@@ -95,7 +95,21 @@ This roadmap separates foundational safety work from product implementation. A l
   and confirms cleanup only after every applicable surface is absent across all
   operations. The limit selects complete attempt groups; it never changes purge
   state or releases dependencies.
-- Phase 12.1E-B/C (not started): adapter purge and later lifecycle hardening.
+- Phase 12.1E-B (current; under review): adds a separate bounded,
+  administrator-only, dry-run-by-default purge authority for one exact
+  validated adapter. PostgreSQL independently reserves the source and
+  registry attempts, versions, manifests, identities, and attempt numbers
+  before any filesystem mutation. Registry bytes are purged first; source
+  bytes are eligible only after an independently verified registry purge.
+  Final artifacts move through the private `.purge-deleting` namespace with
+  descriptor-relative no-follow checks, same-filesystem no-replace rename,
+  fsync, exact tombstone identity, per-file in-flight progress, and
+  crash-resumable descriptor unlink/rmdir. Purge records only content-free
+  metadata and one success audit; it never deletes Phase 10/11 artifacts,
+  history, backups, or audit rows. There is no API route, runtime loading,
+  deployment change, evaluation, or training behavior.
+- Phase 12.1E-C (not started): later lifecycle reconciliation and release
+  hardening beyond the independent purge boundary.
 - Phase 12.2 (not started): adapter-target evaluation, baseline/candidate evidence, and fixed numeric quality and safety gates; no automatic promotion.
 - Phase 12.3 (not started): review, approval, promotion, supersession, rollback, and deployment event history; no silent fallback.
 - Phase 12.4 (not started): department-bound runtime routing, immutable request snapshots, fail-closed loading, and explicit rollback-to-base.

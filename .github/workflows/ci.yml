@@ -145,7 +145,7 @@ jobs:
         run: |
           export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-data"
           export CODE_REVISION="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-          mkdir -p "$DEPTSLM_DATA_DIR/uploads" "$DEPTSLM_DATA_DIR/extracted_text" "$DEPTSLM_DATA_DIR/eval_results" "$DEPTSLM_DATA_DIR/model_cache" "$DEPTSLM_DATA_DIR/adapters" "$DEPTSLM_DATA_DIR/adapters/imports" "$DEPTSLM_DATA_DIR/adapters/registry" "$DEPTSLM_DATA_DIR/adapters/.staging/imports" "$DEPTSLM_DATA_DIR/adapters/.staging/registry" "$DEPTSLM_DATA_DIR/adapters/.deleting"/source_stage "$DEPTSLM_DATA_DIR/adapters/.deleting"/source_final "$DEPTSLM_DATA_DIR/adapters/.deleting"/registry_stage "$DEPTSLM_DATA_DIR/adapters/.deleting"/registry_final
+          mkdir -p "$DEPTSLM_DATA_DIR/uploads" "$DEPTSLM_DATA_DIR/extracted_text" "$DEPTSLM_DATA_DIR/eval_results" "$DEPTSLM_DATA_DIR/model_cache" "$DEPTSLM_DATA_DIR/adapters" "$DEPTSLM_DATA_DIR/adapters/imports" "$DEPTSLM_DATA_DIR/adapters/registry" "$DEPTSLM_DATA_DIR/adapters/.staging/imports" "$DEPTSLM_DATA_DIR/adapters/.staging/registry" "$DEPTSLM_DATA_DIR/adapters/.deleting"/source_stage "$DEPTSLM_DATA_DIR/adapters/.deleting"/source_final "$DEPTSLM_DATA_DIR/adapters/.deleting"/registry_stage "$DEPTSLM_DATA_DIR/adapters/.deleting"/registry_final "$DEPTSLM_DATA_DIR/adapters/.purge-deleting"/source_stage "$DEPTSLM_DATA_DIR/adapters/.purge-deleting"/source_final "$DEPTSLM_DATA_DIR/adapters/.purge-deleting"/registry_stage "$DEPTSLM_DATA_DIR/adapters/.purge-deleting"/registry_final
           find "$DEPTSLM_DATA_DIR/adapters" -type d -exec chmod 700 {} +
           for attempt in {1..30}; do
             if curl --fail --silent --header "api-key: $DEPTSLM_TEST_QDRANT_API_KEY" "$DEPTSLM_TEST_QDRANT_URL/healthz" >/dev/null; then
@@ -158,7 +158,7 @@ jobs:
             sleep 1
           done
           python -m alembic upgrade head
-          test "$(python -m alembic current | awk '{print $1}')" = "0013_phase12_adapter_reconciliation_cursor"
+          test "$(python -m alembic current | awk '{print $1}')" = "0014_phase12_adapter_purge"
           python -m pytest
       - name: Run one-shot worker smoke test
         working-directory: apps/api
@@ -265,6 +265,7 @@ jobs:
           docker run --rm --entrypoint python deptslm-api-ci -c '
           import pathlib
           import app.admin
+          import app.adapter_purge
           import app.document_storage
           import app.document_upload
           import app.main
@@ -282,6 +283,7 @@ jobs:
           assert pathlib.Path("/app/alembic/versions/0011_phase12_adapter_registry.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0012_phase12_adapter_reconciliation.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0013_phase12_adapter_reconciliation_cursor.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0014_phase12_adapter_purge.py").is_file()
           import app.evaluation_admin
           import app.evaluation_services
           import app.sft_services
@@ -346,6 +348,7 @@ jobs:
           import importlib.util
           import app.adapter_artifact_maintenance
           import app.adapter_maintenance_artifacts
+          import app.adapter_purge
           assert importlib.util.find_spec("torch") is None
           assert importlib.util.find_spec("transformers") is None
           assert importlib.util.find_spec("qdrant_client") is None
@@ -558,13 +561,24 @@ jobs:
           grep -F 'AdapterMetadataResponse' apps/api/app/routes.py >/dev/null
       - name: Check Phase 12.1E-A maintenance isolation
         run: |
-          ! grep -R -E '^(from|import) (torch|transformers|sentence_transformers|huggingface_hub|qdrant|safetensors|peft|llamafactory)' apps/api/app/adapter_artifact_maintenance.py apps/api/app/adapter_maintenance_artifacts.py
+          ! grep -R -E '^(from|import) (torch|transformers|sentence_transformers|huggingface_hub|qdrant|safetensors|peft|llamafactory)' apps/api/app/adapter_artifact_maintenance.py apps/api/app/adapter_maintenance_artifacts.py apps/api/app/adapter_purge.py
           maintenance_compose="$(sed -n '/^  adapter-maintenance:/,/^  [a-z][a-z-]*:/p' docker-compose.yml)"
           grep -F 'profiles: ["maintenance"]' <<<"$maintenance_compose" >/dev/null
           grep -F '/adapters' <<<"$maintenance_compose" >/dev/null
           ! grep -E 'uploads|extracted_text|training_datasets|model_cache|eval_results|qdrant|rag|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|PROXY' <<<"$maintenance_compose"
           api_compose="$(sed -n '/^  api:/,/^  postgres:/p' docker-compose.yml)"
           ! grep -E '/adapters|adapters/' <<<"$api_compose"
+      - name: Check Phase 12.1E-B purge isolation
+        run: |
+          ! grep -R -E '^(from|import) (torch|transformers|sentence_transformers|huggingface_hub|qdrant|safetensors|peft|llamafactory|app\.rag|app\.evaluation)' apps/api/app/adapter_purge.py
+          purge_compose="$(sed -n '/^  adapter-maintenance:/,/^  [a-z][a-z-]*:/p' docker-compose.yml)"
+          grep -F 'profiles: ["maintenance"]' <<<"$purge_compose" >/dev/null
+          grep -F '/adapters' <<<"$purge_compose" >/dev/null
+          ! grep -E 'qdrant|rag|model_cache|training_datasets|uploads|extracted_text|eval_results|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|PROXY' <<<"$purge_compose"
+          grep -F '.purge-deleting' scripts/setup_google_drive_storage.sh scripts/validate_data_dir.sh services/adapter-maintenance/entrypoint.sh >/dev/null
+          ! grep -E '@router\.(get|post|put|patch|delete).*purge' apps/api/app/routes.py
+          grep -F 'AdapterPurgeArtifactStore' apps/api/app/adapter_purge.py >/dev/null
+          grep -F 'AdapterPurgeOperation' apps/api/app/adapter_purge.py >/dev/null
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then
@@ -579,6 +593,7 @@ jobs:
             mkdir -p "$DEPTSLM_DATA_DIR/training_datasets/jobs"
             mkdir -p "$DEPTSLM_DATA_DIR"/adapters/{imports,registry,.staging/imports,.staging/registry}
             mkdir -p "$DEPTSLM_DATA_DIR"/adapters/.deleting/{source_stage,source_final,registry_stage,registry_final}
+            mkdir -p "$DEPTSLM_DATA_DIR"/adapters/.purge-deleting/{source_stage,source_final,registry_stage,registry_final}
             mkdir -p "$DEPTSLM_DATA_DIR/service_state/postgres"
             mkdir -p "$DEPTSLM_DATA_DIR/service_state/qdrant"
             ./scripts/compose.sh config --quiet

@@ -272,6 +272,16 @@ ADAPTER_REGISTRY_ERROR_CODES = (
     "worker_timeout",
     "database_unavailable",
 )
+ADAPTER_PURGE_BLOCKED_REASONS = (
+    "purge_authority_changed",
+    "purge_manifest_invalid",
+    "purge_permissions_invalid",
+    "purge_path_unsafe",
+    "purge_tombstone_conflict",
+    "purge_dependency_active",
+    "purge_operation_conflict",
+    "purge_database_unavailable",
+)
 
 
 class Base(DeclarativeBase):
@@ -3650,6 +3660,432 @@ class TrainingJobArtifactOperationItem(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = utc_timestamp()
+
+
+class AdapterPurgeOperation(Base):
+    """Independent durable authority for one adapter-byte purge."""
+
+    __tablename__ = "adapter_purge_operations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_purge_operation_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["source_bundle_id", "department_id"],
+            ["adapter_import_sources.id", "adapter_import_sources.department_id"],
+            name="fk_adapter_purge_operation_source_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["requested_by_user_id", "department_id"],
+            ["memberships.user_id", "memberships.department_id"],
+            name="fk_adapter_purge_operation_requester_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["requested_by_user_id"],
+            ["user_identities.id"],
+            name="fk_adapter_purge_operation_requester_identity",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "source_authoritative_attempt_id",
+                "department_id",
+                "source_bundle_id",
+                "source_publication_attempt_id",
+                "source_attempt_number",
+            ],
+            [
+                "adapter_import_attempts.id",
+                "adapter_import_attempts.department_id",
+                "adapter_import_attempts.source_bundle_id",
+                "adapter_import_attempts.publication_attempt_id",
+                "adapter_import_attempts.attempt_number",
+            ],
+            name="fk_adapter_purge_operation_source_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "registry_attempt_id",
+                "department_id",
+                "adapter_id",
+                "registry_publication_attempt_id",
+                "registry_attempt_number",
+            ],
+            [
+                "adapter_registry_attempts.id",
+                "adapter_registry_attempts.department_id",
+                "adapter_registry_attempts.adapter_id",
+                "adapter_registry_attempts.publication_attempt_id",
+                "adapter_registry_attempts.attempt_number",
+            ],
+            name="fk_adapter_purge_operation_registry_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("id", "department_id", name="uq_adapter_purge_operation_scope"),
+        CheckConstraint(
+            "status IN ('registered','deleting','completed','completed_with_blocks','blocked')",
+            name="ck_adapter_purge_operation_status",
+        ),
+        CheckConstraint(
+            "limit_value BETWEEN 1 AND 1000 AND item_limit_value BETWEEN 2 AND 2000",
+            name="ck_adapter_purge_operation_limits",
+        ),
+        CheckConstraint(
+            "expected_adapter_version > 0 AND expected_source_version > 0 AND "
+            "expected_source_attempt_version > 0 AND expected_registry_attempt_version > 0 "
+            "AND source_attempt_number > 0 AND registry_attempt_number > 0 AND version > 0",
+            name="ck_adapter_purge_operation_versions",
+        ),
+        CheckConstraint(
+            "json_typeof(authority_snapshot) = 'object'",
+            name="ck_adapter_purge_operation_snapshot",
+        ),
+        CheckConstraint(
+            "eligible_item_count >= 0 AND completed_item_count >= 0 AND blocked_item_count >= 0 "
+            "AND completed_item_count + blocked_item_count <= eligible_item_count",
+            name="ck_adapter_purge_operation_counts",
+        ),
+        CheckConstraint(
+            "(status IN ('registered','deleting') AND completed_at IS NULL) OR "
+            "(status IN ('completed','completed_with_blocks','blocked') "
+            "AND completed_at IS NOT NULL)",
+            name="ck_adapter_purge_operation_lifecycle",
+        ),
+        Index(
+            "uq_adapter_purge_operation_active",
+            "department_id",
+            "adapter_id",
+            unique=True,
+            postgresql_where=text("status IN ('registered','deleting')"),
+        ),
+        Index("ix_adapter_purge_operation_department_created", "department_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    adapter_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_bundle_id: Mapped[UUID] = mapped_column(nullable=False)
+    requested_by_user_id: Mapped[UUID] = mapped_column(nullable=False)
+    limit_value: Mapped[int] = mapped_column(Integer, nullable=False)
+    item_limit_value: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="registered")
+    expected_adapter_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_source_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_source_attempt_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_registry_attempt_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_authoritative_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    registry_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    registry_publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    registry_attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    authority_snapshot: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    eligible_item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    completed_item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    blocked_item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    success_audited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class AdapterPurgeReservation(Base):
+    """Exact source or registry authority fence for one purge operation."""
+
+    __tablename__ = "adapter_purge_reservations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["operation_id", "department_id"],
+            ["adapter_purge_operations.id", "adapter_purge_operations.department_id"],
+            name="fk_adapter_purge_reservation_operation_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_purge_reservation_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["source_bundle_id", "department_id"],
+            ["adapter_import_sources.id", "adapter_import_sources.department_id"],
+            name="fk_adapter_purge_reservation_source_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "import_attempt_id",
+                "department_id",
+                "source_bundle_id",
+                "publication_attempt_id",
+                "attempt_number",
+            ],
+            [
+                "adapter_import_attempts.id",
+                "adapter_import_attempts.department_id",
+                "adapter_import_attempts.source_bundle_id",
+                "adapter_import_attempts.publication_attempt_id",
+                "adapter_import_attempts.attempt_number",
+            ],
+            name="fk_adapter_purge_reservation_import_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "registry_attempt_id",
+                "department_id",
+                "adapter_id",
+                "publication_attempt_id",
+                "attempt_number",
+            ],
+            [
+                "adapter_registry_attempts.id",
+                "adapter_registry_attempts.department_id",
+                "adapter_registry_attempts.adapter_id",
+                "adapter_registry_attempts.publication_attempt_id",
+                "adapter_registry_attempts.attempt_number",
+            ],
+            name="fk_adapter_purge_reservation_registry_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("id", "department_id", name="uq_adapter_purge_reservation_scope"),
+        UniqueConstraint(
+            "operation_id", "surface_type", name="uq_adapter_purge_reservation_surface"
+        ),
+        CheckConstraint(
+            "surface_type IN ('source_final','registry_final')",
+            name="ck_adapter_purge_reservation_surface",
+        ),
+        CheckConstraint(
+            "((surface_type = 'source_final' AND import_attempt_id IS NOT NULL AND "
+            "registry_attempt_id IS NULL AND expected_resource_status = 'consumed' "
+            "AND expected_attempt_status = 'committed') OR "
+            "(surface_type = 'registry_final' AND import_attempt_id IS NULL AND "
+            "registry_attempt_id IS NOT NULL AND expected_resource_status = 'validated' "
+            "AND expected_attempt_status = 'succeeded'))",
+            name="ck_adapter_purge_reservation_authority",
+        ),
+        CheckConstraint(
+            "publication_attempt_id IS NOT NULL AND attempt_number > 0 AND "
+            "expected_resource_version > 0 AND expected_attempt_version > 0 AND version > 0",
+            name="ck_adapter_purge_reservation_versions",
+        ),
+        CheckConstraint(
+            "json_typeof(authority_manifest) = 'object' AND "
+            "json_typeof(authority_snapshot) = 'object'",
+            name="ck_adapter_purge_reservation_snapshot",
+        ),
+        CheckConstraint(
+            "status IN ('registered','deletion_authorized','tombstone_bound','deleting',"
+            "'completed','blocked')",
+            name="ck_adapter_purge_reservation_status",
+        ),
+        CheckConstraint(
+            "blocked_reason_code IS NULL OR blocked_reason_code IN ("
+            + ",".join("'" + code + "'" for code in ADAPTER_PURGE_BLOCKED_REASONS)
+            + ")",
+            name="ck_adapter_purge_reservation_reason",
+        ),
+        CheckConstraint("next_entry_index >= 0", name="ck_adapter_purge_reservation_progress"),
+        Index(
+            "uq_adapter_purge_reservation_active_source",
+            "department_id",
+            "source_bundle_id",
+            unique=True,
+            postgresql_where=text(
+                "surface_type = 'source_final' AND status IN "
+                "('registered','deletion_authorized','tombstone_bound','deleting')"
+            ),
+        ),
+        Index(
+            "uq_adapter_purge_reservation_active_registry",
+            "department_id",
+            "adapter_id",
+            unique=True,
+            postgresql_where=text(
+                "surface_type = 'registry_final' AND status IN "
+                "('registered','deletion_authorized','tombstone_bound','deleting')"
+            ),
+        ),
+        Index(
+            "ix_adapter_purge_reservation_operation_status", "operation_id", "status", "created_at"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    operation_id: Mapped[UUID] = mapped_column(nullable=False)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    adapter_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_bundle_id: Mapped[UUID] = mapped_column(nullable=False)
+    surface_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    import_attempt_id: Mapped[UUID | None] = mapped_column()
+    registry_attempt_id: Mapped[UUID | None] = mapped_column()
+    publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_resource_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_attempt_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_resource_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    expected_attempt_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    authority_manifest: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    authority_snapshot: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    expected_tombstone_namespace: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    observed_identity: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    tombstone_identity: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    deletion_plan: Mapped[list[dict[str, object]] | None] = mapped_column(JSON)
+    next_entry_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    in_flight_entry: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="registered")
+    blocked_reason_code: Mapped[str | None] = mapped_column(String(64))
+    registered_at: Mapped[datetime] = utc_timestamp()
+    deletion_authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tombstone_bound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deletion_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    directory_unlink_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class AdapterPurgeItem(Base):
+    """One exact surface item with durable descriptor/tombstone progress."""
+
+    __tablename__ = "adapter_purge_items"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["operation_id", "department_id"],
+            ["adapter_purge_operations.id", "adapter_purge_operations.department_id"],
+            name="fk_adapter_purge_item_operation_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["reservation_id", "department_id"],
+            ["adapter_purge_reservations.id", "adapter_purge_reservations.department_id"],
+            name="fk_adapter_purge_item_reservation_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_purge_item_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["source_bundle_id", "department_id"],
+            ["adapter_import_sources.id", "adapter_import_sources.department_id"],
+            name="fk_adapter_purge_item_source_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "import_attempt_id",
+                "department_id",
+                "source_bundle_id",
+                "publication_attempt_id",
+                "attempt_number",
+            ],
+            [
+                "adapter_import_attempts.id",
+                "adapter_import_attempts.department_id",
+                "adapter_import_attempts.source_bundle_id",
+                "adapter_import_attempts.publication_attempt_id",
+                "adapter_import_attempts.attempt_number",
+            ],
+            name="fk_adapter_purge_item_import_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "registry_attempt_id",
+                "department_id",
+                "adapter_id",
+                "publication_attempt_id",
+                "attempt_number",
+            ],
+            [
+                "adapter_registry_attempts.id",
+                "adapter_registry_attempts.department_id",
+                "adapter_registry_attempts.adapter_id",
+                "adapter_registry_attempts.publication_attempt_id",
+                "adapter_registry_attempts.attempt_number",
+            ],
+            name="fk_adapter_purge_item_registry_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "operation_id", "reservation_id", name="uq_adapter_purge_item_reservation"
+        ),
+        CheckConstraint(
+            "surface_type IN ('source_final','registry_final')",
+            name="ck_adapter_purge_item_surface",
+        ),
+        CheckConstraint(
+            "expected_item_version > 0 AND attempt_number > 0 AND version > 0",
+            name="ck_adapter_purge_item_versions",
+        ),
+        CheckConstraint(
+            "json_typeof(ownership_manifest) = 'object'", name="ck_adapter_purge_item_manifest"
+        ),
+        CheckConstraint(
+            "status IN ('registered','verified','tombstone_bound','deleting',"
+            "'completed','blocked')",
+            name="ck_adapter_purge_item_status",
+        ),
+        CheckConstraint(
+            "blocked_reason_code IS NULL OR blocked_reason_code IN ("
+            + ",".join("'" + code + "'" for code in ADAPTER_PURGE_BLOCKED_REASONS)
+            + ")",
+            name="ck_adapter_purge_item_reason",
+        ),
+        CheckConstraint("next_entry_index >= 0", name="ck_adapter_purge_item_progress"),
+        Index("ix_adapter_purge_item_operation_status", "operation_id", "status", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    operation_id: Mapped[UUID] = mapped_column(nullable=False)
+    reservation_id: Mapped[UUID] = mapped_column(nullable=False)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    surface_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    adapter_id: Mapped[UUID] = mapped_column(nullable=False)
+    source_bundle_id: Mapped[UUID] = mapped_column(nullable=False)
+    import_attempt_id: Mapped[UUID | None] = mapped_column()
+    registry_attempt_id: Mapped[UUID | None] = mapped_column()
+    publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_item_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    ownership_manifest: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    observed_identity: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    tombstone_identity: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    deletion_plan: Mapped[list[dict[str, object]] | None] = mapped_column(JSON)
+    expected_tombstone_namespace: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    next_entry_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    in_flight_entry: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="registered")
+    blocked_reason_code: Mapped[str | None] = mapped_column(String(64))
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    move_authorized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tombstone_bound_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deletion_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    directory_unlink_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
 
 
 class AdapterArtifactOperation(Base):

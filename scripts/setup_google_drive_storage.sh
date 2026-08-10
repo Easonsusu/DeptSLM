@@ -106,6 +106,11 @@ runtime_subdirectories=(
   adapters/.deleting/source_final
   adapters/.deleting/registry_stage
   adapters/.deleting/registry_final
+  adapters/.purge-deleting
+  adapters/.purge-deleting/source_stage
+  adapters/.purge-deleting/source_final
+  adapters/.purge-deleting/registry_stage
+  adapters/.purge-deleting/registry_final
   service_state/postgres
   service_state/qdrant
 )

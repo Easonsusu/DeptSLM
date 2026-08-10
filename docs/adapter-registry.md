@@ -24,10 +24,12 @@ separate Phase 12.1A static compatibility contract is documented in
 - Phase 12.1D is completed and adds only department-scoped
   PostgreSQL metadata list/detail reads through closed projections. It performs
   no mutation, artifact access, or audit.
-- Phase 12.1E-A is the current reviewed reconciliation foundation. It is a
-  separate administrator-only, dry-run-by-default operation for four
-  non-authoritative surfaces. Phase 12.1E-B/C and Phase 12.2, 12.3, and 12.4
-  remain unimplemented.
+- Phase 12.1E-A is completed: it is a separate administrator-only,
+  dry-run-by-default operation for four non-authoritative surfaces.
+- Phase 12.1E-B is the current reviewed purge scope. It independently reserves
+  exact source/registry attempts and removes registry bytes before source bytes
+  through `.purge-deleting` descriptor-bound tombstones. Phase 12.1E-C and
+  Phase 12.2, 12.3, and 12.4 remain unimplemented.
 - Phase 13 has not started.
 
 The Phase 12.1D read routes are the only public adapter metadata surface today:
@@ -116,7 +118,7 @@ the artifact is safe, compatible, or useful.
   exact adapter and department. Inconsistent or missing authority fails closed
   without revealing resource details. PostgreSQL is the only read authority.
 
-#### Phase 12.1E-A (current; under review)
+#### Phase 12.1E-A (completed)
 
 - Reconcile only incomplete source stages, failed or abandoned non-authoritative
   source finals, terminal registry stages, and failed or validation-failed
@@ -127,8 +129,27 @@ the artifact is safe, compatible, or useful.
   bounded cleanup. Unbound item-scoped tombstones are blocked rather than
   adopted, and cleanup confirmation spans every operation for the exact attempt.
 - Never reconcile authoritative finals, purge states, upstream dependencies,
-  Phase 10/11 artifacts, or adapter runtime state. Phase 12.1E-B/C remains
-  unstarted.
+  Phase 10/11 artifacts, or adapter runtime state.
+
+#### Phase 12.1E-B (current; under review)
+
+- `purge-adapter-artifacts` is a bounded, administrator-only command that is
+  dry-run by default and mutates only with `--apply`.
+- PostgreSQL registers one operation, one source reservation, one registry
+  reservation, and exact item rows before mutation. The rows retain IDs,
+  attempts, numbers, versions, closed manifests, expected statuses, and
+  content-free filesystem identities. The final transaction reauthorizes the
+  complete snapshot and writes at most one success audit.
+- Registry final bytes are independently verified and purged first. Source
+  final bytes remain blocked until registry deletion completes. The private
+  `.purge-deleting` namespace, no-follow descriptors, no-replace same-filesystem
+  move, fsync, exact tombstone identities, per-file in-flight progress, and
+  directory unlink intent make deletion crash-resumable without adopting an
+  unknown tombstone.
+- Purge never deletes Phase 10/11 artifacts, lineage, deployment/review
+  history, audit rows, backups, or other retained copies. PostgreSQL and
+  external storage remain non-atomic. There is no public purge route and no
+  runtime adapter loading.
 
 ### Phase 12.2 — adapter-target evaluation (not started)
 
@@ -661,14 +682,14 @@ membership resolution is the authorization boundary.
 
 ## Reconciliation, retention, and purge
 
-Future Phase 12.1E-B/C purge implementation must provide administrator-only
-commands that are dry-run by default and have strict bounded limits. It must
-register a durable operation and item before filesystem mutation, preserve exact
-attempt ownership, clean stages first, retain one authoritative final surface,
-fence review and deployment, support crash-resumable deletion, bind exact
-tombstone identities before unlink, and produce one operation-level
-exactly-once success audit. Phase 12.1E-A already provides the separate
-non-authoritative reconciliation foundation described below.
+Phase 12.1E-B provides the administrator-only dry-run-by-default purge command
+with strict bounded limits. It registers a durable operation, reservations, and
+items before filesystem mutation, preserves exact attempt ownership, deletes
+the registry final before the source final, supports crash-resumable deletion,
+binds exact tombstone identities before unlink, and produces one
+operation-level exactly-once success audit. Phase 12.1E-A remains the separate
+non-authoritative reconciliation foundation described below; Phase 12.1E-C is
+not started.
 
 Metadata, lineage, evaluation, deployment, and audit history are retained. A
 purge must not delete Phase 10 datasets or Phase 11 training-job bundles, and it
@@ -693,8 +714,9 @@ then reopens and compares the exact original before a no-replace tombstone move
 and parent fsync. It commits exact tombstone identities before unlink, never
 adopts an unbound tombstone, and remains crash-resumable. It emits one
 operation-level success audit only after every applicable surface and tombstone
-is absent for the exact attempt across all operations. Phase 12.1E-B/C will
-define later purge and lifecycle work and is not started.
+is absent for the exact attempt across all operations. Phase 12.1E-B uses the
+separate `.purge-deleting` namespace and independent final-byte purge authority
+documented above; Phase 12.1E-C remains unstarted.
 
 Source cleanup must not delete a source still required by an active intake,
 retry, or reconciliation operation; must never delete registry artifacts through

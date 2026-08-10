@@ -67,6 +67,35 @@ def test_phase12_1e_a_migration_is_self_contained_and_has_exact_surfaces() -> No
     assert "ck_adapter_artifact_item_move_namespace_json" in source
 
 
+def test_phase12_1e_b_migration_is_self_contained_and_has_purge_authority() -> None:
+    path = Path(__file__).parents[1] / "alembic" / "versions" / "0014_phase12_adapter_purge.py"
+    source = path.read_text(encoding="utf-8")
+    assert "app.models" not in source
+    assert "app.adapter_maintenance_artifacts" not in source
+    spec = importlib.util.spec_from_file_location("phase12_1e_b_migration", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.revision == "0014_phase12_adapter_purge"
+    assert module.down_revision == "0013_phase12_adapter_reconciliation_cursor"
+    for table in (
+        "adapter_purge_operations",
+        "adapter_purge_reservations",
+        "adapter_purge_items",
+    ):
+        assert table in source
+    for field in (
+        "authority_snapshot",
+        "expected_tombstone_namespace",
+        "in_flight_entry",
+        "directory_unlink_started_at",
+    ):
+        assert field in source
+    assert "fk_adapter_purge_operation_source_attempt_exact" in source
+    assert "fk_adapter_purge_operation_registry_attempt_exact" in source
+    assert "ck_adapter_purge_item_reason" in source
+
+
 def test_phase12_1c_backfill_uses_canonical_manifest_authority() -> None:
     path = Path(__file__).parents[1] / "alembic" / "versions" / "0011_phase12_adapter_registry.py"
     spec = importlib.util.spec_from_file_location("phase12_1c_backfill", path)

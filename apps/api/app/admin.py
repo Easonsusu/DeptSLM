@@ -17,6 +17,11 @@ from app.adapter_artifact_maintenance import (
     AdapterArtifactMaintenanceSettings,
     reconcile_adapter_artifacts,
 )
+from app.adapter_purge import (
+    AdapterPurgeConfigurationError,
+    AdapterPurgeSettings,
+    purge_adapter_artifacts,
+)
 from app.adapter_registry_services import enqueue_adapter_registry
 from app.adapter_source_services import (
     AdapterSourceImportConfigurationError,
@@ -206,6 +211,14 @@ def _parser() -> argparse.ArgumentParser:
     adapter_reconcile.add_argument("--actor-subject", required=True)
     adapter_reconcile.add_argument("--limit", type=_purge_limit, default=100)
     adapter_reconcile.add_argument("--apply", action="store_true")
+    adapter_purge = commands.add_parser("purge-adapter-artifacts")
+    adapter_purge.add_argument("--department-id", required=True, type=_nonzero_uuid)
+    adapter_purge.add_argument("--adapter-id", required=True, type=_nonzero_uuid)
+    adapter_purge.add_argument("--actor-issuer", required=True)
+    adapter_purge.add_argument("--actor-subject", required=True)
+    adapter_purge.add_argument("--limit", type=_purge_limit, default=1)
+    adapter_purge.add_argument("--item-limit", type=_purge_item_limit, default=2)
+    adapter_purge.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -225,6 +238,15 @@ def _purge_limit(raw: str) -> int:
     value = int(raw)
     if not 1 <= value <= 1000:
         raise argparse.ArgumentTypeError("limit must be an ASCII integer from 1 through 1000")
+    return value
+
+
+def _purge_item_limit(raw: str) -> int:
+    if not raw or not raw.isascii() or not raw.isdecimal():
+        raise argparse.ArgumentTypeError("item-limit must be an ASCII integer from 2 through 2000")
+    value = int(raw)
+    if not 2 <= value <= 2000:
+        raise argparse.ArgumentTypeError("item-limit must be an ASCII integer from 2 through 2000")
     return value
 
 
@@ -446,6 +468,28 @@ def main(argv: list[str] | None = None) -> int:
             for surface in ("source_stage", "source_final", "registry_stage", "registry_final"):
                 print(f"{surface}: {result.surface_counts.get(surface, 0)}")
             return 0
+        if args.command == "purge-adapter-artifacts":
+            settings = AdapterPurgeSettings.from_environment()
+            engine = create_database_engine(settings.database_url)
+            factory = create_session_factory(engine)
+            try:
+                result = purge_adapter_artifacts(
+                    factory,
+                    data_dir=settings.data_dir,
+                    department_id=args.department_id,
+                    adapter_id=args.adapter_id,
+                    actor_issuer=args.actor_issuer,
+                    actor_subject=args.actor_subject,
+                    limit=min(args.limit, settings.max_operations),
+                    item_limit=min(args.item_limit, settings.max_items),
+                    apply=args.apply,
+                )
+            finally:
+                engine.dispose()
+            print(f"Eligible count: {result.eligible_count}")
+            print(f"Applied count: {result.applied_count}")
+            print(f"Blocked count: {result.blocked_count}")
+            return 0
         settings = FeedbackPurgeSettings.from_environment()
         result = purge_rag_feedback(
             settings,
@@ -464,6 +508,7 @@ def main(argv: list[str] | None = None) -> int:
         SftMaintenanceConfigurationError,
         TrainingJobMaintenanceConfigurationError,
         AdapterArtifactMaintenanceConfigurationError,
+        AdapterPurgeConfigurationError,
         ServiceError,
     ) as error:
         print(str(error), file=sys.stderr)

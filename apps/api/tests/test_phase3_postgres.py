@@ -137,7 +137,7 @@ def test_00_migration_cycle_reaches_head(engine) -> None:
     command.upgrade(config, "head")
     with engine.connect() as connection:
         current = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert current == "0013_phase12_adapter_reconciliation_cursor"
+        assert current == "0014_phase12_adapter_purge"
         assert {"user_identities", "departments", "memberships", "audit_events"}.issubset(
             set(
                 connection.execute(
