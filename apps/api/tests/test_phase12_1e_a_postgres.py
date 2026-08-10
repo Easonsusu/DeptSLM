@@ -14,11 +14,12 @@ from uuid import UUID, uuid4
 import pytest
 from alembic.config import Config
 from sqlalchemy import delete, func, inspect, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 from test_phase12_1c_integration import Authority, _enqueue, _seed_authority
 from test_phase12_1d_postgres import _cleanup as cleanup_seed
 
+import app.adapter_artifact_maintenance as maintenance
 from alembic import command
 from app.adapter_artifact_maintenance import (
     RECONCILIATION_SCAN_MULTIPLIER,
@@ -1387,6 +1388,81 @@ def test_untried_source_stage_progresses_past_bounded_blocked_window(
         ).all()
         assert old_items and all(item.status == "blocked" for item in old_items)
     assert not fresh_stage.exists()
+
+
+def test_keyset_window_bounds_history_evaluation_before_fairness(
+    factory, authority: Authority, tmp_path: Path, monkeypatch
+) -> None:
+    """History probes receive only one fixed keyset window, never the backlog."""
+
+    _storage(tmp_path)
+    _abandon_source(factory, authority)
+    total_attempts = RECONCILIATION_SCAN_MULTIPLIER * 3
+    attempt_ids = [authority.source_attempt_id]
+    for attempt_number in range(2, total_attempts + 1):
+        attempt_ids.append(
+            _add_failed_source_attempt(factory, authority, attempt_number=attempt_number)
+        )
+    observed: list[tuple[tuple[UUID, UUID], ...]] = []
+    original = maintenance._surface_item_history_for_rows
+    windows: list[tuple[UUID, ...]] = []
+    original_window = maintenance._bounded_keyset_attempt_window
+
+    def capture_window(*args, **kwargs):
+        rows = tuple(original_window(*args, **kwargs))
+        windows.append(tuple(attempt.id for attempt in rows))
+        assert len(rows) <= maintenance._bounded_scan_limit(1)
+        return rows
+
+    def capture(*args, **kwargs):
+        rows = tuple(kwargs["rows"])
+        observed.append(rows)
+        assert len(rows) <= maintenance._bounded_scan_limit(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(maintenance, "_bounded_keyset_attempt_window", capture_window)
+    monkeypatch.setattr(maintenance, "_surface_item_history_for_rows", capture)
+    dry_run = _reconcile(factory, authority, tmp_path, apply=False, limit=1)
+    assert dry_run.eligible_count <= 2
+    assert windows
+    assert len(windows[0]) <= maintenance._bounded_scan_limit(1)
+    nonempty = [row for row in observed if row]
+    assert nonempty
+    seen_attempts = {attempt_id for rows in nonempty for _resource, attempt_id in rows}
+    assert len(seen_attempts) <= maintenance._bounded_scan_limit(1)
+    assert seen_attempts < set(attempt_ids)
+
+
+def test_selection_locks_only_requested_attempts(
+    factory, authority: Authority, tmp_path: Path
+) -> None:
+    """The final lock phase never widens beyond the public attempt limit."""
+
+    _storage(tmp_path)
+    _abandon_source(factory, authority)
+    second_id = _add_failed_source_attempt(factory, authority, attempt_number=2)
+    with factory() as first:
+        candidates = maintenance._select_candidates(first, authority.department_id, 300, 1)
+        selected = {
+            candidate.import_attempt_id
+            for candidate in candidates
+            if candidate.import_attempt_id is not None
+        }
+        assert len(selected) == 1
+        with factory() as second:
+            with pytest.raises(OperationalError):
+                second.execute(
+                    select(AdapterImportAttempt)
+                    .where(AdapterImportAttempt.id.in_(selected))
+                    .with_for_update(nowait=True)
+                ).all()
+        if second_id not in selected:
+            with factory() as unselected:
+                unselected.execute(
+                    select(AdapterImportAttempt)
+                    .where(AdapterImportAttempt.id == second_id)
+                    .with_for_update(nowait=True)
+                ).all()
 
 
 def test_untried_registry_stage_progresses_past_source_retry_backlog(
