@@ -17,6 +17,11 @@ from app.adapter_artifact_maintenance import (
     AdapterArtifactMaintenanceSettings,
     reconcile_adapter_artifacts,
 )
+from app.adapter_lifecycle_release import (
+    AdapterLifecycleReleaseConfigurationError,
+    AdapterLifecycleReleaseSettings,
+    release_adapter_upstream_dependency,
+)
 from app.adapter_purge import (
     AdapterPurgeConfigurationError,
     AdapterPurgeSettings,
@@ -219,6 +224,19 @@ def _parser() -> argparse.ArgumentParser:
     adapter_purge.add_argument("--limit", type=_purge_limit, default=1)
     adapter_purge.add_argument("--item-limit", type=_purge_item_limit, default=2)
     adapter_purge.add_argument("--apply", action="store_true")
+    adapter_release = commands.add_parser("release-adapter-upstream-dependency")
+    adapter_release.add_argument("--department-id", required=True, type=_nonzero_uuid)
+    adapter_release.add_argument("--adapter-id", required=True, type=_nonzero_uuid)
+    adapter_release.add_argument(
+        "--expected-adapter-version", required=True, type=_positive_version
+    )
+    adapter_release.add_argument("--expected-source-version", required=True, type=_positive_version)
+    adapter_release.add_argument(
+        "--expected-dependency-version", required=True, type=_positive_version
+    )
+    adapter_release.add_argument("--actor-issuer", required=True)
+    adapter_release.add_argument("--actor-subject", required=True)
+    adapter_release.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -247,6 +265,15 @@ def _purge_item_limit(raw: str) -> int:
     value = int(raw)
     if not 2 <= value <= 2000:
         raise argparse.ArgumentTypeError("item-limit must be an ASCII integer from 2 through 2000")
+    return value
+
+
+def _positive_version(raw: str) -> int:
+    if not raw or not raw.isascii() or not raw.isdecimal():
+        raise argparse.ArgumentTypeError("version must be a positive ASCII integer")
+    value = int(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("version must be a positive ASCII integer")
     return value
 
 
@@ -490,6 +517,32 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Applied count: {result.applied_count}")
             print(f"Blocked count: {result.blocked_count}")
             return 0
+        if args.command == "release-adapter-upstream-dependency":
+            settings = AdapterLifecycleReleaseSettings.from_environment()
+            engine = create_database_engine(settings.database_url)
+            factory = create_session_factory(engine)
+            try:
+                result = release_adapter_upstream_dependency(
+                    factory,
+                    data_dir=settings.data_dir,
+                    department_id=args.department_id,
+                    adapter_id=args.adapter_id,
+                    expected_adapter_version=args.expected_adapter_version,
+                    expected_source_version=args.expected_source_version,
+                    expected_dependency_version=args.expected_dependency_version,
+                    actor_issuer=args.actor_issuer,
+                    actor_subject=args.actor_subject,
+                    apply=args.apply,
+                )
+            finally:
+                engine.dispose()
+            if result.applied:
+                print("Released one adapter upstream dependency.")
+            elif result.already_released:
+                print("Adapter upstream dependency is already released.")
+            else:
+                print("Validated adapter upstream dependency release.")
+            return 0
         settings = FeedbackPurgeSettings.from_environment()
         result = purge_rag_feedback(
             settings,
@@ -509,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
         TrainingJobMaintenanceConfigurationError,
         AdapterArtifactMaintenanceConfigurationError,
         AdapterPurgeConfigurationError,
+        AdapterLifecycleReleaseConfigurationError,
         ServiceError,
     ) as error:
         print(str(error), file=sys.stderr)

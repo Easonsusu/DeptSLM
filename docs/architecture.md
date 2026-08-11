@@ -139,8 +139,10 @@ consumed by only one exact adapter version. Registry and source-byte purge are
 separate, bounded, crash-resumable, operation-audited operations. PostgreSQL and
 external storage are non-atomic. Phase 12.1E-B fences exact intake/retry
 ownership through independent reservations; it does not delete Phase 10
-datasets, Phase 11 job bundles, backups, or audit history. Future deployment
-fencing remains a later lifecycle requirement. See
+datasets, Phase 11 job bundles, backups, or audit history. Phase 12.1E-C
+separately releases only the exact upstream retention dependency after
+read-only proof of completed E-B authority; it never mutates artifact storage.
+Future deployment fencing remains a later lifecycle requirement. See
 [adapter-registry.md](adapter-registry.md) for the full contract.
 
 The static contract fixes the Qwen3-0.6B/PEFT/safetensors compatibility metadata
@@ -326,6 +328,6 @@ PostgreSQL claims, Qdrant retrieval, Phase 5 artifacts, result publication, and 
 - Production extraction sandbox, malware controls, and additional reviewed formats
 - Hybrid retrieval, reranking, and relevance thresholds beyond the Phase 5 character chunker
 - Production retention, physical purge, reconciliation, and tamper-resistant audit requirements
-- Phase 12.1E-C through 12.4 adapter evaluation, registry lifecycle, and runtime
-  deployment
+- Phase 12.1E-C review completion and Phase 12.2 through 12.4 adapter
+  evaluation, registry lifecycle, and runtime deployment
 - Production topology, secrets, observability, backup, and disaster recovery

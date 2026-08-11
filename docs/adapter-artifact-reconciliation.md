@@ -138,12 +138,13 @@ controls, not a distributed transaction. An in-flight filesystem operation
 cannot be fenced atomically by PostgreSQL; exact descriptors, tombstones, and
 subsequent authority checks keep unknown or orphaned bytes untrusted.
 
-Phase 12.1E-B is the separate current reviewed purge boundary documented in
+Phase 12.1E-B is the completed separate purge boundary documented in
 [adapter-artifact-purge.md](adapter-artifact-purge.md). It uses independent
 reservations and the `.purge-deleting` namespace for authoritative registry and
 source finals; it never changes the E-A reconciliation rows or adopts their
-tombstones. Phase 12.1E-C, evaluation, approval, promotion, loading, runtime
-routing, and later Phase 12/13 work remain separate future phases.
+tombstones. Phase 12.1E-C is the current separate metadata-only lifecycle
+release boundary; evaluation, approval, promotion, loading, runtime routing,
+and later Phase 12/13 work remain separate future phases.
 
 Migration `0013_phase12_adapter_reconciliation_cursor` adds the independent
 cursor table and complete attempt keyset indexes. The cursor identity is

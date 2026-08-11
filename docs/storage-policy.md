@@ -235,8 +235,13 @@ the exact validated adapter, source, attempts, versions, manifests, and active
 E-A reconciliation state before mutation; registry bytes are independently
 verified and deleted before the source copy, and only then may both rows become
 `purged`. It never deletes Phase 10/11 artifacts or releases a future
-deployment/rollback dependency; active deployment fencing and later lifecycle
-transitions remain Phase 12.1E-C and subsequent work.
+deployment/rollback dependency. Phase 12.1E-C may release only its one exact
+upstream retention dependency after independently revalidating the completed
+E-B operation, exact reservations/items/manifests/audit, absent finals, and
+empty exact `.purge-deleting` namespaces. That proof is read-only: it never
+parses, hashes, moves, recreates, deletes, or otherwise mutates adapter
+storage. It changes no E-B history, source, job, dataset, or artifact lifecycle
+state.
 
 Source reconciliation and purge are dry-run by default, strictly bounded,
 administrator-only, department-scoped, durable before mutation,
@@ -323,6 +328,13 @@ department/attempt versions before a no-replace move. Registry bytes are
 deleted before source bytes; per-file in-flight progress and directory unlink
 intent make retries crash-resumable. Purge retains Phase 10/11 data, lineage,
 deployment/review history, audit rows, backups, and Google Drive history.
+
+Phase 12.1E-C uses the same maintenance profile only for no-follow,
+content-free inspection of the external adapters root. It accepts no storage
+paths and performs no artifact operation. A reappeared final, residual
+tombstone, unsafe descriptor chain, or unavailable root blocks the metadata
+release; PostgreSQL and filesystem observations remain non-atomic, so E-C
+rechecks both immediately before the short release transaction.
 
 ## Google Drive limitations
 

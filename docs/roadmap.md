@@ -95,7 +95,7 @@ This roadmap separates foundational safety work from product implementation. A l
   and confirms cleanup only after every applicable surface is absent across all
   operations. The limit selects complete attempt groups; it never changes purge
   state or releases dependencies.
-- Phase 12.1E-B (current; under review): adds a separate bounded,
+- Phase 12.1E-B (completed): adds a separate bounded,
   administrator-only, dry-run-by-default purge authority for one exact
   validated adapter. PostgreSQL independently reserves the source and
   registry attempts, versions, manifests, identities, and attempt numbers
@@ -108,8 +108,16 @@ This roadmap separates foundational safety work from product implementation. A l
   metadata and one success audit; it never deletes Phase 10/11 artifacts,
   history, backups, or audit rows. There is no API route, runtime loading,
   deployment change, evaluation, or training behavior.
-- Phase 12.1E-C (not started): later lifecycle reconciliation and release
-  hardening beyond the independent purge boundary.
+- Phase 12.1E-C (current; under review): adds only a separate,
+  administrator-only, dry-run-by-default metadata lifecycle release for one
+  exact active upstream dependency after independently revalidating an exact
+  completed Phase 12.1E-B purge. It proves the two final paths remain absent
+  and both exact `.purge-deleting` namespaces are empty through read-only,
+  descriptor-relative inspection, then releases only that dependency in one
+  short revalidated PostgreSQL transaction with one success audit. It does not
+  delete, recreate, move, inspect contents of, or otherwise mutate artifacts,
+  Phase 10/11 data, lineage, review history, or purge history; it adds no API,
+  evaluation, approval, promotion, loading, routing, or training behavior.
 - Phase 12.2 (not started): adapter-target evaluation, baseline/candidate evidence, and fixed numeric quality and safety gates; no automatic promotion.
 - Phase 12.3 (not started): review, approval, promotion, supersession, rollback, and deployment event history; no silent fallback.
 - Phase 12.4 (not started): department-bound runtime routing, immutable request snapshots, fail-closed loading, and explicit rollback-to-base.
