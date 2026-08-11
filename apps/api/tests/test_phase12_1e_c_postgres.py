@@ -19,6 +19,15 @@ from test_phase12_1e_b_postgres import (
     _purge,
     _storage,
 )
+from test_phase12_1e_b_postgres import (
+    authority as _phase12_1e_b_authority,
+)
+from test_phase12_1e_b_postgres import (
+    engine as _phase12_1e_b_engine,
+)
+from test_phase12_1e_b_postgres import (
+    factory as _phase12_1e_b_factory,
+)
 
 from app import adapter_lifecycle_release
 from app.adapter_lifecycle_release import release_adapter_upstream_dependency
@@ -44,8 +53,34 @@ from app.services import ServiceError
 from app.sft_maintenance import _has_active_dataset_dependency
 from app.training_job_maintenance import _has_active_adapter_dependency
 
+_PHASE12_1E_B_SHARED_FIXTURES = (
+    _phase12_1e_b_authority,
+    _phase12_1e_b_engine,
+    _phase12_1e_b_factory,
+)
+
 pytestmark = pytest.mark.postgres
-pytest_plugins = ("test_phase12_1e_b_postgres",)
+
+
+@pytest.fixture(scope="module")
+def engine(request):
+    """Reuse the Phase 12.1E-B isolated PostgreSQL fixture explicitly."""
+
+    return request.getfixturevalue("_phase12_1e_b_engine")
+
+
+@pytest.fixture
+def factory(request):
+    """Reuse the Phase 12.1E-B session factory without plugin discovery."""
+
+    return request.getfixturevalue("_phase12_1e_b_factory")
+
+
+@pytest.fixture
+def authority(request):
+    """Reuse the Phase 12.1E-B authority fixture and its exact cleanup."""
+
+    return request.getfixturevalue("_phase12_1e_b_authority")
 
 
 def _versions(factory, authority) -> tuple[UUID, int, int, int]:
