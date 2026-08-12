@@ -1,10 +1,14 @@
-# Database Model Through Phase 12.1E-B
+# Database Model Through Phase 12.1E-C
 
 DeptSLM uses PostgreSQL 16, SQLAlchemy 2, psycopg 3, and Alembic. Revision
 `0014_phase12_adapter_purge` is the current head after
 `0013_phase12_adapter_reconciliation_cursor`, which follows
 `0012_phase12_adapter_reconciliation`. Alembic is the only schema-creation
 mechanism; runtime never calls `metadata.create_all`.
+
+Phase 12.1E-C adds no schema or migration. It uses the existing exact
+`AdapterUpstreamDependency` row for the reviewed `active` to `released`
+lifecycle transition only after independently proving one completed E-B purge.
 
 ## Entities
 

@@ -3,8 +3,9 @@
 This document is the reviewed Phase 12 governance boundary. It describes the
 completed contract work, the reviewed Phase 12.1B source-intake implementation,
 the completed Phase 12.1C immutable registry-publication implementation, the
-completed Phase 12.1D metadata-only registry read boundary, and the reviewed
-Phase 12.1E-A reconciliation foundation.
+completed Phase 12.1D metadata-only registry read boundary, the completed
+Phase 12.1E-A reconciliation foundation, and the completed Phase 12.1E-B
+purge authority. Phase 12.1E-C is the current reviewed lifecycle-release scope.
 It also records future metadata, evaluation, review, deployment, and runtime contracts. The
 separate Phase 12.1A static compatibility contract is documented in
 [adapter-static-contract.md](adapter-static-contract.md).
@@ -26,10 +27,14 @@ separate Phase 12.1A static compatibility contract is documented in
   no mutation, artifact access, or audit.
 - Phase 12.1E-A is completed: it is a separate administrator-only,
   dry-run-by-default operation for four non-authoritative surfaces.
-- Phase 12.1E-B is the current reviewed purge scope. It independently reserves
+- Phase 12.1E-B is completed. It independently reserves
   exact source/registry attempts and removes registry bytes before source bytes
-  through `.purge-deleting` descriptor-bound tombstones. Phase 12.1E-C and
-  Phase 12.2, 12.3, and 12.4 remain unimplemented.
+  through `.purge-deleting` descriptor-bound tombstones.
+- Phase 12.1E-C is the current reviewed scope. It can release only one exact
+  active upstream dependency after read-only proof that the corresponding E-B
+  purge completed without blocks, both final paths remain absent, and both
+  exact purge namespaces are empty. It does not touch artifact bytes.
+- Phase 12.2, 12.3, and 12.4 remain unimplemented.
 - Phase 13 has not started.
 
 The Phase 12.1D read routes are the only public adapter metadata surface today:
@@ -131,7 +136,7 @@ the artifact is safe, compatible, or useful.
 - Never reconcile authoritative finals, purge states, upstream dependencies,
   Phase 10/11 artifacts, or adapter runtime state.
 
-#### Phase 12.1E-B (current; under review)
+#### Phase 12.1E-B (completed)
 
 - `purge-adapter-artifacts` is a bounded, administrator-only command that is
   dry-run by default and mutates only with `--apply`.
@@ -150,6 +155,29 @@ the artifact is safe, compatible, or useful.
   history, audit rows, backups, or other retained copies. PostgreSQL and
   external storage remain non-atomic. There is no public purge route and no
   runtime adapter loading.
+
+#### Phase 12.1E-C (current; under review)
+
+- `release-adapter-upstream-dependency` is an administrator-only command that
+  is dry-run by default. It accepts only the exact department and adapter
+  selectors, expected adapter/source/dependency versions, actor identity, and
+  explicit `--apply`; it accepts no path, manifest, digest, attempt, operation,
+  source, dataset, job, or dependency selector.
+- It proves the adapter and its claimed source are `purged`, the exact one
+  upstream dependency is active, and a unique completed E-B operation retained
+  the exact source/registry attempts, reservations, items, manifests, and
+  success audit with no blocks. It also rejects active E-A or E-B mutation
+  authority for either exact final surface.
+- It opens the adapters root only for descriptor-relative, no-follow,
+  content-free absence checks of the exact source and registry final paths and
+  their exact `.purge-deleting` resource namespaces. Reappeared finals,
+  expected or unknown tombstones, malformed entries, symlinks, and unsafe
+  storage fail closed without cleanup.
+- Apply mode reauthorizes every row and the read-only storage proof under a
+  short transaction, changes only `adapter_upstream_dependencies` from
+  `active` to `released`, increments only that dependency and adapter version,
+  and writes one `adapter.upstream_dependency.release` audit. It never changes
+  source, adapter, job, dataset, or E-B history lifecycle timestamps/statuses.
 
 ### Phase 12.2 — adapter-target evaluation (not started)
 
@@ -689,7 +717,8 @@ the registry final before the source final, supports crash-resumable deletion,
 binds exact tombstone identities before unlink, and produces one
 operation-level exactly-once success audit. Phase 12.1E-A remains the separate
 non-authoritative reconciliation foundation described below; Phase 12.1E-C is
-not started.
+the current lifecycle-release scope and does not change reconciliation
+ownership or artifact cleanup.
 
 Metadata, lineage, evaluation, deployment, and audit history are retained. A
 purge must not delete Phase 10 datasets or Phase 11 training-job bundles, and it
@@ -716,7 +745,7 @@ adopts an unbound tombstone, and remains crash-resumable. It emits one
 operation-level success audit only after every applicable surface and tombstone
 is absent for the exact attempt across all operations. Phase 12.1E-B uses the
 separate `.purge-deleting` namespace and independent final-byte purge authority
-documented above; Phase 12.1E-C remains unstarted.
+documented above; Phase 12.1E-C is separate metadata-only lifecycle release.
 
 Source cleanup must not delete a source still required by an active intake,
 retry, or reconciliation operation; must never delete registry artifacts through

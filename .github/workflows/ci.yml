@@ -349,6 +349,7 @@ jobs:
           import app.adapter_artifact_maintenance
           import app.adapter_maintenance_artifacts
           import app.adapter_purge
+          import app.adapter_lifecycle_release
           assert importlib.util.find_spec("torch") is None
           assert importlib.util.find_spec("transformers") is None
           assert importlib.util.find_spec("qdrant_client") is None
@@ -579,6 +580,19 @@ jobs:
           ! grep -E '@router\.(get|post|put|patch|delete).*purge' apps/api/app/routes.py
           grep -F 'AdapterPurgeArtifactStore' apps/api/app/adapter_purge.py >/dev/null
           grep -F 'AdapterPurgeOperation' apps/api/app/adapter_purge.py >/dev/null
+      - name: Check Phase 12.1E-C lifecycle-release isolation
+        run: |
+          if grep -R -E '^(from|import) (torch|transformers|sentence_transformers|huggingface_hub|qdrant|safetensors|peft|llamafactory|app\.rag|app\.evaluation|app\.sft_|app\.training_job_)' apps/api/app/adapter_lifecycle_release.py; then exit 1; fi
+          if grep -E 'move_verified_surface_to_tombstone|unlink_committed_tombstone_entry|remove_committed_tombstone_directory|recover_authorized_move|open_committed_tombstone' apps/api/app/adapter_lifecycle_release.py; then exit 1; fi
+          grep -F 'AdapterPurgeArtifactStore' apps/api/app/adapter_lifecycle_release.py >/dev/null
+          grep -F 'assert_tombstone_namespace_empty' apps/api/app/adapter_lifecycle_release.py >/dev/null
+          grep -F 'adapter.upstream_dependency.release' apps/api/app/adapter_lifecycle_release.py >/dev/null
+          grep -F 'release-adapter-upstream-dependency' apps/api/app/admin.py >/dev/null
+          if grep -E '@router\.(get|post|put|patch|delete).*release' apps/api/app/routes.py; then exit 1; fi
+          release_compose="$(sed -n '/^  adapter-maintenance:/,/^networks:/p' docker-compose.yml)"
+          grep -F 'profiles: ["maintenance"]' <<<"$release_compose" >/dev/null
+          grep -F '/adapters' <<<"$release_compose" >/dev/null
+          if grep -E 'qdrant|rag-internal|model_cache|training_datasets|uploads|extracted_text|eval_results|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|PROXY' <<<"$release_compose"; then exit 1; fi
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then

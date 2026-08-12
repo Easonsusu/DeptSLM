@@ -2,9 +2,9 @@
 
 ## Phase 12 status
 
-DeptSLM is not a production deployment. Phase 9 completed the internal evaluation runner with external immutable suites, content-free result artifacts, and PostgreSQL-backed leases. It reuses the completed Phase 7 grounded-answer boundary; it is not a public evaluation API. Phase 10 completed an isolated dataset-builder worker that writes only private external SFT dataset artifacts. Phase 11 completed a separate worker that generates immutable LlamaFactory configuration bundles only; it does not install or execute LlamaFactory, train models, or create adapters. Phase 12.0 and Phase 12.1A through D are completed, and Phase 12.1E-A reconciliation is complete. Phase 12.1E-B is the current reviewed scope: a separate manual, dry-run-by-default purge command with independent PostgreSQL reservations and descriptor-bound `.purge-deleting` tombstones. Registry bytes are verified and removed before source bytes; Phase 10/11 artifacts, history, backups, and audit rows are retained. It mounts the external adapters root read-write only in the `adapter-maintenance` Compose service profile and never mounts adapters into the API. Public vector search, conversations, history, streaming, reranking, scheduled evaluation, malware scanning, OCR, training, evaluation, approval, promotion, runtime adapter routing, production identity/storage, secrets management, backups, clustering, and production operations remain deferred. Phase 12.1E-C and later phases are not started.
+DeptSLM is not a production deployment. Phase 9 completed the internal evaluation runner with external immutable suites, content-free result artifacts, and PostgreSQL-backed leases. It reuses the completed Phase 7 grounded-answer boundary; it is not a public evaluation API. Phase 10 completed an isolated dataset-builder worker that writes only private external SFT dataset artifacts. Phase 11 completed a separate worker that generates immutable LlamaFactory configuration bundles only; it does not install or execute LlamaFactory, train models, or create adapters. Phase 12.0 through Phase 12.1E-B are completed. Phase 12.1E-C is the current reviewed scope: a separate manual, dry-run-by-default metadata release command that revalidates one completed E-B purge and releases only its exact upstream retention dependency. It reads the external adapters root only through no-follow, content-free absence checks and never mutates adapter, Phase 10/11, or E-B artifacts or history. The completed E-B purge command remains responsible for independent reservations and descriptor-bound `.purge-deleting` tombstones; registry bytes are verified and removed before source bytes, while Phase 10/11 artifacts, history, backups, and audit rows are retained. The maintenance profile mounts the external adapters root and never mounts adapters into the API. Public vector search, conversations, history, streaming, reranking, scheduled evaluation, malware scanning, OCR, training, evaluation, approval, promotion, runtime adapter routing, production identity/storage, secrets management, backups, clustering, and production operations remain deferred. Phase 12.2 and later phases are not started.
 
-Phase 12.1D and E-A are complete; Phase 12.1E-B is under review, while Phase 12.1E-C and Phase 12.2 through 12.4 are not started. The only public adapter API surface is `GET /departments/{department_id}/adapters` and `GET /departments/{department_id}/adapters/{adapter_id}` for same-department `system_admin`, `department_admin`, and `instructor` roles. These routes return a closed content-free PostgreSQL projection and never upload, download, load, mutate, audit, or expose artifact bytes, paths, hashes, tensor data, identities, or runtime settings. The source CLI is administrator-controlled and dry-run by default. The registry worker is administrator-enqueued through PostgreSQL and does not evaluate, approve, promote, load, reconcile, or purge. The separate maintenance profile runs E-A reconciliation or the E-B purge command only when explicitly invoked; it has no model, Qdrant, dataset, training-job, or API mount. PostgreSQL and external storage remain non-atomic.
+Phase 12.1D, E-A, and E-B are complete; Phase 12.1E-C is under review, while Phase 12.2 through 12.4 are not started. The only public adapter API surface is `GET /departments/{department_id}/adapters` and `GET /departments/{department_id}/adapters/{adapter_id}` for same-department `system_admin`, `department_admin`, and `instructor` roles. These routes return a closed content-free PostgreSQL projection and never upload, download, load, mutate, audit, or expose artifact bytes, paths, hashes, tensor data, identities, or runtime settings. The source CLI is administrator-controlled and dry-run by default. The registry worker is administrator-enqueued through PostgreSQL and does not evaluate, approve, promote, load, reconcile, or purge. The separate maintenance profile runs E-A reconciliation, E-B purge, or E-C lifecycle release only when explicitly invoked; it has no model, Qdrant, dataset, training-job, or API mount. PostgreSQL and external storage remain non-atomic.
 
 The planned intake begins with an administrator-controlled CLI that creates an
 immutable server-ID-derived import bundle from only the two payload files.
@@ -39,7 +39,7 @@ declared external training association, not proven training provenance.
 | `training-worker` | Phase 10 SFT dataset builder | PostgreSQL plus `training_datasets` only; no model, Qdrant, RAG, or adapter stack. |
 | `training-job-worker` | Phase 11 immutable job-bundle generator | PostgreSQL plus `training_datasets` only; no model, tokenizer, LlamaFactory package, Qdrant, RAG, or adapter stack. |
 | `adapter-registry-worker` | Phase 12.1C immutable registry publisher | PostgreSQL, read-only adapter imports and Phase 11 bundles, and private registry staging/final storage only; no model, Qdrant, RAG, evaluation, or public API. |
-| `adapter-maintenance` | Manual Phase 12.1E-A reconciliation or Phase 12.1E-B purge | `maintenance` profile; PostgreSQL plus the external adapters root read-write only; no API, model, Qdrant, dataset, training-job, or adapter-runtime stack. |
+| `adapter-maintenance` | Manual Phase 12.1E-A reconciliation, Phase 12.1E-B purge, or Phase 12.1E-C lifecycle release | `maintenance` profile; PostgreSQL plus the external adapters root only; no API, model, Qdrant, dataset, training-job, or adapter-runtime stack. E-C itself reads storage only. |
 
 ### Phase 12.1E-B purge command
 
@@ -60,7 +60,27 @@ or CLI output, and never touches Phase 10/11 artifacts, audit history,
 backups, or other retained copies. See
 [adapter-artifact-purge.md](adapter-artifact-purge.md).
 
-Phase 6 pins `Qwen/Qwen3-Embedding-0.6B` at immutable revision `d23109d65ca9fdf61eef614209744716f337f50f`; Phase 7 pins `Qwen/Qwen3-0.6B` at revision `c1899de289a04d12100db370d81485cdf75e47ca`. Explicit administration downloads them outside Git while normal processes stay offline. LlamaIndex and adapter runtime loading remain future components. Phase 11 does not execute LLaMA-Factory; model inference dependencies remain outside API/extraction/indexing images. Phase 12.1A fixes a model-free static adapter contract using PEFT `0.18.1`, Transformers `4.55.0`, safetensors `0.7.0`, and bounded metadata only; Phase 12.1B invokes that contract in an isolated child and Phase 12.1C reuses it in a separate registry child. Neither phase loads a model, tokenizer, adapter, or tensor values. Phase 12.1E-A provides bounded reconciliation and Phase 12.1E-B provides a separate purge authority; neither adds evaluation, approval, promotion, loading, or runtime routing.
+### Phase 12.1E-C lifecycle-release command
+
+The same manual profile can perform the separate metadata-only release after
+E-B completes. It is dry-run by default and accepts no artifact path or
+manifest selector:
+
+```bash
+./scripts/compose.sh --profile maintenance run --rm adapter-maintenance \
+  python -m app.admin release-adapter-upstream-dependency \
+  --department-id <department-uuid> --adapter-id <adapter-uuid> \
+  --expected-adapter-version <version> --expected-source-version <version> \
+  --expected-dependency-version <version> \
+  --actor-issuer <issuer> --actor-subject <subject>
+```
+
+Add `--apply` only after the exact E-B authority and read-only storage-absence
+proof succeed. E-C changes only one dependency and adapter version; it never
+deletes, moves, or reads adapter artifact content. See
+[adapter-lifecycle-release.md](adapter-lifecycle-release.md).
+
+Phase 6 pins `Qwen/Qwen3-Embedding-0.6B` at immutable revision `d23109d65ca9fdf61eef614209744716f337f50f`; Phase 7 pins `Qwen/Qwen3-0.6B` at revision `c1899de289a04d12100db370d81485cdf75e47ca`. Explicit administration downloads them outside Git while normal processes stay offline. LlamaIndex and adapter runtime loading remain future components. Phase 11 does not execute LLaMA-Factory; model inference dependencies remain outside API/extraction/indexing images. Phase 12.1A fixes a model-free static adapter contract using PEFT `0.18.1`, Transformers `4.55.0`, safetensors `0.7.0`, and bounded metadata only; Phase 12.1B invokes that contract in an isolated child and Phase 12.1C reuses it in a separate registry child. Neither phase loads a model, tokenizer, adapter, or tensor values. Phase 12.1E-A provides bounded reconciliation, E-B provides a separate purge authority, and E-C provides a metadata-only upstream-retention release; none adds evaluation, approval, promotion, loading, or runtime routing.
 
 ## Prerequisites
 
@@ -251,7 +271,8 @@ Docker Compose is for local development, not the production architecture. A prod
 - prompt-injection defenses and grounded-answer evaluation
 - monitoring, tracing, alerting, retention, disaster recovery, and incident response
 - safe database migrations and rollback
-- Phase 12.1E-C through 12.4 adapter lifecycle, approval, deployment, and rollback
+- Phase 12.1E-C review completion and Phase 12.2 through 12.4 adapter
+  evaluation, approval, deployment, and rollback
 
 No Phase 0 file should be interpreted as a production security or availability guarantee.
 

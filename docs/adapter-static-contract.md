@@ -9,10 +9,10 @@ uses this contract from its isolated source-validation child, and Phase 12.1C
 reuses the same model-free checks in its registry publication child; this
 document does not describe storage or import authority. Phase 12.1D adds only a
 separate PostgreSQL metadata-read boundary; Phase 12.1E-A separately adds the
-administrator-only artifact reconciliation foundation. Phase 12.1E-B is a
-separate current reviewed purge authority and does not change this static
-contract; Phase 12.1E-C, Phases 12.2 through 12.4, and Phase 13 are not
-started.
+administrator-only artifact reconciliation foundation. Phase 12.1E-B is the
+completed separate purge authority and does not change this static contract;
+Phase 12.1E-C is the current reviewed metadata-only lifecycle-release boundary.
+Phases 12.2 through 12.4 and Phase 13 are not started.
 
 The static-contract implementation itself adds no intake command, database model,
 migration, API route, queue, worker, registry, storage directory,
