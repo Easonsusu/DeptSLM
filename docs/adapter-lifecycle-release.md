@@ -80,6 +80,25 @@ performs the proof before apply and rechecks it inside the final short database
 transaction. A same-user writer can still race a filesystem observation, so no
 storage observation is treated as an atomic fence or as permission to delete.
 
+## Transaction lock order
+
+E-C apply uses one canonical PostgreSQL lock order shared with the adjacent
+maintenance workflows. The transaction first acquires the exact department
+authorization fence, then performs a bounded active E-B operation probe. It
+then locks the adapter and source, their authoritative source and registry
+attempts, the exact Phase 11 training job and Phase 10 dataset build, and the
+single upstream dependency. Only after those rows are stable does it select at
+most two matching successful E-B operations and lock the exact two
+reservations, two items, one success audit, and a bounded active E-A probe.
+
+The E-B finalization path acquires the same department fence before its active
+operation, reservations/items, adapter/source, attempts, and upstream rows;
+Phase 12.1C enqueue is authorization-first as well. Dry-run E-C performs the
+same bounded proof without `FOR UPDATE` locks. Historical failed or blocked
+operations are never materialized or locked. This ordering prevents a
+`resource rows -> department authorization` cycle while preserving the
+department-scoped fail-closed boundary.
+
 ## Apply and idempotency
 
 Apply reauthorizes membership, adapter/source/dependency lineage, E-B operation,

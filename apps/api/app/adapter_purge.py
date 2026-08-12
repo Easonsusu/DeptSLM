@@ -385,6 +385,8 @@ def _register_or_resume(
                     AdapterPurgeOperation.adapter_id == adapter_id,
                     AdapterPurgeOperation.status.in_(ACTIVE_PURGE_STATUSES),
                 )
+                .order_by(AdapterPurgeOperation.created_at, AdapterPurgeOperation.id)
+                .limit(1)
                 .with_for_update()
             ).scalar_one_or_none()
             if existing is not None:
@@ -1201,6 +1203,15 @@ def _finalize_operation(
 ) -> None:
     try:
         with factory.begin() as session:
+            # The department authorization fence is always acquired before
+            # the active purge operation, reservations, items, or upstream
+            # rows. This is the shared lock-order boundary with E-C and the
+            # Phase 12.1C registry enqueue path.
+            principal = AuthenticatedPrincipal(actor_subject, actor_issuer)
+            scope = DepartmentRequestScope(DepartmentScope(department_id))
+            authorization = authorize_transaction(
+                session, principal, scope, ADAPTER_PURGE_ADMIN_ROLES, lock=True, audit_action=None
+            )
             operation = session.execute(
                 select(AdapterPurgeOperation)
                 .where(
@@ -1254,11 +1265,6 @@ def _finalize_operation(
             operation.version += 1
             if blocked:
                 return
-            principal = AuthenticatedPrincipal(actor_subject, actor_issuer)
-            scope = DepartmentRequestScope(DepartmentScope(department_id))
-            authorization = authorize_transaction(
-                session, principal, scope, ADAPTER_PURGE_ADMIN_ROLES, lock=True, audit_action=None
-            )
             authority = _load_authority_allow_pending(session, department_id, operation.adapter_id)
             _assert_operation_authority(operation, authority, department_id)
             authority.source.status = "purged"

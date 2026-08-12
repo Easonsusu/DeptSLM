@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import pytest
 
-from app import adapter_lifecycle_release
+from app import adapter_lifecycle_release, adapter_purge
 from app.adapter_lifecycle_release import AdapterLifecycleReleaseSettings
 from app.admin import _parser
 
@@ -141,6 +141,21 @@ def test_release_module_has_no_artifact_mutation_or_public_route_dependency() ->
     )
     assert "release-adapter-upstream-dependency" not in routes
     assert "adapter.upstream_dependency.release" not in routes
+
+
+def test_release_and_purge_use_the_shared_authorization_first_lock_order() -> None:
+    release_source = inspect.getsource(adapter_lifecycle_release)
+    finalize_source = inspect.getsource(adapter_purge._finalize_operation)
+
+    assert release_source.index("authorization = authorize_transaction") < release_source.index(
+        "authority = _load_authority"
+    )
+    assert release_source.count(".limit(2)") >= 3
+    assert ".limit(1)" in release_source
+    assert "lock=lock" in release_source
+    assert finalize_source.index("authorization = authorize_transaction") < finalize_source.index(
+        "operation = session.execute"
+    )
 
 
 def test_release_settings_do_not_fall_back_to_the_checkout(

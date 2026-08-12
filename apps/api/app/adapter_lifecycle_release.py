@@ -244,86 +244,103 @@ def _load_authority(
     expected_adapter_version: int,
     expected_source_version: int,
     expected_dependency_version: int,
+    lock: bool,
 ) -> _ReleaseAuthority:
-    """Lock and prove one exact E-B completion and retention dependency."""
+    """Prove one exact E-B completion using the canonical lock order.
 
-    operations = session.scalars(
-        select(AdapterPurgeOperation)
+    Apply mode enters this function only after ``authorize_transaction`` has
+    locked the department fence.  The active-operation probe is deliberately a
+    bounded query separate from the historical-success lookup; failed and
+    blocked history is never materialized or locked.  Dry-run mode performs
+    the same proof without ``FOR UPDATE`` locks.
+    """
+
+    active_operation_statement = (
+        select(AdapterPurgeOperation.id)
         .where(
             AdapterPurgeOperation.department_id == department_id,
             AdapterPurgeOperation.adapter_id == adapter_id,
+            AdapterPurgeOperation.status.in_(_ACTIVE_PURGE_STATUSES),
         )
         .order_by(AdapterPurgeOperation.created_at, AdapterPurgeOperation.id)
-        .with_for_update()
-    ).all()
-    if any(operation.status in _ACTIVE_PURGE_STATUSES for operation in operations):
+        .limit(1)
+    )
+    if lock:
+        active_operation_statement = active_operation_statement.with_for_update()
+    if session.scalar(active_operation_statement) is not None:
         raise _ReleaseConflict
 
-    adapter = session.execute(
-        select(Adapter)
-        .where(Adapter.id == adapter_id, Adapter.department_id == department_id)
-        .with_for_update()
-    ).scalar_one_or_none()
+    adapter_statement = select(Adapter).where(
+        Adapter.id == adapter_id,
+        Adapter.department_id == department_id,
+    )
+    if lock:
+        adapter_statement = adapter_statement.with_for_update()
+    adapter = session.execute(adapter_statement).scalar_one_or_none()
     if adapter is None:
         raise ServiceError(404, "Adapter not found")
-    source = session.execute(
-        select(AdapterImportSource)
-        .where(
-            AdapterImportSource.id == adapter.source_bundle_id,
-            AdapterImportSource.department_id == department_id,
-        )
-        .with_for_update()
-    ).scalar_one_or_none()
-    source_attempt = session.execute(
-        select(AdapterImportAttempt)
-        .where(
-            AdapterImportAttempt.id == adapter.source_authoritative_attempt_id,
-            AdapterImportAttempt.department_id == department_id,
-            AdapterImportAttempt.source_bundle_id == adapter.source_bundle_id,
-            AdapterImportAttempt.publication_attempt_id == adapter.source_publication_attempt_id,
-            AdapterImportAttempt.attempt_number == adapter.source_attempt_number,
-        )
-        .with_for_update()
-    ).scalar_one_or_none()
-    registry_attempt = session.execute(
-        select(AdapterRegistryAttempt)
-        .where(
-            AdapterRegistryAttempt.department_id == department_id,
-            AdapterRegistryAttempt.adapter_id == adapter.id,
-            AdapterRegistryAttempt.execution_scope_id == adapter.execution_scope_id,
-            AdapterRegistryAttempt.publication_attempt_id == adapter.publication_attempt_id,
-            AdapterRegistryAttempt.attempt_number == adapter.attempt_number,
-        )
-        .with_for_update()
-    ).scalar_one_or_none()
-    training_job = session.execute(
-        select(TrainingJob)
-        .where(
-            TrainingJob.id == adapter.training_job_id,
-            TrainingJob.department_id == department_id,
-        )
-        .with_for_update()
-    ).scalar_one_or_none()
-    dataset_build = session.execute(
-        select(SftDatasetBuild)
-        .where(
-            SftDatasetBuild.id == adapter.dataset_build_id,
-            SftDatasetBuild.department_id == department_id,
-        )
-        .with_for_update()
-    ).scalar_one_or_none()
+
+    source_statement = select(AdapterImportSource).where(
+        AdapterImportSource.id == adapter.source_bundle_id,
+        AdapterImportSource.department_id == department_id,
+    )
+    if lock:
+        source_statement = source_statement.with_for_update()
+    source = session.execute(source_statement).scalar_one_or_none()
+
+    source_attempt_statement = select(AdapterImportAttempt).where(
+        AdapterImportAttempt.id == adapter.source_authoritative_attempt_id,
+        AdapterImportAttempt.department_id == department_id,
+        AdapterImportAttempt.source_bundle_id == adapter.source_bundle_id,
+        AdapterImportAttempt.publication_attempt_id == adapter.source_publication_attempt_id,
+        AdapterImportAttempt.attempt_number == adapter.source_attempt_number,
+    )
+    if lock:
+        source_attempt_statement = source_attempt_statement.with_for_update()
+    source_attempt = session.execute(source_attempt_statement).scalar_one_or_none()
+
+    registry_attempt_statement = select(AdapterRegistryAttempt).where(
+        AdapterRegistryAttempt.department_id == department_id,
+        AdapterRegistryAttempt.adapter_id == adapter.id,
+        AdapterRegistryAttempt.execution_scope_id == adapter.execution_scope_id,
+        AdapterRegistryAttempt.publication_attempt_id == adapter.publication_attempt_id,
+        AdapterRegistryAttempt.attempt_number == adapter.attempt_number,
+    )
+    if lock:
+        registry_attempt_statement = registry_attempt_statement.with_for_update()
+    registry_attempt = session.execute(registry_attempt_statement).scalar_one_or_none()
+
+    training_job_statement = select(TrainingJob).where(
+        TrainingJob.id == adapter.training_job_id,
+        TrainingJob.department_id == department_id,
+    )
+    if lock:
+        training_job_statement = training_job_statement.with_for_update()
+    training_job = session.execute(training_job_statement).scalar_one_or_none()
+
+    dataset_build_statement = select(SftDatasetBuild).where(
+        SftDatasetBuild.id == adapter.dataset_build_id,
+        SftDatasetBuild.department_id == department_id,
+    )
+    if lock:
+        dataset_build_statement = dataset_build_statement.with_for_update()
+    dataset_build = session.execute(dataset_build_statement).scalar_one_or_none()
+
     # Lock upstream resource rows before their dependency. The established
     # Phase 10/11 maintenance paths take the same upstream-before-dependency
     # order, so lifecycle release cannot invert their retention-fence locks.
-    dependencies = session.scalars(
+    dependency_statement = (
         select(AdapterUpstreamDependency)
         .where(
             AdapterUpstreamDependency.department_id == department_id,
             AdapterUpstreamDependency.adapter_id == adapter.id,
         )
         .order_by(AdapterUpstreamDependency.id)
-        .with_for_update()
-    ).all()
+        .limit(2)
+    )
+    if lock:
+        dependency_statement = dependency_statement.with_for_update()
+    dependencies = session.scalars(dependency_statement).all()
     if (
         source is None
         or source_attempt is None
@@ -353,29 +370,64 @@ def _load_authority(
         expected_source_version=expected_source_version,
         expected_dependency_version=expected_dependency_version,
     )
+    # Only terminal rows matching the live purged authority can be candidates.
+    # LIMIT 2 is intentional: one row proves uniqueness, while a second row
+    # proves duplicate successful history without materializing the full table.
+    operation_statement = (
+        select(AdapterPurgeOperation)
+        .where(
+            AdapterPurgeOperation.department_id == department_id,
+            AdapterPurgeOperation.adapter_id == adapter.id,
+            AdapterPurgeOperation.source_bundle_id == source.id,
+            AdapterPurgeOperation.status == "completed",
+            AdapterPurgeOperation.completed_at.is_not(None),
+            AdapterPurgeOperation.completed_at == adapter.purged_at,
+            AdapterPurgeOperation.completed_at == source.purged_at,
+            AdapterPurgeOperation.success_audited_at.is_not(None),
+            AdapterPurgeOperation.eligible_item_count == 2,
+            AdapterPurgeOperation.completed_item_count == 2,
+            AdapterPurgeOperation.blocked_item_count == 0,
+            AdapterPurgeOperation.source_authoritative_attempt_id == source_attempt.id,
+            AdapterPurgeOperation.source_publication_attempt_id
+            == source_attempt.publication_attempt_id,
+            AdapterPurgeOperation.source_attempt_number == source_attempt.attempt_number,
+            AdapterPurgeOperation.registry_attempt_id == registry_attempt.id,
+            AdapterPurgeOperation.registry_publication_attempt_id
+            == registry_attempt.publication_attempt_id,
+            AdapterPurgeOperation.registry_attempt_number == registry_attempt.attempt_number,
+        )
+        .order_by(AdapterPurgeOperation.created_at, AdapterPurgeOperation.id)
+        .limit(2)
+    )
+    if lock:
+        operation_statement = operation_statement.with_for_update()
+    operations = tuple(session.scalars(operation_statement).all())
     operation = _successful_operation(operations, provisional)
-    reservations = tuple(
-        session.scalars(
-            select(AdapterPurgeReservation)
-            .where(
-                AdapterPurgeReservation.operation_id == operation.id,
-                AdapterPurgeReservation.department_id == department_id,
-            )
-            .order_by(AdapterPurgeReservation.surface_type, AdapterPurgeReservation.id)
-            .with_for_update()
-        ).all()
+
+    reservation_statement = (
+        select(AdapterPurgeReservation)
+        .where(
+            AdapterPurgeReservation.operation_id == operation.id,
+            AdapterPurgeReservation.department_id == department_id,
+        )
+        .order_by(AdapterPurgeReservation.surface_type, AdapterPurgeReservation.id)
+        .limit(3)
     )
-    items = tuple(
-        session.scalars(
-            select(AdapterPurgeItem)
-            .where(
-                AdapterPurgeItem.operation_id == operation.id,
-                AdapterPurgeItem.department_id == department_id,
-            )
-            .order_by(AdapterPurgeItem.surface_type, AdapterPurgeItem.id)
-            .with_for_update()
-        ).all()
+    if lock:
+        reservation_statement = reservation_statement.with_for_update()
+    reservations = tuple(session.scalars(reservation_statement).all())
+    item_statement = (
+        select(AdapterPurgeItem)
+        .where(
+            AdapterPurgeItem.operation_id == operation.id,
+            AdapterPurgeItem.department_id == department_id,
+        )
+        .order_by(AdapterPurgeItem.surface_type, AdapterPurgeItem.id)
+        .limit(3)
     )
+    if lock:
+        item_statement = item_statement.with_for_update()
+    items = tuple(session.scalars(item_statement).all())
     authority = _ReleaseAuthority(
         adapter,
         source,
@@ -389,7 +441,7 @@ def _load_authority(
         items,
     )
     _assert_completed_purge(authority)
-    purge_audits = session.scalars(
+    audit_statement = (
         select(PersistentAuditEvent)
         .where(
             PersistentAuditEvent.department_id == department_id,
@@ -400,11 +452,32 @@ def _load_authority(
             PersistentAuditEvent.reason_code == "mutation_applied",
         )
         .order_by(PersistentAuditEvent.created_at, PersistentAuditEvent.id)
-        .with_for_update()
-    ).all()
+        .limit(2)
+    )
+    if lock:
+        audit_statement = audit_statement.with_for_update()
+    purge_audits = session.scalars(audit_statement).all()
     if len(purge_audits) != 1:
         raise _ReleaseConflict
-    _assert_no_active_reconciliation(session, authority, department_id)
+    if dependency.status == "released":
+        release_audit_statement = (
+            select(PersistentAuditEvent)
+            .where(
+                PersistentAuditEvent.department_id == department_id,
+                PersistentAuditEvent.action == "adapter.upstream_dependency.release",
+                PersistentAuditEvent.resource_type == "adapter",
+                PersistentAuditEvent.resource_id == str(adapter.id),
+                PersistentAuditEvent.result == "allowed",
+                PersistentAuditEvent.reason_code == "mutation_applied",
+            )
+            .order_by(PersistentAuditEvent.created_at, PersistentAuditEvent.id)
+            .limit(2)
+        )
+        if lock:
+            release_audit_statement = release_audit_statement.with_for_update()
+        if len(session.scalars(release_audit_statement).all()) != 1:
+            raise _ReleaseConflict
+    _assert_no_active_reconciliation(session, authority, department_id, lock=lock)
     return authority
 
 
@@ -623,10 +696,10 @@ def _assert_completed_purge(authority: _ReleaseAuthority) -> None:
 
 
 def _assert_no_active_reconciliation(
-    session: Session, authority: _ReleaseAuthority, department_id: UUID
+    session: Session, authority: _ReleaseAuthority, department_id: UUID, *, lock: bool
 ) -> None:
-    active = session.scalars(
-        select(AdapterArtifactOperationItem)
+    active_statement = (
+        select(AdapterArtifactOperationItem.id)
         .where(
             AdapterArtifactOperationItem.department_id == department_id,
             AdapterArtifactOperationItem.status.in_(_ACTIVE_RECONCILIATION_ITEM_STATUSES),
@@ -640,9 +713,11 @@ def _assert_no_active_reconciliation(
             ),
         )
         .order_by(AdapterArtifactOperationItem.created_at, AdapterArtifactOperationItem.id)
-        .with_for_update()
-    ).all()
-    if active:
+        .limit(1)
+    )
+    if lock:
+        active_statement = active_statement.with_for_update()
+    if session.scalar(active_statement) is not None:
         raise _ReleaseConflict
 
 
@@ -689,41 +764,21 @@ def _authorize_and_load(
     expected_dependency_version: int,
     actor_issuer: str,
     actor_subject: str,
+    lock: bool,
 ):
     principal = AuthenticatedPrincipal(subject=actor_subject, issuer=actor_issuer)
     scope = DepartmentRequestScope(DepartmentScope(department_id))
-    # Verify access before reading target rows without holding the department
-    # lock while waiting for E-B's operation lock. E-B finalization locks its
-    # operation first, so the final locked authorization below preserves a
-    # consistent order without exposing a foreign adapter to an unauthorised
-    # caller.
-    authorize_transaction(
-        session,
-        principal,
-        scope,
-        ADAPTER_LIFECYCLE_RELEASE_ADMIN_ROLES,
-        lock=False,
-        audit_action=None,
-    )
-    authority = _load_authority(
-        session,
-        department_id=department_id,
-        adapter_id=adapter_id,
-        expected_adapter_version=expected_adapter_version,
-        expected_source_version=expected_source_version,
-        expected_dependency_version=expected_dependency_version,
-    )
+    # Every apply path takes the department authorization fence before any
+    # operation, adapter, upstream, reservation, item, or audit row. Dry-run
+    # uses the same proof without unnecessary FOR UPDATE locks.
     authorization = authorize_transaction(
         session,
         principal,
         scope,
         ADAPTER_LIFECYCLE_RELEASE_ADMIN_ROLES,
-        lock=True,
+        lock=lock,
         audit_action=None,
     )
-    # Re-run the complete locked proof after the department fence is held. This
-    # closes the window in which E-A/E-B could register a new exact mutation
-    # item after the preliminary operation scan.
     authority = _load_authority(
         session,
         department_id=department_id,
@@ -731,6 +786,7 @@ def _authorize_and_load(
         expected_adapter_version=expected_adapter_version,
         expected_source_version=expected_source_version,
         expected_dependency_version=expected_dependency_version,
+        lock=lock,
     )
     return authorization, scope, authority
 
@@ -776,6 +832,7 @@ def release_adapter_upstream_dependency(
                 expected_dependency_version=expected_dependency_version,
                 actor_issuer=actor_issuer,
                 actor_subject=actor_subject,
+                lock=apply,
             )
             storage_scope = _storage_scope(authority)
             dry_result = _result(authority, applied=False)
@@ -792,6 +849,7 @@ def release_adapter_upstream_dependency(
                 expected_dependency_version=expected_dependency_version,
                 actor_issuer=actor_issuer,
                 actor_subject=actor_subject,
+                lock=True,
             )
             _assert_purged_storage_absent(data_dir, _storage_scope(authority))
             if authority.dependency.status == "released":

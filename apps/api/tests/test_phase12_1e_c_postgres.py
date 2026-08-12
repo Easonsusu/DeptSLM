@@ -11,7 +11,7 @@ from threading import Barrier
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, event, func, select, update
 from test_phase12_1c_integration import _enqueue
 from test_phase12_1e_b_postgres import (
     _adapter_id,
@@ -29,7 +29,7 @@ from test_phase12_1e_b_postgres import (
     factory as _phase12_1e_b_factory,
 )
 
-from app import adapter_lifecycle_release
+from app import adapter_lifecycle_release, adapter_purge
 from app.adapter_lifecycle_release import release_adapter_upstream_dependency
 from app.adapter_maintenance_artifacts import AdapterPurgeArtifactStore
 from app.adapter_registry_read_services import _project
@@ -143,6 +143,13 @@ def _release_audit_count(factory, authority) -> int:
         )
 
 
+def _assert_no_deadlock(outcome: object) -> None:
+    if isinstance(outcome, BaseException):
+        assert "deadlock" not in str(outcome).lower()
+        if isinstance(outcome, ServiceError):
+            assert outcome.status_code != 503
+
+
 def test_release_requires_completed_eb_purge_and_releases_one_dependency(
     factory, authority, tmp_path: Path
 ) -> None:
@@ -177,7 +184,9 @@ def test_release_requires_completed_eb_purge_and_releases_one_dependency(
     assert _release_audit_count(factory, authority) == 1
 
 
-def _add_shared_active_dependency(factory, authority) -> tuple[UUID, UUID]:
+def _add_shared_active_dependency(
+    factory, authority, *, enqueue: bool = True
+) -> tuple[UUID, UUID | None]:
     """Create a second valid source that independently retains the same upstream rows."""
 
     source_id = uuid4()
@@ -257,6 +266,8 @@ def _add_shared_active_dependency(factory, authority) -> tuple[UUID, UUID]:
         source_attempt_version=attempt_version,
         source_publication_attempt_id=publication_attempt_id,
     )
+    if not enqueue:
+        return source_id, None
     result = _enqueue(factory, shared_authority, apply=True)
     assert result.adapter_id is not None
     return source_id, result.adapter_id
@@ -319,6 +330,93 @@ def test_replay_is_idempotent_and_does_not_duplicate_audit(
     assert _release_audit_count(factory, authority) == 1
 
 
+def test_already_released_requires_its_single_success_audit(
+    factory, authority, tmp_path: Path
+) -> None:
+    root = _storage(tmp_path)
+    versions = _complete_purge(factory, authority, root)
+    released = _release(factory, authority, root, apply=True, versions=versions)
+    assert released.applied
+    current = _versions(factory, authority)
+    with factory.begin() as session:
+        session.execute(
+            delete(PersistentAuditEvent).where(
+                PersistentAuditEvent.department_id == authority.department_id,
+                PersistentAuditEvent.action == "adapter.upstream_dependency.release",
+            )
+        )
+
+    with pytest.raises(ServiceError, match="release authority changed"):
+        _release(factory, authority, root, apply=True, versions=current)
+
+
+def test_historical_terminal_purge_rows_are_not_materialized_or_locked(
+    factory, engine, authority, tmp_path: Path
+) -> None:
+    """E-C probes active history and at most two successful candidates."""
+
+    root = _storage(tmp_path)
+    versions = _complete_purge(factory, authority, root)
+    with factory() as session:
+        completed = session.scalar(
+            select(AdapterPurgeOperation).where(
+                AdapterPurgeOperation.department_id == authority.department_id,
+                AdapterPurgeOperation.status == "completed",
+            )
+        )
+        adapter = session.get(Adapter, versions[0])
+        assert completed is not None and adapter is not None
+        historical = [
+            AdapterPurgeOperation(
+                id=uuid4(),
+                department_id=authority.department_id,
+                adapter_id=completed.adapter_id,
+                source_bundle_id=completed.source_bundle_id,
+                requested_by_user_id=completed.requested_by_user_id,
+                limit_value=completed.limit_value,
+                item_limit_value=completed.item_limit_value,
+                status="blocked",
+                expected_adapter_version=completed.expected_adapter_version,
+                expected_source_version=completed.expected_source_version,
+                expected_source_attempt_version=completed.expected_source_attempt_version,
+                expected_registry_attempt_version=completed.expected_registry_attempt_version,
+                source_authoritative_attempt_id=completed.source_authoritative_attempt_id,
+                source_publication_attempt_id=completed.source_publication_attempt_id,
+                source_attempt_number=completed.source_attempt_number,
+                registry_attempt_id=completed.registry_attempt_id,
+                registry_publication_attempt_id=completed.registry_publication_attempt_id,
+                registry_attempt_number=completed.registry_attempt_number,
+                authority_snapshot=completed.authority_snapshot,
+                eligible_item_count=2,
+                completed_item_count=0,
+                blocked_item_count=2,
+                completed_at=datetime.now(UTC),
+                version=1,
+            )
+            for _ in range(32)
+        ]
+        session.add_all(historical)
+        session.commit()
+
+    statements: list[str] = []
+
+    def capture(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        if "adapter_purge_operations" in statement:
+            statements.append(statement.upper())
+
+    event.listen(engine, "before_cursor_execute", capture)
+    try:
+        result = _release(factory, authority, root, apply=False, versions=versions)
+    finally:
+        event.remove(engine, "before_cursor_execute", capture)
+
+    assert not result.applied
+    operation_queries = [statement for statement in statements if "SELECT" in statement]
+    assert operation_queries
+    assert all("LIMIT" in statement for statement in operation_queries)
+    assert all("FOR UPDATE" not in statement for statement in operation_queries)
+
+
 def test_stale_second_apply_cannot_duplicate_transition(factory, authority, tmp_path: Path) -> None:
     root = _storage(tmp_path)
     versions = _complete_purge(factory, authority, root)
@@ -357,6 +455,163 @@ def test_concurrent_apply_has_one_transition_and_one_audit(
     assert len(applied) == 1
     assert len(conflicts) == 1
     assert _release_audit_count(factory, authority) == 1
+
+
+def test_release_vs_real_eb_registration_has_no_deadlock(
+    factory, authority, tmp_path: Path
+) -> None:
+    root = _storage(tmp_path)
+    versions = _complete_purge(factory, authority, root)
+    barrier = Barrier(2)
+
+    def release_once():
+        barrier.wait(timeout=10)
+        try:
+            return _release(factory, authority, root, apply=True, versions=versions)
+        except BaseException as error:  # assert the concrete outcome below
+            return error
+
+    def purge_once():
+        barrier.wait(timeout=10)
+        try:
+            return _purge(factory, authority, root, apply=True)
+        except BaseException as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        release_future = executor.submit(release_once)
+        purge_future = executor.submit(purge_once)
+        release_outcome, purge_outcome = release_future.result(), purge_future.result()
+    _assert_no_deadlock(release_outcome)
+    _assert_no_deadlock(purge_outcome)
+    assert not isinstance(release_outcome, BaseException)
+    assert not isinstance(purge_outcome, BaseException)
+    assert getattr(release_outcome, "applied", False)
+    assert getattr(purge_outcome, "eligible_count", 0) == 0
+    assert _release_audit_count(factory, authority) == 1
+
+
+def test_release_vs_real_eb_finalization_has_no_deadlock(
+    factory, authority, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _storage(tmp_path)
+    _prepare_authority(factory, authority, root)
+
+    # Drive the real E-B worker through both item deletions, then hold its
+    # durable operation immediately before finalization. The concurrent call
+    # below invokes the real E-B finalization transaction.
+    original_finalize = adapter_purge._finalize_operation
+    monkeypatch.setattr(adapter_purge, "_finalize_operation", lambda *_args, **_kwargs: None)
+    prepared = _purge(factory, authority, root, apply=True)
+    assert prepared.applied_count == 2
+    adapter_id, adapter_version, source_version, dependency_version = _versions(factory, authority)
+    with factory() as session:
+        operation = session.scalar(
+            select(AdapterPurgeOperation).where(
+                AdapterPurgeOperation.department_id == authority.department_id,
+                AdapterPurgeOperation.status == "deleting",
+            )
+        )
+        assert operation is not None
+        operation_id = operation.id
+
+    barrier = Barrier(2)
+
+    def finalize_once():
+        barrier.wait(timeout=10)
+        try:
+            return original_finalize(
+                factory,
+                data_dir=root,
+                operation_id=operation_id,
+                department_id=authority.department_id,
+                actor_issuer=authority.issuer,
+                actor_subject=authority.subject,
+            )
+        except BaseException as error:
+            return error
+
+    def release_once():
+        barrier.wait(timeout=10)
+        try:
+            return _release(
+                factory,
+                authority,
+                root,
+                apply=True,
+                versions=(adapter_id, adapter_version, source_version, dependency_version),
+            )
+        except BaseException as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        finalize_future = executor.submit(finalize_once)
+        release_future = executor.submit(release_once)
+        finalize_outcome, release_outcome = finalize_future.result(), release_future.result()
+    _assert_no_deadlock(finalize_outcome)
+    _assert_no_deadlock(release_outcome)
+    assert not isinstance(finalize_outcome, BaseException)
+    if isinstance(release_outcome, ServiceError):
+        assert release_outcome.status_code == 409
+    else:
+        assert getattr(release_outcome, "applied", False)
+    with factory() as session:
+        adapter = session.get(Adapter, adapter_id)
+        source = session.get(AdapterImportSource, authority.source_id)
+        assert adapter is not None and source is not None
+        assert adapter.status == "purged" and source.status == "purged"
+    if isinstance(release_outcome, ServiceError):
+        current = _versions(factory, authority)
+        assert _release(factory, authority, root, apply=True, versions=current).applied
+    assert _release_audit_count(factory, authority) == 1
+
+
+def test_release_vs_phase12c_enqueue_shared_upstream_has_no_deadlock(
+    factory, authority, tmp_path: Path
+) -> None:
+    root = _storage(tmp_path)
+    versions = _complete_purge(factory, authority, root)
+    shared_source_id, shared_adapter_id = _add_shared_active_dependency(
+        factory, authority, enqueue=False
+    )
+    assert shared_adapter_id is None
+    shared_authority = replace(authority, source_id=shared_source_id, source_version=2)
+    barrier = Barrier(2)
+
+    def release_once():
+        barrier.wait(timeout=10)
+        try:
+            return _release(factory, authority, root, apply=True, versions=versions)
+        except BaseException as error:
+            return error
+
+    def enqueue_once():
+        barrier.wait(timeout=10)
+        try:
+            return _enqueue(factory, shared_authority, apply=True)
+        except BaseException as error:
+            return error
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            release_future = executor.submit(release_once)
+            enqueue_future = executor.submit(enqueue_once)
+            release_outcome, enqueue_outcome = release_future.result(), enqueue_future.result()
+        _assert_no_deadlock(release_outcome)
+        _assert_no_deadlock(enqueue_outcome)
+        assert not isinstance(release_outcome, BaseException)
+        assert not isinstance(enqueue_outcome, BaseException)
+        assert getattr(release_outcome, "applied", False)
+        assert getattr(enqueue_outcome, "applied", False)
+        with factory() as session:
+            shared_adapter = session.get(Adapter, enqueue_outcome.adapter_id)
+            assert shared_adapter is not None and shared_adapter.status == "queued"
+            assert _has_active_adapter_dependency(
+                session, authority.department_id, authority.training_job_id
+            )
+        assert _release_audit_count(factory, authority) == 1
+    finally:
+        _prepare_shared_source_for_fixture_cleanup(factory, shared_source_id)
 
 
 @pytest.mark.parametrize("field", ("adapter", "source", "dependency"))

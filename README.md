@@ -58,7 +58,9 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > CLI output remain content-free. Purge never deletes Phase 10/11 artifacts,
 > history, backups, or audit rows, and it does not add runtime loading,
 > deployment, evaluation, or training behavior. Phase 12.2 through Phase 12.4
-> and runtime routing remain unstarted.
+> and runtime routing remain unstarted. E-C apply acquires the department
+> authorization fence before bounded operation, adapter, upstream, reservation,
+> item, and audit locks; dry-run performs the same proof without row locks.
 
 > **Phase 12.1E-B recovery:** After durable move authorization, initial rename
 > still requires an empty exact namespace, and unbound post-rename recovery
