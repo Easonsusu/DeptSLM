@@ -71,8 +71,8 @@ def _make_authority(factory: sessionmaker[Session]) -> tuple[Authority, Adapter,
     with factory() as session:
         authority = _seed_authority(session)
     registry = _enqueue(factory, authority, apply=True)
-    assert registry["adapter_id"] is not None
-    adapter_id = registry["adapter_id"]
+    assert registry.adapter_id is not None
+    adapter_id = registry.adapter_id
     suite_id = uuid4()
     now = datetime.now(UTC)
     with factory.begin() as session:
