@@ -20,8 +20,8 @@ from app.rag_domain import (
     SOURCE_LABEL,
     build_generation_messages,
     normalize_question,
-    validate_safe_text,
     validate_generation_response,
+    validate_safe_text,
 )
 from deptslm_adapter_runtime.loader import (
     AdapterRuntimeError,
