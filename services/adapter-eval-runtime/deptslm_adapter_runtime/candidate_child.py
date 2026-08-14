@@ -213,9 +213,7 @@ def main() -> int:
         return 2
     provider = os.getenv("DEPTSLM_ADAPTER_EVAL_PROVIDER", "")
     environment = os.getenv("ENVIRONMENT", "")
-    if provider not in {"real", "fake"} or (
-        provider == "fake" and environment != "test"
-    ):
+    if provider not in {"real", "fake"} or (provider == "fake" and environment != "test"):
         return 2
     if os.getenv("DEPTSLM_ADAPTER_EVAL_BASE_REVISION") != BASE_MODEL_REVISION:
         return 2
