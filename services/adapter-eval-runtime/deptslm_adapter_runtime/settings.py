@@ -48,19 +48,11 @@ class AdapterRuntimeSettings:
         if environment not in {"test", "development", "staging", "production"}:
             raise AdapterRuntimeConfigurationError("ENVIRONMENT must be explicit.")
         provider = os.getenv("DEPTSLM_ADAPTER_EVAL_PROVIDER", "real").strip().lower()
-        if provider not in {"real", "fake"} or (
-            provider == "fake" and environment != "test"
-        ):
+        if provider not in {"real", "fake"} or (provider == "fake" and environment != "test"):
             raise AdapterRuntimeConfigurationError("Fake adapter runtime is test-only.")
         token = os.getenv("DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN", "")
-        if (
-            len(token) < 32
-            or token != token.strip()
-            or any(char.isspace() for char in token)
-        ):
-            raise AdapterRuntimeConfigurationError(
-                "Private adapter runtime token is unsafe."
-            )
+        if len(token) < 32 or token != token.strip() or any(char.isspace() for char in token):
+            raise AdapterRuntimeConfigurationError("Private adapter runtime token is unsafe.")
         root = Path(os.getenv("DEPTSLM_DATA_DIR", "")).expanduser()
         if not root.is_absolute() or root.is_symlink() or not root.is_dir():
             raise AdapterRuntimeConfigurationError(
@@ -68,9 +60,7 @@ class AdapterRuntimeSettings:
             )
         repository_root = Path(__file__).resolve().parents[3]
         resolved_root = root.resolve()
-        if resolved_root == repository_root or resolved_root.is_relative_to(
-            repository_root
-        ):
+        if resolved_root == repository_root or resolved_root.is_relative_to(repository_root):
             raise AdapterRuntimeConfigurationError(
                 "DEPTSLM_DATA_DIR must be outside the repository."
             )
@@ -99,9 +89,7 @@ class AdapterRuntimeSettings:
             "ALL_PROXY",
         )
         if any(os.getenv(name) for name in forbidden):
-            raise AdapterRuntimeConfigurationError(
-                "Forbidden runtime configuration is present."
-            )
+            raise AdapterRuntimeConfigurationError("Forbidden runtime configuration is present.")
         return cls(
             resolved_root,
             model_cache.resolve(),
@@ -129,7 +117,5 @@ class AdapterRuntimeSettings:
             "LC_ALL": "C.UTF-8",
         }
         if not set(values) <= CHILD_ENVIRONMENT_NAMES:
-            raise AdapterRuntimeConfigurationError(
-                "Child environment is outside the allowlist."
-            )
+            raise AdapterRuntimeConfigurationError("Child environment is outside the allowlist.")
         return values

@@ -178,9 +178,7 @@ def process_adapter_evaluation_run(
                 scores.append(score)
                 row = _score_value(score)
                 row["target"] = target
-                row["retrieval_candidate_count"] = (
-                    outcome.retrieval_trace.candidate_count
-                )
+                row["retrieval_candidate_count"] = outcome.retrieval_trace.candidate_count
                 case_rows.append(row)
             renew_lease(factory, job, settings.evaluation.lease_seconds)
         baseline_metrics = aggregate_metrics(baseline_scores)
@@ -346,9 +344,7 @@ def process_adapter_evaluation_run(
                 pass
 
 
-def external_suite_cases(
-    data_dir, scope, suite_id, manifest_sha256, cases_sha256, cases_byte_size
-):
+def external_suite_cases(data_dir, scope, suite_id, manifest_sha256, cases_sha256, cases_byte_size):
     from app.evaluation_artifacts import EvaluationArtifactStore
 
     store = EvaluationArtifactStore(data_dir)
@@ -442,9 +438,7 @@ def _case_contract(case):
     if any(not isinstance(value, str) for value in accepted_values):
         raise AdapterEvaluationQueueError("suite_authority_changed")
     accepted = tuple(accepted_values)
-    if expected == "answered" and not (
-        1 <= len(relevant) <= 8 and 1 <= len(accepted) <= 8
-    ):
+    if expected == "answered" and not (1 <= len(relevant) <= 8 and 1 <= len(accepted) <= 8):
         raise AdapterEvaluationQueueError("suite_authority_changed")
     if expected == "insufficient_information" and (relevant or accepted):
         raise AdapterEvaluationQueueError("suite_authority_changed")
@@ -453,9 +447,7 @@ def _case_contract(case):
 
 def _cleanup_attempt_stage(store, job: ClaimedAdapterEvaluation) -> None:
     try:
-        store.cleanup_stage(
-            DepartmentScope(job.department_id), job.id, job.publication_attempt_id
-        )
+        store.cleanup_stage(DepartmentScope(job.department_id), job.id, job.publication_attempt_id)
     except Exception:
         pass
     try:

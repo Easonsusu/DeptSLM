@@ -133,8 +133,7 @@ def verify_and_copy_adapter(
                 or manifest.get("department_id") != str(department_id)
                 or manifest.get("adapter_id") != str(adapter_id)
                 or manifest.get("attempt_number") != registry_attempt_number
-                or manifest.get("publication_attempt_id")
-                != str(registry_publication_attempt_id)
+                or manifest.get("publication_attempt_id") != str(registry_publication_attempt_id)
             ):
                 raise AdapterRuntimeError("adapter_authority_changed")
             manifest_files = manifest.get("files")

@@ -76,9 +76,7 @@ def _authorize(request: Request) -> None:
     if not hmac.compare_digest(
         request.headers.get("authorization", "").encode(), expected.encode()
     ):
-        raise HTTPException(
-            401, "Authentication required", headers={"WWW-Authenticate": "Bearer"}
-        )
+        raise HTTPException(401, "Authentication required", headers={"WWW-Authenticate": "Bearer"})
 
 
 async def _body(request: Request) -> object:
@@ -199,10 +197,7 @@ def _validate_request(value: object) -> None:
                 validate_safe_text(text, field="evidence", max_chars=1200)
                 labels.append(label)
                 total += len(text)
-            if (
-                labels != [f"S{index}" for index in range(1, len(labels) + 1)]
-                or total > 6000
-            ):
+            if labels != [f"S{index}" for index in range(1, len(labels) + 1)] or total > 6000:
                 raise ValueError
             if (
                 isinstance(value["seed"], bool)

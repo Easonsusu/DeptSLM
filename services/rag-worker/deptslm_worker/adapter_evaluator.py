@@ -61,9 +61,7 @@ def main() -> int:
                 STOP.wait(settings.evaluation.poll_seconds)
                 continue
             if job is not None:
-                process_adapter_evaluation_run(
-                    factory, settings, store, job, STOP.is_set
-                )
+                process_adapter_evaluation_run(factory, settings, store, job, STOP.is_set)
             if args.once:
                 return 0
             STOP.wait(settings.evaluation.poll_seconds)

@@ -23,15 +23,11 @@ class AdapterEvaluationSettings:
         url = os.getenv("DEPTSLM_ADAPTER_EVAL_RUNTIME_URL", "").strip()
         token = os.getenv("DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN", "")
         if not url.startswith("http://") or not url.rstrip("/"):
-            raise EvaluationConfigurationError(
-                "Adapter evaluation runtime URL is required."
-            )
+            raise EvaluationConfigurationError("Adapter evaluation runtime URL is required.")
         if (
             len(token) < 32
             or token != token.strip()
             or any(character.isspace() for character in token)
         ):
-            raise EvaluationConfigurationError(
-                "Adapter evaluation runtime token is unsafe."
-            )
+            raise EvaluationConfigurationError("Adapter evaluation runtime token is unsafe.")
         return cls(evaluation, url.rstrip("/"), token)

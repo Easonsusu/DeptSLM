@@ -41,11 +41,7 @@ class AdapterRuntimeSupervisor:
 
     @property
     def ready(self) -> bool:
-        return (
-            not self._closed
-            and self._process is not None
-            and self._process.returncode is None
-        )
+        return not self._closed and self._process is not None and self._process.returncode is None
 
     async def start(self) -> None:
         async with self._lifecycle:
@@ -82,9 +78,7 @@ class AdapterRuntimeSupervisor:
                 raise
             except TimeoutError as error:
                 await self._retire()
-                raise AdapterRuntimeSupervisorError(
-                    "candidate_runtime_timeout"
-                ) from error
+                raise AdapterRuntimeSupervisorError("candidate_runtime_timeout") from error
             except Exception as error:
                 await self._retire()
                 if isinstance(error, AdapterRuntimeSupervisorError):
@@ -157,9 +151,7 @@ class AdapterRuntimeSupervisor:
 
 def _encode_frame(value: dict[str, Any]) -> bytes:
     try:
-        payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     except (TypeError, UnicodeEncodeError) as error:
         raise AdapterRuntimeSupervisorError("invalid_request") from error
     if not payload or len(payload) > MAX_CHILD_FRAME_BYTES:
