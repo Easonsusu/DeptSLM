@@ -93,8 +93,11 @@ class CandidateSession:
         question = _question(payload.get("question"))
         evidence = _evidence(payload.get("evidence"))
         seed = payload.get("seed")
-        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 1 << 63):
-            raise CandidateChildError("invalid_request")
+        if seed is not None:
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise CandidateChildError("invalid_request")
+            if not 0 <= seed < 1 << 63:
+                raise CandidateChildError("invalid_request")
         if self.provider == "fake":
             labels = [item["source_id"] for item in evidence]
             if not labels:
@@ -266,7 +269,17 @@ def _target(payload: dict[str, Any], *, generation: bool) -> dict[str, Any]:
         or payload.get("target") != "candidate"
     ):
         raise CandidateChildError("invalid_request")
-    if generation and (not {"question", "evidence", "prompt_version", "answer_contract_version"} <= set(payload) or payload["prompt_version"] != PROMPT_VERSION or payload["answer_contract_version"] != ANSWER_CONTRACT_VERSION):
+    required_generation_fields = {
+        "question",
+        "evidence",
+        "prompt_version",
+        "answer_contract_version",
+    }
+    if generation and (
+        not required_generation_fields <= set(payload)
+        or payload["prompt_version"] != PROMPT_VERSION
+        or payload["answer_contract_version"] != ANSWER_CONTRACT_VERSION
+    ):
         raise CandidateChildError("invalid_request")
     result: dict[str, Any] = {}
     for name in _TARGET_FIELDS:
