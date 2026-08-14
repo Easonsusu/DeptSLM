@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 from collections.abc import Callable
@@ -114,6 +116,8 @@ class EphemeralRagOutcome:
     authorized_count: int
     authorized_candidate_ids: tuple[UUID, ...]
     supplied: tuple[LoadedEvidence, ...]
+    answer_contract_valid: bool = True
+    error_code: str | None = None
 
     @property
     def cited_chunk_ids(self) -> tuple[UUID, ...]:
@@ -128,6 +132,179 @@ class EphemeralRagOutcome:
             self.authorized_candidate_ids,
             tuple(item.hit.chunk_id for item in self.supplied),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedRagPolicyContext:
+    """One transient production retrieval/prompt context shared by paired lanes."""
+
+    question: str
+    selected: tuple[AuthorizedVectorHit, ...]
+    loaded: tuple[LoadedEvidence, ...]
+    trace: SafeRetrievalTrace
+    prompt_identity: str
+
+
+def prepare_rag_policy_context(
+    factory: sessionmaker[Session],
+    settings: RagSettings,
+    data_dir: Path,
+    scope: DepartmentScope,
+    question: str,
+    runtime: RagRuntimeClient,
+    qdrant: DepartmentQdrant,
+    *,
+    stage_callback: Callable[[str], None] | None = None,
+) -> PreparedRagPolicyContext:
+    """Run production retrieval once and retain only transient paired inputs."""
+
+    _report_stage(stage_callback, "query_embedding")
+    query = runtime.query_embedding(question)
+    try:
+        query_vector = validate_vector(query)
+    except EmbeddingError as error:
+        raise RagContractError("invalid_query_embedding") from error
+    _report_stage(stage_callback, "retrieval")
+    qdrant.verify_collection()
+    search = search_authorized_result(
+        factory,
+        qdrant,
+        scope,
+        query_vector,
+        limit=settings.candidate_limit,
+    )
+    candidate_ids = tuple(hit.chunk_id for hit in search.hits)
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise RagContractError("retrieval_authority_failed")
+    selected = _select_hits(search.hits, settings)
+    if not selected:
+        loaded: tuple[LoadedEvidence, ...] = ()
+    else:
+        _report_stage(stage_callback, "artifact_loading")
+        loaded = load_selected_chunks(
+            data_dir,
+            scope,
+            selected,
+            max_evidence_chars=settings.max_evidence_chars,
+        )
+    trace = SafeRetrievalTrace(
+        search.candidate_count,
+        len(search.hits),
+        candidate_ids,
+        tuple(item.hit.chunk_id for item in loaded),
+    )
+    prompt_identity = hashlib.sha256(
+        json.dumps(
+            {
+                "question": question,
+                "sources": [
+                    {
+                        "label": item.source.label,
+                        "chunk_id": str(item.hit.chunk_id),
+                        "text": item.source.text,
+                    }
+                    for item in loaded
+                ],
+                "prompt_version": PROMPT_VERSION,
+                "answer_contract_version": ANSWER_CONTRACT_VERSION,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return PreparedRagPolicyContext(question, selected, loaded, trace, prompt_identity)
+
+
+def execute_rag_policy_lane(
+    context: PreparedRagPolicyContext,
+    data_dir: Path,
+    scope: DepartmentScope,
+    runtime: RagRuntimeClient,
+    settings: RagSettings,
+    *,
+    seed: int | None,
+    retain_contract_failure: bool = False,
+    stage_callback: Callable[[str], None] | None = None,
+) -> EphemeralRagOutcome:
+    """Generate and validate one lane against an already-prepared trace."""
+
+    if not context.loaded:
+        return EphemeralRagOutcome(
+            "insufficient_information",
+            INSUFFICIENT_INFORMATION_MESSAGE,
+            (),
+            context.trace.candidate_count,
+            context.trace.authorized_count,
+            context.trace.authorized_candidate_ids,
+            (),
+        )
+    _report_stage(stage_callback, "generation")
+    try:
+        if seed is None:
+            runtime_value = runtime.generate(
+                context.question,
+                tuple(item.source for item in context.loaded),
+            )
+        else:
+            runtime_value = runtime.generate(
+                context.question,
+                tuple(item.source for item in context.loaded),
+                seed=seed,
+            )
+        generation = validate_generation_response(
+            runtime_value,
+            tuple(item.source.label for item in context.loaded),
+        )
+    except RagContractError as error:
+        if error.code in {"invalid_generation_response", "invalid_citation"}:
+            if retain_contract_failure:
+                trace = (
+                    error.trace if isinstance(error, RagPolicyEvaluationError) else context.trace
+                )
+                return EphemeralRagOutcome(
+                    "failed",
+                    "",
+                    (),
+                    trace.candidate_count,
+                    trace.authorized_count,
+                    trace.authorized_candidate_ids,
+                    context.loaded,
+                    False,
+                    error.code,
+                )
+            raise RagPolicyEvaluationError(error.code, context.trace) from error
+        raise
+    _report_stage(stage_callback, "artifact_loading")
+    reloaded = load_selected_chunks(
+        data_dir,
+        scope,
+        context.selected,
+        max_evidence_chars=settings.max_evidence_chars,
+    )
+    if tuple((item.hit.chunk_id, item.source.label, item.source.text) for item in reloaded) != (
+        tuple((item.hit.chunk_id, item.source.label, item.source.text) for item in context.loaded)
+    ):
+        raise RagContractError("source_changed")
+    if generation.status == "insufficient_information":
+        return EphemeralRagOutcome(
+            generation.status,
+            INSUFFICIENT_INFORMATION_MESSAGE,
+            (),
+            context.trace.candidate_count,
+            context.trace.authorized_count,
+            context.trace.authorized_candidate_ids,
+            reloaded,
+        )
+    return EphemeralRagOutcome(
+        generation.status,
+        generation.answer,
+        generation.citations,
+        context.trace.candidate_count,
+        context.trace.authorized_count,
+        context.trace.authorized_candidate_ids,
+        reloaded,
+    )
 
 
 def answer_question(
@@ -274,93 +451,24 @@ def execute_rag_policy(
     stage_callback: Callable[[str], None] | None = None,
 ) -> EphemeralRagOutcome:
     """Execute the exact production retrieval, selection, artifact, and answer policy."""
-
-    _report_stage(stage_callback, "query_embedding")
-    query = runtime.query_embedding(question)
-    try:
-        query_vector = validate_vector(query)
-    except EmbeddingError as error:
-        raise RagContractError("invalid_query_embedding") from error
-    _report_stage(stage_callback, "retrieval")
-    qdrant.verify_collection()
-    search = search_authorized_result(
+    context = prepare_rag_policy_context(
         factory,
+        settings,
+        data_dir,
+        scope,
+        question,
+        runtime,
         qdrant,
-        scope,
-        query_vector,
-        limit=settings.candidate_limit,
+        stage_callback=stage_callback,
     )
-    candidate_ids = tuple(hit.chunk_id for hit in search.hits)
-    if len(candidate_ids) != len(set(candidate_ids)):
-        raise RagContractError("retrieval_authority_failed")
-    selected = _select_hits(search.hits, settings)
-    if not selected:
-        return EphemeralRagOutcome(
-            "insufficient_information",
-            INSUFFICIENT_INFORMATION_MESSAGE,
-            (),
-            search.candidate_count,
-            len(search.hits),
-            candidate_ids,
-            (),
-        )
-    _report_stage(stage_callback, "artifact_loading")
-    loaded = load_selected_chunks(
+    return execute_rag_policy_lane(
+        context,
         data_dir,
         scope,
-        selected,
-        max_evidence_chars=settings.max_evidence_chars,
-    )
-    _report_stage(stage_callback, "generation")
-    trace = SafeRetrievalTrace(
-        search.candidate_count,
-        len(search.hits),
-        candidate_ids,
-        tuple(item.hit.chunk_id for item in loaded),
-    )
-    try:
-        runtime_value = (
-            runtime.generate(question, tuple(item.source for item in loaded))
-            if seed is None
-            else runtime.generate(question, tuple(item.source for item in loaded), seed=seed)
-        )
-        generation = validate_generation_response(
-            runtime_value,
-            tuple(item.source.label for item in loaded),
-        )
-    except RagContractError as error:
-        if error.code in {"invalid_generation_response", "invalid_citation"}:
-            raise RagPolicyEvaluationError(error.code, trace) from error
-        raise
-    _report_stage(stage_callback, "artifact_loading")
-    reloaded = load_selected_chunks(
-        data_dir,
-        scope,
-        selected,
-        max_evidence_chars=settings.max_evidence_chars,
-    )
-    if tuple((item.hit.chunk_id, item.source.label, item.source.text) for item in reloaded) != (
-        tuple((item.hit.chunk_id, item.source.label, item.source.text) for item in loaded)
-    ):
-        raise RagContractError("source_changed")
-    if generation.status == "insufficient_information":
-        return EphemeralRagOutcome(
-            generation.status,
-            INSUFFICIENT_INFORMATION_MESSAGE,
-            (),
-            search.candidate_count,
-            len(search.hits),
-            candidate_ids,
-            reloaded,
-        )
-    return EphemeralRagOutcome(
-        generation.status,
-        generation.answer,
-        generation.citations,
-        search.candidate_count,
-        len(search.hits),
-        candidate_ids,
-        reloaded,
+        runtime,
+        settings,
+        seed=seed,
+        stage_callback=stage_callback,
     )
 
 

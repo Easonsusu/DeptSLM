@@ -48,4 +48,14 @@ USER deptslm
 ENTRYPOINT ["sh", "/app/entrypoint.sh"]
 CMD ["python", "-m", "deptslm_worker.evaluator", "--poll"]
 
+FROM worker-source AS adapter-evaluator
+ENV DEPTSLM_STORAGE_READ_ONLY=1
+RUN pip install --no-cache-dir --disable-pip-version-check "/build/api[rag]" \
+    && pip install --no-cache-dir --disable-pip-version-check --no-deps /build/worker \
+    && rm -rf /build
+
+USER deptslm
+ENTRYPOINT ["sh", "/app/entrypoint.sh"]
+CMD ["python", "-m", "deptslm_worker.adapter_evaluator", "--poll"]
+
 FROM extraction AS final

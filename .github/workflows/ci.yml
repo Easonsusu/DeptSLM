@@ -138,8 +138,8 @@ jobs:
       - name: Lint API
         working-directory: apps/api
         run: |
-          python -m ruff check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime
-          python -m ruff format --check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime
+          python -m ruff check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime ../../services/adapter-eval-runtime/deptslm_adapter_runtime
+          python -m ruff format --check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime ../../services/adapter-eval-runtime/deptslm_adapter_runtime
       - name: Run API tests with temporary storage
         working-directory: apps/api
         run: |
@@ -158,7 +158,7 @@ jobs:
             sleep 1
           done
           python -m alembic upgrade head
-          test "$(python -m alembic current | awk '{print $1}')" = "0014_phase12_adapter_purge"
+          test "$(python -m alembic current | awk '{print $1}')" = "0015_phase12_adapter_evaluation"
           python -m pytest
       - name: Run one-shot worker smoke test
         working-directory: apps/api
@@ -195,6 +195,23 @@ jobs:
           export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-evaluator-smoke"
           mkdir -p "$DEPTSLM_DATA_DIR/extracted_text" "$DEPTSLM_DATA_DIR/eval_results"
           python -m deptslm_worker.evaluator --once
+      - name: Run one-shot adapter-evaluation worker smoke test
+        working-directory: apps/api
+        env:
+          ENVIRONMENT: test
+          DEPTSLM_QDRANT_URL: http://localhost:6333
+          DEPTSLM_QDRANT_API_KEY: phase6-ci-qdrant-key-0123456789
+          DEPTSLM_QDRANT_COLLECTION: deptslm_chunks_qwen3_0_6b_1024_v1
+          DEPTSLM_RAG_RUNTIME_URL: http://localhost:8010
+          DEPTSLM_RAG_RUNTIME_TOKEN: phase9-ci-runtime-token-0123456789-abcdef
+          DEPTSLM_ADAPTER_EVAL_RUNTIME_URL: http://localhost:8011
+          DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN: phase12-ci-adapter-runtime-token-0123456789
+          DEPTSLM_EVALUATION_WORKER_ID: 00000000-0000-0000-0000-000000000013
+          DEPTSLM_EVALUATION_CODE_REVISION: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        run: |
+          export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-adapter-evaluator-smoke"
+          mkdir -p "$DEPTSLM_DATA_DIR/extracted_text" "$DEPTSLM_DATA_DIR/eval_results"
+          python -m deptslm_worker.adapter_evaluator --once
       - name: Run one-shot SFT dataset builder smoke test
         working-directory: apps/api
         env:
@@ -259,6 +276,8 @@ jobs:
           test -x services/training-job-worker/entrypoint.sh
           test -x services/adapter-registry-worker/entrypoint.sh
           test -x services/adapter-maintenance/entrypoint.sh
+          test -s services/adapter-eval-runtime/Dockerfile
+          test -s services/adapter-eval-runtime/pyproject.toml
       - name: Build and inspect API migration image
         run: |
           docker build --tag deptslm-api-ci --file apps/api/Dockerfile .
@@ -284,6 +303,7 @@ jobs:
           assert pathlib.Path("/app/alembic/versions/0012_phase12_adapter_reconciliation.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0013_phase12_adapter_reconciliation_cursor.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0014_phase12_adapter_purge.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0015_phase12_adapter_evaluation.py").is_file()
           import app.evaluation_admin
           import app.evaluation_services
           import app.sft_services
@@ -411,6 +431,33 @@ jobs:
             printf 'Forbidden model-weight-like files in evaluator image:\n%s\n' "$weight_matches" >&2
             exit 1
           fi
+      - name: Build and inspect adapter evaluator worker image
+        run: |
+          docker build --target adapter-evaluator --tag deptslm-adapter-evaluator-worker-ci --file services/rag-worker/Dockerfile .
+          docker run --rm --entrypoint python deptslm-adapter-evaluator-worker-ci -I -c '
+          import importlib.util
+          import deptslm_worker.adapter_evaluator
+          import deptslm_worker.adapter_evaluation_pipeline
+          import app.adapter_evaluation_queue
+          import qdrant_client
+          assert importlib.util.find_spec("torch") is None
+          assert importlib.util.find_spec("transformers") is None
+          assert importlib.util.find_spec("peft") is None
+          assert importlib.util.find_spec("huggingface_hub") is None
+          '
+      - name: Build and inspect adapter evaluation runtime image
+        run: |
+          docker build --tag deptslm-adapter-eval-runtime-ci --file services/adapter-eval-runtime/Dockerfile .
+          docker run --rm --entrypoint python deptslm-adapter-eval-runtime-ci -I -c '
+          import peft, safetensors, transformers
+          import deptslm_adapter_runtime.main
+          import deptslm_adapter_runtime.loader
+          assert peft.__version__ == "0.18.1"
+          assert transformers.__version__ == "4.55.0"
+          assert safetensors.__version__ == "0.7.0"
+          '
+          if docker image inspect deptslm-adapter-eval-runtime-ci --format '{{json .Config.ExposedPorts}}' | grep -F '8011/tcp' >/dev/null; then :; else exit 1; fi
+          if docker image inspect deptslm-adapter-eval-runtime-ci --format '{{json .Config.Env}}' | grep -E 'DATABASE_URL|DEPTSLM_QDRANT|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|HTTP_PROXY|HTTPS_PROXY' >/dev/null; then exit 1; fi
       - name: Build and inspect internal RAG runtime image
         run: |
           docker build --tag deptslm-rag-runtime-ci --file services/rag-runtime/Dockerfile .
@@ -542,7 +589,9 @@ jobs:
       - name: Check Phase 12.1C adapter registry isolation
         run: |
           ! grep -R -E '^(from|import) (torch|transformers|sentence_transformers|huggingface_hub|qdrant|app\.evaluation|app\.rag_feedback)' apps/api/app/adapter_registry_*.py
-          ! grep -n -A6 -E '@router\.(post|put|patch|delete)' apps/api/app/routes.py | grep -E '/departments/\{department_id\}/adapters'
+          if grep -n -A6 -E '@router\.(post|put|patch|delete)' apps/api/app/routes.py | grep -E '/departments/\{department_id\}/adapters' | grep -v '/evaluations'; then
+            exit 1
+          fi
           registry_compose="$(sed -n '/^  adapter-registry-worker:/,/^  [a-z][a-z-]*:/p' docker-compose.yml)"
           grep -F '/adapters/imports' <<<"$registry_compose" >/dev/null
           grep -F '/training_datasets' <<<"$registry_compose" >/dev/null
@@ -557,7 +606,9 @@ jobs:
           ! grep -E '^(from|import) (adapter_registry_artifacts|adapter_source_artifacts|torch|transformers|sentence_transformers|huggingface_hub|qdrant|safetensors|peft|llamafactory)' apps/api/app/adapter_registry_read_services.py
           api_compose="$(sed -n '/^  api:/,/^  postgres:/p' docker-compose.yml)"
           ! grep -E '/adapters|adapters/' <<<"$api_compose"
-          ! grep -E '@router\.(post|put|patch|delete)' apps/api/app/routes.py | grep -E '/departments/\{department_id\}/adapters'
+          if grep -n -A6 -E '@router\.(post|put|patch|delete)' apps/api/app/routes.py | grep -E '/departments/\{department_id\}/adapters' | grep -v '/evaluations'; then
+            exit 1
+          fi
           grep -F 'AdapterMetadataListResponse' apps/api/app/routes.py >/dev/null
           grep -F 'AdapterMetadataResponse' apps/api/app/routes.py >/dev/null
       - name: Check Phase 12.1E-A maintenance isolation
@@ -593,6 +644,22 @@ jobs:
           grep -F 'profiles: ["maintenance"]' <<<"$release_compose" >/dev/null
           grep -F '/adapters' <<<"$release_compose" >/dev/null
           if grep -E 'qdrant|rag-internal|model_cache|training_datasets|uploads|extracted_text|eval_results|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|PROXY' <<<"$release_compose"; then exit 1; fi
+      - name: Check Phase 12.2 adapter evaluation isolation and paired policy
+        run: |
+          grep -F 'execute_paired_rag_case' apps/api/app/adapter_evaluation_policy.py services/rag-worker/deptslm_worker/adapter_evaluation_pipeline.py >/dev/null
+          grep -F 'prepare_rag_policy_context' apps/api/app/adapter_evaluation_policy.py >/dev/null
+          ! grep -E '@router\.(get|post|put|patch|delete).*adapter.*(approve|promote|rollback)' apps/api/app/routes.py
+          ! grep -E 'adapter_selector|deployment_pointer|production_adapter' apps/api/app/routes.py apps/api/app/schemas.py
+          ! grep -E 'Mapped\[.*(question|accepted_answer|generated_answer|prompt|evidence_text|chunk_text|vector|adapter_bytes|path)' apps/api/app/models.py
+          adapter_eval_compose="$(sed -n '/^  adapter-evaluator:/,/^  adapter-eval-runtime:/p' docker-compose.yml)"
+          grep -F '/extracted_text' <<<"$adapter_eval_compose" >/dev/null
+          grep -F '/eval_results' <<<"$adapter_eval_compose" >/dev/null
+          ! grep -E 'model_cache|adapters|training_datasets|uploads|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|DEPTSLM_AUTH_SECRET' <<<"$adapter_eval_compose"
+          candidate_compose="$(sed -n '/^  adapter-eval-runtime:/,/^  vector-admin:/p' docker-compose.yml)"
+          grep -F '/model_cache' <<<"$candidate_compose" >/dev/null
+          grep -F '/adapters/registry' <<<"$candidate_compose" >/dev/null
+          ! grep -E 'DATABASE_URL|QDRANT|eval_results|training_datasets|uploads|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|DEPTSLM_AUTH_SECRET' <<<"$candidate_compose"
+          grep -F 'phase12-adapter-evaluation-v1' apps/api/app/adapter_evaluation_domain.py >/dev/null
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then

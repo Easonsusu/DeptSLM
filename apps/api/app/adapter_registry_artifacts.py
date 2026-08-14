@@ -219,6 +219,17 @@ class AdapterRegistryArtifactStore:
             read_only=True,
         )
 
+    def open_registry_final(self, department: DepartmentScope, adapter_id: UUID) -> RetainedFinal:
+        """Open the exact immutable registry final for a private consumer."""
+
+        return self._open_final(
+            self._registry_fd,
+            department,
+            adapter_id,
+            frozenset({"manifest.json", "adapter_config.json", "adapter_model.safetensors"}),
+            read_only=True,
+        )
+
     def open_training_job_final(
         self, department: DepartmentScope, training_job_id: UUID
     ) -> RetainedFinal:

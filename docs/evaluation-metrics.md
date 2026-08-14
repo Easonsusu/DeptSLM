@@ -1,5 +1,9 @@
 # Evaluation metrics
 
+Phase 12.2 uses these same deterministic metrics for both baseline and
+candidate lanes. Candidate-minus-baseline deltas are Decimal evidence only;
+they do not create a relative improvement threshold or change production.
+
 Phase 9 uses `phase9-deterministic-metrics-v1`; it has no LLM judge, semantic grader, external API, BLEU, ROUGE, BERTScore, or embedding-similarity score.
 
 For answered cases, exact authorized top-20 chunk UUIDs produce macro-averaged recall@5, recall@10, recall@20, and reciprocal rank@20. Duplicate candidates invalidate the case. Foreign or PostgreSQL-unauthorized candidates are excluded by the production retrieval authority.

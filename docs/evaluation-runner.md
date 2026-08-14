@@ -1,5 +1,9 @@
 # Evaluation runner
 
+Phase 9 is complete. Phase 12.2 reuses this runner's exact production policy
+for paired baseline/candidate adapter evaluation; it does not add an
+evaluator-only retrieval, prompt, citation, or gate implementation.
+
 The dedicated evaluator claims one department-scoped run at a time:
 
 ```bash

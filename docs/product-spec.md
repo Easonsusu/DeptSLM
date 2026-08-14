@@ -2,7 +2,7 @@
 
 ## Document status
 
-This document describes the product direction and separates completed Phase 0–11 boundaries from the planned scope. Phase 12.0 is completed and Phase 12.1 is under review; Phase 12.1A, Phase 12.1B, and Phase 12.1C are completed, while Phase 12.1D adds only department-scoped, metadata-only PostgreSQL registry list/detail reads. Evaluation, promotion, runtime loading, and Phases 12.1E through 12.4 remain unimplemented. Unless a capability is explicitly labeled as completed, it is not implemented.
+This document describes the product direction and separates completed Phase 0–11 boundaries from the planned scope. Phase 12.0 through Phase 12.1E-C are completed, and Phase 12.2 is the current reviewed, metadata-only adapter-target evaluation boundary. It compares one exact validated adapter with the exact Phase 7 baseline and does not approve, promote, load, or route an adapter. Phase 12.3 and 12.4 remain unimplemented. Unless a capability is explicitly labeled as completed, it is not implemented.
 
 ## Product summary
 
