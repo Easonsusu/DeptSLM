@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import multiprocessing
+import os
+import signal
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.adapter_evaluation_artifacts import AdapterEvaluationArtifactStore
+from app.adapter_evaluation_artifacts import (
+    AdapterEvaluationArtifactStore,
+    AdapterEvaluationPublishedArtifact,
+    AdapterEvaluationStagedArtifact,
+)
 from app.adapter_evaluation_domain import compute_metric_deltas
 from app.adapter_evaluation_policy import (
     AdapterEvaluationLaneError,
@@ -24,6 +33,7 @@ from app.adapter_evaluation_queue import (
     require_live_claim,
 )
 from app.authorization import DepartmentScope
+from app.database import create_database_engine, create_session_factory
 from app.evaluation_artifacts import _score_value
 from app.evaluation_domain import (
     EvaluationContractError,
@@ -31,13 +41,63 @@ from app.evaluation_domain import (
     evaluate_gates,
     score_case,
 )
-from app.evaluation_suites import capture_canonical_suite_authority
+from app.evaluation_suites import (
+    GroundTruthAuthoritySnapshot,
+    capture_canonical_suite_authority,
+)
 from app.models import AdapterEvaluationRun, EvaluationSuite
+from app.rag_answer_services import SafeRetrievalTrace
 from app.rag_domain import RagContractError
 from app.rag_runtime_client import RagRuntimeClient
 from deptslm_worker.adapter_evaluation_runtime import AdapterEvaluationRuntimeClient
 from deptslm_worker.adapter_evaluation_settings import AdapterEvaluationSettings
-from deptslm_worker.qdrant_adapter import DepartmentQdrant
+from deptslm_worker.qdrant_adapter import DepartmentQdrant, QdrantBoundaryError
+
+
+class _WorkerStopped(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _LaneResult:
+    """Content-free case result sent from a supervised child."""
+
+    status: str
+    answer: str
+    candidate_count: int
+    authorized_count: int
+    authorized_candidate_ids: tuple[UUID, ...]
+    cited_chunk_ids: tuple[UUID, ...]
+    answer_contract_valid: bool
+    error_code: str | None
+
+    @property
+    def retrieval_trace(self) -> SafeRetrievalTrace:
+        return SafeRetrievalTrace(
+            self.candidate_count,
+            self.authorized_count,
+            self.authorized_candidate_ids,
+            (),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _PairedCaseResult:
+    baseline: _LaneResult
+    candidate: _LaneResult
+
+
+def _lane_result(value) -> _LaneResult:
+    return _LaneResult(
+        value.status,
+        value.answer,
+        value.candidate_count,
+        value.authorized_count,
+        value.authorized_candidate_ids,
+        value.cited_chunk_ids,
+        value.answer_contract_valid,
+        value.error_code,
+    )
 
 
 def process_adapter_evaluation_run(
@@ -50,7 +110,6 @@ def process_adapter_evaluation_run(
     """Process one exact pair; all answers/evidence remain transient."""
 
     base = settings.evaluation
-    qdrant = None
     try:
         require_live_claim(factory, job)
         _cleanup_stale_attempt(store, job)
@@ -72,19 +131,6 @@ def process_adapter_evaluation_run(
             if run is None or suite is None:
                 raise AdapterEvaluationQueueError("database_unavailable")
             scope = DepartmentScope(job.department_id)
-            suite_cases = _load_suite_cases(
-                base.data_dir,
-                scope,
-                suite.id,
-                suite.artifact_manifest_sha256,
-                suite.canonical_cases_sha256,
-                suite.canonical_cases_byte_size,
-                factory=factory,
-                job=job,
-                heartbeat_seconds=settings.evaluation.heartbeat_seconds,
-                lease_seconds=settings.evaluation.lease_seconds,
-                should_stop=should_stop,
-            )
             adapter_fields = {
                 "registry_publication_attempt_id": run.registry_publication_attempt_id,
                 "registry_attempt_number": run.registry_attempt_number,
@@ -94,70 +140,41 @@ def process_adapter_evaluation_run(
                 "adapter_model_sha256": run.registry_adapter_model_sha256,
                 "adapter_model_byte_size": run.registry_adapter_model_byte_size,
             }
-        suite_authority = capture_canonical_suite_authority(
+        suite_execution = _supervise_suite_load(
             factory,
-            base.data_dir,
+            settings,
             scope,
-            suite_cases,
+            suite.id,
+            suite.artifact_manifest_sha256,
+            suite.canonical_cases_sha256,
+            suite.canonical_cases_byte_size,
+            job,
+            should_stop,
         )
+        suite_cases = suite_execution.cases
         if should_stop():
-            raise AdapterEvaluationQueueError("cancelled")
+            raise _WorkerStopped()
         renew_lease(factory, job, settings.evaluation.lease_seconds)
         if len(suite_cases) != job_case_count(factory, job):
             raise AdapterEvaluationQueueError("suite_authority_changed")
-        baseline_runtime = RagRuntimeClient(
-            base.rag.runtime_url,
-            base.rag.runtime_token,
-            base.rag.request_timeout_seconds,
-        )
-        candidate_runtime = AdapterEvaluationRuntimeClient(
-            settings.candidate_runtime_url,
-            settings.candidate_runtime_token,
-            base.rag.request_timeout_seconds,
-            department_id=job.department_id,
-            adapter_id=job.adapter_id,
-            adapter_version=run.adapter_version,
-            **adapter_fields,
-        )
-        qdrant = DepartmentQdrant(
-            base.rag.qdrant_url,
-            base.rag.qdrant_api_key,
-            base.rag.qdrant_timeout_seconds,
-        )
         baseline_scores = []
         candidate_scores = []
         case_rows = []
-        last_heartbeat = time.monotonic()
-
-        def stage_checkpoint(_stage: str) -> None:
-            nonlocal last_heartbeat
-            if should_stop():
-                raise AdapterEvaluationQueueError("cancelled")
-            now = time.monotonic()
-            if now - last_heartbeat >= settings.evaluation.heartbeat_seconds:
-                renew_lease(factory, job, settings.evaluation.lease_seconds)
-                last_heartbeat = now
-
         for case in suite_cases:
             if should_stop():
-                raise AdapterEvaluationQueueError("cancelled")
+                raise _WorkerStopped()
             renew_lease(factory, job, settings.evaluation.lease_seconds)
             expected, relevant, accepted = _case_contract(case)
-            pair = execute_paired_rag_case(
+            pair = _supervise_pair_case(
                 factory,
-                base.rag,
-                base.data_dir,
+                settings,
                 scope,
                 case["question"],
-                department_id=job.department_id,
-                adapter_id=job.adapter_id,
-                adapter_version=run.adapter_version,
-                suite_id=job.suite_id,
-                case_id=UUID(case["case_id"]),
-                baseline_runtime=baseline_runtime,
-                candidate_runtime=candidate_runtime,
-                qdrant=qdrant,
-                stage_callback=stage_checkpoint,
+                UUID(case["case_id"]),
+                run.adapter_version,
+                adapter_fields,
+                job,
+                should_stop,
             )
             for target, outcome, scores in (
                 ("baseline", pair.baseline, baseline_scores),
@@ -227,17 +244,19 @@ def process_adapter_evaluation_run(
             "baseline_failed_gate_count": baseline_gate.failed_count,
             "candidate_failed_gate_count": candidate_gate.failed_count,
         }
-        staged = store.stage_run(
+        staged = _supervise_result_stage(
+            factory,
+            settings,
             DepartmentScope(job.department_id),
-            job.id,
-            job.publication_attempt_id,
-            manifest=manifest,
-            summary=summary,
-            case_rows=case_rows,
+            job,
+            manifest,
+            summary,
+            case_rows,
+            should_stop,
         )
         renew_lease(factory, job, settings.evaluation.lease_seconds)
         require_live_claim(factory, job)
-        published = store.publish(staged)
+        published = _supervise_result_publish(factory, settings, job, staged, should_stop)
         published = store.verify_published(
             DepartmentScope(job.department_id),
             job.id,
@@ -246,9 +265,16 @@ def process_adapter_evaluation_run(
             expected_files=dict(published.files),
         )
         files = dict(published.files)
-        candidate_runtime.verify_target()
         renew_lease(factory, job, settings.evaluation.lease_seconds)
         require_live_claim(factory, job)
+        final_authority = _supervise_authority(
+            factory,
+            settings,
+            scope,
+            suite_cases,
+            job,
+            should_stop,
+        )
         finalize_success(
             factory,
             job,
@@ -263,12 +289,15 @@ def process_adapter_evaluation_run(
             case_rows=tuple(case_rows),
             data_dir=base.data_dir,
             suite_cases=suite_cases,
-            suite_authority=suite_authority,
+            suite_authority=final_authority,
             result_store=store,
             result_manifest=staged.manifest,
             result_files=dict(published.files),
         )
         return True
+    except _WorkerStopped:
+        _cleanup_attempt_stage(store, job)
+        return False
     except AdapterEvaluationQueueError as error:
         _cleanup_attempt_stage(store, job)
         try:
@@ -336,12 +365,508 @@ def process_adapter_evaluation_run(
         except AdapterEvaluationQueueError:
             pass
         return False
+
+
+def _suite_process_entry(
+    connection,
+    settings: AdapterEvaluationSettings,
+    scope: DepartmentScope,
+    suite_id: UUID,
+    manifest_sha256: str,
+    cases_sha256: str,
+    cases_byte_size: int,
+) -> None:
+    """Load immutable suite bytes and capture authority in one killable child."""
+
+    if not _enter_child_process_group(connection):
+        return
+    connection.send(("ready",))
+    engine = None
+    try:
+        cases = tuple(
+            external_suite_cases(
+                settings.evaluation.data_dir,
+                scope,
+                suite_id,
+                manifest_sha256,
+                cases_sha256,
+                cases_byte_size,
+            )
+        )
+        engine = create_database_engine(settings.evaluation.database_url)
+        child_factory = create_session_factory(engine)
+        authority = capture_canonical_suite_authority(
+            child_factory,
+            settings.evaluation.data_dir,
+            scope,
+            cases,
+        )
+        connection.send(("result", _SuiteExecution(cases, authority)))
+    except EvaluationContractError as error:
+        connection.send(("failure", error.code))
+    except SQLAlchemyError:
+        connection.send(("failure", "database_unavailable"))
+    except BaseException:
+        connection.send(("failure", "suite_authority_changed"))
+    finally:
+        if engine is not None:
+            engine.dispose()
+        connection.close()
+
+
+@dataclass(frozen=True, slots=True)
+class _SuiteExecution:
+    cases: tuple[dict[str, object], ...]
+    authority: GroundTruthAuthoritySnapshot
+
+
+def _supervise_suite_load(
+    factory: sessionmaker[Session],
+    settings: AdapterEvaluationSettings,
+    scope: DepartmentScope,
+    suite_id: UUID,
+    manifest_sha256: str,
+    cases_sha256: str,
+    cases_byte_size: int,
+    job: ClaimedAdapterEvaluation,
+    should_stop: Callable[[], bool],
+) -> _SuiteExecution:
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_suite_process_entry,
+        args=(
+            child,
+            settings,
+            scope,
+            suite_id,
+            manifest_sha256,
+            cases_sha256,
+            cases_byte_size,
+        ),
+        daemon=False,
+    )
+    process.start()
+    child.close()
+    result = _wait_for_supervised_process(
+        factory, settings, job, should_stop, parent, process, _SuiteExecution
+    )
+    if not isinstance(result, _SuiteExecution):
+        raise AdapterEvaluationQueueError("suite_authority_changed")
+    return result
+
+
+def _paired_case_process_entry(
+    connection,
+    settings: AdapterEvaluationSettings,
+    scope: DepartmentScope,
+    question: str,
+    case_id: UUID,
+    adapter_version: int,
+    adapter_fields: dict[str, object],
+    job: ClaimedAdapterEvaluation,
+) -> None:
+    """Run both lanes in one child so retrieval and evidence cannot diverge."""
+
+    if not _enter_child_process_group(connection):
+        return
+    connection.send(("ready",))
+    engine = None
+    qdrant = None
+    try:
+        base = settings.evaluation
+        engine = create_database_engine(base.database_url)
+        child_factory = create_session_factory(engine)
+        baseline_runtime = RagRuntimeClient(
+            base.rag.runtime_url,
+            base.rag.runtime_token,
+            min(base.rag.request_timeout_seconds, base.operation_timeout_seconds),
+        )
+        candidate_runtime = AdapterEvaluationRuntimeClient(
+            settings.candidate_runtime_url,
+            settings.candidate_runtime_token,
+            min(base.rag.request_timeout_seconds, base.operation_timeout_seconds),
+            department_id=job.department_id,
+            adapter_id=job.adapter_id,
+            adapter_version=adapter_version,
+            **adapter_fields,
+        )
+        qdrant = DepartmentQdrant(
+            base.rag.qdrant_url,
+            base.rag.qdrant_api_key,
+            base.rag.qdrant_timeout_seconds,
+        )
+
+        def report_stage(stage: str) -> None:
+            connection.send(("stage", stage))
+
+        pair = execute_paired_rag_case(
+            child_factory,
+            base.rag,
+            base.data_dir,
+            scope,
+            question,
+            department_id=job.department_id,
+            adapter_id=job.adapter_id,
+            adapter_version=adapter_version,
+            suite_id=job.suite_id,
+            case_id=case_id,
+            baseline_runtime=baseline_runtime,
+            candidate_runtime=candidate_runtime,
+            qdrant=qdrant,
+            stage_callback=report_stage,
+        )
+        connection.send(
+            (
+                "result",
+                _PairedCaseResult(_lane_result(pair.baseline), _lane_result(pair.candidate)),
+            )
+        )
+    except AdapterEvaluationLaneError as error:
+        connection.send(("failure", error.code))
+    except RagContractError as error:
+        connection.send(("failure", error.code))
+    except QdrantBoundaryError as error:
+        connection.send(("failure", error.code))
+    except SQLAlchemyError:
+        connection.send(("failure", "database_unavailable"))
+    except BaseException:
+        connection.send(("failure", "candidate_runtime_unavailable"))
     finally:
         if qdrant is not None:
             try:
                 qdrant.close()
             except Exception:
                 pass
+        if engine is not None:
+            engine.dispose()
+        connection.close()
+
+
+def _supervise_pair_case(
+    factory: sessionmaker[Session],
+    settings: AdapterEvaluationSettings,
+    scope: DepartmentScope,
+    question: str,
+    case_id: UUID,
+    adapter_version: int,
+    adapter_fields: dict[str, object],
+    job: ClaimedAdapterEvaluation,
+    should_stop: Callable[[], bool],
+) -> _PairedCaseResult:
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_paired_case_process_entry,
+        args=(
+            child,
+            settings,
+            scope,
+            question,
+            case_id,
+            adapter_version,
+            adapter_fields,
+            job,
+        ),
+        daemon=False,
+    )
+    process.start()
+    child.close()
+    result = _wait_for_supervised_process(
+        factory, settings, job, should_stop, parent, process, _PairedCaseResult
+    )
+    if not isinstance(result, _PairedCaseResult):
+        raise AdapterEvaluationQueueError("candidate_runtime_unavailable")
+    return result
+
+
+def _authority_process_entry(
+    connection,
+    settings: AdapterEvaluationSettings,
+    scope: DepartmentScope,
+    cases: tuple[dict[str, object], ...],
+) -> None:
+    if not _enter_child_process_group(connection):
+        return
+    connection.send(("ready",))
+    engine = None
+    try:
+        engine = create_database_engine(settings.evaluation.database_url)
+        child_factory = create_session_factory(engine)
+        authority = capture_canonical_suite_authority(
+            child_factory,
+            settings.evaluation.data_dir,
+            scope,
+            cases,
+        )
+        connection.send(("result", authority))
+    except EvaluationContractError as error:
+        connection.send(("failure", error.code))
+    except SQLAlchemyError:
+        connection.send(("failure", "database_unavailable"))
+    except BaseException:
+        connection.send(("failure", "suite_authority_changed"))
+    finally:
+        if engine is not None:
+            engine.dispose()
+        connection.close()
+
+
+def _supervise_authority(
+    factory: sessionmaker[Session],
+    settings: AdapterEvaluationSettings,
+    scope: DepartmentScope,
+    cases: tuple[dict[str, object], ...],
+    job: ClaimedAdapterEvaluation,
+    should_stop: Callable[[], bool],
+) -> GroundTruthAuthoritySnapshot:
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_authority_process_entry,
+        args=(child, settings, scope, cases),
+        daemon=False,
+    )
+    process.start()
+    child.close()
+    result = _wait_for_supervised_process(
+        factory,
+        settings,
+        job,
+        should_stop,
+        parent,
+        process,
+        GroundTruthAuthoritySnapshot,
+    )
+    if not isinstance(result, GroundTruthAuthoritySnapshot):
+        raise AdapterEvaluationQueueError("suite_authority_changed")
+    return result
+
+
+def _result_stage_process_entry(
+    connection,
+    settings: AdapterEvaluationSettings,
+    scope: DepartmentScope,
+    evaluation_id: UUID,
+    publication_attempt_id: UUID,
+    manifest: dict[str, object],
+    summary: dict[str, object],
+    case_rows: list[dict[str, object]],
+) -> None:
+    if not _enter_child_process_group(connection):
+        return
+    connection.send(("ready",))
+    try:
+        staged = AdapterEvaluationArtifactStore(settings.evaluation.data_dir).stage_run(
+            scope,
+            evaluation_id,
+            publication_attempt_id,
+            manifest=manifest,
+            summary=summary,
+            case_rows=case_rows,
+        )
+        connection.send(("result", staged))
+    except EvaluationContractError as error:
+        connection.send(("failure", error.code))
+    except BaseException:
+        connection.send(("failure", "result_publication_failed"))
+    finally:
+        connection.close()
+
+
+def _supervise_result_stage(
+    factory: sessionmaker[Session],
+    settings: AdapterEvaluationSettings,
+    scope: DepartmentScope,
+    job: ClaimedAdapterEvaluation,
+    manifest: dict[str, object],
+    summary: dict[str, object],
+    case_rows: list[dict[str, object]],
+    should_stop: Callable[[], bool],
+) -> AdapterEvaluationStagedArtifact:
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_result_stage_process_entry,
+        args=(
+            child,
+            settings,
+            scope,
+            job.id,
+            job.publication_attempt_id,
+            manifest,
+            summary,
+            case_rows,
+        ),
+        daemon=False,
+    )
+    process.start()
+    child.close()
+    result = _wait_for_supervised_process(
+        factory,
+        settings,
+        job,
+        should_stop,
+        parent,
+        process,
+        AdapterEvaluationStagedArtifact,
+    )
+    if not isinstance(result, AdapterEvaluationStagedArtifact):
+        raise AdapterEvaluationQueueError("result_publication_failed")
+    return result
+
+
+def _result_publish_process_entry(
+    connection,
+    settings: AdapterEvaluationSettings,
+    staged: AdapterEvaluationStagedArtifact,
+) -> None:
+    if not _enter_child_process_group(connection):
+        return
+    connection.send(("ready",))
+    try:
+        published = AdapterEvaluationArtifactStore(settings.evaluation.data_dir).publish(staged)
+        connection.send(("result", published))
+    except EvaluationContractError as error:
+        connection.send(("failure", error.code))
+    except BaseException:
+        connection.send(("failure", "result_publication_failed"))
+    finally:
+        connection.close()
+
+
+def _supervise_result_publish(
+    factory: sessionmaker[Session],
+    settings: AdapterEvaluationSettings,
+    job: ClaimedAdapterEvaluation,
+    staged: AdapterEvaluationStagedArtifact,
+    should_stop: Callable[[], bool],
+) -> AdapterEvaluationPublishedArtifact:
+    context = multiprocessing.get_context("fork")
+    parent, child = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_result_publish_process_entry,
+        args=(child, settings, staged),
+        daemon=False,
+    )
+    process.start()
+    child.close()
+    result = _wait_for_supervised_process(
+        factory,
+        settings,
+        job,
+        should_stop,
+        parent,
+        process,
+        AdapterEvaluationPublishedArtifact,
+    )
+    if not isinstance(result, AdapterEvaluationPublishedArtifact):
+        raise AdapterEvaluationQueueError("result_publication_failed")
+    return result
+
+
+def _wait_for_supervised_process(
+    factory: sessionmaker[Session],
+    settings: AdapterEvaluationSettings,
+    job: ClaimedAdapterEvaluation,
+    should_stop: Callable[[], bool],
+    parent,
+    process: multiprocessing.Process,
+    result_type: type,
+):
+    """Keep parent-side lease/cancellation authority around one child operation."""
+
+    evaluation = settings.evaluation
+    deadline = time.monotonic() + evaluation.operation_timeout_seconds
+    next_heartbeat = time.monotonic()
+    group_ready = False
+    completed = False
+    try:
+        while True:
+            now = time.monotonic()
+            if should_stop():
+                raise _WorkerStopped()
+            if now >= deadline:
+                raise AdapterEvaluationQueueError(
+                    "candidate_runtime_timeout"
+                    if result_type is _PairedCaseResult
+                    else "result_publication_failed"
+                )
+            if now >= next_heartbeat:
+                renew_lease(factory, job, evaluation.lease_seconds)
+                next_heartbeat = now + evaluation.heartbeat_seconds
+            wait_for = min(deadline - now, max(0.0, next_heartbeat - now), 0.1)
+            if parent.poll(wait_for):
+                try:
+                    message = parent.recv()
+                except EOFError as error:
+                    raise AdapterEvaluationQueueError("database_unavailable") from error
+                if (
+                    not isinstance(message, tuple)
+                    or not message
+                    or message[0] not in {"ready", "stage", "result", "failure"}
+                ):
+                    raise AdapterEvaluationQueueError("database_unavailable")
+                if message[0] == "ready" and len(message) == 1:
+                    group_ready = True
+                    continue
+                if not group_ready:
+                    raise AdapterEvaluationQueueError("database_unavailable")
+                if message[0] == "stage" and len(message) == 2 and isinstance(message[1], str):
+                    continue
+                if message[0] == "failure" and len(message) == 2:
+                    raise AdapterEvaluationQueueError(str(message[1]))
+                if (
+                    message[0] == "result"
+                    and len(message) == 2
+                    and isinstance(message[1], result_type)
+                ):
+                    completed = True
+                    return message[1]
+                raise AdapterEvaluationQueueError("database_unavailable")
+            if not process.is_alive():
+                raise AdapterEvaluationQueueError("database_unavailable")
+    finally:
+        parent.close()
+        _terminate_and_reap(process, group_ready=group_ready, terminate=not completed)
+
+
+def _enter_child_process_group(connection) -> bool:
+    try:
+        os.setsid()
+    except OSError:
+        connection.send(("failure", "database_unavailable"))
+        connection.close()
+        return False
+    return True
+
+
+def _terminate_and_reap(
+    process: multiprocessing.Process,
+    *,
+    group_ready: bool,
+    terminate: bool,
+) -> None:
+    if terminate and process.is_alive():
+        try:
+            if group_ready and process.pid is not None:
+                os.killpg(process.pid, signal.SIGTERM)
+            else:
+                process.terminate()
+        except (OSError, ProcessLookupError):
+            pass
+    process.join(timeout=1)
+    if process.is_alive():
+        try:
+            if group_ready and process.pid is not None:
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except (OSError, ProcessLookupError):
+            pass
+        process.join(timeout=1)
+    if process.is_alive():
+        raise AdapterEvaluationQueueError("database_unavailable")
 
 
 def external_suite_cases(data_dir, scope, suite_id, manifest_sha256, cases_sha256, cases_byte_size):
@@ -355,43 +880,6 @@ def external_suite_cases(data_dir, scope, suite_id, manifest_sha256, cases_sha25
         cases_sha256=cases_sha256,
         cases_byte_size=cases_byte_size,
     )
-
-
-def _load_suite_cases(
-    data_dir,
-    scope,
-    suite_id,
-    manifest_sha256,
-    cases_sha256,
-    cases_byte_size,
-    *,
-    factory,
-    job,
-    heartbeat_seconds: int,
-    lease_seconds: int,
-    should_stop: Callable[[], bool],
-):
-    """Scan the immutable suite with cancellation and lease checkpoints."""
-
-    cases = []
-    last_heartbeat = time.monotonic()
-    for case in external_suite_cases(
-        data_dir,
-        scope,
-        suite_id,
-        manifest_sha256,
-        cases_sha256,
-        cases_byte_size,
-    ):
-        if should_stop():
-            raise AdapterEvaluationQueueError("cancelled")
-        now = time.monotonic()
-        if now - last_heartbeat >= heartbeat_seconds:
-            renew_lease(factory, job, lease_seconds)
-            last_heartbeat = now
-        cases.append(case)
-    renew_lease(factory, job, lease_seconds)
-    return tuple(cases)
 
 
 def job_case_count(factory, job):

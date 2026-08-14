@@ -13,8 +13,20 @@ from typing import Any
 from uuid import UUID
 
 from app.adapter_contract import BASE_MODEL_REVISION
+from app.generation_contract import (
+    GENERATION_DO_SAMPLE,
+    GENERATION_MIN_P,
+    GENERATION_TEMPERATURE,
+    GENERATION_TOP_K,
+    GENERATION_TOP_P,
+    GenerationContractError,
+    initialize_generation_seed,
+    tokenize_generation_input,
+)
+from app.model_store import validate_generation_model_store
 from app.rag_domain import (
     ANSWER_CONTRACT_VERSION,
+    GENERATION_NEW_TOKEN_RESERVE,
     MAX_CHILD_FRAME_BYTES,
     PROMPT_VERSION,
     SOURCE_LABEL,
@@ -82,8 +94,13 @@ class CandidateSession:
                         expected_model_sha256=target["adapter_model_sha256"],
                         expected_model_byte_size=target["adapter_model_byte_size"],
                     )
-                    self.model = load_candidate_model(self.copy, self.data_dir / "model_cache")
-                    self.tokenizer = _load_tokenizer(self.data_dir / "model_cache")
+                    generation = validate_generation_model_store(self.data_dir)
+                    self.tokenizer = _load_tokenizer(generation.path)
+                    self.model = load_candidate_model(
+                        self.copy,
+                        self.data_dir,
+                        tokenizer_limit=getattr(self.tokenizer, "model_max_length", None),
+                    )
                 except AdapterRuntimeError as error:
                     self.close()
                     raise CandidateChildError(error.code) from error
@@ -131,6 +148,7 @@ class CandidateSession:
         if self.provider == "fake":
             return {"verified": True}
         try:
+            validate_generation_model_store(self.data_dir)
             verified = verify_and_copy_adapter(
                 self.data_dir / "adapters" / "registry",
                 department_id=target["department_id"],
@@ -155,39 +173,33 @@ class CandidateSession:
         if self.model is None or self.tokenizer is None:
             raise CandidateChildError("candidate_adapter_load_failed")
         try:
-            import torch
-
             if seed is not None:
-                torch.manual_seed(seed)
+                initialize_generation_seed(seed)
             messages = build_generation_messages(question, evidence)
-            inputs = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=True,
-                return_tensors="pt",
-                enable_thinking=False,
-                truncation=False,
-            )
+            inputs = tokenize_generation_input(self.tokenizer, messages)
             inputs = inputs.to(self.model.device)
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=512,
-                do_sample=True,
-                temperature=0.7,
-                top_p=0.8,
-                top_k=20,
-                min_p=0.0,
+                max_new_tokens=GENERATION_NEW_TOKEN_RESERVE,
+                do_sample=GENERATION_DO_SAMPLE,
+                temperature=GENERATION_TEMPERATURE,
+                top_p=GENERATION_TOP_P,
+                top_k=GENERATION_TOP_K,
+                min_p=GENERATION_MIN_P,
                 pad_token_id=self.tokenizer.eos_token_id,
             )
             generated = outputs[0][inputs["input_ids"].shape[-1] :]
             raw = self.tokenizer.decode(generated, skip_special_tokens=True).strip()
+            if "<think" in raw.casefold() or "</think" in raw.casefold():
+                raise CandidateChildError("invalid_generation_response")
             value = json.loads(raw)
             if not isinstance(value, dict):
                 raise ValueError("generation response is not an object")
             return value
         except CandidateChildError:
             raise
+        except GenerationContractError as error:
+            raise CandidateChildError(error.args[0]) from error
         except Exception as error:
             raise CandidateChildError("candidate_runtime_unavailable") from error
 
@@ -346,13 +358,11 @@ def _evidence(value: Any) -> list[dict[str, str]]:
     return result
 
 
-def _load_tokenizer(model_cache: Path) -> Any:
+def _load_tokenizer(model_path: Path) -> Any:
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(
-        "Qwen/Qwen3-0.6B",
-        revision=BASE_MODEL_REVISION,
-        cache_dir=str(model_cache),
+        str(model_path),
         local_files_only=True,
         trust_remote_code=False,
     )

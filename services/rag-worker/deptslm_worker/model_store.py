@@ -9,6 +9,12 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.model_store import (
+    ModelStoreError as GenerationModelStoreError,
+)
+from app.model_store import (
+    validate_generation_model_store as _validate_generation_store,
+)
 from app.rag_domain import (
     GENERATION_MODEL_CONTEXT_TOKENS,
     GENERATION_MODEL_ID,
@@ -74,23 +80,13 @@ def validate_model_store(data_dir: Path) -> ModelLocation:
 
 
 def validate_generation_model_store(data_dir: Path) -> ModelLocation:
-    expected = {
-        "model_id": GENERATION_MODEL_ID,
-        "revision": GENERATION_MODEL_REVISION,
-        "library": "transformers",
-        "safetensors_only": True,
-        "trust_remote_code": False,
-        "enable_thinking": False,
-        "context_tokens": GENERATION_MODEL_CONTEXT_TOKENS,
-        "maximum_input_tokens": MAX_GENERATION_INPUT_TOKENS,
-        "maximum_new_tokens": GENERATION_NEW_TOKEN_RESERVE,
-    }
-    return _validate_store(
-        data_dir,
-        generation_model_directory(data_dir),
-        expected,
-        GENERATION_MODEL_REVISION,
-    )
+    try:
+        location = _validate_generation_store(data_dir)
+    except GenerationModelStoreError as error:
+        raise ModelStoreError(str(error)) from error
+    except Exception as error:
+        raise ModelStoreError("generation_model_unavailable") from error
+    return ModelLocation(location.path, location.revision)
 
 
 def _validate_store(

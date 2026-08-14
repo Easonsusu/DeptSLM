@@ -12,7 +12,6 @@ from pathlib import Path
 from uuid import UUID
 
 from app.adapter_contract import (
-    BASE_MODEL_ID,
     BASE_MODEL_REVISION,
     AdapterContractError,
     validate_adapter_config,
@@ -20,6 +19,8 @@ from app.adapter_contract import (
 )
 from app.adapter_registry_domain import canonical_json_bytes, parse_registry_manifest
 from app.authorization import DepartmentScope
+from app.generation_contract import validate_generation_context_contract
+from app.model_store import validate_generation_model_store
 
 
 class AdapterRuntimeError(RuntimeError):
@@ -67,6 +68,56 @@ class VerifiedAdapterCopy:
         self.close()
 
 
+@dataclass(frozen=True, slots=True)
+class SourceIdentity:
+    """Closed identity snapshot for one reviewed source file descriptor."""
+
+    st_dev: int
+    st_ino: int
+    st_mode: int
+    st_uid: int
+    st_nlink: int
+    st_size: int
+    st_mtime_ns: int
+    st_ctime_ns: int
+
+    @classmethod
+    def capture(cls, descriptor: int, expected_size: int) -> SourceIdentity:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size != expected_size
+            or expected_size <= 0
+        ):
+            raise AdapterRuntimeError("adapter_authority_changed")
+        return cls(
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_mode,
+            metadata.st_uid,
+            metadata.st_nlink,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+            metadata.st_ctime_ns,
+        )
+
+    def matches(self, descriptor: int) -> bool:
+        metadata = os.fstat(descriptor)
+        return (
+            metadata.st_dev == self.st_dev
+            and metadata.st_ino == self.st_ino
+            and metadata.st_mode == self.st_mode
+            and metadata.st_uid == self.st_uid
+            and metadata.st_nlink == self.st_nlink
+            and metadata.st_size == self.st_size
+            and metadata.st_mtime_ns == self.st_mtime_ns
+            and metadata.st_ctime_ns == self.st_ctime_ns
+        )
+
+
 def verify_and_copy_adapter(
     registry_root: Path,
     *,
@@ -80,6 +131,7 @@ def verify_and_copy_adapter(
     expected_config_byte_size: int,
     expected_model_sha256: str,
     expected_model_byte_size: int,
+    copy_hook=None,
 ) -> VerifiedAdapterCopy:
     """Verify the exact registry final and copy bytes through retained descriptors."""
 
@@ -141,6 +193,8 @@ def verify_and_copy_adapter(
                 raise AdapterRuntimeError("adapter_authority_changed")
             config_fd = _open_private_file(final_fd, "adapter_config.json")
             model_fd = _open_private_file(final_fd, "adapter_model.safetensors")
+            config_identity = SourceIdentity.capture(config_fd, expected_config_byte_size)
+            model_identity = SourceIdentity.capture(model_fd, expected_model_byte_size)
             config_digest = _digest_fd(config_fd)
             model_digest = _digest_fd(model_fd)
             config_meta = manifest_files.get("adapter_config.json")
@@ -170,8 +224,25 @@ def verify_and_copy_adapter(
             config_path = directory / "adapter_config.json"
             model_path = directory / "adapter_model.safetensors"
             try:
-                _copy_descriptor(config_fd, config_path, expected_config_byte_size)
-                _copy_descriptor(model_fd, model_path, expected_model_byte_size)
+                copied_config = _copy_descriptor(
+                    config_fd,
+                    config_path,
+                    expected_config_byte_size,
+                    copy_hook=copy_hook,
+                )
+                copied_model = _copy_descriptor(
+                    model_fd,
+                    model_path,
+                    expected_model_byte_size,
+                    copy_hook=copy_hook,
+                )
+                if (
+                    copied_config != (expected_config_sha256, expected_config_byte_size)
+                    or copied_model != (expected_model_sha256, expected_model_byte_size)
+                    or not config_identity.matches(config_fd)
+                    or not model_identity.matches(model_fd)
+                ):
+                    raise AdapterRuntimeError("adapter_authority_changed")
                 _verify_entry(final_fd, "adapter_config.json", config_fd)
                 _verify_entry(final_fd, "adapter_model.safetensors", model_fd)
                 if set(os.listdir(final_fd)) != {
@@ -180,6 +251,13 @@ def verify_and_copy_adapter(
                     "adapter_model.safetensors",
                 }:
                     raise AdapterRuntimeError("adapter_authority_changed")
+                _verify_ephemeral_copy(
+                    directory,
+                    expected_config_sha256,
+                    expected_config_byte_size,
+                    expected_model_sha256,
+                    expected_model_byte_size,
+                )
                 return VerifiedAdapterCopy(directory, config_path, model_path, key)
             except Exception:
                 shutil.rmtree(directory, ignore_errors=True)
@@ -202,19 +280,28 @@ def verify_and_copy_adapter(
         raise AdapterRuntimeError("adapter_artifact_mismatch") from error
 
 
-def load_candidate_model(copy: VerifiedAdapterCopy, model_cache: Path):
+def load_candidate_model(
+    copy: VerifiedAdapterCopy,
+    data_dir: Path,
+    *,
+    tokenizer_limit: object | None = None,
+):
     """Load one exact adapter into the private runtime; never fall back to base."""
 
     try:
         from peft import PeftModel
         from transformers import AutoModelForCausalLM
 
+        generation = validate_generation_model_store(data_dir)
         base = AutoModelForCausalLM.from_pretrained(
-            BASE_MODEL_ID,
-            revision=BASE_MODEL_REVISION,
-            cache_dir=str(model_cache),
+            str(generation.path),
             local_files_only=True,
             trust_remote_code=False,
+            use_safetensors=True,
+        )
+        validate_generation_context_contract(
+            tokenizer_limit,
+            getattr(getattr(base, "config", None), "max_position_embeddings", None),
         )
         return PeftModel.from_pretrained(
             base,
@@ -226,10 +313,14 @@ def load_candidate_model(copy: VerifiedAdapterCopy, model_cache: Path):
         raise AdapterRuntimeError("candidate_adapter_load_failed") from error
 
 
-def _copy_descriptor(source: int, destination: Path, size: int) -> None:
+def _copy_descriptor(source: int, destination: Path, size: int, *, copy_hook=None):
     if size <= 0:
         raise AdapterRuntimeError("adapter_artifact_mismatch")
+    digest = hashlib.sha256()
+    total = 0
     with destination.open("xb") as handle:
+        if copy_hook is not None:
+            copy_hook(destination, 0)
         remaining = size
         offset = 0
         while remaining:
@@ -237,11 +328,56 @@ def _copy_descriptor(source: int, destination: Path, size: int) -> None:
             if not block:
                 raise AdapterRuntimeError("adapter_authority_changed")
             handle.write(block)
+            digest.update(block)
             offset += len(block)
             remaining -= len(block)
+            total += len(block)
+        if os.pread(source, 1, size):
+            raise AdapterRuntimeError("adapter_authority_changed")
         handle.flush()
         os.fsync(handle.fileno())
     os.chmod(destination, 0o600)
+    if copy_hook is not None:
+        copy_hook(destination, total)
+    return digest.hexdigest(), total
+
+
+def _verify_ephemeral_copy(
+    directory: Path,
+    config_sha256: str,
+    config_size: int,
+    model_sha256: str,
+    model_size: int,
+) -> None:
+    directory_fd = _open_private_directory(directory)
+    config_fd = None
+    model_fd = None
+    try:
+        if set(os.listdir(directory_fd)) != {
+            "adapter_config.json",
+            "adapter_model.safetensors",
+        }:
+            raise AdapterRuntimeError("adapter_authority_changed")
+        config_fd = _open_private_file(directory_fd, "adapter_config.json")
+        model_fd = _open_private_file(directory_fd, "adapter_model.safetensors")
+        if _digest_fd(config_fd) != (config_sha256, config_size):
+            raise AdapterRuntimeError("adapter_authority_changed")
+        if _digest_fd(model_fd) != (model_sha256, model_size):
+            raise AdapterRuntimeError("adapter_authority_changed")
+        config_raw = os.pread(config_fd, config_size, 0)
+        validate_adapter_config(config_raw)
+        model_meta = os.fstat(model_fd)
+        with os.fdopen(os.dup(model_fd), "rb", closefd=True) as model_file:
+            validate_safetensors_header(model_file, model_meta.st_size)
+        _verify_entry(directory_fd, "adapter_config.json", config_fd)
+        _verify_entry(directory_fd, "adapter_model.safetensors", model_fd)
+    finally:
+        for descriptor in (config_fd, model_fd, directory_fd):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 def _make_ephemeral_copy_directory() -> Path:
@@ -332,6 +468,8 @@ def _verify_entry(parent: int, name: str, descriptor: int) -> None:
         or current.st_uid != opened.st_uid
         or current.st_nlink != opened.st_nlink
         or current.st_size != opened.st_size
+        or current.st_mtime_ns != opened.st_mtime_ns
+        or current.st_ctime_ns != opened.st_ctime_ns
     ):
         raise AdapterRuntimeError("adapter_authority_changed")
 

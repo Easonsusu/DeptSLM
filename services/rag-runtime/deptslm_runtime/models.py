@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import random
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +12,18 @@ from deptslm_worker.model_store import (
     validate_model_store,
 )
 
+from app.generation_contract import (
+    GENERATION_DO_SAMPLE,
+    GENERATION_MIN_P,
+    GENERATION_TEMPERATURE,
+    GENERATION_TOP_K,
+    GENERATION_TOP_P,
+    GenerationContractError,
+    initialize_generation_seed,
+)
+from app.generation_contract import (
+    tokenize_generation_input as _shared_tokenize_generation_input,
+)
 from app.rag_domain import (
     GENERATION_MODEL_CONTEXT_TOKENS,
     GENERATION_NEW_TOKEN_RESERVE,
@@ -109,24 +120,20 @@ class RuntimeModels:
             validate_generation_response(value, labels)
             return value
         if seed is not None:
-            random.seed(seed)
-            import numpy
-            import torch
-
-            numpy.random.seed(seed % (1 << 32))
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
+            try:
+                initialize_generation_seed(seed)
+            except (GenerationContractError, ImportError, RuntimeError) as error:
+                raise RuntimeModelError("model_context_mismatch") from error
         inputs = tokenize_generation_input(self._tokenizer, messages)
         inputs = inputs.to(self._generation.device)
         outputs = self._generation.generate(
             **inputs,
             max_new_tokens=GENERATION_NEW_TOKEN_RESERVE,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.8,
-            top_k=20,
-            min_p=0.0,
+            do_sample=GENERATION_DO_SAMPLE,
+            temperature=GENERATION_TEMPERATURE,
+            top_p=GENERATION_TOP_P,
+            top_k=GENERATION_TOP_K,
+            min_p=GENERATION_MIN_P,
             pad_token_id=self._tokenizer.eos_token_id,
         )
         generated = outputs[0][inputs["input_ids"].shape[-1] :]
@@ -220,14 +227,7 @@ def tokenize_query_input(tokenizer: Any, query: str) -> Any:
 
 
 def tokenize_generation_input(tokenizer: Any, messages: list[dict[str, str]]) -> Any:
-    inputs = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_dict=True,
-        return_tensors="pt",
-        enable_thinking=False,
-        truncation=False,
-    )
-    enforce_generation_token_budget(_token_count(inputs), GENERATION_MODEL_CONTEXT_TOKENS)
-    return inputs
+    try:
+        return _shared_tokenize_generation_input(tokenizer, messages)
+    except GenerationContractError as error:
+        raise RuntimeModelError(error.args[0]) from error
