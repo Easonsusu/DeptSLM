@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import pytest
 
-SERVICE_ROOT = Path(__file__).parents[2] / "services" / "adapter-eval-runtime"
+SERVICE_ROOT = Path(__file__).parents[3] / "services" / "adapter-eval-runtime"
 if str(SERVICE_ROOT) not in sys.path:
     sys.path.insert(0, str(SERVICE_ROOT))
 
