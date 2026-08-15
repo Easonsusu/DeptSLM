@@ -655,14 +655,17 @@ def finalize_owned_operation(
             if current_version != current_operation.expected_deployment_version:
                 raise AdapterGovernanceWorkerError("deployment_version_conflict")
             if current_operation.operation_type == "promote":
-                authority = _validate_approved_target(
-                    session,
-                    current_operation.department_id,
-                    current_operation.target_adapter_id,
-                    current_operation.target_adapter_version,
-                    current_operation.target_review_id,
-                    current_operation.target_review_version,
-                )
+                try:
+                    authority = _validate_approved_target(
+                        session,
+                        current_operation.department_id,
+                        current_operation.target_adapter_id,
+                        current_operation.target_adapter_version,
+                        current_operation.target_review_id,
+                        current_operation.target_review_version,
+                    )
+                except ServiceError:
+                    raise AdapterGovernanceWorkerError("adapter_authority_changed") from None
                 adapter, review, run, suite, registry, dependency, _evidence = authority
                 if not _operation_authority_matches(
                     current_operation, adapter, review, run, suite, registry, dependency
@@ -671,14 +674,17 @@ def finalize_owned_operation(
                 event_type = "promote"
                 target_kind = "adapter"
             elif current_operation.operation_type == "rollback_adapter":
-                authority = _validate_approved_target(
-                    session,
-                    current_operation.department_id,
-                    current_operation.target_adapter_id,
-                    current_operation.target_adapter_version,
-                    current_operation.target_review_id,
-                    current_operation.target_review_version,
-                )
+                try:
+                    authority = _validate_approved_target(
+                        session,
+                        current_operation.department_id,
+                        current_operation.target_adapter_id,
+                        current_operation.target_adapter_version,
+                        current_operation.target_review_id,
+                        current_operation.target_review_version,
+                    )
+                except ServiceError:
+                    raise AdapterGovernanceWorkerError("adapter_authority_changed") from None
                 adapter, review, run, suite, registry, dependency, _evidence = authority
                 if not _operation_authority_matches(
                     current_operation, adapter, review, run, suite, registry, dependency
@@ -762,14 +768,17 @@ def finalize_owned_operation(
                 )
                 if outgoing_review is None:
                     raise AdapterGovernanceWorkerError("review_authority_changed")
-                outgoing_authority = _validate_approved_target(
-                    session,
-                    current_operation.department_id,
-                    current.adapter_id,
-                    current.adapter_version,
-                    outgoing_review.id,
-                    outgoing_review.version,
-                )
+                try:
+                    outgoing_authority = _validate_approved_target(
+                        session,
+                        current_operation.department_id,
+                        current.adapter_id,
+                        current.adapter_version,
+                        outgoing_review.id,
+                        outgoing_review.version,
+                    )
+                except ServiceError:
+                    raise AdapterGovernanceWorkerError("adapter_authority_changed") from None
                 (
                     outgoing_adapter,
                     _outgoing_review,

@@ -21,6 +21,7 @@ from test_phase12_2_postgres import (
     _storage,
 )
 
+import app.adapter_governance_worker as governance_worker
 from alembic import command
 from app.adapter_evaluation_queue import claim_next, finalize_success
 from app.adapter_evaluation_services import enqueue_adapter_evaluation
@@ -174,6 +175,8 @@ def _prepare_approved_promotion(
             {
                 "target_review_version": persisted.target_review_version,
                 "target_evaluation_version": persisted.target_evaluation_version,
+                "registry_attempt_id": persisted.registry_attempt_id,
+                "dependency_id": persisted.dependency_id,
                 "suite_id": persisted.suite_id,
             }
         )
@@ -1057,6 +1060,174 @@ def test_stale_claim_cannot_finalize_or_publish(factory, tmp_path: Path) -> None
     with pytest.raises(AdapterGovernanceWorkerError, match="claim_lost"):
         finalize_owned_operation(factory, claim, data_dir=tmp_path)
     with factory() as session:
+        assert (
+            session.scalar(
+                select(func.count(AdapterDeploymentEvent.id)).where(
+                    AdapterDeploymentEvent.operation_id == operation["id"]
+                )
+            )
+            == 0
+        )
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.action == "adapter.deployment.success",
+                    PersistentAuditEvent.resource_id == str(operation["id"]),
+                )
+            )
+            == 0
+        )
+
+
+def test_expired_claim_is_replaced_before_finalization(factory, tmp_path: Path) -> None:
+    authority, operation = _prepare_approved_promotion(factory, tmp_path)
+    first = claim_next_operation(factory, worker_id=uuid4(), lease_seconds=120)
+    assert first is not None
+    with factory.begin() as session:
+        session.execute(
+            update(AdapterDeploymentOperation)
+            .where(AdapterDeploymentOperation.id == first.id)
+            .values(lease_expires_at=func.clock_timestamp() - text("interval '1 second'"))
+        )
+    replacement = claim_next_operation(factory, worker_id=uuid4(), lease_seconds=120)
+    assert replacement is not None
+    assert replacement.id == first.id
+    assert replacement.worker_id != first.worker_id
+    assert replacement.claim_token != first.claim_token
+    fail_owned_operation(factory, replacement, "adapter_authority_changed")
+    with factory() as session:
+        row = session.get(AdapterDeploymentOperation, operation["id"])
+        assert row is not None and row.status == "failed"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["adapter", "review", "evaluation", "registry", "dependency", "suite"],
+)
+def test_authority_mutation_after_artifact_verification_is_fenced(
+    factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    """A final transaction must reject every changed target authority snapshot."""
+
+    _authority, operation = _prepare_approved_promotion(factory, tmp_path)
+    claim = claim_next_operation(factory, worker_id=uuid4(), lease_seconds=120)
+    assert claim is not None
+    original = governance_worker._validate_approved_target
+    mutated = False
+
+    def mutate_then_validate(*args, **kwargs):
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            with factory.begin() as other:
+                if mutation == "adapter":
+                    row = other.get(Adapter, operation["target_adapter_id"])
+                    assert row is not None
+                    row.version += 1
+                elif mutation == "review":
+                    row = other.get(AdapterReview, operation["target_review_id"])
+                    assert row is not None
+                    row.version += 1
+                elif mutation == "evaluation":
+                    row = other.get(AdapterEvaluationRun, operation["target_evaluation_id"])
+                    assert row is not None
+                    row.version += 1
+                elif mutation == "registry":
+                    row = other.scalar(
+                        select(AdapterRegistryAttempt).where(
+                            AdapterRegistryAttempt.id == operation["registry_attempt_id"]
+                        )
+                    )
+                    assert row is not None
+                    row.version += 1
+                elif mutation == "dependency":
+                    row = other.scalar(
+                        select(AdapterUpstreamDependency).where(
+                            AdapterUpstreamDependency.id == operation["dependency_id"]
+                        )
+                    )
+                    assert row is not None
+                    row.version += 1
+                else:
+                    row = other.get(EvaluationSuite, operation["suite_id"])
+                    assert row is not None
+                    row.version += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(governance_worker, "_validate_approved_target", mutate_then_validate)
+    with pytest.raises(AdapterGovernanceWorkerError, match="adapter_authority_changed"):
+        finalize_owned_operation(factory, claim, data_dir=tmp_path)
+    fail_owned_operation(factory, claim, "adapter_authority_changed")
+    with factory() as session:
+        row = session.get(AdapterDeploymentOperation, operation["id"])
+        pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == operation["department_id"]
+            )
+        )
+        events = session.scalar(
+            select(func.count(AdapterDeploymentEvent.id)).where(
+                AdapterDeploymentEvent.operation_id == operation["id"]
+            )
+        )
+        audits = session.scalar(
+            select(func.count(PersistentAuditEvent.id)).where(
+                PersistentAuditEvent.action == "adapter.deployment.success",
+                PersistentAuditEvent.resource_id == str(operation["id"]),
+            )
+        )
+        retentions = session.scalar(
+            select(func.count(AdapterRollbackRetention.id)).where(
+                AdapterRollbackRetention.department_id == operation["department_id"]
+            )
+        )
+        assert mutated
+        assert row is not None and row.status == "failed"
+        assert pointer is None
+        assert events == 0
+        assert audits == 0
+        assert retentions == 0
+
+
+def test_deployment_version_mutation_after_artifact_verification_is_fenced(
+    factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pointer appearing after verification cannot race a base promotion."""
+
+    _authority, operation = _prepare_approved_promotion(factory, tmp_path)
+    claim = claim_next_operation(factory, worker_id=uuid4(), lease_seconds=120)
+    assert claim is not None
+    original_verify = governance_worker.verify_registry_final
+
+    def verify_then_insert_pointer(*args, **kwargs):
+        retained = original_verify(*args, **kwargs)
+        with factory.begin() as other:
+            other.add(
+                DepartmentAdapterDeployment(
+                    id=uuid4(),
+                    department_id=operation["department_id"],
+                    target_kind="base",
+                    base_model_id="Qwen/Qwen3-0.6B",
+                    base_model_revision="c1899de289a04d12100db370d81485cdf75e47ca",
+                    deployment_version=1,
+                    version=1,
+                )
+            )
+        return retained
+
+    monkeypatch.setattr(governance_worker, "verify_registry_final", verify_then_insert_pointer)
+    with pytest.raises(AdapterGovernanceWorkerError, match="deployment_version_conflict"):
+        finalize_owned_operation(factory, claim, data_dir=tmp_path)
+    fail_owned_operation(factory, claim, "deployment_version_conflict")
+    with factory() as session:
+        row = session.get(AdapterDeploymentOperation, operation["id"])
+        pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == operation["department_id"]
+            )
+        )
+        assert row is not None and row.status == "failed"
+        assert pointer is not None and pointer.target_kind == "base"
         assert (
             session.scalar(
                 select(func.count(AdapterDeploymentEvent.id)).where(
