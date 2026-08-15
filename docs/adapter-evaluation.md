@@ -1,6 +1,6 @@
 # Phase 12.2 adapter-target evaluation
 
-Phase 12.2 is the current reviewed, administrator-only evaluation boundary. It
+Phase 12.2 is the completed, administrator-only evaluation boundary. It
 compares one exact validated adapter with the exact Phase 7 base lane for one
 immutable department-scoped Phase 9 evaluation suite. The phase produces
 evidence only; review, approval, promotion, rollback, and runtime routing are
@@ -78,5 +78,7 @@ Phase 12.2 does not train models, invoke LlamaFactory, create or modify
 adapters, approve or promote adapters, route production requests through an
 adapter, add a public evaluation/search/RAG endpoint, persist evaluation
 content, add an LLM judge, or change feedback, retrieval, prompt, generation,
-or quality-gate behavior. Phase 12.3 review/promotion/rollback and Phase 12.4
-runtime routing remain unstarted.
+or quality-gate behavior. Phase 12.3 now provides separate review,
+promotion, rollback, retention, and deployment-event metadata authorities; it
+still does not load or route adapters. Phase 12.4 runtime routing remains
+unstarted.

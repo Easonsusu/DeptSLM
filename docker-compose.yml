@@ -514,6 +514,31 @@ services:
       postgres:
         condition: service_healthy
 
+  adapter-governance-worker:
+    build:
+      context: .
+      dockerfile: services/adapter-governance-worker/Dockerfile
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      DEPTSLM_STORAGE_READ_ONLY: "1"
+      DEPTSLM_ADAPTER_GOVERNANCE_WORKER_ID: "${DEPTSLM_ADAPTER_GOVERNANCE_WORKER_ID:-00000000-0000-0000-0000-000000000014}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/adapters/registry"
+        target: /runtime/deptslm/adapters/registry
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   adapter-maintenance:
     profiles: ["maintenance"]
     build:

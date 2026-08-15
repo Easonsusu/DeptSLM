@@ -153,6 +153,26 @@ Suite import, suite/run metadata, enqueue, cancellation, and execution require a
 
 All suite, run, case-result rows and suite/run artifact paths contain exact non-null department scope. Public APIs expose no questions, accepted/generated answers, source identifiers, prompts, evidence, vectors, identities, claims, workers, paths, or secrets. Phase 8 feedback is not imported, weighted, or resolved by evaluation. Gate outcomes cannot change production automatically.
 
+## Phase 12.3 adapter governance boundary
+
+Review, deployment, operation, event, and rollback-retention rows each carry
+the exact non-null department scope and same-department composite authorities.
+Starting or deciding a review requires the exact immutable Phase 12.2 run,
+registry attempt, suite, upstream dependency, contract versions, and result
+digests. Promotion, adapter rollback, base rollback, and retention release are
+explicit administrator mutations with independent optimistic versions;
+`system_admin` has no cross-department bypass. A review never promotes
+automatically, and `Adapter.status` remains the artifact lifecycle rather than
+a governance state.
+
+The governance worker reclaims PostgreSQL-server-time leases, revalidates the
+complete authority snapshot, and verifies only the exact private registry-final
+descriptor through a read-only external mount. It never receives model,
+Qdrant, RAG, dataset, training-job, evaluation-result, upload, extraction, or
+credential access. Phase 12.1E-B purge and E-C release fence active governance
+operations. No Phase 12.3 API loads or routes an adapter; runtime routing and
+explicit request snapshots remain Phase 12.4.
+
 ## Acceptance criteria for Phase 2
 
 - Authentication produces a server-validated user identity.

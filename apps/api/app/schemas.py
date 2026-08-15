@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 from uuid import UUID
 
 from pydantic import (
@@ -720,3 +721,212 @@ class AdapterEvaluationListResponse(BaseModel):
     items: list[AdapterEvaluationResponse]
     limit: int
     next_cursor: str | None
+
+
+class AdapterReviewRequest(BaseModel):
+    """Closed discriminated review mutation body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["start", "approve", "reject", "archive"]
+    evaluation_id: UUID | None = None
+    review_id: UUID | None = None
+    expected_adapter_version: StrictInt = Field(ge=1)
+    expected_evaluation_version: StrictInt | None = Field(default=None, ge=1)
+    expected_review_version: StrictInt | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> AdapterReviewRequest:
+        if self.action == "start":
+            if self.evaluation_id is None or self.expected_evaluation_version is None:
+                raise ValueError("start requires evaluation authority")
+            if self.review_id is not None or self.expected_review_version is not None:
+                raise ValueError("start cannot contain review authority")
+        elif self.review_id is None or self.expected_review_version is None:
+            raise ValueError("review transition requires review authority")
+        elif self.evaluation_id is not None or self.expected_evaluation_version is not None:
+            raise ValueError("review transition cannot contain evaluation authority")
+        return self
+
+
+class AdapterReviewResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    department_id: UUID
+    adapter_id: UUID
+    adapter_version: int
+    evaluation_id: UUID
+    evaluation_version: int
+    suite_id: UUID
+    suite_version: int
+    status: str
+    evaluation_gate_status: str | None
+    version: int
+    started_at: datetime
+    decided_at: datetime | None
+    archived_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdapterReviewListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[AdapterReviewResponse]
+    limit: int
+    next_cursor: str | None
+
+
+class AdapterPromotionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_adapter_version: StrictInt = Field(ge=1)
+    review_id: UUID
+    expected_review_version: StrictInt = Field(ge=1)
+    expected_deployment_version: StrictInt = Field(ge=0)
+
+
+class AdapterRollbackRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target: Literal["base", "adapter"]
+    adapter_id: UUID | None = None
+    expected_adapter_version: StrictInt | None = Field(default=None, ge=1)
+    rollback_retention_id: UUID | None = None
+    expected_retention_version: StrictInt | None = Field(default=None, ge=1)
+    expected_deployment_version: StrictInt = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> AdapterRollbackRequest:
+        if self.target == "base":
+            if any(
+                value is not None
+                for value in (
+                    self.adapter_id,
+                    self.expected_adapter_version,
+                    self.rollback_retention_id,
+                    self.expected_retention_version,
+                )
+            ):
+                raise ValueError("base rollback cannot select an adapter")
+        elif (
+            self.adapter_id is None
+            or self.expected_adapter_version is None
+            or self.rollback_retention_id is None
+            or self.expected_retention_version is None
+        ):
+            raise ValueError("adapter rollback requires exact retention authority")
+        return self
+
+
+class AdapterDeploymentResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    department_id: UUID
+    target: Literal["base", "adapter"]
+    explicit: bool
+    deployment_version: int
+    version: int
+    adapter_id: UUID | None
+    adapter_version: int | None
+    review_id: UUID | None
+    evaluation_id: UUID | None
+    base_model_id: str
+    base_model_revision: str
+    created_at: datetime | None
+    updated_at: datetime | None
+
+
+class AdapterDeploymentOperationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    department_id: UUID
+    operation_type: str
+    status: str
+    expected_deployment_version: int
+    target: Literal["base", "adapter"]
+    target_adapter_id: UUID | None
+    target_adapter_version: int | None
+    target_review_id: UUID | None
+    target_evaluation_id: UUID | None
+    target_retention_id: UUID | None
+    attempt_number: int
+    error_code: str | None
+    cancellation_requested: bool
+    started_at: datetime | None
+    finished_at: datetime | None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdapterDeploymentOperationListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[AdapterDeploymentOperationResponse]
+    limit: int
+    offset: int
+
+
+class AdapterDeploymentCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: StrictInt = Field(ge=1)
+
+
+class AdapterDeploymentEventResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    department_id: UUID
+    operation_id: UUID | None
+    event_type: str
+    deployment_version_before: int
+    deployment_version_after: int
+    from_target: str
+    from_adapter_id: UUID | None
+    from_adapter_version: int | None
+    to_target: str
+    to_adapter_id: UUID | None
+    to_adapter_version: int | None
+    approved_review_id: UUID | None
+    evaluation_id: UUID | None
+    suite_id: UUID | None
+    base_model_id: str
+    base_model_revision: str
+    rollback_retention_id: UUID | None
+    created_at: datetime
+
+
+class AdapterDeploymentEventListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[AdapterDeploymentEventResponse]
+    limit: int
+    offset: int
+
+
+class AdapterRollbackRetentionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    department_id: UUID
+    adapter_id: UUID
+    adapter_version: int
+    approved_review_id: UUID
+    evaluation_id: UUID
+    status: Literal["active", "released"]
+    release_reason: str | None
+    version: int
+    created_at: datetime
+    released_at: datetime | None
+
+
+class AdapterRollbackRetentionReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rollback_retention_id: UUID
+    expected_adapter_version: StrictInt = Field(ge=1)
+    expected_retention_version: StrictInt = Field(ge=1)

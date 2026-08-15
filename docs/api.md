@@ -2,7 +2,7 @@
 
 ## Status
 
-The Phase 8 API preserves the completed grounded-answer boundary and adds structured feedback submission and review metadata. Phase 11 exposes metadata for completed immutable training-job bundles only; it never executes LlamaFactory or creates adapters. Phase 12.0 through Phase 12.1E-C are complete, and Phase 12.2 is under review. Phase 12.2 adds only administrator-scoped enqueue/cancel/list/detail metadata routes for paired adapter evaluation; it returns no question, answer, prompt, evidence, vector, path, model output, adapter bytes, or runtime identity. Feedback routes use PostgreSQL only and expose no content or identity IDs. There is no public vector search, query-vector API, conversation history, streaming, reranking, adapter upload/download, production identity integration, approval, promotion, or runtime routing.
+The Phase 8 API preserves the completed grounded-answer boundary and adds structured feedback submission and review metadata. Phase 11 exposes metadata for completed immutable training-job bundles only; it never executes LlamaFactory or creates adapters. Phase 12.0 through Phase 12.2 are complete, and Phase 12.3 is under review. Phase 12.2 adds administrator-scoped enqueue/cancel/list/detail metadata routes for paired adapter evaluation; Phase 12.3 adds explicit review, approval, deployment, rollback, retention, and event metadata routes. These routes return no question, answer, prompt, evidence, vector, path, model output, adapter bytes, or runtime identity. Feedback and governance use PostgreSQL metadata only. There is no public vector search, query-vector API, conversation history, streaming, reranking, adapter upload/download, production identity integration, automatic approval/promotion, or runtime routing.
 
 For the default local configuration, the base URL is:
 
@@ -225,16 +225,22 @@ for one exact validated adapter:
 They return only closed lifecycle and numeric evidence projections. Questions,
 answers, prompts, evidence, vectors, paths, and adapter bytes remain outside
 PostgreSQL and public responses. The following artifact and deployment routes
-remain conceptual and are not implemented:
+are implemented as closed governance metadata operations:
 - `PATCH /departments/{department_id}/adapters/{adapter_id}/review`
 - `POST /departments/{department_id}/adapters/{adapter_id}/promote`
 - `POST /departments/{department_id}/adapters/rollback`
 - `GET /departments/{department_id}/adapter-deployment`
+- `GET /departments/{department_id}/adapters/{adapter_id}/reviews`
+- `GET /departments/{department_id}/adapters/{adapter_id}/reviews/{review_id}`
+- `GET /departments/{department_id}/adapter-deployment/operations`
+- `GET /departments/{department_id}/adapter-deployment/operations/{operation_id}`
+- `GET /departments/{department_id}/adapter-deployment/events`
+- `POST /departments/{department_id}/adapter-deployment/operations/{operation_id}/cancel`
+- `POST /departments/{department_id}/adapters/{adapter_id}/rollback-retention/release`
 
-If a later reviewed phase implements the remaining routes, they will expose safe metadata only
-and require exact same-department authorization, Phase 10/11 governance
-lineage, reviewed evaluation evidence, explicit approval, and optimistic version
-checks. There is no adapter weight upload or download, raw manifest or
+They expose safe metadata only and require exact same-department authorization,
+Phase 10/11 governance lineage, reviewed evaluation evidence, explicit approval,
+and optimistic version checks. There is no adapter weight upload or download, raw manifest or
 configuration download, host path, tensor disclosure, arbitrary model selector,
 or arbitrary adapter selector endpoint. The planned first intake is an
 administrator-controlled CLI that creates a committed immutable source bundle;
@@ -249,10 +255,10 @@ purged. The registry records verified governance lineage and a declared external
 training association, not proven dataset use or trusted training execution.
 Cross-department fallback is prohibited; runtime loading must eventually fail
 closed and never silently fall back to the base model. Phase 12.1A static
-validation is model-free with fixed package references, closed schema, and
 numeric limits. Phase 12.1C adds no public mutation or artifact route; Phase
-12.1D adds the metadata-only GET routes above and Phase 12.2 adds only the
-paired evaluation metadata operations above.
+12.1D adds metadata-only GET routes, Phase 12.2 adds paired evaluation
+metadata, and Phase 12.3 adds only explicit governance metadata. Phase 12.4
+runtime routing remains unstarted.
 
 ### Evaluations and exports
 

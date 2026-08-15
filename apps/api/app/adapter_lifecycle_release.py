@@ -29,13 +29,16 @@ from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.models import (
     Adapter,
     AdapterArtifactOperationItem,
+    AdapterDeploymentOperation,
     AdapterImportAttempt,
     AdapterImportSource,
     AdapterPurgeItem,
     AdapterPurgeOperation,
     AdapterPurgeReservation,
     AdapterRegistryAttempt,
+    AdapterRollbackRetention,
     AdapterUpstreamDependency,
+    DepartmentAdapterDeployment,
     PersistentAuditEvent,
     SftDatasetBuild,
     TrainingJob,
@@ -279,6 +282,43 @@ def _load_authority(
     adapter = session.execute(adapter_statement).scalar_one_or_none()
     if adapter is None:
         raise ServiceError(404, "Adapter not found")
+
+    # E-C is deliberately downstream of governance. A purged adapter must
+    # never retain an active deployment pointer, rollback reference, or queue
+    # operation; reject contradictory metadata rather than releasing upstream
+    # retention under an unsafe snapshot.
+    if (
+        session.scalar(
+            select(DepartmentAdapterDeployment.id).where(
+                DepartmentAdapterDeployment.department_id == department_id,
+                DepartmentAdapterDeployment.target_kind == "adapter",
+                DepartmentAdapterDeployment.adapter_id == adapter.id,
+                DepartmentAdapterDeployment.adapter_version == expected_adapter_version,
+            )
+        )
+        is not None
+        or session.scalar(
+            select(AdapterRollbackRetention.id).where(
+                AdapterRollbackRetention.department_id == department_id,
+                AdapterRollbackRetention.adapter_id == adapter.id,
+                AdapterRollbackRetention.adapter_version == expected_adapter_version,
+                AdapterRollbackRetention.status == "active",
+            )
+        )
+        is not None
+        or session.scalar(
+            select(AdapterDeploymentOperation.id).where(
+                AdapterDeploymentOperation.department_id == department_id,
+                AdapterDeploymentOperation.status.in_(("queued", "running")),
+                (
+                    (AdapterDeploymentOperation.target_adapter_id == adapter.id)
+                    | (AdapterDeploymentOperation.current_adapter_id == adapter.id)
+                ),
+            )
+        )
+        is not None
+    ):
+        raise _ReleaseConflict
 
     source_statement = select(AdapterImportSource).where(
         AdapterImportSource.id == adapter.source_bundle_id,

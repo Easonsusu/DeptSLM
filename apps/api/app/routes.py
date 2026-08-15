@@ -15,6 +15,20 @@ from app.adapter_evaluation_services import (
     list_adapter_evaluations,
     read_adapter_evaluation,
 )
+from app.adapter_governance_services import (
+    cancel_operation,
+    enqueue_promotion,
+    enqueue_rollback,
+    list_events,
+    list_operations,
+    list_reviews,
+    read_deployment,
+    read_operation,
+    read_review,
+    release_rollback_retention,
+    start_review,
+    transition_review,
+)
 from app.adapter_registry_read_services import list_adapters, read_adapter
 from app.audit import AuditResult
 from app.auth import AuthenticatedPrincipal
@@ -73,12 +87,24 @@ from app.rag_feedback_services import (
     submit_feedback,
 )
 from app.schemas import (
+    AdapterDeploymentCancelRequest,
+    AdapterDeploymentEventListResponse,
+    AdapterDeploymentOperationListResponse,
+    AdapterDeploymentOperationResponse,
+    AdapterDeploymentResponse,
     AdapterEvaluationCancelRequest,
     AdapterEvaluationCreateRequest,
     AdapterEvaluationListResponse,
     AdapterEvaluationResponse,
     AdapterMetadataListResponse,
     AdapterMetadataResponse,
+    AdapterPromotionRequest,
+    AdapterReviewListResponse,
+    AdapterReviewRequest,
+    AdapterReviewResponse,
+    AdapterRollbackRequest,
+    AdapterRollbackRetentionReleaseRequest,
+    AdapterRollbackRetentionResponse,
     ChunkListResponse,
     ChunkResponse,
     DepartmentArchive,
@@ -1394,6 +1420,301 @@ async def post_adapter_evaluation_cancel(
                 adapter_id=adapter_id,
                 evaluation_id=evaluation_id,
                 expected_version=body.expected_version,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.patch(
+    "/departments/{department_id}/adapters/{adapter_id}/review",
+    response_model=AdapterReviewResponse,
+    tags=["adapter-governance"],
+)
+async def patch_adapter_review(
+    adapter_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> AdapterReviewResponse:
+    body = await _validated_evaluation_body(
+        request, AdapterReviewRequest, maximum_bytes=MAX_RUN_BODY_BYTES
+    )
+    try:
+        if body.action == "start":
+            value = start_review(
+                session,
+                principal,
+                request_scope,
+                evaluation_id=body.evaluation_id,
+                expected_adapter_version=body.expected_adapter_version,
+                expected_evaluation_version=body.expected_evaluation_version,
+            )
+        else:
+            value = transition_review(
+                session,
+                principal,
+                request_scope,
+                review_id=body.review_id,
+                action=body.action,
+                expected_adapter_version=body.expected_adapter_version,
+                expected_review_version=body.expected_review_version,
+            )
+        return AdapterReviewResponse.model_validate(value)
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/adapters/{adapter_id}/reviews",
+    response_model=AdapterReviewListResponse,
+    tags=["adapter-governance"],
+)
+def get_adapter_reviews(
+    adapter_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    cursor: Annotated[str | None, Query(max_length=1024)] = None,
+) -> AdapterReviewListResponse:
+    try:
+        page = list_reviews(
+            session, principal, request_scope, adapter_id=adapter_id, limit=limit, cursor=cursor
+        )
+        return AdapterReviewListResponse(
+            items=list(page.items), limit=page.limit, next_cursor=page.next_cursor
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/adapters/{adapter_id}/reviews/{review_id}",
+    response_model=AdapterReviewResponse,
+    tags=["adapter-governance"],
+)
+def get_adapter_review(
+    adapter_id: UUID,
+    review_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> AdapterReviewResponse:
+    try:
+        return AdapterReviewResponse.model_validate(
+            read_review(
+                session, principal, request_scope, adapter_id=adapter_id, review_id=review_id
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/adapters/{adapter_id}/promote",
+    response_model=AdapterDeploymentOperationResponse,
+    status_code=202,
+    tags=["adapter-governance"],
+)
+async def post_adapter_promote(
+    adapter_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> AdapterDeploymentOperationResponse:
+    body = await _validated_evaluation_body(
+        request, AdapterPromotionRequest, maximum_bytes=MAX_RUN_BODY_BYTES
+    )
+    try:
+        return AdapterDeploymentOperationResponse.model_validate(
+            enqueue_promotion(
+                session,
+                principal,
+                request_scope,
+                adapter_id=adapter_id,
+                review_id=body.review_id,
+                expected_adapter_version=body.expected_adapter_version,
+                expected_review_version=body.expected_review_version,
+                expected_deployment_version=body.expected_deployment_version,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/adapters/rollback",
+    response_model=AdapterDeploymentOperationResponse,
+    status_code=202,
+    tags=["adapter-governance"],
+)
+async def post_adapter_rollback(
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> AdapterDeploymentOperationResponse:
+    body = await _validated_evaluation_body(
+        request, AdapterRollbackRequest, maximum_bytes=MAX_RUN_BODY_BYTES
+    )
+    try:
+        return AdapterDeploymentOperationResponse.model_validate(
+            enqueue_rollback(
+                session,
+                principal,
+                request_scope,
+                target=body.target,
+                adapter_id=body.adapter_id,
+                expected_adapter_version=body.expected_adapter_version,
+                retention_id=body.rollback_retention_id,
+                expected_retention_version=body.expected_retention_version,
+                expected_deployment_version=body.expected_deployment_version,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/adapter-deployment",
+    response_model=AdapterDeploymentResponse,
+    tags=["adapter-governance"],
+)
+def get_adapter_deployment(
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> AdapterDeploymentResponse:
+    try:
+        return AdapterDeploymentResponse.model_validate(
+            read_deployment(session, principal, request_scope)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/adapter-deployment/operations",
+    response_model=AdapterDeploymentOperationListResponse,
+    tags=["adapter-governance"],
+)
+def get_adapter_deployment_operations(
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> AdapterDeploymentOperationListResponse:
+    try:
+        return AdapterDeploymentOperationListResponse(
+            items=list(
+                list_operations(session, principal, request_scope, limit=limit, offset=offset)
+            ),
+            limit=limit,
+            offset=offset,
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/adapter-deployment/operations/{operation_id}",
+    response_model=AdapterDeploymentOperationResponse,
+    tags=["adapter-governance"],
+)
+def get_adapter_deployment_operation(
+    operation_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> AdapterDeploymentOperationResponse:
+    try:
+        return AdapterDeploymentOperationResponse.model_validate(
+            read_operation(session, principal, request_scope, operation_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/adapter-deployment/operations/{operation_id}/cancel",
+    response_model=AdapterDeploymentOperationResponse,
+    tags=["adapter-governance"],
+)
+async def post_adapter_deployment_operation_cancel(
+    operation_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> AdapterDeploymentOperationResponse:
+    body = await _validated_evaluation_body(
+        request, AdapterDeploymentCancelRequest, maximum_bytes=MAX_CANCEL_BODY_BYTES
+    )
+    try:
+        return AdapterDeploymentOperationResponse.model_validate(
+            cancel_operation(
+                session,
+                principal,
+                request_scope,
+                operation_id=operation_id,
+                expected_version=body.expected_version,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/adapter-deployment/events",
+    response_model=AdapterDeploymentEventListResponse,
+    tags=["adapter-governance"],
+)
+def get_adapter_deployment_events(
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> AdapterDeploymentEventListResponse:
+    try:
+        return AdapterDeploymentEventListResponse(
+            items=list(list_events(session, principal, request_scope, limit=limit, offset=offset)),
+            limit=limit,
+            offset=offset,
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/adapters/{adapter_id}/rollback-retention/release",
+    response_model=AdapterRollbackRetentionResponse,
+    tags=["adapter-governance"],
+)
+async def post_adapter_rollback_retention_release(
+    adapter_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> AdapterRollbackRetentionResponse:
+    body = await _validated_evaluation_body(
+        request, AdapterRollbackRetentionReleaseRequest, maximum_bytes=MAX_CANCEL_BODY_BYTES
+    )
+    try:
+        return AdapterRollbackRetentionResponse.model_validate(
+            release_rollback_retention(
+                session,
+                principal,
+                request_scope,
+                adapter_id=adapter_id,
+                retention_id=body.rollback_retention_id,
+                expected_adapter_version=body.expected_adapter_version,
+                expected_retention_version=body.expected_retention_version,
             )
         )
     except ServiceError as error:
