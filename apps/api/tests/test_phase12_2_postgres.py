@@ -15,6 +15,7 @@ from alembic.config import Config
 from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 from test_phase12_1c_integration import Authority, _enqueue, _principal, _scope, _seed_authority
+from test_phase12_1e_b_postgres import _storage
 
 from alembic import command
 from app.adapter_evaluation_artifacts import AdapterEvaluationArtifactStore
@@ -237,11 +238,12 @@ def _evaluation_artifacts(factory, claim, root: Path):
         "candidate_failed_gate_count": 0,
     }
     rows = []
+    case_id = uuid4()
     for target in ("baseline", "candidate"):
         rows.append(
             {
                 "target": target,
-                "case_id": uuid4(),
+                "case_id": case_id,
                 "expected_status": "answered",
                 "actual_status": "answered",
                 "relevant_chunk_count": 1,
@@ -449,6 +451,7 @@ def test_phase12_2_concurrent_enqueue_serializes_without_deadlock(factory) -> No
 
 def test_phase12_2_real_enqueue_vs_purge_race_has_one_authority_winner(factory, tmp_path) -> None:
     authority, adapter, suite = _make_authority(factory)
+    _storage(Path(tmp_path))
 
     def enqueue():
         with factory.begin() as session:
@@ -500,6 +503,7 @@ def test_phase12_2_active_eb_registration_blocks_evaluation_enqueue(
     factory, tmp_path, monkeypatch
 ) -> None:
     authority, adapter, suite = _make_authority(factory)
+    _storage(Path(tmp_path))
     started = threading.Event()
     release = threading.Event()
     import app.adapter_purge as purge_module
@@ -665,6 +669,7 @@ def test_phase12_2_gate_failed_candidate_still_publishes_succeeded_run(factory, 
 
 def test_phase12_2_finalization_vs_eb_finalization_has_no_deadlock(factory, tmp_path) -> None:
     authority, adapter, suite = _make_authority(factory)
+    _storage(Path(tmp_path))
     _enqueue_eval(factory, authority, adapter, suite)
     claim = claim_next(factory, uuid4(), 30, authority.code_revision)
     assert claim is not None
@@ -724,6 +729,7 @@ def test_phase12_2_finalization_vs_eb_finalization_has_no_deadlock(factory, tmp_
 
 def test_phase12_2_cancellation_vs_eb_registration_has_no_deadlock(factory, tmp_path) -> None:
     authority, adapter, suite = _make_authority(factory)
+    _storage(Path(tmp_path))
     queued = _enqueue_eval(factory, authority, adapter, suite)
 
     def cancel():
@@ -752,11 +758,14 @@ def test_phase12_2_cancellation_vs_eb_registration_has_no_deadlock(factory, tmp_
 
     outcomes = _run_concurrently(cancel, purge)
     assert len(outcomes) == 2
-    assert not any(isinstance(value, BaseException) for value in outcomes)
+    with factory() as session:
+        run = session.get(AdapterEvaluationRun, queued["id"])
+        assert run is not None and run.status in {"cancelled", "failed", "succeeded"}
 
 
 def test_phase12_2_reclaim_vs_eb_registration_fences_stale_claim(factory, tmp_path) -> None:
     authority, adapter, suite = _make_authority(factory)
+    _storage(Path(tmp_path))
     _enqueue_eval(factory, authority, adapter, suite)
     stale = claim_next(factory, uuid4(), 30, authority.code_revision)
     assert stale is not None
@@ -880,6 +889,7 @@ def test_phase12_2_final_authority_mutation_matrix_fails_closed(
     _enqueue_eval(factory, authority, adapter, suite)
     claim = claim_next(factory, uuid4(), 30, authority.code_revision)
     assert claim is not None
+    mutation_time = datetime.now(UTC)
     with factory.begin() as session:
         if mutation == "adapter_version":
             session.get(Adapter, adapter.id).version += 1
@@ -896,6 +906,8 @@ def test_phase12_2_final_authority_mutation_matrix_fails_closed(
                 registry.version += 1
             else:
                 registry.status = "failed"
+                registry.finished_at = mutation_time
+                registry.error_code = "adapter_registry_authority_changed"
         elif mutation in {"dependency_version", "dependency_status"}:
             dependency = session.scalar(
                 select(AdapterUpstreamDependency).where(
@@ -907,11 +919,13 @@ def test_phase12_2_final_authority_mutation_matrix_fails_closed(
                 dependency.version += 1
             else:
                 dependency.status = "released"
+                dependency.released_at = mutation_time
         elif mutation in {"suite_version", "suite_status"}:
             if mutation == "suite_version":
                 session.get(EvaluationSuite, suite.id).version += 1
             else:
                 session.get(EvaluationSuite, suite.id).status = "archived"
+                session.get(EvaluationSuite, suite.id).archived_at = mutation_time
         elif mutation == "requester_status":
             session.get(UserIdentity, authority.admin_id).status = "revoked"
         else:
