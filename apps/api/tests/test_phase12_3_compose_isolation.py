@@ -36,3 +36,10 @@ def test_governance_worker_image_has_no_model_or_vector_stack():
     for forbidden in ("torch", "transformers", "peft", "qdrant", "llamaindex", "huggingface"):
         assert forbidden not in dockerfile
         assert forbidden not in entrypoint
+
+
+def test_governance_worker_uses_only_the_narrow_registry_reader():
+    source = (ROOT / "apps/api/app/adapter_governance_worker.py").read_text(encoding="utf-8")
+    assert "AdapterRegistryFinalReader" in source
+    assert "AdapterRegistryArtifactStore" not in source
+    assert "from app.settings import Settings" not in source

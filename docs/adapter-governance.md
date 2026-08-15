@@ -52,6 +52,27 @@ registry-final allowlist and digests through descriptor-bound handles, and only
 then writes the deployment pointer and one success event. PostgreSQL remains
 the authority; filesystem publication is not transactionally atomic.
 
+The governance container uses a dedicated read-only registry-final descriptor
+reader. Its only runtime storage requirement is
+`DEPTSLM_DATA_DIR/adapters/registry`; it does not require `uploads`, imports,
+staging, datasets, models, Qdrant, or API settings. The retained allowlist is
+exactly `manifest.json`, `adapter_config.json`, and
+`adapter_model.safetensors`. Before the final transaction, the worker reruns
+the model-free Phase 12.1A canonical-config and complete safetensors-header
+contracts in a bounded, secret-free child process using the same open file
+descriptors, then rechecks descriptor identities. The child receives no paths,
+bytes, database, network, model, or token authority and is always reaped.
+
+The final transaction reauthorizes the operation's original requester by
+server-owned identity: the department must be active, the identity and exact
+same-department membership must be active, the role must be
+`system_admin`/`department_admin`, and any expiry must be in the future under
+PostgreSQL server time. A deployment success therefore has one pointer change,
+one immutable event, and one mandatory mutation-success audit, or none of
+them. Review start and every review transition also require the exact adapter
+path selector; a same-department review/evaluation belonging to another
+adapter is not mutated.
+
 ## Isolation and retention
 
 All review, deployment, operation, event, and retention reads and writes carry

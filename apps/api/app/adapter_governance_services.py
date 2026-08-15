@@ -531,10 +531,12 @@ def start_review(
     principal: AuthenticatedPrincipal,
     scope: DepartmentRequestScope,
     *,
+    adapter_id: UUID,
     evaluation_id: UUID,
     expected_adapter_version: int,
     expected_evaluation_version: int,
 ) -> dict[str, object]:
+    _safe_uuid(adapter_id, label="adapter")
     _safe_uuid(evaluation_id, label="evaluation")
     _safe_version(expected_adapter_version, label="adapter")
     _safe_version(expected_evaluation_version, label="evaluation")
@@ -552,6 +554,7 @@ def start_review(
             .where(
                 AdapterEvaluationRun.id == evaluation_id,
                 AdapterEvaluationRun.department_id == scope.department.value,
+                AdapterEvaluationRun.adapter_id == adapter_id,
             )
             .with_for_update()
         )
@@ -563,7 +566,7 @@ def start_review(
         ):
             raise ServiceError(409, "Evaluation authority changed")
         adapter, run, suite, registry, dependency, evidence = _load_evaluation_authority(
-            session, scope.department.value, run.adapter_id, evaluation_id, lock=True
+            session, scope.department.value, adapter_id, evaluation_id, lock=True
         )
         if adapter.version != expected_adapter_version:
             raise ServiceError(409, "Adapter authority changed")
@@ -653,11 +656,13 @@ def transition_review(
     principal: AuthenticatedPrincipal,
     scope: DepartmentRequestScope,
     *,
+    adapter_id: UUID,
     review_id: UUID,
     action: str,
     expected_adapter_version: int,
     expected_review_version: int,
 ) -> dict[str, object]:
+    _safe_uuid(adapter_id, label="adapter")
     _safe_uuid(review_id, label="review")
     _safe_version(expected_adapter_version, label="adapter")
     _safe_version(expected_review_version, label="review")
@@ -675,7 +680,9 @@ def transition_review(
         review = session.scalar(
             select(AdapterReview)
             .where(
-                AdapterReview.id == review_id, AdapterReview.department_id == scope.department.value
+                AdapterReview.id == review_id,
+                AdapterReview.department_id == scope.department.value,
+                AdapterReview.adapter_id == adapter_id,
             )
             .with_for_update()
         )
@@ -687,7 +694,7 @@ def transition_review(
         ):
             raise ServiceError(409, "Review authority changed")
         adapter, run, suite, registry, dependency, evidence = _load_evaluation_authority(
-            session, scope.department.value, review.adapter_id, review.evaluation_id, lock=True
+            session, scope.department.value, adapter_id, review.evaluation_id, lock=True
         )
         if (
             review.evaluation_id != run.id

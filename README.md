@@ -49,6 +49,14 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > improvement threshold. Phase 12.2 evaluation authority remains exact and
 > immutable; Phase 12.4 runtime routing and Phase 13 are not started.
 
+The governance worker is deliberately narrower than the API: its dedicated
+settings loader requires PostgreSQL plus only the external read-only
+`adapters/registry` root. It validates the exact three-file registry-final
+allowlist and reruns the model-free Phase 12.1A config/header contract in a
+bounded child using retained descriptors. Final deployment reauthorizes the
+original requester with PostgreSQL server time and requires one success event
+and one success audit for the pointer change.
+
 > **Phase 12.1E-B recovery:** After durable move authorization, initial rename
 > still requires an empty exact namespace, and unbound post-rename recovery
 > accepts only its one exact durable tombstone UUID. A canonical private unknown

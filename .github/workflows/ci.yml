@@ -246,8 +246,39 @@ jobs:
           DEPTSLM_ADAPTER_GOVERNANCE_WORKER_ID: 00000000-0000-0000-0000-000000000014
         run: |
           export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-adapter-governance-smoke"
-          mkdir -p "$DEPTSLM_DATA_DIR/uploads" "$DEPTSLM_DATA_DIR/adapters/registry"
+          mkdir -p "$DEPTSLM_DATA_DIR/adapters/registry"
+          chmod 700 "$DEPTSLM_DATA_DIR" "$DEPTSLM_DATA_DIR/adapters" "$DEPTSLM_DATA_DIR/adapters/registry"
           python -m app.adapter_governance_worker --once
+      - name: Prepare actual Phase 12.3 governance promotion smoke
+        working-directory: apps/api
+        env:
+          DEPTSLM_DATA_DIR: ${{ runner.temp }}/deptslm-governance-operation
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE/apps/api:$GITHUB_WORKSPACE/services/rag-worker:$GITHUB_WORKSPACE/services/rag-runtime"
+          python tests/phase12_3_container_smoke.py prepare
+          chmod 700 "$DEPTSLM_DATA_DIR" "$DEPTSLM_DATA_DIR/adapters" "$DEPTSLM_DATA_DIR/adapters/registry"
+      - name: Build the Phase 12.3 governance worker image
+        run: docker build --tag deptslm-adapter-governance-smoke --file services/adapter-governance-worker/Dockerfile .
+      - name: Run the actual Phase 12.3 governance promotion container
+        env:
+          DEPTSLM_DATA_DIR: ${{ runner.temp }}/deptslm-governance-operation
+        run: |
+          docker run --rm --read-only --network host --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            --user "$(id -u):$(id -g)" \
+            --volume "$DEPTSLM_DATA_DIR/adapters/registry:/runtime/deptslm/adapters/registry:ro" \
+            --env DATABASE_URL="$DATABASE_URL" \
+            --env DEPTSLM_DATA_DIR=/runtime/deptslm \
+            --env DEPTSLM_STORAGE_READ_ONLY=1 \
+            --env DEPTSLM_ADAPTER_GOVERNANCE_WORKER_ID=00000000-0000-0000-0000-000000000015 \
+            deptslm-adapter-governance-smoke python -m app.adapter_governance_worker --once
+      - name: Verify actual Phase 12.3 governance promotion
+        working-directory: apps/api
+        env:
+          DEPTSLM_DATA_DIR: ${{ runner.temp }}/deptslm-governance-operation
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE/apps/api:$GITHUB_WORKSPACE/services/rag-worker:$GITHUB_WORKSPACE/services/rag-runtime"
+          python tests/phase12_3_container_smoke.py verify
       - name: Verify API checks leave the checkout clean
         shell: bash
         run: |
@@ -701,9 +732,15 @@ jobs:
           grep -F 'read_only: true' <<<"$governance_compose" >/dev/null
           grep -F '/adapters/registry' <<<"$governance_compose" >/dev/null
           grep -F 'DEPTSLM_STORAGE_READ_ONLY: "1"' <<<"$governance_compose" >/dev/null
+          grep -F 'AdapterRegistryFinalReader' apps/api/app/adapter_governance_worker.py >/dev/null
+          grep -F 'AdapterGovernanceWorkerSettings' apps/api/app/adapter_governance_worker.py >/dev/null
+          grep -F 'run_adapter_governance_validation_child' apps/api/app/adapter_governance_worker.py >/dev/null
+          grep -F 'parse_canonical_adapter_config' apps/api/app/adapter_governance_child.py >/dev/null
+          grep -F 'validate_safetensors_metadata' apps/api/app/adapter_governance_child.py >/dev/null
           ! grep -E 'qdrant|model_cache|uploads|extracted_text|training_datasets|eval_results|exports|rag-internal|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|DEPTSLM_AUTH|PROXY' <<<"$governance_compose"
           ! grep -E '@router\.(get|post|put|patch|delete).*search|/search|query_vector' apps/api/app/routes.py
           ! grep -E 'adapter_selector|runtime_adapter|model_path|qdrant_url' apps/api/app/adapter_governance_*.py
+          ! grep -R --include='*.py' -E 'DepartmentAdapterDeployment|adapter_selector|runtime_adapter|peft|PEFT' apps/api/app/rag_answer_services.py services/rag-runtime/deptslm_runtime
           grep -F 'Phase 12.4' docs/adapter-governance.md >/dev/null
       - name: Validate Compose configuration when available
         run: |

@@ -36,6 +36,19 @@ class AdapterRegistryArtifactError(RuntimeError):
             "adapter_registry_publication_failed",
             "adapter_registry_authority_changed",
             "adapter_input_unsafe",
+            "adapter_config_invalid",
+            "adapter_config_unsupported",
+            "adapter_header_invalid",
+            "adapter_header_too_large",
+            "adapter_file_too_large",
+            "adapter_tensor_set_invalid",
+            "adapter_tensor_shape_invalid",
+            "adapter_tensor_dtype_invalid",
+            "adapter_tensor_offsets_invalid",
+            "adapter_tensor_size_invalid",
+            "claim_lost",
+            "worker_shutdown",
+            "worker_timeout",
         }
     )
 
@@ -52,6 +65,7 @@ class RetainedFinal:
     parent_fd: int
     resource_id: UUID
     files: tuple[tuple[str, int, os.stat_result], ...]
+    allowlist: frozenset[str]
     read_only: bool = True
     directory_metadata: os.stat_result | None = None
 
@@ -105,17 +119,7 @@ class RetainedFinal:
         ):
             raise AdapterRegistryArtifactError("adapter_registry_authority_changed")
         _entry_matches(self.parent_fd, str(self.resource_id), self.directory_fd)
-        if {name for name, _fd, _meta in self.files} != {
-            "intake_manifest.json",
-            "adapter_config.json",
-            "adapter_model.safetensors",
-        } and {name for name, _fd, _meta in self.files} != {
-            "manifest.json",
-            "training.yaml",
-            "dataset_info.json",
-            "train.jsonl",
-            "validation.jsonl",
-        }:
+        if {name for name, _fd, _meta in self.files} != self.allowlist:
             raise AdapterRegistryArtifactError("adapter_registry_authority_changed")
         for name, descriptor, before in self.files:
             after = os.fstat(descriptor)
@@ -283,8 +287,8 @@ class AdapterRegistryArtifactStore:
                 except OSError:
                     pass
 
+    @staticmethod
     def _open_final(
-        self,
         root_fd: int,
         department: DepartmentScope,
         resource_id: UUID,
@@ -320,6 +324,7 @@ class AdapterRegistryArtifactStore:
                 parent,
                 resource_id,
                 tuple(files),
+                allowlist,
                 read_only=read_only,
                 directory_metadata=os.fstat(directory),
             )
@@ -447,6 +452,68 @@ class AdapterRegistryArtifactStore:
             raise
 
 
+class AdapterRegistryFinalReader:
+    """Read-only registry-final reader for private governance consumers.
+
+    Unlike :class:`AdapterRegistryArtifactStore`, this reader opens only the
+    external ``adapters/registry`` tree. It never requires imports, staging,
+    training-job storage, or a writable adapters root.
+    """
+
+    def __init__(self, data_dir: Path) -> None:
+        if not isinstance(data_dir, Path) or not data_dir.is_absolute() or not data_dir.is_dir():
+            raise AdapterRegistryArtifactError("adapter_input_unsafe")
+        data_descriptor: int | None = None
+        adapters_descriptor: int | None = None
+        try:
+            data_descriptor = os.open(
+                os.fspath(data_dir),
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            )
+            data_metadata = os.fstat(data_descriptor)
+            if not stat.S_ISDIR(data_metadata.st_mode) or data_metadata.st_uid != os.geteuid():
+                raise AdapterRegistryArtifactError("adapter_input_unsafe")
+            adapters_descriptor = _open_owned_directory_child(data_descriptor, "adapters")
+            self._registry_fd = _open_private_child(adapters_descriptor, "registry", writable=False)
+        except OSError as error:
+            raise AdapterRegistryArtifactError("adapter_registry_authority_changed") from error
+        finally:
+            for descriptor in (adapters_descriptor, data_descriptor):
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+        self._closed = False
+
+    def close(self) -> None:
+        descriptor = getattr(self, "_registry_fd", None)
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            self._registry_fd = None
+        self._closed = True
+
+    def __enter__(self) -> AdapterRegistryFinalReader:
+        return self
+
+    def __exit__(self, *_ignored: object) -> None:
+        self.close()
+
+    def open_registry_final(self, department: DepartmentScope, adapter_id: UUID) -> RetainedFinal:
+        if self._closed or self._registry_fd is None:
+            raise AdapterRegistryArtifactError("adapter_registry_authority_changed")
+        return AdapterRegistryArtifactStore._open_final(
+            self._registry_fd,
+            department,
+            adapter_id,
+            REGISTRY_FINAL_FILES,
+            read_only=True,
+        )
+
+
 def _open_directory_path(path: Path, *, writable: bool) -> int:
     descriptor = os.open(
         os.fspath(path), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
@@ -473,6 +540,30 @@ def _open_private_child(parent_fd: int, name: str, *, writable: bool = True) -> 
     )
     try:
         _require_private_directory(descriptor, writable=writable)
+        _entry_matches(parent_fd, name, descriptor)
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_owned_directory_child(parent_fd: int, name: str) -> int:
+    """Open a no-follow service-owned parent without requiring private mode."""
+
+    _safe_name(name)
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise AdapterRegistryArtifactError("adapter_registry_authority_changed")
         _entry_matches(parent_fd, name, descriptor)
         return descriptor
     except Exception:
@@ -653,4 +744,5 @@ __all__ = [
     "RetainedFinal",
     "RegistryStage",
     "AdapterRegistryArtifactStore",
+    "AdapterRegistryFinalReader",
 ]

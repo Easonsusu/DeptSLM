@@ -1,8 +1,10 @@
+import inspect
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
+from app.adapter_governance_services import start_review, transition_review
 from app.routes import router
 from app.schemas import (
     AdapterDeploymentCancelRequest,
@@ -54,3 +56,11 @@ def test_phase12_3_request_schemas_are_closed():
             runtime_url="forbidden",
         )
     assert AdapterDeploymentCancelRequest(expected_version=1).expected_version == 1
+
+
+def test_review_mutations_require_the_path_adapter_selector():
+    assert "adapter_id" in inspect.signature(start_review).parameters
+    assert "adapter_id" in inspect.signature(transition_review).parameters
+    source = inspect.getsource(start_review) + inspect.getsource(transition_review)
+    assert "AdapterEvaluationRun.adapter_id == adapter_id" in source
+    assert "AdapterReview.adapter_id == adapter_id" in source
