@@ -159,6 +159,19 @@ def _prepare_approved_promotion(
             expected_review_version=approved["version"],
             expected_deployment_version=0,
         )
+    # The public enqueue response intentionally omits internal snapshot fields.
+    # Keep the test's durable-authority assertions explicit by loading those
+    # fields from the persisted operation row rather than widening the API.
+    with factory() as session:
+        persisted = session.get(AdapterDeploymentOperation, operation["id"])
+        assert persisted is not None
+        operation.update(
+            {
+                "target_review_version": persisted.target_review_version,
+                "target_evaluation_version": persisted.target_evaluation_version,
+                "suite_id": persisted.suite_id,
+            }
+        )
     return authority, operation
 
 
@@ -408,6 +421,36 @@ def test_target_snapshot_updates_suite_on_base_and_new_suite_transitions(
         assert base_pointer.deployment_version == 2
         assert active_retention is not None
 
+        # The approved review is retained while its rollback reservation is
+        # active.  Release that exact non-current retention, then archive the
+        # old review so the database's one-approved-review-per-adapter-version
+        # constraint permits a second immutable suite authority for the same
+        # adapter version.
+        retention_id = active_retention.id
+        retention_version = active_retention.version
+    with factory.begin() as session:
+        released = release_rollback_retention(
+            session,
+            _principal(authority),
+            _scope(authority),
+            adapter_id=first_operation["target_adapter_id"],
+            retention_id=retention_id,
+            expected_adapter_version=adapter_version,
+            expected_retention_version=retention_version,
+        )
+        assert released["status"] == "released"
+        archived = transition_review(
+            session,
+            _principal(authority),
+            _scope(authority),
+            adapter_id=first_operation["target_adapter_id"],
+            review_id=first_operation["target_review_id"],
+            action="archive",
+            expected_adapter_version=adapter_version,
+            expected_review_version=first_operation["target_review_version"],
+        )
+        assert archived["status"] == "archived"
+
     second_operation = _prepare_approved_promotion_for_suite(
         factory,
         tmp_path,
@@ -464,7 +507,7 @@ def test_target_snapshot_updates_suite_on_base_and_new_suite_transitions(
         assert run is not None and run.suite_id == suite_b.id
         assert adapter.status == adapter_status == "validated"
         assert adapter.version == adapter_version
-        assert active_retentions == 1
+        assert active_retentions == 0
         assert promote_events == 2
         assert rollback_events == 1
         assert success_audits == 3
