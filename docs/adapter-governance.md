@@ -47,10 +47,13 @@ baseline/candidate deltas remain evidence for the human reviewer.
 Approval never promotes. Administrators must enqueue an explicit promotion or
 rollback with optimistic adapter, review, retention, and deployment versions.
 The worker locks the department first, checks the current deployment version,
-revalidates the complete PostgreSQL snapshot, verifies the exact private
-registry-final allowlist and digests through descriptor-bound handles, and only
-then writes the deployment pointer and one success event. PostgreSQL remains
-the authority; filesystem publication is not transactionally atomic.
+reauthorizes the requester, revalidates the complete PostgreSQL snapshot,
+verifies the exact private registry-final allowlist and digests through
+descriptor-bound handles, and only then replaces the deployment pointer's
+complete target snapshot (including review, evaluation, and `suite_id`) and
+writes one success event. Cancellation of a live claim is terminalized before
+publication; it is never treated as an ordinary stale-claim loss. PostgreSQL
+remains the authority; filesystem publication is not transactionally atomic.
 
 The governance container uses a dedicated read-only registry-final descriptor
 reader. Its only runtime storage requirement is

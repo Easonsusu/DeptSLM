@@ -323,8 +323,10 @@ def _heartbeat_owned(
             )
             .with_for_update()
         )
-        if row is None or not _claim_is_owned(session, row, operation):
+        if row is None or not _claim_matches_live_worker(session, row, operation):
             raise AdapterGovernanceWorkerError("claim_lost")
+        if row.cancellation_requested_at is not None:
+            raise AdapterGovernanceWorkerError("cancelled")
         now = session.scalar(select(func.clock_timestamp()))
         row.lease_expires_at = now + timedelta(seconds=lease_seconds)
         row.version += 1
@@ -465,6 +467,18 @@ def _claim_is_owned(
     row: AdapterDeploymentOperation,
     claimant: AdapterDeploymentOperation,
 ) -> bool:
+    return _claim_matches_live_worker(session, row, claimant) and (
+        row.cancellation_requested_at is None
+    )
+
+
+def _claim_matches_live_worker(
+    session: Session,
+    row: AdapterDeploymentOperation,
+    claimant: AdapterDeploymentOperation,
+) -> bool:
+    """Match a live worker token without treating cancellation as claim loss."""
+
     now = session.scalar(select(func.clock_timestamp()))
     return (
         row.id == claimant.id
@@ -472,7 +486,6 @@ def _claim_is_owned(
         and row.status == "running"
         and row.worker_id == claimant.worker_id
         and row.claim_token == claimant.claim_token
-        and row.cancellation_requested_at is None
         and row.lease_expires_at is not None
         and row.lease_expires_at > now
     )
@@ -506,6 +519,14 @@ def _retention_for_outgoing(
         .with_for_update()
     )
     if existing is not None:
+        if (
+            existing.approved_review_id != review_id
+            or existing.review_version != review_version
+            or existing.evaluation_id != evaluation_id
+            or existing.evaluation_version != evaluation_version
+            or existing.suite_id != suite_id
+        ):
+            raise AdapterGovernanceWorkerError("review_authority_changed")
         return existing
     row = AdapterRollbackRetention(
         id=uuid4(),
@@ -540,7 +561,10 @@ def finalize_owned_operation(
     retained_final: RetainedFinal | None = None
     with factory.begin() as session:
         claimed = session.get(AdapterDeploymentOperation, operation.id)
-        if claimed is None or not _claim_is_owned(session, claimed, operation):
+        if claimed is not None and _claim_matches_live_worker(session, claimed, operation):
+            if claimed.cancellation_requested_at is not None:
+                raise AdapterGovernanceWorkerError("cancelled")
+        elif claimed is None or not _claim_is_owned(session, claimed, operation):
             raise AdapterGovernanceWorkerError("claim_lost")
 
     if operation.target_adapter_id is not None:
@@ -607,6 +631,13 @@ def finalize_owned_operation(
                 if retained_final is not None:
                     retained_final.close()
                 return False
+            if (
+                current_operation.cancellation_requested_at is not None
+                and _claim_matches_live_worker(session, current_operation, operation)
+            ):
+                if retained_final is not None:
+                    retained_final.close()
+                raise AdapterGovernanceWorkerError("cancelled")
             if not _claim_is_owned(session, current_operation, operation):
                 if retained_final is not None:
                     retained_final.close()
@@ -799,6 +830,7 @@ def finalize_owned_operation(
                 current.review_version = review.version if review is not None else None
                 current.evaluation_id = run.id if run is not None else None
                 current.evaluation_version = run.version if run is not None else None
+                current.suite_id = run.suite_id if run is not None else None
                 current.base_model_id = _BASE_MODEL_ID
                 current.base_model_revision = _BASE_MODEL_REVISION
                 current.deployment_version = after_version
@@ -841,7 +873,11 @@ def fail_owned_operation(
             )
             .with_for_update()
         )
-        if row is None or not _claim_is_owned(session, row, operation):
+        if row is None or not _claim_matches_live_worker(session, row, operation):
+            return
+        if row.cancellation_requested_at is not None:
+            safe = "cancelled"
+        elif safe == "cancelled":
             return
         now = session.scalar(select(func.clock_timestamp()))
         row.status = "cancelled" if safe == "cancelled" else "failed"

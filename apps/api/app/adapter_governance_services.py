@@ -1496,18 +1496,20 @@ def release_rollback_retention(
                     AdapterEvaluationRun.adapter_version == current.adapter_version,
                 )
             )
-            if current_run is None:
+            if current_run is None or current_run.suite_id != current.suite_id:
                 raise ServiceError(409, "Current deployment authority is unavailable")
             current_review = session.scalar(
-                select(AdapterReview)
-                .where(
+                select(AdapterReview).where(
+                    AdapterReview.id == current.review_id,
                     AdapterReview.department_id == scope.department.value,
                     AdapterReview.adapter_id == current.adapter_id,
                     AdapterReview.adapter_version == current.adapter_version,
+                    AdapterReview.evaluation_id == current.evaluation_id,
+                    AdapterReview.evaluation_version == current.evaluation_version,
+                    AdapterReview.suite_id == current.suite_id,
                     AdapterReview.status == "approved",
                     AdapterReview.archived_at.is_(None),
                 )
-                .order_by(AdapterReview.created_at.desc())
             )
             if current_review is None:
                 raise ServiceError(409, "Current deployment review is unavailable")
