@@ -5,7 +5,8 @@ completed contract work, the reviewed Phase 12.1B source-intake implementation,
 the completed Phase 12.1C immutable registry-publication implementation, the
 completed Phase 12.1D metadata-only registry read boundary, the completed
 Phase 12.1E-A reconciliation foundation, and the completed Phase 12.1E-B
-purge authority. Phase 12.1E-C is the current reviewed lifecycle-release scope.
+purge authority, and the completed Phase 12.1E-C lifecycle-release scope.
+Phase 12.2 is the current reviewed adapter-evaluation scope.
 It also records future metadata, evaluation, review, deployment, and runtime contracts. The
 separate Phase 12.1A static compatibility contract is documented in
 [adapter-static-contract.md](adapter-static-contract.md).
@@ -16,7 +17,7 @@ separate Phase 12.1A static compatibility contract is documented in
   LlamaFactory job bundle; it does not execute training or create an adapter.
 - Phase 12 is under review.
 - Phase 12.0 is completed: it defines contracts and the threat model.
-- Phase 12.1 is under review. Phase 12.1A, Phase 12.1B, and Phase 12.1C are
+- Phase 12.1 is completed. Phase 12.1A, Phase 12.1B, and Phase 12.1C are
   completed. Phase 12.1C binds one exact committed source to one approved succeeded Phase 11
   job and captured Phase 10 authority, then publishes an immutable private
   registry bundle through a leased descriptor-bound worker. It records only
@@ -30,18 +31,22 @@ separate Phase 12.1A static compatibility contract is documented in
 - Phase 12.1E-B is completed. It independently reserves
   exact source/registry attempts and removes registry bytes before source bytes
   through `.purge-deleting` descriptor-bound tombstones.
-- Phase 12.1E-C is the current reviewed scope. It can release only one exact
+- Phase 12.1E-C is completed. It can release only one exact
   active upstream dependency after read-only proof that the corresponding E-B
   purge completed without blocks, both final paths remain absent, and both
   exact purge namespaces are empty. It does not touch artifact bytes.
-- Phase 12.2, 12.3, and 12.4 remain unimplemented.
+- Phase 12.2 is the current reviewed scope. It adds only paired, content-free
+  adapter-target evaluation and does not approve, promote, load, or route.
+- Phase 12.3 and 12.4 remain unimplemented.
 - Phase 13 has not started.
 
-The Phase 12.1D read routes are the only public adapter metadata surface today:
-they return a closed PostgreSQL projection and never access registry files.
-There is still no adapter upload/download, evaluation, deployment pointer,
-runtime loading, or rollback route. The Phase 12.1C internal worker publishes
-immutable registry files and content-free PostgreSQL authority only.
+The Phase 12.1D read routes and the Phase 12.2 evaluation metadata routes are
+the only public adapter metadata surfaces today. They return closed
+PostgreSQL projections; evaluation enqueue, cancellation, listing, and detail
+operations never expose registry files or evaluation content. There is still
+no adapter upload/download, deployment pointer, runtime loading, or rollback
+route. The Phase 12.1C internal worker publishes immutable registry files and
+content-free PostgreSQL authority only.
 
 ## Phase 12 objective
 
@@ -69,7 +74,7 @@ the artifact is safe, compatible, or useful.
   reconciliation, and purge boundaries.
 - Phase 12.0 made no migration, dependency, service, or runtime change.
 
-### Phase 12.1 — immutable adapter intake (under review)
+### Phase 12.1 — immutable adapter intake (completed)
 
 #### Phase 12.1A — static compatibility contract (implemented in this review)
 
@@ -156,7 +161,7 @@ the artifact is safe, compatible, or useful.
   external storage remain non-atomic. There is no public purge route and no
   runtime adapter loading.
 
-#### Phase 12.1E-C (current; under review)
+#### Phase 12.1E-C (completed)
 
 - `release-adapter-upstream-dependency` is an administrator-only command that
   is dry-run by default. It accepts only the exact department and adapter
@@ -179,7 +184,24 @@ the artifact is safe, compatible, or useful.
   and writes one `adapter.upstream_dependency.release` audit. It never changes
   source, adapter, job, dataset, or E-B history lifecycle timestamps/statuses.
 
-### Phase 12.2 — adapter-target evaluation (not started)
+### Phase 12.2 — adapter-target evaluation (current; under review)
+
+Phase 12.2 evaluates one exact validated adapter against the exact Phase 7
+baseline using the reviewed Phase 9 production retrieval, prompt, generation,
+citation, metric, and Decimal gate policies. For each suite case the worker
+prepares one department-authorized retrieval context and deterministic seed,
+then sends that same transient context to the baseline and isolated candidate
+lanes. The candidate runtime is pinned to the reviewed base model revision and
+adapter stack, runs offline, and has no base-model fallback.
+
+The worker stores only closed run, attempt, case, and aggregate numeric
+metadata. External result storage contains exactly `manifest.json`,
+`summary.json`, and `case_results.jsonl`; it never contains questions, accepted
+answers, prompts, retrieved evidence, generated answers, vectors, paths, or
+adapter bytes. PostgreSQL server-time leases, cancellation/reclaim, final
+authority checks, and the active E-B purge fence remain required. Evaluation
+does not change production retrieval, prompts, adapter state, approval,
+promotion, or runtime routing.
 
 - Produce exact baseline and candidate evidence for one adapter version.
 - Reuse reviewed production-policy evaluation behavior where applicable.
@@ -689,20 +711,23 @@ the base model. The base model is used only when no adapter is explicitly
 deployed or after explicit rollback-to-base. Cache keys must include department,
 adapter ID, adapter version, and base revision.
 
-## Planned metadata-only API boundary
+## Metadata-only API boundary
 
 The following endpoint shapes are implemented only where noted and otherwise
 remain conceptual:
 
 - `GET /departments/{department_id}/adapters` (Phase 12.1D metadata only)
 - `GET /departments/{department_id}/adapters/{adapter_id}` (Phase 12.1D metadata only)
-- `POST /departments/{department_id}/adapters/{adapter_id}/evaluations`
+- `POST /departments/{department_id}/adapters/{adapter_id}/evaluations` (Phase 12.2 paired evaluation)
+- `GET /departments/{department_id}/adapters/{adapter_id}/evaluations` (Phase 12.2 paired evaluation)
+- `GET /departments/{department_id}/adapters/{adapter_id}/evaluations/{evaluation_id}` (Phase 12.2 paired evaluation)
+- `POST /departments/{department_id}/adapters/{adapter_id}/evaluations/{evaluation_id}/cancel` (Phase 12.2 paired evaluation)
 - `PATCH /departments/{department_id}/adapters/{adapter_id}/review`
 - `POST /departments/{department_id}/adapters/{adapter_id}/promote`
 - `POST /departments/{department_id}/adapters/rollback`
 - `GET /departments/{department_id}/adapter-deployment`
 
-If implemented, these routes expose safe metadata only. There must be no adapter
+If implemented, the remaining routes expose safe metadata only. There must be no adapter
 weight upload or download, raw manifest or configuration download, host path,
 tensor metadata disclosure, arbitrary model selector, or arbitrary adapter
 selector endpoint. A URL `department_id` remains a selector; server-side

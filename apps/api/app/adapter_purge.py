@@ -35,6 +35,7 @@ from app.models import (
     ADAPTER_PURGE_BLOCKED_REASONS,
     Adapter,
     AdapterArtifactOperationItem,
+    AdapterEvaluationRun,
     AdapterImportAttempt,
     AdapterImportSource,
     AdapterPurgeItem,
@@ -313,6 +314,17 @@ def _assert_eligible(session: Session, authority: _Authority, department_id: UUI
     if active_reconcile is not None:
         raise ServiceError(409, "Adapter purge conflicts with reconciliation")
     if adapter.status == "validated" and source.status == "consumed":
+        active_evaluation = session.scalar(
+            select(AdapterEvaluationRun.id)
+            .where(
+                AdapterEvaluationRun.department_id == department_id,
+                AdapterEvaluationRun.adapter_id == adapter.id,
+                AdapterEvaluationRun.status.in_(("queued", "running")),
+            )
+            .limit(1)
+        )
+        if active_evaluation is not None:
+            raise ServiceError(409, "Adapter purge conflicts with active evaluation")
         active_purge = session.scalar(
             select(AdapterPurgeOperation.id).where(
                 AdapterPurgeOperation.department_id == department_id,
@@ -1222,6 +1234,17 @@ def _finalize_operation(
             ).scalar_one_or_none()
             if operation is None or operation.status not in ACTIVE_PURGE_STATUSES:
                 return
+            active_evaluation = session.scalar(
+                select(AdapterEvaluationRun.id)
+                .where(
+                    AdapterEvaluationRun.department_id == department_id,
+                    AdapterEvaluationRun.adapter_id == operation.adapter_id,
+                    AdapterEvaluationRun.status.in_(("queued", "running")),
+                )
+                .limit(1)
+            )
+            if active_evaluation is not None:
+                raise ServiceError(409, "Adapter purge conflicts with active evaluation")
             items = session.scalars(
                 select(AdapterPurgeItem)
                 .where(

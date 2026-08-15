@@ -65,7 +65,7 @@ This roadmap separates foundational safety work from product implementation. A l
 ## Phase 12 — LoRA adapter registry (under review)
 
 - Phase 12.0 (completed) defines the adapter-registry threat model, immutable administrator-controlled source boundary, closed artifact and metadata contracts, governance-lineage versus training-provenance limits, and future lifecycle, evaluation, promotion, rollback, reconciliation, and purge design.
-- Phase 12.1 (under review): immutable external adapter intake and metadata-only registry foundations; no runtime loading.
+- Phase 12.1 (completed): immutable external adapter intake, registry publication, metadata-only reads, reconciliation, purge, and lifecycle-release foundations; no runtime loading.
 - Phase 12.1A (completed): pure standard-library static compatibility validation for the pinned Qwen3-0.6B LoRA/QLoRA configuration, tensor-key and shape contract, and bounded safetensors metadata.
 - Phase 12.1B (completed): administrator-only,
   dry-run-by-default source intake accepts exactly `adapter_config.json` and
@@ -108,7 +108,7 @@ This roadmap separates foundational safety work from product implementation. A l
   metadata and one success audit; it never deletes Phase 10/11 artifacts,
   history, backups, or audit rows. There is no API route, runtime loading,
   deployment change, evaluation, or training behavior.
-- Phase 12.1E-C (current; under review): adds only a separate,
+- Phase 12.1E-C (completed): adds only a separate,
   administrator-only, dry-run-by-default metadata lifecycle release for one
   exact active upstream dependency after independently revalidating an exact
   completed Phase 12.1E-B purge. It proves the two final paths remain absent
@@ -118,7 +118,15 @@ This roadmap separates foundational safety work from product implementation. A l
   delete, recreate, move, inspect contents of, or otherwise mutate artifacts,
   Phase 10/11 data, lineage, review history, or purge history; it adds no API,
   evaluation, approval, promotion, loading, routing, or training behavior.
-- Phase 12.2 (not started): adapter-target evaluation, baseline/candidate evidence, and fixed numeric quality and safety gates; no automatic promotion.
+- Phase 12.2 (current; under review): adds a separate, department-scoped,
+  administrator-only paired evaluation of one exact validated adapter against
+  the exact Phase 7 baseline. Each case shares one Phase 9-authorized retrieval
+  context, production prompt contract, and deterministic seed across both
+  lanes. The candidate runtime is isolated and offline-capable; only numeric,
+  content-free evidence and fixed Decimal metrics/gates are published beneath
+  external `eval_results`. Queue leases, cancellation, reclaim, final
+  PostgreSQL authority, and the Phase 12.1E-B purge fence remain mandatory.
+  Evaluation does not approve, promote, route, or change production behavior.
 - Phase 12.3 (not started): review, approval, promotion, supersession, rollback, and deployment event history; no silent fallback.
 - Phase 12.4 (not started): department-bound runtime routing, immutable request snapshots, fail-closed loading, and explicit rollback-to-base.
 

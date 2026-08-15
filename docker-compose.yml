@@ -272,6 +272,98 @@ services:
         bind:
           create_host_path: false
 
+  adapter-evaluator:
+    profiles: ["adapter-evaluation"]
+    build:
+      context: .
+      dockerfile: services/rag-worker/Dockerfile
+      target: adapter-evaluator
+    command: ["python", "-m", "deptslm_worker.adapter_evaluator", "--poll"]
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      DEPTSLM_STORAGE_READ_ONLY: "1"
+      DEPTSLM_QDRANT_URL: "${DEPTSLM_QDRANT_URL:-http://qdrant:6333}"
+      DEPTSLM_QDRANT_API_KEY: "${DEPTSLM_QDRANT_API_KEY:?Set a non-placeholder Qdrant API key in the untracked .env file}"
+      DEPTSLM_QDRANT_COLLECTION: "${DEPTSLM_QDRANT_COLLECTION:-deptslm_chunks_qwen3_0_6b_1024_v1}"
+      DEPTSLM_QDRANT_TIMEOUT_SECONDS: "${DEPTSLM_QDRANT_TIMEOUT_SECONDS:-30}"
+      DEPTSLM_RAG_RUNTIME_URL: "${DEPTSLM_RAG_RUNTIME_URL:-http://rag-runtime:8010}"
+      DEPTSLM_RAG_RUNTIME_TOKEN: "${DEPTSLM_RAG_RUNTIME_TOKEN:?Set a separate RAG runtime token in the untracked .env file}"
+      DEPTSLM_ADAPTER_EVAL_RUNTIME_URL: "http://adapter-eval-runtime:8011"
+      DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN: "${DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN:?Set a separate adapter-evaluation runtime token in the untracked .env file}"
+      DEPTSLM_EVALUATION_WORKER_ID: "${DEPTSLM_ADAPTER_EVALUATION_WORKER_ID:-00000000-0000-0000-0000-000000000013}"
+      DEPTSLM_EVALUATION_POLL_SECONDS: "${DEPTSLM_EVALUATION_POLL_SECONDS:-5}"
+      DEPTSLM_EVALUATION_LEASE_SECONDS: "${DEPTSLM_EVALUATION_LEASE_SECONDS:-300}"
+      DEPTSLM_EVALUATION_HEARTBEAT_SECONDS: "${DEPTSLM_EVALUATION_HEARTBEAT_SECONDS:-30}"
+      DEPTSLM_EVALUATION_OPERATION_TIMEOUT_SECONDS: "${DEPTSLM_EVALUATION_OPERATION_TIMEOUT_SECONDS:-120}"
+      DEPTSLM_EVALUATION_CODE_REVISION: "${DEPTSLM_EVALUATION_CODE_REVISION:?Set the exact lowercase 40-character code revision}"
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/extracted_text"
+        target: /runtime/deptslm/extracted_text
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/eval_results"
+        target: /runtime/deptslm/eval_results
+        bind:
+          create_host_path: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      rag-runtime:
+        condition: service_started
+      adapter-eval-runtime:
+        condition: service_started
+    networks:
+      - default
+      - rag-internal
+
+  adapter-eval-runtime:
+    profiles: ["adapter-evaluation"]
+    build:
+      context: .
+      dockerfile: services/adapter-eval-runtime/Dockerfile
+    environment:
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN: "${DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN:?Set a separate adapter-evaluation runtime token in the untracked .env file}"
+      DEPTSLM_ADAPTER_EVAL_PROVIDER: "${DEPTSLM_ADAPTER_EVAL_PROVIDER:-real}"
+      DEPTSLM_ADAPTER_EVAL_BASE_REVISION: "${DEPTSLM_ADAPTER_EVAL_BASE_REVISION:-c1899de289a04d12100db370d81485cdf75e47ca}"
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp/adapter-eval:rw,noexec,nosuid,size=512m,uid=1001,gid=1001,mode=700
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/model_cache"
+        target: /runtime/deptslm/model_cache
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/adapters/registry"
+        target: /runtime/deptslm/adapters/registry
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - rag-internal
+
   vector-admin:
     profiles: ["admin"]
     build:

@@ -61,7 +61,7 @@ def test_phase12_migration_upgrade_downgrade_upgrade_reaches_head(engine) -> Non
     command.upgrade(config, "head")
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0014_phase12_adapter_purge"
+            "0015_phase12_adapter_evaluation"
         )
 
 

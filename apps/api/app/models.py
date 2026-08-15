@@ -161,6 +161,35 @@ EVALUATION_ERROR_CODES = (
     "claim_lost",
     "cancelled",
 )
+ADAPTER_EVALUATION_STATUSES = ("queued", "running", "succeeded", "failed", "cancelled")
+ADAPTER_EVALUATION_TARGETS = ("baseline", "candidate")
+ADAPTER_EVALUATION_GATE_STATUSES = ("pending", "passed", "failed")
+ADAPTER_EVALUATION_ERROR_CODES = (
+    "adapter_unavailable",
+    "adapter_authority_changed",
+    "adapter_artifact_missing",
+    "adapter_artifact_mismatch",
+    "suite_unavailable",
+    "suite_authority_changed",
+    "department_unavailable",
+    "requester_unauthorized",
+    "qdrant_unavailable",
+    "retrieval_authority_failed",
+    "source_artifact_missing",
+    "source_artifact_mismatch",
+    "base_runtime_unavailable",
+    "base_runtime_timeout",
+    "candidate_runtime_unavailable",
+    "candidate_runtime_timeout",
+    "candidate_adapter_load_failed",
+    "invalid_generation_response",
+    "invalid_citation",
+    "result_publication_failed",
+    "claim_lost",
+    "worker_shutdown",
+    "cancelled",
+    "database_unavailable",
+)
 SFT_SOURCE_STATUSES = ("active", "archived", "purged")
 SFT_IMPORT_ATTEMPT_STATUSES = (
     "registered",
@@ -1859,6 +1888,513 @@ class EvaluationCaseResult(Base):
     created_at: Mapped[datetime] = utc_timestamp()
 
 
+class AdapterEvaluationRun(Base):
+    """Content-free paired baseline/candidate evaluation authority."""
+
+    __tablename__ = "adapter_evaluation_runs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_evaluation_run_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["suite_id", "department_id"],
+            ["evaluation_suites.id", "evaluation_suites.department_id"],
+            name="fk_adapter_evaluation_run_suite_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "registry_attempt_id",
+                "department_id",
+                "adapter_id",
+                "registry_publication_attempt_id",
+                "registry_attempt_number",
+            ],
+            [
+                "adapter_registry_attempts.id",
+                "adapter_registry_attempts.department_id",
+                "adapter_registry_attempts.adapter_id",
+                "adapter_registry_attempts.publication_attempt_id",
+                "adapter_registry_attempts.attempt_number",
+            ],
+            name="fk_adapter_evaluation_run_registry_attempt",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["requested_by_user_id"],
+            ["user_identities.id"],
+            name="fk_adapter_evaluation_run_requester",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dependency_id", "department_id", "adapter_id"],
+            [
+                "adapter_upstream_dependencies.id",
+                "adapter_upstream_dependencies.department_id",
+                "adapter_upstream_dependencies.adapter_id",
+            ],
+            name="fk_adapter_evaluation_run_dependency",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "id",
+            "department_id",
+            "adapter_id",
+            "suite_id",
+            name="uq_adapter_evaluation_run_scope",
+        ),
+        CheckConstraint(
+            "status IN ('queued','running','succeeded','failed','cancelled')",
+            name="ck_adapter_evaluation_run_status",
+        ),
+        CheckConstraint(
+            "gate_status IN ('pending','passed','failed')",
+            name="ck_adapter_evaluation_run_gate_status",
+        ),
+        CheckConstraint(
+            "runner_contract_version = 'phase12-adapter-evaluation-v1' AND "
+            "artifact_contract_version = 'phase12-adapter-evaluation-artifact-v1' AND "
+            "metric_contract_version = 'phase9-deterministic-metrics-v1' AND "
+            "gate_policy_version = 'phase9-quality-gates-v1' AND "
+            "seed_policy_version = 'phase12-adapter-evaluation-seed-v1'",
+            name="ck_adapter_evaluation_run_contracts",
+        ),
+        CheckConstraint(
+            "base_model_id = 'Qwen/Qwen3-0.6B' AND "
+            "base_model_revision = 'c1899de289a04d12100db370d81485cdf75e47ca'",
+            name="ck_adapter_evaluation_run_model",
+        ),
+        CheckConstraint(
+            "code_revision ~ '^[0-9a-f]{40}$' AND base_seed BETWEEN 0 AND 9223372036854775807 "
+            "AND expected_adapter_version > 0 AND adapter_version > 0 "
+            "AND registry_attempt_version > 0 AND registry_attempt_number > 0 "
+            "AND dependency_version > 0 AND suite_version > 0 AND case_count BETWEEN 1 AND 500 "
+            "AND completed_case_count BETWEEN 0 AND case_count "
+            "AND attempt_number > 0 AND version > 0",
+            name="ck_adapter_evaluation_run_versions_counts",
+        ),
+        CheckConstraint(
+            "registry_manifest_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "registry_adapter_config_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "registry_adapter_model_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "registry_adapter_config_byte_size > 0 AND registry_adapter_model_byte_size > 0 AND "
+            "suite_artifact_manifest_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "suite_canonical_cases_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "suite_canonical_cases_byte_size > 0",
+            name="ck_adapter_evaluation_run_authority_digests",
+        ),
+        CheckConstraint(
+            "retrieval_recall_at_5_min BETWEEN 0 AND 1 "
+            "AND retrieval_mrr_at_20_min BETWEEN 0 AND 1 "
+            "AND answer_status_accuracy_min BETWEEN 0 AND 1 "
+            "AND citation_precision_min BETWEEN 0 AND 1 "
+            "AND citation_recall_min BETWEEN 0 AND 1 "
+            "AND normalized_exact_match_min BETWEEN 0 AND 1 "
+            "AND character_f1_min BETWEEN 0 AND 1 "
+            "AND invalid_contract_rate_max BETWEEN 0 AND 1",
+            name="ck_adapter_evaluation_run_gate_ranges",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            + ",".join("'" + code + "'" for code in ADAPTER_EVALUATION_ERROR_CODES)
+            + ")",
+            name="ck_adapter_evaluation_run_error_code",
+        ),
+        CheckConstraint(
+            "(result_manifest_sha256 IS NULL OR result_manifest_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(result_summary_sha256 IS NULL OR result_summary_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(case_results_sha256 IS NULL OR case_results_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(case_results_byte_size IS NULL OR case_results_byte_size > 0)",
+            name="ck_adapter_evaluation_run_artifacts",
+        ),
+        CheckConstraint(
+            "(status = 'queued' AND gate_status = 'pending' AND worker_id IS NULL "
+            "AND claim_token IS NULL AND lease_expires_at IS NULL AND claimed_at IS NULL "
+            "AND started_at IS NULL AND finished_at IS NULL AND cancellation_requested_at IS NULL "
+            "AND cancelled_at IS NULL AND result_publication_attempt_id IS NULL "
+            "AND completed_case_count = 0) "
+            "OR status <> 'queued'",
+            name="ck_adapter_evaluation_run_queued_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'running' AND gate_status = 'pending' AND worker_id IS NOT NULL "
+            "AND claim_token IS NOT NULL AND lease_expires_at IS NOT NULL "
+            "AND claimed_at IS NOT NULL AND started_at IS NOT NULL AND finished_at IS NULL "
+            "AND cancelled_at IS NULL "
+            "AND result_publication_attempt_id IS NOT NULL) OR status <> 'running'",
+            name="ck_adapter_evaluation_run_running_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'succeeded' AND gate_status IN ('passed','failed') "
+            "AND worker_id IS NULL AND claim_token IS NULL AND lease_expires_at IS NULL "
+            "AND finished_at IS NOT NULL AND result_manifest_sha256 IS NOT NULL "
+            "AND result_summary_sha256 IS NOT NULL AND case_results_sha256 IS NOT NULL "
+            "AND completed_case_count = case_count AND cancellation_requested_at IS NULL "
+            "AND cancelled_at IS NULL AND error_code IS NULL) "
+            "OR status <> 'succeeded'",
+            name="ck_adapter_evaluation_run_succeeded_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'failed' AND gate_status = 'pending' AND worker_id IS NULL "
+            "AND claim_token IS NULL AND lease_expires_at IS NULL AND finished_at IS NOT NULL "
+            "AND cancelled_at IS NULL AND error_code IS NOT NULL) OR status <> 'failed'",
+            name="ck_adapter_evaluation_run_failed_lifecycle",
+        ),
+        CheckConstraint(
+            "(status = 'cancelled' AND gate_status = 'pending' AND worker_id IS NULL "
+            "AND claim_token IS NULL AND lease_expires_at IS NULL AND finished_at IS NOT NULL "
+            "AND cancellation_requested_at IS NOT NULL AND cancelled_at IS NOT NULL "
+            "AND error_code = 'cancelled') OR status <> 'cancelled'",
+            name="ck_adapter_evaluation_run_cancelled_lifecycle",
+        ),
+        Index(
+            "uq_adapter_evaluation_run_active",
+            "department_id",
+            "adapter_id",
+            "suite_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued','running')"),
+        ),
+        Index(
+            "ix_adapter_evaluation_run_department_status_created",
+            "department_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(
+        ForeignKey("departments.id", ondelete="RESTRICT"), nullable=False
+    )
+    adapter_id: Mapped[UUID] = mapped_column(nullable=False)
+    suite_id: Mapped[UUID] = mapped_column(nullable=False)
+    requested_by_user_id: Mapped[UUID] = mapped_column(nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    gate_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    expected_adapter_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    adapter_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    registry_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    registry_attempt_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    registry_publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    registry_attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    registry_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    registry_adapter_config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    registry_adapter_config_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    registry_adapter_model_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    registry_adapter_model_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    dependency_id: Mapped[UUID] = mapped_column(nullable=False)
+    dependency_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    suite_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    suite_artifact_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    suite_canonical_cases_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    suite_canonical_cases_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    retrieval_recall_at_5_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    retrieval_mrr_at_20_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    answer_status_accuracy_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    citation_precision_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    citation_recall_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    normalized_exact_match_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    character_f1_min: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    invalid_contract_rate_max: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    base_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    base_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    runner_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    artifact_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    metric_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    gate_policy_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    seed_policy_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    base_seed: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    case_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_case_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    result_publication_attempt_id: Mapped[UUID | None] = mapped_column()
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    worker_id: Mapped[UUID | None] = mapped_column()
+    claim_token: Mapped[UUID | None] = mapped_column()
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    result_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    result_summary_sha256: Mapped[str | None] = mapped_column(String(64))
+    case_results_sha256: Mapped[str | None] = mapped_column(String(64))
+    case_results_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class AdapterEvaluationAttempt(Base):
+    """Historical non-revivable worker/publication ownership for an evaluation."""
+
+    __tablename__ = "adapter_evaluation_attempts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "department_id", "adapter_id", "suite_id"],
+            [
+                "adapter_evaluation_runs.id",
+                "adapter_evaluation_runs.department_id",
+                "adapter_evaluation_runs.adapter_id",
+                "adapter_evaluation_runs.suite_id",
+            ],
+            name="fk_adapter_evaluation_attempt_run_scope",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "id", "department_id", "run_id", name="uq_adapter_evaluation_attempt_scope"
+        ),
+        UniqueConstraint("run_id", "attempt_number", name="uq_adapter_evaluation_attempt_number"),
+        UniqueConstraint(
+            "publication_attempt_id", name="uq_adapter_evaluation_attempt_publication"
+        ),
+        CheckConstraint(
+            "status IN ('running','reclaimed','succeeded','failed','cancelled')",
+            name="ck_adapter_evaluation_attempt_status",
+        ),
+        CheckConstraint(
+            "attempt_number > 0 AND version > 0",
+            name="ck_adapter_evaluation_attempt_versions",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            + ",".join("'" + code + "'" for code in ADAPTER_EVALUATION_ERROR_CODES)
+            + ")",
+            name="ck_adapter_evaluation_attempt_error_code",
+        ),
+        CheckConstraint(
+            "code_revision ~ '^[0-9a-f]{40}$' AND "
+            "((status = 'running' AND worker_id IS NOT NULL AND claim_token IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL AND finished_at IS NULL) OR "
+            "(status IN ('reclaimed','failed','cancelled') AND worker_id IS NULL "
+            "AND claim_token IS NULL AND lease_expires_at IS NULL AND finished_at IS NOT NULL "
+            "AND error_code IS NOT NULL) OR "
+            "(status = 'succeeded' AND worker_id IS NULL AND claim_token IS NULL "
+            "AND lease_expires_at IS NULL AND finished_at IS NOT NULL AND error_code IS NULL "
+            "AND result_manifest_sha256 IS NOT NULL AND result_summary_sha256 IS NOT NULL "
+            "AND case_results_sha256 IS NOT NULL AND case_results_byte_size > 0))",
+            name="ck_adapter_evaluation_attempt_lifecycle",
+        ),
+        CheckConstraint(
+            "(result_manifest_sha256 IS NULL OR result_manifest_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(result_summary_sha256 IS NULL OR result_summary_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(case_results_sha256 IS NULL OR case_results_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(case_results_byte_size IS NULL OR case_results_byte_size > 0)",
+            name="ck_adapter_evaluation_attempt_artifacts",
+        ),
+        Index(
+            "uq_adapter_evaluation_attempt_active",
+            "run_id",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    run_id: Mapped[UUID] = mapped_column(nullable=False)
+    adapter_id: Mapped[UUID] = mapped_column(nullable=False)
+    suite_id: Mapped[UUID] = mapped_column(nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    worker_id: Mapped[UUID | None] = mapped_column()
+    claim_token: Mapped[UUID | None] = mapped_column()
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    result_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    result_summary_sha256: Mapped[str | None] = mapped_column(String(64))
+    case_results_sha256: Mapped[str | None] = mapped_column(String(64))
+    case_results_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    claimed_at: Mapped[datetime] = utc_timestamp()
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class AdapterEvaluationEvidence(Base):
+    """Immutable content-free aggregate evidence for one evaluation target."""
+
+    __tablename__ = "adapter_evaluation_evidence"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "department_id", "adapter_id", "suite_id"],
+            [
+                "adapter_evaluation_runs.id",
+                "adapter_evaluation_runs.department_id",
+                "adapter_evaluation_runs.adapter_id",
+                "adapter_evaluation_runs.suite_id",
+            ],
+            name="fk_adapter_evaluation_evidence_run_scope",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("run_id", "target", name="uq_adapter_evaluation_evidence_target"),
+        CheckConstraint(
+            "target IN ('baseline','candidate')",
+            name="ck_adapter_evaluation_evidence_target",
+        ),
+        CheckConstraint(
+            "gate_status IN ('passed','failed') AND failed_gate_count BETWEEN 0 AND 8",
+            name="ck_adapter_evaluation_evidence_gate",
+        ),
+        CheckConstraint(
+            "adapter_version > 0 AND base_model_id = 'Qwen/Qwen3-0.6B' AND "
+            "base_model_revision = 'c1899de289a04d12100db370d81485cdf75e47ca' AND "
+            "metric_contract_version = 'phase9-deterministic-metrics-v1' AND "
+            "gate_policy_version = 'phase9-quality-gates-v1' AND "
+            "seed_policy_version = 'phase12-adapter-evaluation-seed-v1'",
+            name="ck_adapter_evaluation_evidence_contract",
+        ),
+        CheckConstraint(
+            "retrieval_recall_at_5 BETWEEN 0 AND 1 AND retrieval_recall_at_10 BETWEEN 0 AND 1 "
+            "AND retrieval_recall_at_20 BETWEEN 0 AND 1 AND retrieval_mrr_at_20 BETWEEN 0 AND 1 "
+            "AND answer_status_accuracy BETWEEN 0 AND 1 AND citation_precision BETWEEN 0 AND 1 "
+            "AND citation_recall BETWEEN 0 AND 1 AND normalized_exact_match BETWEEN 0 AND 1 "
+            "AND character_f1 BETWEEN 0 AND 1 AND invalid_contract_rate BETWEEN 0 AND 1",
+            name="ck_adapter_evaluation_evidence_metric_ranges",
+        ),
+        Index(
+            "ix_adapter_evaluation_evidence_department_run",
+            "department_id",
+            "run_id",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    run_id: Mapped[UUID] = mapped_column(nullable=False)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    adapter_id: Mapped[UUID] = mapped_column(nullable=False)
+    suite_id: Mapped[UUID] = mapped_column(nullable=False)
+    target: Mapped[str] = mapped_column(String(16), nullable=False)
+    adapter_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    base_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    base_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    metric_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    gate_policy_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    seed_policy_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    gate_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    failed_gate_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    retrieval_recall_at_5: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    retrieval_recall_at_10: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    retrieval_recall_at_20: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    retrieval_mrr_at_20: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    answer_status_accuracy: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    citation_precision: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    citation_recall: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    normalized_exact_match: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    character_f1: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    invalid_contract_rate: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    delta_retrieval_recall_at_5: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    delta_retrieval_recall_at_10: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    delta_retrieval_recall_at_20: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    delta_retrieval_mrr_at_20: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    delta_answer_status_accuracy: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    delta_citation_precision: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    delta_citation_recall: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    delta_normalized_exact_match: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    delta_character_f1: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    delta_invalid_contract_rate: Mapped[Decimal | None] = mapped_column(Numeric(20, 18))
+    created_at: Mapped[datetime] = utc_timestamp()
+
+
+class AdapterEvaluationCaseResult(Base):
+    """Numeric/content-free per-case result for one evaluation target."""
+
+    __tablename__ = "adapter_evaluation_case_results"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["run_id", "department_id", "adapter_id", "suite_id"],
+            [
+                "adapter_evaluation_runs.id",
+                "adapter_evaluation_runs.department_id",
+                "adapter_evaluation_runs.adapter_id",
+                "adapter_evaluation_runs.suite_id",
+            ],
+            name="fk_adapter_evaluation_case_result_run_scope",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("run_id", "target", "case_id", name="uq_adapter_evaluation_case_target"),
+        CheckConstraint(
+            "target IN ('baseline','candidate')",
+            name="ck_adapter_evaluation_case_target",
+        ),
+        CheckConstraint(
+            "actual_status IN ('answered','insufficient_information','failed')",
+            name="ck_adapter_evaluation_case_status",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            + ",".join("'" + code + "'" for code in ADAPTER_EVALUATION_ERROR_CODES)
+            + ")",
+            name="ck_adapter_evaluation_case_error_code",
+        ),
+        CheckConstraint(
+            "expected_status IN ('answered','insufficient_information') AND "
+            "((expected_status = 'answered' AND relevant_chunk_count BETWEEN 1 AND 8) OR "
+            "(expected_status = 'insufficient_information' AND relevant_chunk_count = 0)) AND "
+            "((actual_status = 'failed' AND error_code IS NOT NULL) OR "
+            "(actual_status <> 'failed' AND error_code IS NULL))",
+            name="ck_adapter_evaluation_case_expected_lifecycle",
+        ),
+        CheckConstraint(
+            "retrieval_candidate_count >= 0 AND retrieved_relevant_at_5 >= 0 AND "
+            "retrieved_relevant_at_10 >= retrieved_relevant_at_5 AND "
+            "retrieved_relevant_at_20 >= retrieved_relevant_at_10 AND "
+            "retrieved_relevant_at_20 <= relevant_chunk_count AND cited_count >= 0 AND "
+            "cited_relevant_count BETWEEN 0 AND cited_count AND "
+            "cited_relevant_count <= relevant_chunk_count AND "
+            "reciprocal_rank_at_20 BETWEEN 0 AND 1 AND "
+            "citation_precision BETWEEN 0 AND 1 AND citation_recall BETWEEN 0 AND 1 AND "
+            "normalized_exact_match BETWEEN 0 AND 1 AND character_f1 BETWEEN 0 AND 1",
+            name="ck_adapter_evaluation_case_numeric_ranges",
+        ),
+        Index(
+            "ix_adapter_evaluation_case_department_run",
+            "department_id",
+            "run_id",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    run_id: Mapped[UUID] = mapped_column(nullable=False)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    adapter_id: Mapped[UUID] = mapped_column(nullable=False)
+    suite_id: Mapped[UUID] = mapped_column(nullable=False)
+    target: Mapped[str] = mapped_column(String(16), nullable=False)
+    case_id: Mapped[UUID] = mapped_column(nullable=False)
+    expected_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    actual_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    relevant_chunk_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    retrieval_candidate_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    retrieved_relevant_at_5: Mapped[int] = mapped_column(Integer, nullable=False)
+    retrieved_relevant_at_10: Mapped[int] = mapped_column(Integer, nullable=False)
+    retrieved_relevant_at_20: Mapped[int] = mapped_column(Integer, nullable=False)
+    reciprocal_rank_at_20: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    answer_status_correct: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    cited_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    cited_relevant_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    citation_precision: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    citation_recall: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    normalized_exact_match: Mapped[Decimal] = mapped_column(Numeric(1, 0), nullable=False)
+    character_f1: Mapped[Decimal] = mapped_column(Numeric(20, 18), nullable=False)
+    answer_contract_valid: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    case_gate_passed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = utc_timestamp()
+
+
 class SftSourceBundle(Base):
     """Metadata-only ownership record for a human-authored external SFT source bundle."""
 
@@ -3159,6 +3695,7 @@ class AdapterUpstreamDependency(Base):
             ondelete="RESTRICT",
         ),
         UniqueConstraint("adapter_id", name="uq_adapter_dependency_adapter"),
+        UniqueConstraint("id", "department_id", "adapter_id", name="uq_adapter_dependency_scope"),
         CheckConstraint("status IN ('active','released')", name="ck_adapter_dependency_status"),
         CheckConstraint("version > 0", name="ck_adapter_dependency_version"),
         CheckConstraint(

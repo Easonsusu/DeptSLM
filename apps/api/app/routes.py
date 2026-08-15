@@ -9,6 +9,12 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import ValidationError
 
+from app.adapter_evaluation_services import (
+    cancel_adapter_evaluation,
+    enqueue_adapter_evaluation,
+    list_adapter_evaluations,
+    read_adapter_evaluation,
+)
 from app.adapter_registry_read_services import list_adapters, read_adapter
 from app.audit import AuditResult
 from app.auth import AuthenticatedPrincipal
@@ -67,6 +73,10 @@ from app.rag_feedback_services import (
     submit_feedback,
 )
 from app.schemas import (
+    AdapterEvaluationCancelRequest,
+    AdapterEvaluationCreateRequest,
+    AdapterEvaluationListResponse,
+    AdapterEvaluationResponse,
     AdapterMetadataListResponse,
     AdapterMetadataResponse,
     ChunkListResponse,
@@ -1267,6 +1277,124 @@ def get_adapter(
     try:
         return AdapterMetadataResponse.model_validate(
             read_adapter(session, principal, request_scope, adapter_id).public_data()
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/adapters/{adapter_id}/evaluations",
+    response_model=AdapterEvaluationResponse,
+    status_code=202,
+    tags=["adapter-evaluations"],
+)
+async def post_adapter_evaluation(
+    adapter_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> AdapterEvaluationResponse:
+    body = await _validated_evaluation_body(
+        request, AdapterEvaluationCreateRequest, maximum_bytes=MAX_RUN_BODY_BYTES
+    )
+    try:
+        return AdapterEvaluationResponse.model_validate(
+            enqueue_adapter_evaluation(
+                session,
+                principal,
+                request_scope,
+                adapter_id=adapter_id,
+                suite_id=body.suite_id,
+                expected_adapter_version=body.expected_adapter_version,
+                code_revision=request.app.state.settings.evaluation_code_revision,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/adapters/{adapter_id}/evaluations",
+    response_model=AdapterEvaluationListResponse,
+    tags=["adapter-evaluations"],
+)
+def get_adapter_evaluations(
+    adapter_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    cursor: Annotated[str | None, Query(max_length=1024)] = None,
+) -> AdapterEvaluationListResponse:
+    try:
+        page = list_adapter_evaluations(
+            session,
+            principal,
+            request_scope,
+            adapter_id=adapter_id,
+            limit=limit,
+            cursor=cursor,
+        )
+        return AdapterEvaluationListResponse(
+            items=list(page.items), limit=limit, next_cursor=page.next_cursor
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/adapters/{adapter_id}/evaluations/{evaluation_id}",
+    response_model=AdapterEvaluationResponse,
+    tags=["adapter-evaluations"],
+)
+def get_adapter_evaluation(
+    adapter_id: UUID,
+    evaluation_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> AdapterEvaluationResponse:
+    try:
+        return AdapterEvaluationResponse.model_validate(
+            read_adapter_evaluation(
+                session,
+                principal,
+                request_scope,
+                adapter_id=adapter_id,
+                evaluation_id=evaluation_id,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/adapters/{adapter_id}/evaluations/{evaluation_id}/cancel",
+    response_model=AdapterEvaluationResponse,
+    tags=["adapter-evaluations"],
+)
+async def post_adapter_evaluation_cancel(
+    adapter_id: UUID,
+    evaluation_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> AdapterEvaluationResponse:
+    body = await _validated_evaluation_body(
+        request, AdapterEvaluationCancelRequest, maximum_bytes=MAX_CANCEL_BODY_BYTES
+    )
+    try:
+        return AdapterEvaluationResponse.model_validate(
+            cancel_adapter_evaluation(
+                session,
+                principal,
+                request_scope,
+                adapter_id=adapter_id,
+                evaluation_id=evaluation_id,
+                expected_version=body.expected_version,
+            )
         )
     except ServiceError as error:
         _raise(error)

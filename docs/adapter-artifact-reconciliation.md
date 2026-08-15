@@ -142,7 +142,7 @@ Phase 12.1E-B is the completed separate purge boundary documented in
 [adapter-artifact-purge.md](adapter-artifact-purge.md). It uses independent
 reservations and the `.purge-deleting` namespace for authoritative registry and
 source finals; it never changes the E-A reconciliation rows or adopts their
-tombstones. Phase 12.1E-C is the current separate metadata-only lifecycle
+tombstones. Phase 12.1E-C is the completed separate metadata-only lifecycle
 release boundary; evaluation, approval, promotion, loading, runtime routing,
 and later Phase 12/13 work remain separate future phases.
 

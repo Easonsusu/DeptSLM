@@ -1,5 +1,9 @@
 # Evaluation quality gates
 
+Phase 12.2 evaluates the baseline and candidate independently against the
+same immutable Phase 9 gate thresholds. A candidate gate failure is evidence,
+not an automatic rejection, approval, promotion, or rollback action.
+
 Each suite owns an immutable closed set of eight canonical Decimal thresholds under `phase9-quality-gates-v1`. Import accepts only finite ASCII decimal strings from zero through one with at most four fractional digits; floats, defaults, missing keys, and unknown keys are rejected.
 
 Gate comparison uses unrounded `Decimal` aggregates. A run has `gate_status=passed` only when every threshold passes. If metric computation and artifact publication succeed but a threshold fails, the run remains `succeeded` with `gate_status=failed` and an exact failed-gate count. Infrastructure or authority failures instead produce a failed run with no final result artifact or completion-success audit.

@@ -93,7 +93,7 @@ def test_00_migration_cycle_and_content_free_schema(engine) -> None:
     command.upgrade(config, "head")
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "0014_phase12_adapter_purge"
+            "0015_phase12_adapter_evaluation"
         )
     run_columns = {column["name"] for column in inspect(engine).get_columns("rag_answer_runs")}
     citation_columns = {

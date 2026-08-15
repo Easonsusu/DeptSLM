@@ -54,8 +54,13 @@ def test_openapi_exposes_only_two_get_adapter_routes() -> None:
     assert set(paths["/departments/{department_id}/adapters"]) == {"get"}
     assert set(paths["/departments/{department_id}/adapters/{adapter_id}"]) == {"get"}
     assert all("requestBody" not in paths[path]["get"] for path in adapter_paths)
+    # Phase 12.1D still exposes no adapter mutation or artifact route.  The
+    # separate Phase 12.2 evaluation metadata routes are intentionally nested
+    # below ``/evaluations`` and must not be mistaken for adapter lifecycle
+    # mutation.
     assert not any(
         path.startswith("/departments/{department_id}/adapters")
+        and "/evaluations" not in path
         and method in {"post", "put", "patch", "delete"}
         for path, methods in paths.items()
         for method in methods

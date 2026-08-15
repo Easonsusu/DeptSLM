@@ -651,3 +651,72 @@ class AdapterMetadataListResponse(BaseModel):
     items: list[AdapterMetadataResponse]
     limit: int
     offset: int
+
+
+class AdapterEvaluationCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    suite_id: UUID
+    expected_adapter_version: StrictInt = Field(ge=1)
+
+
+class AdapterEvaluationCancelRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: StrictInt = Field(ge=1)
+
+
+class AdapterEvaluationEvidenceResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target: str
+    gate_status: str
+    failed_gate_count: int
+    retrieval_recall_at_5: Decimal
+    retrieval_recall_at_10: Decimal
+    retrieval_recall_at_20: Decimal
+    retrieval_mrr_at_20: Decimal
+    answer_status_accuracy: Decimal
+    citation_precision: Decimal
+    citation_recall: Decimal
+    normalized_exact_match: Decimal
+    character_f1: Decimal
+    invalid_contract_rate: Decimal
+    deltas: dict[str, Decimal] | None = None
+
+
+class AdapterEvaluationResponse(ORMResponse):
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    department_id: UUID
+    adapter_id: UUID
+    suite_id: UUID
+    status: str
+    gate_status: str
+    error_code: str | None
+    expected_adapter_version: int
+    adapter_version: int
+    base_model_id: str
+    base_model_revision: str
+    runner_contract_version: str
+    metric_contract_version: str
+    gate_policy_version: str
+    seed_policy_version: str
+    case_count: int
+    completed_case_count: int
+    evidence: list[AdapterEvaluationEvidenceResponse]
+    started_at: datetime | None
+    finished_at: datetime | None
+    cancelled_at: datetime | None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdapterEvaluationListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[AdapterEvaluationResponse]
+    limit: int
+    next_cursor: str | None

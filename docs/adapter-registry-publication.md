@@ -5,7 +5,7 @@ external LoRA or QLoRA adapter. Phase 12.1D separately adds only PostgreSQL
 metadata list/detail reads; it does not change this publication contract.
 Phase 12.1E-A is a separate maintenance boundary for terminal artifact
 reconciliation. Phase 12.1E-B independently purges exact validated registry
-and source finals, and Phase 12.1E-C is the current read-only-proven lifecycle
+and source finals, and Phase 12.1E-C is the completed read-only-proven lifecycle
 release boundary; neither changes this publication contract. This phase does
 not evaluate, approve, promote, load, route, reconcile, purge, or execute
 training.

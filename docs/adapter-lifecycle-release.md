@@ -1,6 +1,6 @@
 # Phase 12.1E-C adapter lifecycle release
 
-Phase 12.1E-C is the current reviewed, narrow lifecycle boundary after a
+Phase 12.1E-C is the completed reviewed, narrow lifecycle boundary after a
 completed Phase 12.1E-B adapter-byte purge. It does not perform another purge,
 reconcile artifacts, read artifact contents, or implement evaluation, approval,
 promotion, deployment, routing, loading, rollback, training, or Phase 12.2.
