@@ -931,7 +931,7 @@ def _validate_approved_target(
         raise ServiceError(409, "Approved review authority changed")
     if _active_purge(session, department_id, adapter_id):
         raise ServiceError(409, "Adapter purge is active")
-    return (review, *authority)
+    return (authority[0], review, *authority[1:])
 
 
 def _operation_from_target(
