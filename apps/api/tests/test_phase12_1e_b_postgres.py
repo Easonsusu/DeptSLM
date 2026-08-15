@@ -373,7 +373,7 @@ def test_phase12_1e_b_migration_chain_preserves_ea_cursor(factory, authority: Au
             )
         command.upgrade(config, "0014_phase12_adapter_purge")
         command.upgrade(config, "head")
-        assert _migration_version(factory) == "0015_phase12_adapter_evaluation"
+        assert _migration_version(factory) == "0016_phase12_adapter_governance"
         with factory() as session:
             cursor = session.get(
                 AdapterArtifactReconciliationCursor,
