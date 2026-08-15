@@ -109,17 +109,16 @@ def _lineage() -> tuple[dict[str, object], dict[str, object]]:
 
 
 def _prepare_registry_final(
-    root: Path, factory: sessionmaker[Session], authority
+    root: Path, factory: sessionmaker[Session], authority, adapter_id: UUID | None = None
 ) -> tuple[UUID, int]:
     with factory() as session:
-        adapter = session.scalar(
-            select(Adapter).where(Adapter.department_id == authority.department_id)
-        )
-        attempt = session.scalar(
-            select(AdapterRegistryAttempt).where(
-                AdapterRegistryAttempt.department_id == authority.department_id
-            )
-        )
+        adapter_filters = [Adapter.department_id == authority.department_id]
+        attempt_filters = [AdapterRegistryAttempt.department_id == authority.department_id]
+        if adapter_id is not None:
+            adapter_filters.append(Adapter.id == adapter_id)
+            attempt_filters.append(AdapterRegistryAttempt.adapter_id == adapter_id)
+        adapter = session.scalar(select(Adapter).where(*adapter_filters))
+        attempt = session.scalar(select(AdapterRegistryAttempt).where(*attempt_filters))
         if adapter is None or attempt is None:
             raise RuntimeError("synthetic registry authority is incomplete")
         adapter_id = adapter.id

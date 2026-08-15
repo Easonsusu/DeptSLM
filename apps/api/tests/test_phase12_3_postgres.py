@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from copy import deepcopy
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
@@ -46,8 +47,12 @@ from app.models import (
     AdapterDeploymentEvent,
     AdapterDeploymentOperation,
     AdapterEvaluationRun,
+    AdapterImportAttempt,
+    AdapterImportSource,
+    AdapterRegistryAttempt,
     AdapterReview,
     AdapterRollbackRetention,
+    AdapterUpstreamDependency,
     Department,
     DepartmentAdapterDeployment,
     EvaluationSuite,
@@ -192,6 +197,134 @@ def _clone_suite(factory: sessionmaker[Session], suite: EvaluationSuite) -> Eval
         return clone
 
 
+def _clone_adapter_authority(
+    factory: sessionmaker[Session], authority: object, adapter_id
+) -> tuple[object, int]:
+    """Create a second validated adapter in the same department for lifecycle races."""
+
+    def values(row, model):
+        return {
+            column.name: deepcopy(getattr(row, column.name))
+            for column in model.__table__.columns
+            if column.name not in {"id", "created_at", "updated_at"}
+        }
+
+    with factory.begin() as session:
+        source_adapter = session.get(Adapter, adapter_id)
+        assert source_adapter is not None
+        source = session.get(AdapterImportSource, source_adapter.source_bundle_id)
+        source_attempt = session.get(
+            AdapterImportAttempt, source_adapter.source_authoritative_attempt_id
+        )
+        registry_attempt = session.scalar(
+            select(AdapterRegistryAttempt).where(
+                AdapterRegistryAttempt.adapter_id == source_adapter.id,
+                AdapterRegistryAttempt.department_id == authority.department_id,
+            )
+        )
+        dependency = session.scalar(
+            select(AdapterUpstreamDependency).where(
+                AdapterUpstreamDependency.adapter_id == source_adapter.id,
+                AdapterUpstreamDependency.department_id == authority.department_id,
+            )
+        )
+        assert source is not None
+        assert source_attempt is not None
+        assert registry_attempt is not None
+        assert dependency is not None
+
+        new_source_id = uuid4()
+        new_source_attempt_id = uuid4()
+        new_source_publication_id = uuid4()
+        new_source = AdapterImportSource(
+            id=new_source_id,
+            **values(source, AdapterImportSource),
+        )
+        new_source.status = "staging"
+        new_source.authoritative_attempt_id = None
+        new_source.claimed_adapter_id = None
+        new_source.claimed_at = None
+        new_source.consumed_at = None
+        new_source.adapter_config_sha256 = None
+        new_source.adapter_config_byte_size = None
+        new_source.adapter_model_sha256 = None
+        new_source.adapter_model_byte_size = None
+        new_source.intake_manifest_sha256 = None
+        new_source.intake_manifest_byte_size = None
+        new_source.tensor_dtype = None
+        new_source.tensor_count = None
+        new_source.tensor_element_count = None
+        new_source.tensor_payload_byte_size = None
+        new_source.committed_at = None
+        new_source.rejected_at = None
+        new_source.abandoned_at = None
+        new_source.purged_at = None
+        new_source.error_code = None
+        session.add(new_source)
+        session.flush()
+
+        new_source_attempt = AdapterImportAttempt(
+            id=new_source_attempt_id,
+            **values(source_attempt, AdapterImportAttempt),
+        )
+        new_source_attempt.source_bundle_id = new_source_id
+        new_source_attempt.publication_attempt_id = new_source_publication_id
+        session.add(new_source_attempt)
+        session.flush()
+
+        # Re-bind the source's committed authority only after the exact new
+        # attempt exists, preserving the same deferred-FK construction order
+        # used by Phase 12.1C.
+        for column in AdapterImportSource.__table__.columns:
+            if column.name in {
+                "id",
+                "created_at",
+                "updated_at",
+                "authoritative_attempt_id",
+                "claimed_adapter_id",
+                "claimed_at",
+                "consumed_at",
+            }:
+                continue
+            setattr(new_source, column.name, deepcopy(getattr(source, column.name)))
+        new_source.authoritative_attempt_id = new_source_attempt_id
+        new_source.status = "committed"
+        new_source.claimed_adapter_id = None
+        new_source.claimed_at = None
+        new_source.consumed_at = None
+        session.flush()
+
+        new_adapter_id = uuid4()
+        new_registry_publication_id = uuid4()
+        new_registry_execution_scope_id = uuid4()
+        new_adapter = Adapter(id=new_adapter_id, **values(source_adapter, Adapter))
+        new_adapter.source_bundle_id = new_source_id
+        new_adapter.source_authoritative_attempt_id = new_source_attempt_id
+        new_adapter.source_publication_attempt_id = new_source_publication_id
+        new_adapter.publication_attempt_id = new_registry_publication_id
+        new_adapter.execution_scope_id = new_registry_execution_scope_id
+        session.add(new_adapter)
+        session.flush()
+
+        new_registry_attempt = AdapterRegistryAttempt(
+            id=uuid4(),
+            **values(registry_attempt, AdapterRegistryAttempt),
+        )
+        new_registry_attempt.adapter_id = new_adapter_id
+        new_registry_attempt.publication_attempt_id = new_registry_publication_id
+        new_registry_attempt.execution_scope_id = new_registry_execution_scope_id
+        session.add(new_registry_attempt)
+
+        new_dependency = AdapterUpstreamDependency(
+            id=uuid4(),
+            **values(dependency, AdapterUpstreamDependency),
+        )
+        new_dependency.adapter_id = new_adapter_id
+        session.add(new_dependency)
+        session.flush()
+        return new_adapter_id, new_adapter.version
+
+
 def _prepare_approved_promotion_for_suite(
     factory: sessionmaker[Session],
     root: Path,
@@ -330,6 +463,207 @@ def test_real_promotion_publishes_one_pointer_event_and_audit(factory, tmp_path:
         assert events == 1
         assert audits == 1
         assert retentions == 0
+
+
+def test_real_promotion_A_to_B_uses_different_suite_and_retains_A(factory, tmp_path: Path) -> None:
+    """A -> B must publish B's complete suite snapshot and retain A exactly once."""
+
+    authority, operation_a = _prepare_approved_promotion(factory, tmp_path)
+    assert run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    with factory() as session:
+        adapter_a = session.get(Adapter, operation_a["target_adapter_id"])
+        suite_a = session.get(EvaluationSuite, operation_a["suite_id"])
+        assert adapter_a is not None and suite_a is not None
+        adapter_a_version = adapter_a.version
+        suite_a_id = suite_a.id
+
+    adapter_b_id, adapter_b_version = _clone_adapter_authority(
+        factory, authority, operation_a["target_adapter_id"]
+    )
+    _prepare_registry_final(tmp_path, factory, authority, adapter_id=adapter_b_id)
+    suite_b = _clone_suite(factory, suite_a)
+    operation_b = _prepare_approved_promotion_for_suite(
+        factory,
+        tmp_path,
+        authority,
+        adapter_id=adapter_b_id,
+        suite_id=suite_b.id,
+        expected_deployment_version=1,
+    )
+    assert operation_b["target_adapter_version"] == adapter_b_version
+    assert run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+
+    with factory() as session:
+        pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
+            )
+        )
+        adapter_a = session.get(Adapter, operation_a["target_adapter_id"])
+        adapter_b = session.get(Adapter, adapter_b_id)
+        review_a = session.get(AdapterReview, operation_a["target_review_id"])
+        review_b = session.get(AdapterReview, operation_b["target_review_id"])
+        run_b = session.get(AdapterEvaluationRun, operation_b["target_evaluation_id"])
+        retention_a = session.scalar(
+            select(AdapterRollbackRetention).where(
+                AdapterRollbackRetention.department_id == authority.department_id,
+                AdapterRollbackRetention.adapter_id == operation_a["target_adapter_id"],
+                AdapterRollbackRetention.status == "active",
+            )
+        )
+        active_retentions = session.scalar(
+            select(func.count(AdapterRollbackRetention.id)).where(
+                AdapterRollbackRetention.department_id == authority.department_id,
+                AdapterRollbackRetention.status == "active",
+            )
+        )
+        promote_events = session.scalar(
+            select(func.count(AdapterDeploymentEvent.id)).where(
+                AdapterDeploymentEvent.department_id == authority.department_id,
+                AdapterDeploymentEvent.event_type == "promote",
+            )
+        )
+        success_audits = session.scalar(
+            select(func.count(PersistentAuditEvent.id)).where(
+                PersistentAuditEvent.department_id == authority.department_id,
+                PersistentAuditEvent.action == "adapter.deployment.success",
+            )
+        )
+        assert pointer is not None
+        assert pointer.target_kind == "adapter"
+        assert pointer.adapter_id == adapter_b_id
+        assert pointer.adapter_version == adapter_b_version
+        assert pointer.review_id == operation_b["target_review_id"]
+        assert pointer.evaluation_id == operation_b["target_evaluation_id"]
+        assert pointer.suite_id == suite_b.id
+        assert pointer.suite_id != suite_a_id
+        assert run_b is not None and run_b.suite_id == suite_b.id
+        assert review_a is not None and review_a.status == "approved"
+        assert review_b is not None and review_b.status == "approved"
+        assert adapter_a is not None and adapter_a.status == "validated"
+        assert adapter_a.version == adapter_a_version
+        assert adapter_b is not None and adapter_b.status == "validated"
+        assert retention_a is not None
+        assert active_retentions == 1
+        assert promote_events == 2
+        assert success_audits == 2
+
+
+def test_real_A_to_B_to_A_rollback_reactivates_exact_authority(factory, tmp_path: Path) -> None:
+    """Rollback-to-adapter returns to A's suite and fences a replayed finalizer."""
+
+    authority, operation_a = _prepare_approved_promotion(factory, tmp_path)
+    assert run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    with factory() as session:
+        adapter_a = session.get(Adapter, operation_a["target_adapter_id"])
+        suite_a = session.get(EvaluationSuite, operation_a["suite_id"])
+        assert adapter_a is not None and suite_a is not None
+        adapter_a_version = adapter_a.version
+
+    adapter_b_id, _adapter_b_version = _clone_adapter_authority(
+        factory, authority, operation_a["target_adapter_id"]
+    )
+    _prepare_registry_final(tmp_path, factory, authority, adapter_id=adapter_b_id)
+    suite_b = _clone_suite(factory, suite_a)
+    operation_b = _prepare_approved_promotion_for_suite(
+        factory,
+        tmp_path,
+        authority,
+        adapter_id=adapter_b_id,
+        suite_id=suite_b.id,
+        expected_deployment_version=1,
+    )
+    assert run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+
+    with factory() as session:
+        retention_a = session.scalar(
+            select(AdapterRollbackRetention).where(
+                AdapterRollbackRetention.department_id == authority.department_id,
+                AdapterRollbackRetention.adapter_id == operation_a["target_adapter_id"],
+                AdapterRollbackRetention.status == "active",
+            )
+        )
+        assert retention_a is not None
+        retention_a_id = retention_a.id
+        retention_a_version = retention_a.version
+
+    with factory.begin() as session:
+        enqueue_rollback(
+            session,
+            _principal(authority),
+            _scope(authority),
+            target="adapter",
+            adapter_id=operation_a["target_adapter_id"],
+            expected_adapter_version=adapter_a_version,
+            retention_id=retention_a_id,
+            expected_retention_version=retention_a_version,
+            expected_deployment_version=2,
+        )
+    assert run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+
+    with factory() as session:
+        pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
+            )
+        )
+        retained_a = session.get(AdapterRollbackRetention, retention_a_id)
+        retained_b = session.scalar(
+            select(AdapterRollbackRetention).where(
+                AdapterRollbackRetention.department_id == authority.department_id,
+                AdapterRollbackRetention.adapter_id == adapter_b_id,
+                AdapterRollbackRetention.status == "active",
+            )
+        )
+        rollback_events = session.scalar(
+            select(func.count(AdapterDeploymentEvent.id)).where(
+                AdapterDeploymentEvent.department_id == authority.department_id,
+                AdapterDeploymentEvent.event_type == "rollback_adapter",
+            )
+        )
+        success_audits = session.scalar(
+            select(func.count(PersistentAuditEvent.id)).where(
+                PersistentAuditEvent.department_id == authority.department_id,
+                PersistentAuditEvent.action == "adapter.deployment.success",
+            )
+        )
+        stale = session.get(AdapterDeploymentOperation, operation_b["id"])
+        assert pointer is not None and retained_a is not None and retained_b is not None
+        assert pointer.adapter_id == operation_a["target_adapter_id"]
+        assert pointer.suite_id == suite_a.id
+        assert pointer.review_id == operation_a["target_review_id"]
+        assert pointer.evaluation_id == operation_a["target_evaluation_id"]
+        assert retained_a.status == "released"
+        assert retained_a.release_reason == "reactivated"
+        assert retained_b.status == "active"
+        assert rollback_events == 1
+        assert success_audits == 3
+        assert stale is not None and stale.status == "succeeded"
+        session.expunge(stale)
+
+    # A stale finalizer replay is harmless and cannot append another event or
+    # success audit after the operation already reached succeeded.
+    with pytest.raises(AdapterGovernanceWorkerError, match="claim_lost"):
+        finalize_owned_operation(factory, stale, data_dir=tmp_path)
+    with factory() as session:
+        assert (
+            session.scalar(
+                select(func.count(AdapterDeploymentEvent.id)).where(
+                    AdapterDeploymentEvent.department_id == authority.department_id,
+                    AdapterDeploymentEvent.event_type == "rollback_adapter",
+                )
+            )
+            == 1
+        )
+        assert (
+            session.scalar(
+                select(func.count(PersistentAuditEvent.id)).where(
+                    PersistentAuditEvent.department_id == authority.department_id,
+                    PersistentAuditEvent.action == "adapter.deployment.success",
+                )
+            )
+            == 3
+        )
 
 
 def test_requester_revocation_after_enqueue_blocks_final_success(factory, tmp_path: Path) -> None:
