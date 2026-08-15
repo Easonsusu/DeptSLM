@@ -26,6 +26,7 @@ from app.adapter_evaluation_services import enqueue_adapter_evaluation
 from app.adapter_governance_services import enqueue_promotion, start_review, transition_review
 from app.adapter_governance_worker import (
     AdapterGovernanceWorkerError,
+    claim_next_operation,
     finalize_owned_operation,
     run_once,
 )
@@ -214,7 +215,7 @@ def test_requester_revocation_after_enqueue_blocks_final_success(factory, tmp_pa
 
 def test_stale_claim_cannot_finalize_or_publish(factory, tmp_path: Path) -> None:
     _authority, operation = _prepare_approved_promotion(factory, tmp_path)
-    claim = claim_next(factory, uuid4(), 120, "a" * 40)
+    claim = claim_next_operation(factory, worker_id=uuid4(), lease_seconds=120)
     assert claim is not None
     with factory.begin() as session:
         session.execute(
