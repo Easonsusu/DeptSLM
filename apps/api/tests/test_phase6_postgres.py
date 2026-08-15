@@ -246,7 +246,7 @@ def test_00_migration_cycle_and_metadata_only_schema(engine) -> None:
     command.upgrade(config, "head")
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "0015_phase12_adapter_evaluation"
+            "0016_phase12_adapter_governance"
         )
         columns = set(
             connection.execute(

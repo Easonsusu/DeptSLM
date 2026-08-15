@@ -190,6 +190,49 @@ ADAPTER_EVALUATION_ERROR_CODES = (
     "cancelled",
     "database_unavailable",
 )
+ADAPTER_REVIEW_STATUSES = ("pending", "approved", "rejected", "archived")
+ADAPTER_REVIEW_ACTIONS = ("start", "approve", "reject", "archive")
+ADAPTER_DEPLOYMENT_TARGETS = ("base", "adapter")
+ADAPTER_DEPLOYMENT_OPERATION_TYPES = ("promote", "rollback_adapter", "rollback_base")
+ADAPTER_DEPLOYMENT_OPERATION_STATUSES = (
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "cancelled",
+)
+ADAPTER_DEPLOYMENT_EVENT_TYPES = (
+    "promote",
+    "rollback_adapter",
+    "rollback_base",
+    "rollback_retention_release",
+)
+ADAPTER_ROLLBACK_RETENTION_STATUSES = ("active", "released")
+ADAPTER_ROLLBACK_RELEASE_REASONS = ("reactivated", "manual_release")
+ADAPTER_GOVERNANCE_ERROR_CODES = (
+    "adapter_unavailable",
+    "adapter_authority_changed",
+    "review_unavailable",
+    "review_authority_changed",
+    "evaluation_unavailable",
+    "evaluation_authority_changed",
+    "evaluation_gate_failed",
+    "suite_authority_changed",
+    "registry_artifact_missing",
+    "registry_artifact_mismatch",
+    "registry_artifact_unsafe",
+    "rollback_target_unavailable",
+    "deployment_version_conflict",
+    "deployment_operation_conflict",
+    "purge_conflict",
+    "claim_lost",
+    "cancelled",
+    "worker_shutdown",
+    "worker_timeout",
+    "requester_unauthorized",
+    "department_unavailable",
+    "database_unavailable",
+)
 SFT_SOURCE_STATUSES = ("active", "archived", "purged")
 SFT_IMPORT_ATTEMPT_STATUSES = (
     "registered",
@@ -5047,6 +5090,666 @@ class AdapterArtifactOperationItem(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+class AdapterReview(Base):
+    """Immutable, department-scoped human governance decision for one evaluation."""
+
+    __tablename__ = "adapter_reviews"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_review_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["evaluation_id", "department_id", "adapter_id", "suite_id"],
+            [
+                "adapter_evaluation_runs.id",
+                "adapter_evaluation_runs.department_id",
+                "adapter_evaluation_runs.adapter_id",
+                "adapter_evaluation_runs.suite_id",
+            ],
+            name="fk_adapter_review_evaluation_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "registry_attempt_id",
+                "department_id",
+                "adapter_id",
+                "registry_publication_attempt_id",
+                "registry_attempt_number",
+            ],
+            [
+                "adapter_registry_attempts.id",
+                "adapter_registry_attempts.department_id",
+                "adapter_registry_attempts.adapter_id",
+                "adapter_registry_attempts.publication_attempt_id",
+                "adapter_registry_attempts.attempt_number",
+            ],
+            name="fk_adapter_review_registry_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dependency_id", "department_id", "adapter_id"],
+            [
+                "adapter_upstream_dependencies.id",
+                "adapter_upstream_dependencies.department_id",
+                "adapter_upstream_dependencies.adapter_id",
+            ],
+            name="fk_adapter_review_dependency_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["suite_id", "department_id"],
+            ["evaluation_suites.id", "evaluation_suites.department_id"],
+            name="fk_adapter_review_suite_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["requested_by_user_id"],
+            ["user_identities.id"],
+            name="fk_adapter_review_requester",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["reviewed_by_user_id"],
+            ["user_identities.id"],
+            name="fk_adapter_review_reviewer",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("id", "department_id", name="uq_adapter_review_scope"),
+        UniqueConstraint(
+            "evaluation_id", "department_id", name="uq_adapter_review_evaluation_once"
+        ),
+        CheckConstraint(
+            "status IN ('pending','approved','rejected','archived')",
+            name="ck_adapter_review_status",
+        ),
+        CheckConstraint(
+            "adapter_version > 0 AND evaluation_version > 0 AND suite_version > 0 AND version > 0",
+            name="ck_adapter_review_versions",
+        ),
+        CheckConstraint(
+            "registry_attempt_version > 0 AND registry_attempt_number > 0 AND "
+            "registry_manifest_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "registry_adapter_config_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "registry_adapter_config_byte_size > 0 AND "
+            "registry_adapter_model_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "registry_adapter_model_byte_size > 0 AND "
+            "suite_artifact_manifest_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "suite_canonical_cases_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "suite_canonical_cases_byte_size > 0 AND "
+            "result_manifest_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "result_summary_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "case_results_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "case_results_byte_size > 0 AND "
+            "code_revision ~ '^[0-9a-f]{40}$'",
+            name="ck_adapter_review_authority",
+        ),
+        CheckConstraint(
+            "reviewed_by_user_id IS NULL OR decided_at IS NOT NULL",
+            name="ck_adapter_review_decision_actor",
+        ),
+        CheckConstraint(
+            "status = 'pending' OR decided_at IS NOT NULL",
+            name="ck_adapter_review_decision_lifecycle",
+        ),
+        Index(
+            "uq_adapter_review_pending_adapter",
+            "department_id",
+            "adapter_id",
+            "adapter_version",
+            unique=True,
+            postgresql_where=text("status = 'pending'"),
+        ),
+        Index(
+            "uq_adapter_review_approved_adapter",
+            "department_id",
+            "adapter_id",
+            "adapter_version",
+            unique=True,
+            postgresql_where=text("status = 'approved' AND archived_at IS NULL"),
+        ),
+        Index("ix_adapter_review_department_created", "department_id", "created_at", "id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    adapter_id: Mapped[UUID] = mapped_column(nullable=False)
+    adapter_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    evaluation_id: Mapped[UUID] = mapped_column(nullable=False)
+    evaluation_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    baseline_evidence_id: Mapped[UUID] = mapped_column(nullable=False)
+    candidate_evidence_id: Mapped[UUID] = mapped_column(nullable=False)
+    suite_id: Mapped[UUID] = mapped_column(nullable=False)
+    suite_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    registry_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    registry_attempt_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    registry_publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    registry_attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    registry_execution_scope_id: Mapped[UUID] = mapped_column(nullable=False)
+    registry_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    registry_adapter_config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    registry_adapter_config_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    registry_adapter_model_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    registry_adapter_model_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    dependency_id: Mapped[UUID] = mapped_column(nullable=False)
+    dependency_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    base_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    base_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    runner_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    artifact_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    metric_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    gate_policy_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    seed_policy_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    suite_artifact_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    suite_canonical_cases_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    suite_canonical_cases_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    result_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_summary_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    case_results_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    case_results_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    requested_by_user_id: Mapped[UUID] = mapped_column(nullable=False)
+    reviewed_by_user_id: Mapped[UUID | None] = mapped_column()
+    started_at: Mapped[datetime] = utc_timestamp()
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class DepartmentAdapterDeployment(Base):
+    """One explicit deployment pointer per department; absent means implicit base."""
+
+    __tablename__ = "department_adapter_deployments"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["department_id"],
+            ["departments.id"],
+            name="fk_adapter_deployment_department",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_deployment_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["review_id", "department_id"],
+            ["adapter_reviews.id", "adapter_reviews.department_id"],
+            name="fk_adapter_deployment_review_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["evaluation_id", "department_id", "adapter_id", "suite_id"],
+            [
+                "adapter_evaluation_runs.id",
+                "adapter_evaluation_runs.department_id",
+                "adapter_evaluation_runs.adapter_id",
+                "adapter_evaluation_runs.suite_id",
+            ],
+            name="fk_adapter_deployment_evaluation_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("target_kind IN ('base','adapter')", name="ck_adapter_deployment_target"),
+        CheckConstraint(
+            "deployment_version > 0 AND version > 0", name="ck_adapter_deployment_versions"
+        ),
+        CheckConstraint(
+            "(target_kind = 'base' AND adapter_id IS NULL AND adapter_version IS NULL "
+            "AND review_id IS NULL AND review_version IS NULL AND evaluation_id IS NULL "
+            "AND evaluation_version IS NULL AND suite_id IS NULL) OR "
+            "(target_kind = 'adapter' AND adapter_id IS NOT NULL AND adapter_version > 0 "
+            "AND review_id IS NOT NULL AND review_version > 0 AND evaluation_id IS NOT NULL "
+            "AND evaluation_version > 0 AND suite_id IS NOT NULL)",
+            name="ck_adapter_deployment_target_shape",
+        ),
+        UniqueConstraint("department_id", name="uq_adapter_deployment_department"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    target_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    adapter_id: Mapped[UUID | None] = mapped_column()
+    adapter_version: Mapped[int | None] = mapped_column(Integer)
+    review_id: Mapped[UUID | None] = mapped_column()
+    review_version: Mapped[int | None] = mapped_column(Integer)
+    evaluation_id: Mapped[UUID | None] = mapped_column()
+    evaluation_version: Mapped[int | None] = mapped_column(Integer)
+    suite_id: Mapped[UUID | None] = mapped_column()
+    base_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    base_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    deployment_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class AdapterDeploymentOperation(Base):
+    """Durable metadata-only queue authority for one deployment mutation."""
+
+    __tablename__ = "adapter_deployment_operations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["department_id"],
+            ["departments.id"],
+            name="fk_adapter_deployment_operation_department",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["requested_by_user_id"],
+            ["user_identities.id"],
+            name="fk_adapter_deployment_operation_requester",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["target_adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_deployment_operation_target_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["current_adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_deployment_operation_current_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["target_review_id", "department_id"],
+            ["adapter_reviews.id", "adapter_reviews.department_id"],
+            name="fk_adapter_deployment_operation_target_review_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["target_evaluation_id", "department_id", "target_adapter_id", "suite_id"],
+            [
+                "adapter_evaluation_runs.id",
+                "adapter_evaluation_runs.department_id",
+                "adapter_evaluation_runs.adapter_id",
+                "adapter_evaluation_runs.suite_id",
+            ],
+            name="fk_adapter_deployment_operation_target_evaluation_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            [
+                "registry_attempt_id",
+                "department_id",
+                "target_adapter_id",
+                "registry_publication_attempt_id",
+                "registry_attempt_number",
+            ],
+            [
+                "adapter_registry_attempts.id",
+                "adapter_registry_attempts.department_id",
+                "adapter_registry_attempts.adapter_id",
+                "adapter_registry_attempts.publication_attempt_id",
+                "adapter_registry_attempts.attempt_number",
+            ],
+            name="fk_adapter_deployment_operation_registry_attempt_exact",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["dependency_id", "department_id", "target_adapter_id"],
+            [
+                "adapter_upstream_dependencies.id",
+                "adapter_upstream_dependencies.department_id",
+                "adapter_upstream_dependencies.adapter_id",
+            ],
+            name="fk_adapter_deployment_operation_dependency_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["target_retention_id", "department_id", "target_adapter_id"],
+            [
+                "adapter_rollback_retentions.id",
+                "adapter_rollback_retentions.department_id",
+                "adapter_rollback_retentions.adapter_id",
+            ],
+            name="fk_adapter_deployment_operation_target_retention_exact",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "operation_type IN ('promote','rollback_adapter','rollback_base')",
+            name="ck_adapter_deployment_operation_type",
+        ),
+        CheckConstraint(
+            "status IN ('queued','running','succeeded','failed','cancelled')",
+            name="ck_adapter_deployment_operation_status",
+        ),
+        CheckConstraint(
+            "expected_deployment_version >= 0 AND attempt_number > 0 AND version > 0",
+            name="ck_adapter_deployment_operation_versions",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            + ",".join("'" + code + "'" for code in ADAPTER_GOVERNANCE_ERROR_CODES)
+            + ")",
+            name="ck_adapter_deployment_operation_error",
+        ),
+        CheckConstraint(
+            "((operation_type = 'rollback_base' AND target_adapter_id IS NULL AND "
+            "target_review_id IS NULL AND target_evaluation_id IS NULL AND "
+            "target_retention_id IS NULL AND registry_attempt_id IS NULL AND "
+            "dependency_id IS NULL AND suite_id IS NULL) OR "
+            "(operation_type IN ('promote','rollback_adapter') AND "
+            "target_adapter_id IS NOT NULL AND target_review_id IS NOT NULL AND "
+            "target_evaluation_id IS NOT NULL AND registry_attempt_id IS NOT NULL AND "
+            "dependency_id IS NOT NULL AND suite_id IS NOT NULL AND "
+            "(operation_type = 'promote' OR (target_retention_id IS NOT NULL AND "
+            "target_retention_version > 0))))",
+            name="ck_adapter_deployment_operation_target_shape",
+        ),
+        CheckConstraint(
+            "(status IN ('queued','running') AND finished_at IS NULL) OR "
+            "(status IN ('succeeded','failed','cancelled') AND finished_at IS NOT NULL)",
+            name="ck_adapter_deployment_operation_lifecycle",
+        ),
+        UniqueConstraint("id", "department_id", name="uq_adapter_deployment_operation_scope"),
+        Index(
+            "uq_adapter_deployment_operation_active",
+            "department_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued','running')"),
+        ),
+        Index(
+            "ix_adapter_deployment_operation_department_created",
+            "department_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    requested_by_user_id: Mapped[UUID] = mapped_column(nullable=False)
+    operation_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
+    expected_deployment_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_adapter_id: Mapped[UUID | None] = mapped_column()
+    target_adapter_version: Mapped[int | None] = mapped_column(Integer)
+    target_review_id: Mapped[UUID | None] = mapped_column()
+    target_review_version: Mapped[int | None] = mapped_column(Integer)
+    target_evaluation_id: Mapped[UUID | None] = mapped_column()
+    target_evaluation_version: Mapped[int | None] = mapped_column(Integer)
+    target_retention_id: Mapped[UUID | None] = mapped_column()
+    target_retention_version: Mapped[int | None] = mapped_column(Integer)
+    current_target_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="base")
+    current_adapter_id: Mapped[UUID | None] = mapped_column()
+    current_adapter_version: Mapped[int | None] = mapped_column(Integer)
+    current_deployment_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    base_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    base_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    registry_attempt_id: Mapped[UUID | None] = mapped_column()
+    registry_attempt_version: Mapped[int | None] = mapped_column(Integer)
+    registry_publication_attempt_id: Mapped[UUID | None] = mapped_column()
+    registry_attempt_number: Mapped[int | None] = mapped_column(Integer)
+    registry_execution_scope_id: Mapped[UUID | None] = mapped_column()
+    registry_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    registry_adapter_config_sha256: Mapped[str | None] = mapped_column(String(64))
+    registry_adapter_config_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    registry_adapter_model_sha256: Mapped[str | None] = mapped_column(String(64))
+    registry_adapter_model_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    dependency_id: Mapped[UUID | None] = mapped_column()
+    dependency_version: Mapped[int | None] = mapped_column(Integer)
+    suite_id: Mapped[UUID | None] = mapped_column()
+    suite_version: Mapped[int | None] = mapped_column(Integer)
+    suite_artifact_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    suite_canonical_cases_sha256: Mapped[str | None] = mapped_column(String(64))
+    suite_canonical_cases_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    result_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    result_summary_sha256: Mapped[str | None] = mapped_column(String(64))
+    case_results_sha256: Mapped[str | None] = mapped_column(String(64))
+    case_results_byte_size: Mapped[int | None] = mapped_column(BigInteger)
+    runner_contract_version: Mapped[str | None] = mapped_column(String(100))
+    artifact_contract_version: Mapped[str | None] = mapped_column(String(100))
+    metric_contract_version: Mapped[str | None] = mapped_column(String(100))
+    gate_policy_version: Mapped[str | None] = mapped_column(String(100))
+    seed_policy_version: Mapped[str | None] = mapped_column(String(100))
+    code_revision: Mapped[str | None] = mapped_column(String(40))
+    worker_id: Mapped[UUID | None] = mapped_column()
+    claim_token: Mapped[UUID | None] = mapped_column()
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    queued_at: Mapped[datetime] = utc_timestamp()
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class AdapterDeploymentEvent(Base):
+    """Append-only, content-free deployment-governance history."""
+
+    __tablename__ = "adapter_deployment_events"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["department_id"],
+            ["departments.id"],
+            name="fk_adapter_deployment_event_department",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["actor_user_id"],
+            ["user_identities.id"],
+            name="fk_adapter_deployment_event_actor",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["operation_id", "department_id"],
+            ["adapter_deployment_operations.id", "adapter_deployment_operations.department_id"],
+            name="fk_adapter_deployment_event_operation_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["from_adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_deployment_event_from_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["to_adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_deployment_event_to_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["approved_review_id", "department_id"],
+            ["adapter_reviews.id", "adapter_reviews.department_id"],
+            name="fk_adapter_deployment_event_review_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["evaluation_id", "department_id", "to_adapter_id", "suite_id"],
+            [
+                "adapter_evaluation_runs.id",
+                "adapter_evaluation_runs.department_id",
+                "adapter_evaluation_runs.adapter_id",
+                "adapter_evaluation_runs.suite_id",
+            ],
+            name="fk_adapter_deployment_event_evaluation_scope",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "event_type IN ("
+            "'promote','rollback_adapter','rollback_base','rollback_retention_release'"
+            ")",
+            name="ck_adapter_deployment_event_type",
+        ),
+        CheckConstraint(
+            "from_target_kind IN ('base','adapter') AND to_target_kind IN ('base','adapter')",
+            name="ck_adapter_deployment_event_targets",
+        ),
+        CheckConstraint(
+            "((from_target_kind = 'base' AND from_adapter_id IS NULL "
+            "AND from_adapter_version IS NULL) OR "
+            "(from_target_kind = 'adapter' AND from_adapter_id IS NOT NULL "
+            "AND from_adapter_version > 0)) AND "
+            "((to_target_kind = 'base' AND to_adapter_id IS NULL "
+            "AND to_adapter_version IS NULL) OR "
+            "(to_target_kind = 'adapter' AND to_adapter_id IS NOT NULL "
+            "AND to_adapter_version > 0))",
+            name="ck_adapter_deployment_event_target_shape",
+        ),
+        CheckConstraint(
+            "((to_target_kind = 'base' AND approved_review_id IS NULL "
+            "AND approved_review_version IS NULL AND evaluation_id IS NULL "
+            "AND evaluation_version IS NULL AND suite_id IS NULL) OR "
+            "(to_target_kind = 'adapter' AND approved_review_id IS NOT NULL "
+            "AND approved_review_version > 0 AND evaluation_id IS NOT NULL "
+            "AND evaluation_version > 0 AND suite_id IS NOT NULL))",
+            name="ck_adapter_deployment_event_authority_shape",
+        ),
+        CheckConstraint(
+            "deployment_version_before >= 0 AND ((event_type = "
+            "'rollback_retention_release' AND "
+            "deployment_version_after = deployment_version_before) "
+            "OR (event_type <> 'rollback_retention_release' AND "
+            "deployment_version_after > deployment_version_before))",
+            name="ck_adapter_deployment_event_versions",
+        ),
+        Index(
+            "ix_adapter_deployment_event_department_created", "department_id", "created_at", "id"
+        ),
+        UniqueConstraint("id", "department_id", name="uq_adapter_deployment_event_scope"),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    operation_id: Mapped[UUID | None] = mapped_column()
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    deployment_version_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    deployment_version_after: Mapped[int] = mapped_column(Integer, nullable=False)
+    from_target_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    from_adapter_id: Mapped[UUID | None] = mapped_column()
+    from_adapter_version: Mapped[int | None] = mapped_column(Integer)
+    to_target_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    to_adapter_id: Mapped[UUID | None] = mapped_column()
+    to_adapter_version: Mapped[int | None] = mapped_column(Integer)
+    approved_review_id: Mapped[UUID | None] = mapped_column()
+    approved_review_version: Mapped[int | None] = mapped_column(Integer)
+    evaluation_id: Mapped[UUID | None] = mapped_column()
+    evaluation_version: Mapped[int | None] = mapped_column(Integer)
+    suite_id: Mapped[UUID | None] = mapped_column()
+    base_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    base_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    rollback_retention_id: Mapped[UUID | None] = mapped_column()
+    actor_user_id: Mapped[UUID] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = utc_timestamp()
+
+
+class AdapterRollbackRetention(Base):
+    """Explicit authority retaining one exact adapter version for rollback."""
+
+    __tablename__ = "adapter_rollback_retentions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["department_id"],
+            ["departments.id"],
+            name="fk_adapter_rollback_retention_department",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["adapter_id", "department_id"],
+            ["adapters.id", "adapters.department_id"],
+            name="fk_adapter_rollback_retention_adapter_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["approved_review_id", "department_id"],
+            ["adapter_reviews.id", "adapter_reviews.department_id"],
+            name="fk_adapter_rollback_retention_review_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["evaluation_id", "department_id", "adapter_id", "suite_id"],
+            [
+                "adapter_evaluation_runs.id",
+                "adapter_evaluation_runs.department_id",
+                "adapter_evaluation_runs.adapter_id",
+                "adapter_evaluation_runs.suite_id",
+            ],
+            name="fk_adapter_rollback_retention_evaluation_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["creation_event_id", "department_id"],
+            ["adapter_deployment_events.id", "adapter_deployment_events.department_id"],
+            name="fk_adapter_rollback_retention_creation_event",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["release_event_id", "department_id"],
+            ["adapter_deployment_events.id", "adapter_deployment_events.department_id"],
+            name="fk_adapter_rollback_retention_release_event",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("id", "department_id", name="uq_adapter_rollback_retention_scope"),
+        UniqueConstraint(
+            "id", "department_id", "adapter_id", name="uq_adapter_rollback_retention_adapter_scope"
+        ),
+        CheckConstraint(
+            "status IN ('active','released')", name="ck_adapter_rollback_retention_status"
+        ),
+        CheckConstraint(
+            "adapter_version > 0 AND review_version > 0 AND evaluation_version > 0 AND version > 0",
+            name="ck_adapter_rollback_retention_versions",
+        ),
+        CheckConstraint(
+            "release_reason IS NULL OR release_reason IN ('reactivated','manual_release')",
+            name="ck_adapter_rollback_retention_reason",
+        ),
+        CheckConstraint(
+            "(status = 'active' AND released_at IS NULL AND release_event_id IS NULL) OR "
+            "(status = 'released' AND released_at IS NOT NULL AND release_event_id IS NOT NULL)",
+            name="ck_adapter_rollback_retention_lifecycle",
+        ),
+        Index(
+            "uq_adapter_rollback_retention_active",
+            "department_id",
+            "adapter_id",
+            "adapter_version",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+        ),
+        Index(
+            "ix_adapter_rollback_retention_department_created", "department_id", "created_at", "id"
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    adapter_id: Mapped[UUID] = mapped_column(nullable=False)
+    adapter_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    approved_review_id: Mapped[UUID] = mapped_column(nullable=False)
+    review_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    evaluation_id: Mapped[UUID] = mapped_column(nullable=False)
+    evaluation_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    suite_id: Mapped[UUID] = mapped_column(nullable=False)
+    creation_event_id: Mapped[UUID] = mapped_column(nullable=False)
+    release_event_id: Mapped[UUID | None] = mapped_column()
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    release_reason: Mapped[str | None] = mapped_column(String(32))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class PersistentAuditEvent(Base):

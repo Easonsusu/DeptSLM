@@ -35,6 +35,7 @@ from app.models import (
     ADAPTER_PURGE_BLOCKED_REASONS,
     Adapter,
     AdapterArtifactOperationItem,
+    AdapterDeploymentOperation,
     AdapterEvaluationRun,
     AdapterImportAttempt,
     AdapterImportSource,
@@ -42,6 +43,9 @@ from app.models import (
     AdapterPurgeOperation,
     AdapterPurgeReservation,
     AdapterRegistryAttempt,
+    AdapterReview,
+    AdapterRollbackRetention,
+    DepartmentAdapterDeployment,
 )
 from app.services import ServiceError, append_mutation_audit, authorize_transaction
 
@@ -313,18 +317,8 @@ def _assert_eligible(session: Session, authority: _Authority, department_id: UUI
     )
     if active_reconcile is not None:
         raise ServiceError(409, "Adapter purge conflicts with reconciliation")
+    _assert_governance_fences(session, adapter, department_id)
     if adapter.status == "validated" and source.status == "consumed":
-        active_evaluation = session.scalar(
-            select(AdapterEvaluationRun.id)
-            .where(
-                AdapterEvaluationRun.department_id == department_id,
-                AdapterEvaluationRun.adapter_id == adapter.id,
-                AdapterEvaluationRun.status.in_(("queued", "running")),
-            )
-            .limit(1)
-        )
-        if active_evaluation is not None:
-            raise ServiceError(409, "Adapter purge conflicts with active evaluation")
         active_purge = session.scalar(
             select(AdapterPurgeOperation.id).where(
                 AdapterPurgeOperation.department_id == department_id,
@@ -334,6 +328,64 @@ def _assert_eligible(session: Session, authority: _Authority, department_id: UUI
         )
         if active_purge is not None:
             raise ServiceError(409, "Adapter purge is already active")
+
+
+def _assert_governance_fences(session: Session, adapter: Adapter, department_id: UUID) -> None:
+    """Keep E-B registration and finalization fenced by governance metadata."""
+
+    active_evaluation = session.scalar(
+        select(AdapterEvaluationRun.id)
+        .where(
+            AdapterEvaluationRun.department_id == department_id,
+            AdapterEvaluationRun.adapter_id == adapter.id,
+            AdapterEvaluationRun.status.in_(("queued", "running")),
+        )
+        .limit(1)
+    )
+    if active_evaluation is not None:
+        raise ServiceError(409, "Adapter purge conflicts with active evaluation")
+    active_review = session.scalar(
+        select(AdapterReview.id).where(
+            AdapterReview.department_id == department_id,
+            AdapterReview.adapter_id == adapter.id,
+            AdapterReview.adapter_version == adapter.version,
+            AdapterReview.status == "pending",
+        )
+    )
+    if active_review is not None:
+        raise ServiceError(409, "Adapter purge conflicts with pending review")
+    deployment = session.scalar(
+        select(DepartmentAdapterDeployment.id).where(
+            DepartmentAdapterDeployment.department_id == department_id,
+            DepartmentAdapterDeployment.target_kind == "adapter",
+            DepartmentAdapterDeployment.adapter_id == adapter.id,
+            DepartmentAdapterDeployment.adapter_version == adapter.version,
+        )
+    )
+    if deployment is not None:
+        raise ServiceError(409, "Adapter purge conflicts with active deployment")
+    retention = session.scalar(
+        select(AdapterRollbackRetention.id).where(
+            AdapterRollbackRetention.department_id == department_id,
+            AdapterRollbackRetention.adapter_id == adapter.id,
+            AdapterRollbackRetention.adapter_version == adapter.version,
+            AdapterRollbackRetention.status == "active",
+        )
+    )
+    if retention is not None:
+        raise ServiceError(409, "Adapter purge conflicts with rollback retention")
+    deployment_operation = session.scalar(
+        select(AdapterDeploymentOperation.id).where(
+            AdapterDeploymentOperation.department_id == department_id,
+            AdapterDeploymentOperation.status.in_(("queued", "running")),
+            (
+                (AdapterDeploymentOperation.target_adapter_id == adapter.id)
+                | (AdapterDeploymentOperation.current_adapter_id == adapter.id)
+            ),
+        )
+    )
+    if deployment_operation is not None:
+        raise ServiceError(409, "Adapter purge conflicts with deployment operation")
 
 
 def _address(
@@ -1289,6 +1341,7 @@ def _finalize_operation(
             if blocked:
                 return
             authority = _load_authority_allow_pending(session, department_id, operation.adapter_id)
+            _assert_governance_fences(session, authority.adapter, department_id)
             _assert_operation_authority(operation, authority, department_id)
             authority.source.status = "purged"
             authority.source.purged_at = operation.completed_at

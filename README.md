@@ -40,19 +40,22 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > keeps the reservation active. Review changes are rejected while a reservation
 > is active. This is a reviewed boundary, not training execution.
 
-> **Phase 12 status:** Phase 12.0 and Phase 12.1A through Phase 12.1E-C are
-> completed. Phase 12.2 is the current reviewed scope: it adds a separate,
-> administrator-only, department-scoped paired evaluation of one exact
-> validated adapter against the exact Phase 7 baseline. It reuses the Phase 9
-> retrieval, prompt, generation, citation, metric, and Decimal gate contracts,
-> performs one shared retrieval/context/seed per case, and publishes only
-> content-free numeric evidence under external `eval_results` storage. The
-> candidate runtime is isolated, pinned to the reviewed base-model revision
-> and adapter stack, has no fallback to the base lane, and cannot receive
-> database, Qdrant, application-auth, or cloud credentials. Evaluation never
-> changes retrieval or production behavior, never stores questions, answers,
-> prompts, evidence, vectors, model output, paths, or adapter bytes, and is
-> fenced against active adapter purge. Phase 12.3 and later remain unstarted.
+> **Phase 12 status:** Phase 12.0, Phase 12.1A through Phase 12.1E-C, and
+> Phase 12.2 are completed. Phase 12.3 is the current reviewed scope: it adds
+> separate human review, approval, department deployment metadata, explicit
+> promotion and rollback operations, retention references, and immutable
+> content-free deployment events. It never overloads `Adapter.status`, approves
+> or promotes automatically, loads or routes an adapter, or adds a numeric
+> improvement threshold. Phase 12.2 evaluation authority remains exact and
+> immutable; Phase 12.4 runtime routing and Phase 13 are not started.
+
+The governance worker is deliberately narrower than the API: its dedicated
+settings loader requires PostgreSQL plus only the external read-only
+`adapters/registry` root. It validates the exact three-file registry-final
+allowlist and reruns the model-free Phase 12.1A config/header contract in a
+bounded child using retained descriptors. Final deployment reauthorizes the
+original requester with PostgreSQL server time and requires one success event
+and one success audit for the pointer change.
 
 > **Phase 12.1E-B recovery:** After durable move authorization, initial rename
 > still requires an empty exact namespace, and unbound post-rename recovery
@@ -318,6 +321,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Phase 12.1E-B adapter artifact purge](docs/adapter-artifact-purge.md)
 - [Phase 12.1E-C adapter lifecycle release](docs/adapter-lifecycle-release.md)
 - [Phase 12 adapter registry contract](docs/adapter-registry.md)
+- [Phase 12.3 adapter governance](docs/adapter-governance.md)
 - [Grounded RAG answering](docs/rag-answering.md)
 - [Prompt-injection boundary](docs/prompt-injection-boundary.md)
 - [Citation model](docs/citation-model.md)
@@ -335,7 +339,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 
 Phase 9 does not implement LLM judging, semantic grading, public raw results, a frontend dashboard, feedback-derived cases, automatic threshold or RAG changes, training datasets, SFT, adapters, model promotion, cross-department benchmarking, production OAuth/OIDC/SSO, or production deployment.
 
-Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 through Phase 12.1E-C are complete. Phase 12.1E-C is the separate reviewed, administrator-only, dry-run-by-default lifecycle-release authority described above; it releases only one exact upstream dependency after read-only proof of completed E-B authority and never deletes upstream Phase 10/11 artifacts, history, backups, audit rows, or adapter bytes. Phase 12.2 is the current reviewed, administrator-only paired evaluation boundary and publishes only content-free numeric evidence; it does not approve, promote, load, or route adapters. Phase 12.3 and later phases remain unstarted. Google Drive storage is an external development runtime location, not a production object store or backup.
+Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 through Phase 12.2 are complete. Phase 12.3 is the current reviewed, administrator-only governance boundary: review, approval, deployment, rollback, and retention are separate PostgreSQL authorities with explicit operations and immutable events; it does not route or load adapters. Phase 12.4 runtime routing and Phase 13 remain unstarted. Google Drive storage is an external development runtime location, not a production object store or backup.
 
 ## License
 

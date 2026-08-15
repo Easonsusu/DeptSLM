@@ -6,7 +6,8 @@ the completed Phase 12.1C immutable registry-publication implementation, the
 completed Phase 12.1D metadata-only registry read boundary, the completed
 Phase 12.1E-A reconciliation foundation, and the completed Phase 12.1E-B
 purge authority, and the completed Phase 12.1E-C lifecycle-release scope.
-Phase 12.2 is the current reviewed adapter-evaluation scope.
+Phase 12.2 is completed, and Phase 12.3 is the current reviewed adapter-
+governance scope.
 It also records future metadata, evaluation, review, deployment, and runtime contracts. The
 separate Phase 12.1A static compatibility contract is documented in
 [adapter-static-contract.md](adapter-static-contract.md).
@@ -15,7 +16,7 @@ separate Phase 12.1A static compatibility contract is documented in
 
 - Phase 11 is completed. Its reviewed output is an immutable, department-scoped
   LlamaFactory job bundle; it does not execute training or create an adapter.
-- Phase 12 is under review.
+- Phase 12.3 is under review; Phase 12.0 through Phase 12.2 are completed.
 - Phase 12.0 is completed: it defines contracts and the threat model.
 - Phase 12.1 is completed. Phase 12.1A, Phase 12.1B, and Phase 12.1C are
   completed. Phase 12.1C binds one exact committed source to one approved succeeded Phase 11
@@ -35,13 +36,16 @@ separate Phase 12.1A static compatibility contract is documented in
   active upstream dependency after read-only proof that the corresponding E-B
   purge completed without blocks, both final paths remain absent, and both
   exact purge namespaces are empty. It does not touch artifact bytes.
-- Phase 12.2 is the current reviewed scope. It adds only paired, content-free
-  adapter-target evaluation and does not approve, promote, load, or route.
-- Phase 12.3 and 12.4 remain unimplemented.
+- Phase 12.2 is completed. It adds only paired, content-free adapter-target
+  evaluation and does not approve, promote, load, or route.
+- Phase 12.3 is the current reviewed scope. It adds separate review,
+  approval, deployment, promotion, rollback, retention, and immutable event
+  authorities without changing `Adapter.status` or routing requests.
+- Phase 12.4 remains unimplemented.
 - Phase 13 has not started.
 
-The Phase 12.1D read routes and the Phase 12.2 evaluation metadata routes are
-the only public adapter metadata surfaces today. They return closed
+The Phase 12.1D, Phase 12.2, and Phase 12.3 metadata routes are the only public
+adapter metadata surfaces today. They return closed
 PostgreSQL projections; evaluation enqueue, cancellation, listing, and detail
 operations never expose registry files or evaluation content. There is still
 no adapter upload/download, deployment pointer, runtime loading, or rollback
@@ -184,7 +188,7 @@ the artifact is safe, compatible, or useful.
   and writes one `adapter.upstream_dependency.release` audit. It never changes
   source, adapter, job, dataset, or E-B history lifecycle timestamps/statuses.
 
-### Phase 12.2 — adapter-target evaluation (current; under review)
+### Phase 12.2 — adapter-target evaluation (completed)
 
 Phase 12.2 evaluates one exact validated adapter against the exact Phase 7
 baseline using the reviewed Phase 9 production retrieval, prompt, generation,
@@ -208,11 +212,28 @@ promotion, or runtime routing.
 - Apply fixed numeric quality and safety gates.
 - Never promote automatically.
 
-### Phase 12.3 — review, promotion, and rollback (not started)
+### Phase 12.3 — review, promotion, and rollback (current; under review)
 
-- Add explicit review and approval, department promotion, supersession,
-  rollback, rollback-to-base, and immutable deployment-event history.
-- Never silently fall back between departments or from a failed adapter load.
+Phase 12.3 adds the control-plane governance layer between completed
+evaluation and future runtime routing. Review, approval, deployment, rollback,
+and retention are separate department-scoped PostgreSQL authorities; the
+artifact lifecycle in `Adapter.status` remains unchanged. The reviewed scope
+provides explicit metadata-only operations for:
+
+- starting, approving, rejecting, and archiving a review bound to one exact
+  Phase 12.2 run, registry attempt, suite, dependency, and result authority;
+- promoting an approved adapter, rolling back to a retained adapter, or
+  explicitly rolling back to the base model;
+- durable server-time worker leases, reclaim, exact registry-final descriptor
+  verification, and operation-scoped safe error codes;
+- supersession/deployment history, rollback-retention references, explicit
+  retention release, and immutable content-free deployment events.
+
+No review or evaluation automatically approves or promotes an adapter. No
+Phase 12.3 operation loads an adapter or routes a production request; those
+behaviors remain Phase 12.4. The governance worker receives only PostgreSQL
+and a read-only registry-final mount, while Phase 12.1E purge and lifecycle
+release remain fenced against active governance operations.
 
 ### Phase 12.4 — runtime routing (not started)
 
@@ -742,7 +763,7 @@ the registry final before the source final, supports crash-resumable deletion,
 binds exact tombstone identities before unlink, and produces one
 operation-level exactly-once success audit. Phase 12.1E-A remains the separate
 non-authoritative reconciliation foundation described below; Phase 12.1E-C is
-the current lifecycle-release scope and does not change reconciliation
+the completed lifecycle-release scope and does not change reconciliation
 ownership or artifact cleanup.
 
 Metadata, lineage, evaluation, deployment, and audit history are retained. A

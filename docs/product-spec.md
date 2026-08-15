@@ -2,7 +2,7 @@
 
 ## Document status
 
-This document describes the product direction and separates completed Phase 0–11 boundaries from the planned scope. Phase 12.0 through Phase 12.1E-C are completed, and Phase 12.2 is the current reviewed, metadata-only adapter-target evaluation boundary. It compares one exact validated adapter with the exact Phase 7 baseline and does not approve, promote, load, or route an adapter. Phase 12.3 and 12.4 remain unimplemented. Unless a capability is explicitly labeled as completed, it is not implemented.
+This document describes the product direction and separates completed Phase 0–12.2 boundaries from the planned scope. Phase 12.0 through Phase 12.2 are completed, and Phase 12.3 is the current reviewed, metadata-only adapter-governance boundary. It records explicit review, approval, deployment, promotion, rollback, retention, and event authorities but does not load or route an adapter. Phase 12.4 and Phase 13 remain unimplemented. Unless a capability is explicitly labeled as completed, it is not implemented.
 
 ## Product summary
 
@@ -67,7 +67,7 @@ Students may become an end-user group in a future deployment, but only after a d
 
 - Build reviewed department-specific training datasets.
 - Phase 11 generates immutable LoRA or QLoRA LlamaFactory job bundles; it does not execute training or create adapters.
-- Phase 12.1B stores externally produced adapters outside the repository, and Phase 12.1C records a department-scoped, verified governance association to one exact Phase 10 dataset and Phase 11 job plus the reviewed base-model and closed artifact contracts. Evaluation evidence, approval, promotion, and runtime loading remain future work.
+- Phase 12.1B stores externally produced adapters outside the repository, and Phase 12.1C records a department-scoped, verified governance association to one exact Phase 10 dataset and Phase 11 job plus the reviewed base-model and closed artifact contracts. Phase 12.2 evaluates one exact adapter; Phase 12.3 records explicit human review and deployment decisions. Runtime loading remains future work.
 - Evaluation and explicit review approval are required before promotion or runtime use. Adaptation remains optional and must demonstrate value beyond the approved base/RAG behavior.
 
 ### Phase 12 governance boundary
@@ -77,11 +77,13 @@ governance-lineage contracts, metadata-only registry, evaluation evidence,
 review, promotion, rollback, and eventual fail-closed runtime routing. Phase
 12.1C adds only the internal migration and administrator-enqueued worker for
 immutable registry publication. Phase 12.1D adds only the two department-scoped
-metadata GETs; it adds no artifact mutation, model loading, or runtime routing.
-An imported adapter is not approved, an approved adapter is not promoted, and
-promotion is not proof of safety or quality. Cross-department fallback and
-silent fallback to the base model are prohibited; rollback-to-base must be
-explicit. See [adapter-registry.md](adapter-registry.md).
+metadata GETs, Phase 12.2 adds paired evaluation, and Phase 12.3 adds separate
+review/deployment authorities; none loads or routes an adapter. An imported
+adapter is not approved, an approved adapter is not promoted, and promotion is
+not proof of safety or quality. Cross-department fallback and silent fallback
+to the base model are prohibited; rollback-to-base must be explicit. See
+[adapter-registry.md](adapter-registry.md) and
+[adapter-governance.md](adapter-governance.md).
 
 The first intake is an administrator-controlled CLI, not a browser or public
 weight-upload route. It streams only the two payload files into a
