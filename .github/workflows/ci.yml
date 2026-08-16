@@ -280,6 +280,65 @@ jobs:
         run: |
           export PYTHONPATH="$GITHUB_WORKSPACE/apps/api:$GITHUB_WORKSPACE/services/rag-worker:$GITHUB_WORKSPACE/services/rag-runtime"
           python tests/phase12_3_container_smoke.py verify
+      - name: Build production adapter runtime image for Phase 12.4 smoke
+        run: docker build --tag deptslm-adapter-runtime-smoke --file services/adapter-runtime/Dockerfile .
+      - name: Prepare actual Phase 12.4 production runtime smoke
+        working-directory: apps/api
+        env:
+          DEPTSLM_DATA_DIR: ${{ runner.temp }}/deptslm-governance-operation
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE/apps/api:$GITHUB_WORKSPACE/services/rag-worker:$GITHUB_WORKSPACE/services/rag-runtime"
+          python tests/phase12_4_container_smoke.py prepare
+          chmod 700 "$DEPTSLM_DATA_DIR" "$DEPTSLM_DATA_DIR/adapters" "$DEPTSLM_DATA_DIR/adapters/registry"
+      - name: Run actual Phase 12.4 production runtime container smoke
+        working-directory: apps/api
+        env:
+          DEPTSLM_DATA_DIR: ${{ runner.temp }}/deptslm-governance-operation
+          DEPTSLM_ADAPTER_RUNTIME_TOKEN: phase12-ci-production-runtime-token-0123456789
+          DEPTSLM_ADAPTER_RUNTIME_BASE_REVISION: c1899de289a04d12100db370d81485cdf75e47ca
+          DEPTSLM_ADAPTER_RUNTIME_PROVIDER: fake
+          ENVIRONMENT: test
+        run: |
+          runtime_uid="$(id -u)"
+          runtime_gid="$(id -g)"
+          container_id="$(docker run --detach --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --publish 127.0.0.1:18012:8012 \
+            --user "${runtime_uid}:${runtime_gid}" \
+            --tmpfs "/tmp/adapter-runtime:rw,noexec,nosuid,size=512m,uid=${runtime_uid},gid=${runtime_gid},mode=700" \
+            --volume "$DEPTSLM_DATA_DIR/model_cache:/runtime/deptslm/model_cache:ro" \
+            --volume "$DEPTSLM_DATA_DIR/adapters/registry:/runtime/deptslm/adapters/registry:ro" \
+            --env DEPTSLM_DATA_DIR=/runtime/deptslm \
+            --env DEPTSLM_ADAPTER_RUNTIME_TOKEN \
+            --env DEPTSLM_ADAPTER_RUNTIME_BASE_REVISION \
+            --env DEPTSLM_ADAPTER_RUNTIME_PROVIDER \
+            --env ENVIRONMENT \
+            deptslm-adapter-runtime-smoke)"
+          trap 'docker rm --force "$container_id" >/dev/null 2>&1 || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18012/healthz >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" == "30" ]]; then
+              echo "Phase 12.4 adapter runtime fake smoke did not become ready." >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          curl --fail --silent \
+            --header 'Authorization: Bearer phase12-ci-production-runtime-token-0123456789' \
+            --header 'Content-Type: application/json' \
+            --data-binary @"$RUNNER_TEMP/deptslm-adapter-runtime-request.json" \
+            http://127.0.0.1:18012/internal/v1/generate \
+            > "$RUNNER_TEMP/deptslm-adapter-runtime-response.json"
+          curl --fail --silent \
+            --header 'Authorization: Bearer phase12-ci-production-runtime-token-0123456789' \
+            --header 'Content-Type: application/json' \
+            --data-binary @"$RUNNER_TEMP/deptslm-adapter-runtime-request-b.json" \
+            http://127.0.0.1:18012/internal/v1/generate \
+            > "$RUNNER_TEMP/deptslm-adapter-runtime-response-b.json"
+          python tests/phase12_4_container_smoke.py verify
+          docker rm --force "$container_id" >/dev/null
+          trap - EXIT
       - name: Verify API checks leave the checkout clean
         shell: bash
         run: |
@@ -543,63 +602,6 @@ jobs:
             printf 'Forbidden model-weight-like files in adapter runtime image:\n%s\n' "$weight_matches" >&2
             exit 1
           fi
-      - name: Prepare actual Phase 12.4 production runtime smoke
-        working-directory: apps/api
-        env:
-          DEPTSLM_DATA_DIR: ${{ runner.temp }}/deptslm-governance-operation
-        run: |
-          export PYTHONPATH="$GITHUB_WORKSPACE/apps/api:$GITHUB_WORKSPACE/services/rag-worker:$GITHUB_WORKSPACE/services/rag-runtime"
-          python tests/phase12_4_container_smoke.py prepare
-          chmod 700 "$DEPTSLM_DATA_DIR" "$DEPTSLM_DATA_DIR/adapters" "$DEPTSLM_DATA_DIR/adapters/registry"
-      - name: Run actual Phase 12.4 production runtime container smoke
-        working-directory: apps/api
-        env:
-          DEPTSLM_DATA_DIR: ${{ runner.temp }}/deptslm-governance-operation
-          DEPTSLM_ADAPTER_RUNTIME_TOKEN: phase12-ci-production-runtime-token-0123456789
-          DEPTSLM_ADAPTER_RUNTIME_BASE_REVISION: c1899de289a04d12100db370d81485cdf75e47ca
-          DEPTSLM_ADAPTER_RUNTIME_PROVIDER: fake
-          ENVIRONMENT: test
-        run: |
-          runtime_uid="$(id -u)"
-          runtime_gid="$(id -g)"
-          container_id="$(docker run --detach --read-only --cap-drop ALL --security-opt no-new-privileges:true \
-            --publish 127.0.0.1:18012:8012 \
-            --user "${runtime_uid}:${runtime_gid}" \
-            --tmpfs "/tmp/adapter-runtime:rw,noexec,nosuid,size=512m,uid=${runtime_uid},gid=${runtime_gid},mode=700" \
-            --volume "$DEPTSLM_DATA_DIR/model_cache:/runtime/deptslm/model_cache:ro" \
-            --volume "$DEPTSLM_DATA_DIR/adapters/registry:/runtime/deptslm/adapters/registry:ro" \
-            --env DEPTSLM_DATA_DIR=/runtime/deptslm \
-            --env DEPTSLM_ADAPTER_RUNTIME_TOKEN \
-            --env DEPTSLM_ADAPTER_RUNTIME_BASE_REVISION \
-            --env DEPTSLM_ADAPTER_RUNTIME_PROVIDER \
-            --env ENVIRONMENT \
-            deptslm-adapter-runtime-ci)"
-          trap 'docker rm --force "$container_id" >/dev/null 2>&1 || true' EXIT
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:18012/healthz >/dev/null; then
-              break
-            fi
-            if [[ "$attempt" == "30" ]]; then
-              echo "Phase 12.4 adapter runtime fake smoke did not become ready." >&2
-              exit 1
-            fi
-            sleep 1
-          done
-          curl --fail --silent \
-            --header 'Authorization: Bearer phase12-ci-production-runtime-token-0123456789' \
-            --header 'Content-Type: application/json' \
-            --data-binary @"$RUNNER_TEMP/deptslm-adapter-runtime-request.json" \
-            http://127.0.0.1:18012/internal/v1/generate \
-            > "$RUNNER_TEMP/deptslm-adapter-runtime-response.json"
-          curl --fail --silent \
-            --header 'Authorization: Bearer phase12-ci-production-runtime-token-0123456789' \
-            --header 'Content-Type: application/json' \
-            --data-binary @"$RUNNER_TEMP/deptslm-adapter-runtime-request-b.json" \
-            http://127.0.0.1:18012/internal/v1/generate \
-            > "$RUNNER_TEMP/deptslm-adapter-runtime-response-b.json"
-          python tests/phase12_4_container_smoke.py verify
-          docker rm --force "$container_id" >/dev/null
-          trap - EXIT
       - name: Build and inspect internal RAG runtime image
         run: |
           docker build --tag deptslm-rag-runtime-ci --file services/rag-runtime/Dockerfile .
