@@ -320,6 +320,7 @@ jobs:
             fi
             if [[ "$attempt" == "30" ]]; then
               echo "Phase 12.4 adapter runtime fake smoke did not become ready." >&2
+              docker logs "$container_id" >&2 || true
               exit 1
             fi
             sleep 1
