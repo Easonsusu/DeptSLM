@@ -253,6 +253,35 @@ def test_runtime_settings_reject_fake_provider_and_token_reuse(monkeypatch, tmp_
         AdapterRuntimeSettings.from_environment()
 
 
+def test_child_runtime_settings_are_secret_free(monkeypatch, tmp_path) -> None:
+    (tmp_path / "model_cache").mkdir()
+    (tmp_path / "adapters" / "registry").mkdir(parents=True)
+    monkeypatch.setenv("ENVIRONMENT", "test")
+    monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("DEPTSLM_ADAPTER_RUNTIME_TOKEN", raising=False)
+    monkeypatch.setenv(
+        "DEPTSLM_ADAPTER_RUNTIME_BASE_REVISION",
+        "c1899de289a04d12100db370d81485cdf75e47ca",
+    )
+    for name in (
+        "DATABASE_URL",
+        "DEPTSLM_QDRANT_URL",
+        "DEPTSLM_QDRANT_API_KEY",
+        "DEPTSLM_AUTH_SECRET",
+        "DEPTSLM_RAG_RUNTIME_TOKEN",
+        "DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    settings = AdapterRuntimeSettings.from_environment(require_token=False)
+    assert settings.token == ""
+    assert "DEPTSLM_ADAPTER_RUNTIME_TOKEN" not in settings.child_environment()
+
+
 def test_supervisor_target_key_includes_department_and_artifact_authority() -> None:
     target = _target()
     payload = {"operation": "generate", "target": target.adapter_request_fields()}

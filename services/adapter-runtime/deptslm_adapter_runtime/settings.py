@@ -22,16 +22,29 @@ class AdapterRuntimeSettings:
     provider: str
 
     @classmethod
-    def from_environment(cls) -> AdapterRuntimeSettings:
+    def from_environment(cls, *, require_token: bool = True) -> AdapterRuntimeSettings:
         environment = os.getenv("ENVIRONMENT", "").strip().lower()
         if environment not in {"test", "development", "staging", "production"}:
             raise AdapterRuntimeConfigurationError("ENVIRONMENT must be explicit.")
         provider = os.getenv("DEPTSLM_ADAPTER_RUNTIME_PROVIDER", "real").strip().lower()
-        if provider not in {"real", "fake"} or (provider == "fake" and environment != "test"):
+        if provider not in {"real", "fake"} or (
+            provider == "fake" and environment != "test"
+        ):
             raise AdapterRuntimeConfigurationError("Fake adapter runtime is test-only.")
         token = os.getenv("DEPTSLM_ADAPTER_RUNTIME_TOKEN", "")
-        if len(token) < 32 or token != token.strip() or any(char.isspace() for char in token):
-            raise AdapterRuntimeConfigurationError("Production runtime token is unsafe.")
+        if require_token:
+            if (
+                len(token) < 32
+                or token != token.strip()
+                or any(char.isspace() for char in token)
+            ):
+                raise AdapterRuntimeConfigurationError(
+                    "Production runtime token is unsafe."
+                )
+        elif token:
+            raise AdapterRuntimeConfigurationError(
+                "Child runtime must not receive the bearer token."
+            )
         root = Path(os.getenv("DEPTSLM_DATA_DIR", "")).expanduser()
         if not root.is_absolute() or root.is_symlink() or not root.is_dir():
             raise AdapterRuntimeConfigurationError("DEPTSLM_DATA_DIR is unavailable.")
@@ -45,7 +58,9 @@ class AdapterRuntimeSettings:
         ):
             raise AdapterRuntimeConfigurationError("Runtime mounts are unavailable.")
         if os.getenv("DEPTSLM_ADAPTER_RUNTIME_BASE_REVISION") != BASE_MODEL_REVISION:
-            raise AdapterRuntimeConfigurationError("Base model revision is not reviewed.")
+            raise AdapterRuntimeConfigurationError(
+                "Base model revision is not reviewed."
+            )
         forbidden = (
             "DATABASE_URL",
             "DEPTSLM_QDRANT_URL",
@@ -60,8 +75,16 @@ class AdapterRuntimeSettings:
             "ALL_PROXY",
         )
         if any(os.getenv(name) for name in forbidden):
-            raise AdapterRuntimeConfigurationError("Forbidden runtime configuration is present.")
-        return cls(root.resolve(), model_cache.resolve(), registry.resolve(), token, provider)
+            raise AdapterRuntimeConfigurationError(
+                "Forbidden runtime configuration is present."
+            )
+        return cls(
+            root.resolve(),
+            model_cache.resolve(),
+            registry.resolve(),
+            token if require_token else "",
+            provider,
+        )
 
     def child_environment(self) -> dict[str, str]:
         return {
