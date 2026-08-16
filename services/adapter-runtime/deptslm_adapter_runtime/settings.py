@@ -27,20 +27,12 @@ class AdapterRuntimeSettings:
         if environment not in {"test", "development", "staging", "production"}:
             raise AdapterRuntimeConfigurationError("ENVIRONMENT must be explicit.")
         provider = os.getenv("DEPTSLM_ADAPTER_RUNTIME_PROVIDER", "real").strip().lower()
-        if provider not in {"real", "fake"} or (
-            provider == "fake" and environment != "test"
-        ):
+        if provider not in {"real", "fake"} or (provider == "fake" and environment != "test"):
             raise AdapterRuntimeConfigurationError("Fake adapter runtime is test-only.")
         token = os.getenv("DEPTSLM_ADAPTER_RUNTIME_TOKEN", "")
         if require_token:
-            if (
-                len(token) < 32
-                or token != token.strip()
-                or any(char.isspace() for char in token)
-            ):
-                raise AdapterRuntimeConfigurationError(
-                    "Production runtime token is unsafe."
-                )
+            if len(token) < 32 or token != token.strip() or any(char.isspace() for char in token):
+                raise AdapterRuntimeConfigurationError("Production runtime token is unsafe.")
         elif token:
             raise AdapterRuntimeConfigurationError(
                 "Child runtime must not receive the bearer token."
@@ -58,9 +50,7 @@ class AdapterRuntimeSettings:
         ):
             raise AdapterRuntimeConfigurationError("Runtime mounts are unavailable.")
         if os.getenv("DEPTSLM_ADAPTER_RUNTIME_BASE_REVISION") != BASE_MODEL_REVISION:
-            raise AdapterRuntimeConfigurationError(
-                "Base model revision is not reviewed."
-            )
+            raise AdapterRuntimeConfigurationError("Base model revision is not reviewed.")
         forbidden = (
             "DATABASE_URL",
             "DEPTSLM_QDRANT_URL",
@@ -75,9 +65,7 @@ class AdapterRuntimeSettings:
             "ALL_PROXY",
         )
         if any(os.getenv(name) for name in forbidden):
-            raise AdapterRuntimeConfigurationError(
-                "Forbidden runtime configuration is present."
-            )
+            raise AdapterRuntimeConfigurationError("Forbidden runtime configuration is present.")
         return cls(
             root.resolve(),
             model_cache.resolve(),

@@ -101,9 +101,7 @@ class Session:
 
     def generate(self, payload: dict[str, Any]) -> dict[str, Any]:
         target = _validate_target(payload)
-        key = tuple(target[field] for field in _TARGET_FIELDS) + (
-            payload["target_fingerprint"],
-        )
+        key = tuple(target[field] for field in _TARGET_FIELDS) + (payload["target_fingerprint"],)
         if key != self.key:
             self.close()
             self.key = key
@@ -113,9 +111,7 @@ class Session:
                     department_id=UUID(target["department_id"]),
                     adapter_id=UUID(target["adapter_id"]),
                     adapter_version=target["adapter_version"],
-                    registry_publication_attempt_id=UUID(
-                        target["registry_publication_attempt_id"]
-                    ),
+                    registry_publication_attempt_id=UUID(target["registry_publication_attempt_id"]),
                     registry_attempt_number=target["registry_attempt_number"],
                     expected_manifest_sha256=target["registry_manifest_sha256"],
                     expected_config_sha256=target["adapter_config_sha256"],
@@ -161,16 +157,12 @@ class Session:
             "citations": list(result.citations),
         }
 
-    def _real_generate(
-        self, question: str, evidence: list[dict[str, str]]
-    ) -> dict[str, Any]:
+    def _real_generate(self, question: str, evidence: list[dict[str, str]]) -> dict[str, Any]:
         if self.model is None or self.tokenizer is None:
             raise ChildError("adapter_load_failed")
         try:
             messages = build_generation_messages(question, evidence)
-            inputs = tokenize_generation_input(self.tokenizer, messages).to(
-                self.model.device
-            )
+            inputs = tokenize_generation_input(self.tokenizer, messages).to(self.model.device)
             outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=GENERATION_NEW_TOKEN_RESERVE,
@@ -315,11 +307,7 @@ def _validate_generation(value: dict[str, Any]) -> tuple[str, list[dict[str, str
                 raise ValueError
             label, text = item["source_id"], item["text"]
             validate_safe_text(text, field="evidence", max_chars=1200)
-            if (
-                not isinstance(label, str)
-                or label in labels
-                or label != f"S{len(labels) + 1}"
-            ):
+            if not isinstance(label, str) or label in labels or label != f"S{len(labels) + 1}":
                 raise ValueError
             labels.append(label)
             total += len(text)
@@ -364,11 +352,7 @@ def _write_frame(stream, value: object, maximum: int) -> None:
 
 def main() -> int:
     settings = AdapterRuntimeSettings.from_environment(require_token=False)
-    if (
-        set(os.environ)
-        - set(settings.child_environment())
-        - {"PATH", "PWD", "SHLVL", "_"}
-    ):
+    if set(os.environ) - set(settings.child_environment()) - {"PATH", "PWD", "SHLVL", "_"}:
         return 2
     session = Session(settings)
     try:
