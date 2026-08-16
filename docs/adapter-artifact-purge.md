@@ -1,8 +1,10 @@
 # Phase 12.1E-B adapter artifact purge
 
-Phase 12.1E-B is a maintenance-only, administrator-authorized purge boundary
-for one exact validated adapter. It is under review and does not add an HTTP
-route, deployment state, evaluation, runtime loading, or training behavior.
+Phase 12.1E-B is a completed maintenance-only, administrator-authorized purge
+boundary for one exact validated adapter. It does not add an HTTP route,
+deployment state, evaluation, runtime loading, or training behavior. Phase
+12.4 adds a separate running-request snapshot fence so this purge cannot remove
+bytes needed by an active adapter-target request.
 
 ## Authority and authorization
 

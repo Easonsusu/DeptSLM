@@ -39,6 +39,8 @@ services:
       DEPTSLM_QDRANT_TIMEOUT_SECONDS: "${DEPTSLM_QDRANT_TIMEOUT_SECONDS:-30}"
       DEPTSLM_RAG_RUNTIME_URL: "${DEPTSLM_RAG_RUNTIME_URL:-http://rag-runtime:8010}"
       DEPTSLM_RAG_RUNTIME_TOKEN: "${DEPTSLM_RAG_RUNTIME_TOKEN:?Set a separate RAG runtime token in the untracked .env file}"
+      DEPTSLM_ADAPTER_RUNTIME_URL: "${DEPTSLM_ADAPTER_RUNTIME_URL:-http://adapter-runtime:8012}"
+      DEPTSLM_ADAPTER_RUNTIME_TOKEN: "${DEPTSLM_ADAPTER_RUNTIME_TOKEN:?Set a separate production adapter runtime token in the untracked .env file}"
       DEPTSLM_RAG_CANDIDATE_LIMIT: "${DEPTSLM_RAG_CANDIDATE_LIMIT:-20}"
       DEPTSLM_RAG_MAX_SOURCES: "${DEPTSLM_RAG_MAX_SOURCES:-8}"
       DEPTSLM_RAG_MAX_SOURCES_PER_DOCUMENT: "${DEPTSLM_RAG_MAX_SOURCES_PER_DOCUMENT:-2}"
@@ -409,6 +411,41 @@ services:
       - type: bind
         source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/model_cache"
         target: /runtime/deptslm/model_cache
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - rag-internal
+
+  adapter-runtime:
+    build:
+      context: .
+      dockerfile: services/adapter-runtime/Dockerfile
+    environment:
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      DEPTSLM_ADAPTER_RUNTIME_TOKEN: "${DEPTSLM_ADAPTER_RUNTIME_TOKEN:?Set a separate production adapter runtime token in the untracked .env file}"
+      DEPTSLM_ADAPTER_RUNTIME_PROVIDER: "${DEPTSLM_ADAPTER_RUNTIME_PROVIDER:-real}"
+      DEPTSLM_ADAPTER_RUNTIME_BASE_REVISION: "${DEPTSLM_GENERATION_MODEL_REVISION:-c1899de289a04d12100db370d81485cdf75e47ca}"
+      ENVIRONMENT: "${ENVIRONMENT:-development}"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp/adapter-runtime:rw,noexec,nosuid,size=512m,uid=1001,gid=1001,mode=700
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/model_cache"
+        target: /runtime/deptslm/model_cache
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/adapters/registry"
+        target: /runtime/deptslm/adapters/registry
         read_only: true
         bind:
           create_host_path: false

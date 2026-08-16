@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from deptslm_worker.embedding import EmbeddingError, validate_vector
 from deptslm_worker.qdrant_adapter import DepartmentQdrant, QdrantBoundaryError
@@ -24,6 +24,9 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.adapter_deployment_authority import load_runtime_target
+from app.adapter_runtime_client import AdapterRuntimeClient
+from app.adapter_runtime_contract import RuntimeTarget
 from app.auth import AuthenticatedPrincipal
 from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.extraction_domain import CHUNKING_VERSION, NORMALIZATION_VERSION, PIPELINE_VERSION
@@ -34,6 +37,7 @@ from app.models import (
     DocumentVectorIndexing,
     RagAnswerCitation,
     RagAnswerRun,
+    RagAnswerRuntimeSnapshot,
 )
 from app.rag_domain import (
     ANSWER_CONTRACT_VERSION,
@@ -46,6 +50,7 @@ from app.rag_domain import (
     validate_generation_response,
 )
 from app.rag_runtime_client import RagRuntimeClient
+from app.rag_runtime_router import RoutedRagRuntime
 from app.rag_settings import RagSettings
 from app.schemas import RagAnswerResponse, RagCitationResponse
 from app.selected_chunk_reader import LoadedEvidence, load_selected_chunks
@@ -103,6 +108,7 @@ class RagPolicyEvaluationError(RagContractError):
 class _StartedRun:
     id: UUID
     created_at: datetime
+    runtime_target: RuntimeTarget
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,14 +322,27 @@ def answer_question(
     question: str,
     *,
     runtime: RagRuntimeClient | None = None,
+    adapter_runtime: AdapterRuntimeClient | None = None,
     qdrant: DepartmentQdrant | None = None,
 ) -> RagAnswerResponse:
     """Run short transactions around external retrieval and generation operations."""
 
     started = _start_run(factory, settings, principal, request_scope, len(question))
-    runtime_client = runtime or RagRuntimeClient(
+    base_runtime = runtime or RagRuntimeClient(
         settings.runtime_url, settings.runtime_token, settings.request_timeout_seconds
     )
+    adapter_runtime_client = adapter_runtime
+    if (
+        adapter_runtime_client is None
+        and settings.adapter_runtime_url
+        and settings.adapter_runtime_token
+    ):
+        adapter_runtime_client = AdapterRuntimeClient(
+            settings.adapter_runtime_url,
+            settings.adapter_runtime_token,
+            settings.request_timeout_seconds,
+        )
+    runtime_client = RoutedRagRuntime(base_runtime, adapter_runtime_client, started.runtime_target)
     owned_qdrant = qdrant is None
     adapter = qdrant
     candidate_count = None
@@ -506,6 +525,7 @@ def _start_run(factory, settings, principal, request_scope, question_chars) -> _
                 lock=True,
                 audit_action="rag.answer.start.authorization",
             )
+            runtime_target = load_runtime_target(session, request_scope.department.value, lock=True)
             run = RagAnswerRun(
                 department_id=request_scope.department.value,
                 requested_by_user_id=authorization.identity.id,
@@ -522,6 +542,41 @@ def _start_run(factory, settings, principal, request_scope, question_chars) -> _
             )
             session.add(run)
             session.flush()
+            session.add(
+                RagAnswerRuntimeSnapshot(
+                    id=uuid4(),
+                    run_id=run.id,
+                    department_id=request_scope.department.value,
+                    target_kind=runtime_target.target_kind,
+                    deployment_id=runtime_target.deployment_id,
+                    deployment_version=runtime_target.deployment_version,
+                    deployment_row_version=runtime_target.deployment_row_version,
+                    base_model_id=runtime_target.base_model_id,
+                    base_model_revision=runtime_target.base_model_revision,
+                    adapter_id=runtime_target.adapter_id,
+                    adapter_version=runtime_target.adapter_version,
+                    review_id=runtime_target.review_id,
+                    review_version=runtime_target.review_version,
+                    evaluation_id=runtime_target.evaluation_id,
+                    evaluation_version=runtime_target.evaluation_version,
+                    suite_id=runtime_target.suite_id,
+                    suite_version=runtime_target.suite_version,
+                    registry_attempt_id=runtime_target.registry_attempt_id,
+                    registry_attempt_version=runtime_target.registry_attempt_version,
+                    registry_publication_attempt_id=runtime_target.registry_publication_attempt_id,
+                    registry_attempt_number=runtime_target.registry_attempt_number,
+                    registry_execution_scope_id=runtime_target.registry_execution_scope_id,
+                    registry_manifest_sha256=runtime_target.registry_manifest_sha256,
+                    adapter_config_sha256=runtime_target.adapter_config_sha256,
+                    adapter_config_byte_size=runtime_target.adapter_config_byte_size,
+                    adapter_model_sha256=runtime_target.adapter_model_sha256,
+                    adapter_model_byte_size=runtime_target.adapter_model_byte_size,
+                    dependency_id=runtime_target.dependency_id,
+                    dependency_version=runtime_target.dependency_version,
+                    runtime_contract_version="phase12-adapter-runtime-routing-v1",
+                    target_fingerprint=runtime_target.fingerprint,
+                )
+            )
             append_mutation_audit(
                 session,
                 actor=authorization.identity,
@@ -532,7 +587,7 @@ def _start_run(factory, settings, principal, request_scope, question_chars) -> _
                 resource_id=run.id,
             )
             session.flush()
-            return _StartedRun(run.id, run.created_at)
+            return _StartedRun(run.id, run.created_at, runtime_target)
     except ServiceError:
         raise
     except SQLAlchemyError as error:
@@ -583,6 +638,7 @@ def _finalize_insufficient(
             run = _lock_running_run(session, request_scope.department, started.id)
             if run.requested_by_user_id != authorization.identity.id:
                 raise RagContractError("department_unavailable")
+            _lock_and_verify_runtime_snapshot(session, run, started.runtime_target)
             if supplied:
                 _lock_and_revalidate_sources(session, request_scope.department, supplied)
             run.status = "insufficient_information"
@@ -639,6 +695,7 @@ def _finalize_answered(
             run = _lock_running_run(session, request_scope.department, started.id)
             if run.requested_by_user_id != authorization.identity.id:
                 raise RagContractError("department_unavailable")
+            _lock_and_verify_runtime_snapshot(session, run, started.runtime_target)
             current = _lock_and_revalidate_sources(session, request_scope.department, supplied)
             by_label = {item.source.label: item for item in supplied}
             if len(by_label) != len(supplied) or any(
@@ -732,6 +789,33 @@ def _lock_running_run(session, scope, run_id):
     if run is None or run.status != "running":
         raise RagContractError("source_changed")
     return run
+
+
+def _lock_and_verify_runtime_snapshot(
+    session: Session, run: RagAnswerRun, target: RuntimeTarget
+) -> None:
+    snapshot = session.scalar(
+        select(RagAnswerRuntimeSnapshot)
+        .where(
+            RagAnswerRuntimeSnapshot.run_id == run.id,
+            RagAnswerRuntimeSnapshot.department_id == run.department_id,
+        )
+        .with_for_update()
+    )
+    if snapshot is None:
+        raise RagContractError("deployment_authority_changed")
+    values = {
+        name: str(getattr(snapshot, name))
+        if isinstance(getattr(snapshot, name), UUID)
+        else getattr(snapshot, name)
+        for name in target.canonical_fields()
+    }
+    if (
+        values != target.canonical_fields()
+        or snapshot.runtime_contract_version != "phase12-adapter-runtime-routing-v1"
+        or snapshot.target_fingerprint != target.fingerprint
+    ):
+        raise RagContractError("deployment_authority_changed")
 
 
 def _lock_and_revalidate_sources(session, scope, supplied):

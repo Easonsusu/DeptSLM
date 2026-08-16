@@ -1,14 +1,18 @@
-# Database Model Through Phase 12.2
+# Database Model Through Phase 12.4
 
 DeptSLM uses PostgreSQL 16, SQLAlchemy 2, psycopg 3, and Alembic. Revision
-`0015_phase12_adapter_evaluation` is the current head after
+`0017_phase12_adapter_runtime_routing` is the current head after
 `0013_phase12_adapter_reconciliation_cursor`, which follows
 `0012_phase12_adapter_reconciliation`. Alembic is the only schema-creation
 mechanism; runtime never calls `metadata.create_all`.
 
 Phase 12.2 adds paired, department-scoped evaluation metadata in migration
 `0015_phase12_adapter_evaluation`; questions, answers, prompts, evidence, vectors,
-and adapter bytes remain external or process-local. Phase 12.1E-C adds no schema or migration. It uses the existing exact
+and adapter bytes remain external or process-local. Phase 12.3 adds governance
+metadata in `0016_phase12_adapter_governance`. Phase 12.4 adds the immutable
+content-free `rag_answer_runtime_snapshots` table in migration
+`0017_phase12_adapter_runtime_routing`; it uses composite same-department
+foreign keys to the run and explicit deployment pointer. Phase 12.1E-C adds no schema or migration. It uses the existing exact
 `AdapterUpstreamDependency` row for the reviewed `active` to `released`
 lifecycle transition only after independently proving one completed E-B purge.
 
@@ -27,6 +31,8 @@ erDiagram
     DOCUMENT_EXTRACTIONS ||--o{ DOCUMENT_VECTOR_INDEXINGS : indexes
     DEPARTMENTS ||--o{ RAG_ANSWER_RUNS : scopes
     USER_IDENTITIES ||--o{ RAG_ANSWER_RUNS : requests
+    RAG_ANSWER_RUNS ||--|| RAG_ANSWER_RUNTIME_SNAPSHOTS : freezes
+    DEPARTMENT_ADAPTER_DEPLOYMENTS ||--o{ RAG_ANSWER_RUNTIME_SNAPSHOTS : targets
     RAG_ANSWER_RUNS ||--o{ RAG_ANSWER_CITATIONS : cites
     DOCUMENT_CHUNKS ||--o{ RAG_ANSWER_CITATIONS : supports
     RAG_ANSWER_RUNS ||--o{ RAG_ANSWER_FEEDBACK : receives
@@ -58,6 +64,22 @@ erDiagram
 `training_jobs`, `training_job_attempts`, bounded artifact-operation rows, and job-level purge reservations record department scope, the complete exact Phase 10 dataset snapshot, fixed LlamaFactory/model/profile contracts, lifecycle, review state, execution ownership, content-free file digests and counts, and retention cleanup state. A succeeded job requires a non-null publication attempt, closed object manifest, positive train/validation counts, result manifest digest, and positive digest/size metadata for all four payloads. Staged, published, and succeeded attempts require their closed ownership manifest and lifecycle timestamps. Application authority additionally requires the job's manifest to exactly equal the one matching succeeded attempt manifest and every closed manifest field to match the job row.
 
 A purge reservation captures the expected job version, review status, server-time anchor, retention period, and durable registered/deletion-authorized/terminalized lifecycle before any external deletion. Each job operation contains unresolved attempt-stage items plus exactly one final item for the authoritative succeeded owner; historical manifests never create duplicate final ownership. They contain no dataset records, configuration bytes, source chunk identifiers, artifact paths, model outputs, adapters, logs, tokens, or credentials. Composite department constraints keep attempts and cleanup operations scoped to the same job department.
+
+## Phase 12.4 runtime snapshots
+
+`rag_answer_runtime_snapshots` is one immutable, content-free row for each new
+Phase 12.4 run. It stores implicit/explicit base or adapter target shape, exact
+deployment and governance lineage, registry publication/attempt authority,
+artifact digests and sizes, fixed base model, runtime contract, and the
+canonical target fingerprint. A composite `(run_id, department_id)` foreign
+key prevents cross-department attachment; an explicit deployment uses the
+same composite authority. There is no update or delete API. Existing Phase 7
+and Phase 8 historical runs predate the table and receive no fabricated row.
+
+The Phase 12.1E-B purge lookup uses the indexed adapter/version pair joined to
+`rag_answer_runs` and considers only `status = 'running'`; terminal runs do not
+fence purge. PostgreSQL success remains the authority if an external runtime
+or filesystem operation is non-atomic.
 
 ## Phase 12.1B adapter source metadata
 

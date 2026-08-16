@@ -40,14 +40,14 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > keeps the reservation active. Review changes are rejected while a reservation
 > is active. This is a reviewed boundary, not training execution.
 
-> **Phase 12 status:** Phase 12.0, Phase 12.1A through Phase 12.1E-C, and
-> Phase 12.2 are completed. Phase 12.3 is the current reviewed scope: it adds
-> separate human review, approval, department deployment metadata, explicit
-> promotion and rollback operations, retention references, and immutable
-> content-free deployment events. It never overloads `Adapter.status`, approves
-> or promotes automatically, loads or routes an adapter, or adds a numeric
-> improvement threshold. Phase 12.2 evaluation authority remains exact and
-> immutable; Phase 12.4 runtime routing and Phase 13 are not started.
+> **Phase 12 status:** Phase 12.0 through Phase 12.3 are completed. Phase 12.4
+> is the current reviewed scope: it captures one immutable deployment target
+> per public RAG request and routes generation only to a separate, private
+> adapter runtime after exact Phase 12.3 authority checks. Query embedding,
+> retrieval, evidence selection, prompt, citations, and PostgreSQL final
+> authority remain the Phase 7 contracts. The production runtime verifies and
+> privately copies the exact registry final, never falls back to base, and
+> never changes deployment governance. Phase 13 is not started.
 
 The governance worker is deliberately narrower than the API: its dedicated
 settings loader requires PostgreSQL plus only the external read-only
@@ -155,7 +155,8 @@ DeptSLM/
 │   └── web/                  # Next.js application
 ├── services/
 │   ├── rag-worker/           # Extraction plus isolated Phase 6 indexing paths
-│   ├── rag-runtime/          # Private supervised Phase 7 model runtime
+│   ├── rag-runtime/          # Private supervised Phase 7 base model runtime
+│   ├── adapter-runtime/      # Private Phase 12.4 deployed-adapter runtime
 │   ├── training-worker/      # Phase 10 dataset builder
 │   └── training-job-worker/  # Phase 11 bundle generator only
 ├── packages/
@@ -339,7 +340,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 
 Phase 9 does not implement LLM judging, semantic grading, public raw results, a frontend dashboard, feedback-derived cases, automatic threshold or RAG changes, training datasets, SFT, adapters, model promotion, cross-department benchmarking, production OAuth/OIDC/SSO, or production deployment.
 
-Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 through Phase 12.2 are complete. Phase 12.3 is the current reviewed, administrator-only governance boundary: review, approval, deployment, rollback, and retention are separate PostgreSQL authorities with explicit operations and immutable events; it does not route or load adapters. Phase 12.4 runtime routing and Phase 13 remain unstarted. Google Drive storage is an external development runtime location, not a production object store or backup.
+Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 through Phase 12.3 are complete. Phase 12.4 is the current reviewed, administrator-governed runtime boundary: it snapshots exact deployment authority and routes only adapter generation through a separate private runtime; retrieval remains Phase 7, and runtime errors never fall back to base or mutate governance. Phase 13 remains unstarted. Google Drive storage is an external development runtime location, not a production object store or backup.
 
 ## License
 

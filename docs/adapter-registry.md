@@ -6,8 +6,8 @@ the completed Phase 12.1C immutable registry-publication implementation, the
 completed Phase 12.1D metadata-only registry read boundary, the completed
 Phase 12.1E-A reconciliation foundation, and the completed Phase 12.1E-B
 purge authority, and the completed Phase 12.1E-C lifecycle-release scope.
-Phase 12.2 is completed, and Phase 12.3 is the current reviewed adapter-
-governance scope.
+Phase 12.2 and Phase 12.3 are completed, and Phase 12.4 is the current
+reviewed adapter-runtime routing scope.
 It also records future metadata, evaluation, review, deployment, and runtime contracts. The
 separate Phase 12.1A static compatibility contract is documented in
 [adapter-static-contract.md](adapter-static-contract.md).
@@ -16,7 +16,7 @@ separate Phase 12.1A static compatibility contract is documented in
 
 - Phase 11 is completed. Its reviewed output is an immutable, department-scoped
   LlamaFactory job bundle; it does not execute training or create an adapter.
-- Phase 12.3 is under review; Phase 12.0 through Phase 12.2 are completed.
+- Phase 12.0 through Phase 12.3 are completed; Phase 12.4 is under review.
 - Phase 12.0 is completed: it defines contracts and the threat model.
 - Phase 12.1 is completed. Phase 12.1A, Phase 12.1B, and Phase 12.1C are
   completed. Phase 12.1C binds one exact committed source to one approved succeeded Phase 11
@@ -38,19 +38,24 @@ separate Phase 12.1A static compatibility contract is documented in
   exact purge namespaces are empty. It does not touch artifact bytes.
 - Phase 12.2 is completed. It adds only paired, content-free adapter-target
   evaluation and does not approve, promote, load, or route.
-- Phase 12.3 is the current reviewed scope. It adds separate review,
-  approval, deployment, promotion, rollback, retention, and immutable event
-  authorities without changing `Adapter.status` or routing requests.
-- Phase 12.4 remains unimplemented.
+- Phase 12.3 is completed. It adds separate review, approval, deployment,
+  promotion, rollback, retention, and immutable event authorities without
+  changing `Adapter.status` or loading an adapter.
+- Phase 12.4 is the current reviewed scope. It captures immutable content-free
+  deployment snapshots for public RAG requests and routes only adapter
+  generation through a separate private runtime; retrieval and evaluation
+  runtime semantics remain unchanged.
 - Phase 13 has not started.
 
-The Phase 12.1D, Phase 12.2, and Phase 12.3 metadata routes are the only public
-adapter metadata surfaces today. They return closed
+The Phase 12.1D, Phase 12.2, and Phase 12.3 metadata routes remain the only
+public adapter metadata surfaces today. Phase 12.4 adds no adapter selector or
+mutation route; the existing grounded-answer endpoint resolves deployment
+authority server-side. These surfaces return closed
 PostgreSQL projections; evaluation enqueue, cancellation, listing, and detail
 operations never expose registry files or evaluation content. There is still
-no adapter upload/download, deployment pointer, runtime loading, or rollback
-route. The Phase 12.1C internal worker publishes immutable registry files and
-content-free PostgreSQL authority only.
+no adapter upload/download or public runtime route. The Phase 12.1C internal
+worker publishes immutable registry files and content-free PostgreSQL authority
+only; the Phase 12.4 production runtime verifies a private copy before PEFT.
 
 ## Phase 12 objective
 
@@ -212,7 +217,7 @@ promotion, or runtime routing.
 - Apply fixed numeric quality and safety gates.
 - Never promote automatically.
 
-### Phase 12.3 — review, promotion, and rollback (current; under review)
+### Phase 12.3 — review, promotion, and rollback (completed)
 
 Phase 12.3 adds the control-plane governance layer between completed
 evaluation and future runtime routing. Review, approval, deployment, rollback,
@@ -235,11 +240,13 @@ behaviors remain Phase 12.4. The governance worker receives only PostgreSQL
 and a read-only registry-final mount, while Phase 12.1E purge and lifecycle
 release remain fenced against active governance operations.
 
-### Phase 12.4 — runtime routing (not started)
+### Phase 12.4 — runtime routing (current; under review)
 
-- Route a department request through one immutable deployment snapshot.
-- Load only an exactly validated and approved department adapter.
-- Fail closed on load or contract errors.
+- Route only generation for a department request through one immutable
+  deployment snapshot; query embedding and retrieval remain Phase 7.
+- Load only an exactly validated and approved department adapter in the
+  separate private production runtime.
+- Fail closed on load or contract errors, with no base retry or fallback.
 - Support explicit rollback-to-base; do not use an implicit fallback.
 
 ### Phase 13 (not started)
@@ -725,12 +732,13 @@ safety gate, an approved adapter review, current same-department authorization,
 an expected version match, no active purge or conflicting deployment operation,
 and final artifact identity revalidation.
 
-Eventually, runtime routing must use one immutable deployment snapshot for the
-complete request, reject cross-department or base-revision mismatches, return a
-safe `503` on a required adapter-load failure, and never silently fall back to
-the base model. The base model is used only when no adapter is explicitly
-deployed or after explicit rollback-to-base. Cache keys must include department,
-adapter ID, adapter version, and base revision.
+Phase 12.4 runtime routing uses one immutable deployment snapshot for the
+complete request, rejects cross-department or base-revision mismatches, returns
+a safe `503` on a required adapter-load failure, and never silently falls back
+to the base model. The base model is used only when no deployment exists or
+after explicit rollback-to-base. Cache keys include department, adapter ID,
+adapter version, registry publication, digest/size authority, and base revision;
+target changes retire the old child process.
 
 ## Metadata-only API boundary
 

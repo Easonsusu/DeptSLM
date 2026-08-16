@@ -2,7 +2,7 @@
 
 ## Status
 
-The Phase 8 API preserves the completed grounded-answer boundary and adds structured feedback submission and review metadata. Phase 11 exposes metadata for completed immutable training-job bundles only; it never executes LlamaFactory or creates adapters. Phase 12.0 through Phase 12.2 are complete, and Phase 12.3 is under review. Phase 12.2 adds administrator-scoped enqueue/cancel/list/detail metadata routes for paired adapter evaluation; Phase 12.3 adds explicit review, approval, deployment, rollback, retention, and event metadata routes. These routes return no question, answer, prompt, evidence, vector, path, model output, adapter bytes, or runtime identity. Feedback and governance use PostgreSQL metadata only. There is no public vector search, query-vector API, conversation history, streaming, reranking, adapter upload/download, production identity integration, automatic approval/promotion, or runtime routing.
+The Phase 8 API preserves the completed grounded-answer boundary and adds structured feedback submission and review metadata. Phase 11 exposes metadata for completed immutable training-job bundles only; it never executes LlamaFactory or creates adapters. Phase 12.0 through Phase 12.3 are complete, and Phase 12.4 is the current reviewed scope. Phase 12.2 adds administrator-scoped enqueue/cancel/list/detail metadata routes for paired adapter evaluation; Phase 12.3 adds explicit review, approval, deployment, rollback, retention, and event metadata routes. Phase 12.4 adds no public route: the existing grounded-answer endpoint resolves deployment authority server-side and routes only its generation lane. These routes return no question, answer, prompt, evidence, vector, path, model output, adapter bytes, or runtime identity. Feedback and governance use PostgreSQL metadata only. There is no public vector search, query-vector API, conversation history, streaming, reranking, adapter upload/download, production identity integration, automatic approval/promotion, or client adapter selector.
 
 For the default local configuration, the base URL is:
 
@@ -258,7 +258,9 @@ closed and never silently fall back to the base model. Phase 12.1A static
 numeric limits. Phase 12.1C adds no public mutation or artifact route; Phase
 12.1D adds metadata-only GET routes, Phase 12.2 adds paired evaluation
 metadata, and Phase 12.3 adds only explicit governance metadata. Phase 12.4
-runtime routing remains unstarted.
+routes only the server-owned generation lane of the existing grounded-answer
+endpoint; query embedding and retrieval remain Phase 7. See
+[adapter-runtime-routing.md](adapter-runtime-routing.md).
 
 ### Evaluations and exports
 

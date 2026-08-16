@@ -25,6 +25,8 @@ class RagSettings:
     qdrant_timeout_seconds: int
     runtime_url: str
     runtime_token: str
+    adapter_runtime_url: str | None
+    adapter_runtime_token: str | None
     candidate_limit: int
     max_sources: int
     max_sources_per_document: int
@@ -50,6 +52,35 @@ class RagSettings:
             raise RagConfigurationError("DEPTSLM_QDRANT_COLLECTION does not match the contract.")
         token = _secret("DEPTSLM_RAG_RUNTIME_TOKEN", required["DEPTSLM_RAG_RUNTIME_TOKEN"], 32)
         qdrant_key = _secret("DEPTSLM_QDRANT_API_KEY", required["DEPTSLM_QDRANT_API_KEY"], 16)
+        adapter_url_raw = os.getenv("DEPTSLM_ADAPTER_RUNTIME_URL", "").strip()
+        adapter_token_raw = os.getenv("DEPTSLM_ADAPTER_RUNTIME_TOKEN", "").strip()
+        if bool(adapter_url_raw) != bool(adapter_token_raw):
+            raise RagConfigurationError(
+                "DEPTSLM_ADAPTER_RUNTIME_URL and DEPTSLM_ADAPTER_RUNTIME_TOKEN "
+                "must be configured together."
+            )
+        adapter_url = (
+            _safe_url(
+                "DEPTSLM_ADAPTER_RUNTIME_URL",
+                adapter_url_raw,
+                environment,
+                {"adapter-runtime", "localhost", "127.0.0.1", "::1"},
+            )
+            if adapter_url_raw
+            else None
+        )
+        adapter_token = (
+            _secret("DEPTSLM_ADAPTER_RUNTIME_TOKEN", adapter_token_raw, 32)
+            if adapter_token_raw
+            else None
+        )
+        if adapter_token is not None and adapter_token in {
+            token,
+            os.getenv("DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN", ""),
+        }:
+            raise RagConfigurationError(
+                "Production, base, and evaluation runtime tokens must differ."
+            )
         max_sources = _bounded("DEPTSLM_RAG_MAX_SOURCES", 8, 1, 8)
         per_document = _bounded("DEPTSLM_RAG_MAX_SOURCES_PER_DOCUMENT", 2, 1, 8)
         if per_document > max_sources:
@@ -72,6 +103,8 @@ class RagSettings:
                 {"rag-runtime", "localhost", "127.0.0.1", "::1"},
             ),
             runtime_token=token,
+            adapter_runtime_url=adapter_url,
+            adapter_runtime_token=adapter_token,
             candidate_limit=_bounded("DEPTSLM_RAG_CANDIDATE_LIMIT", 20, 1, 100),
             max_sources=max_sources,
             max_sources_per_document=per_document,

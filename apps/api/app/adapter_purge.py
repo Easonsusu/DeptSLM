@@ -46,6 +46,8 @@ from app.models import (
     AdapterReview,
     AdapterRollbackRetention,
     DepartmentAdapterDeployment,
+    RagAnswerRun,
+    RagAnswerRuntimeSnapshot,
 )
 from app.services import ServiceError, append_mutation_audit, authorize_transaction
 
@@ -330,7 +332,13 @@ def _assert_eligible(session: Session, authority: _Authority, department_id: UUI
             raise ServiceError(409, "Adapter purge is already active")
 
 
-def _assert_governance_fences(session: Session, adapter: Adapter, department_id: UUID) -> None:
+def _assert_governance_fences(
+    session: Session,
+    adapter: Adapter,
+    department_id: UUID,
+    *,
+    target_adapter_version: int | None = None,
+) -> None:
     """Keep E-B registration and finalization fenced by governance metadata."""
 
     active_evaluation = session.scalar(
@@ -386,6 +394,25 @@ def _assert_governance_fences(session: Session, adapter: Adapter, department_id:
     )
     if deployment_operation is not None:
         raise ServiceError(409, "Adapter purge conflicts with deployment operation")
+    active_runtime = session.scalar(
+        select(RagAnswerRuntimeSnapshot.id)
+        .join(
+            RagAnswerRun,
+            (RagAnswerRun.id == RagAnswerRuntimeSnapshot.run_id)
+            & (RagAnswerRun.department_id == RagAnswerRuntimeSnapshot.department_id),
+        )
+        .where(
+            RagAnswerRuntimeSnapshot.department_id == department_id,
+            RagAnswerRuntimeSnapshot.target_kind == "adapter",
+            RagAnswerRuntimeSnapshot.adapter_id == adapter.id,
+            RagAnswerRuntimeSnapshot.adapter_version
+            == (adapter.version if target_adapter_version is None else target_adapter_version),
+            RagAnswerRun.status == "running",
+        )
+        .limit(1)
+    )
+    if active_runtime is not None:
+        raise ServiceError(409, "Adapter purge conflicts with active RAG runtime snapshot")
 
 
 def _address(
@@ -1341,7 +1368,24 @@ def _finalize_operation(
             if blocked:
                 return
             authority = _load_authority_allow_pending(session, department_id, operation.adapter_id)
-            _assert_governance_fences(session, authority.adapter, department_id)
+            snapshot = (
+                operation.authority_snapshot
+                if isinstance(operation.authority_snapshot, dict)
+                else {}
+            )
+            adapter_snapshot = snapshot.get("adapter") if isinstance(snapshot, dict) else None
+            target_adapter_version = (
+                adapter_snapshot.get("version")
+                if isinstance(adapter_snapshot, dict)
+                and isinstance(adapter_snapshot.get("version"), int)
+                else None
+            )
+            _assert_governance_fences(
+                session,
+                authority.adapter,
+                department_id,
+                target_adapter_version=target_adapter_version,
+            )
             _assert_operation_authority(operation, authority, department_id)
             authority.source.status = "purged"
             authority.source.purged_at = operation.completed_at

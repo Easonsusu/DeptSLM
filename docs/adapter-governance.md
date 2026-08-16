@@ -1,9 +1,10 @@
 # Phase 12.3 adapter governance
 
-Phase 12.3 is the reviewed control-plane boundary between completed Phase 12.2
-adapter evaluation and the future Phase 12.4 runtime router. It records human
-decisions and explicit deployment operations only. It does not load an adapter,
-change RAG retrieval, or route a production request through an adapter.
+Phase 12.3 is the completed control-plane boundary between Phase 12.2 adapter
+evaluation and the current Phase 12.4 runtime router. It records human
+decisions and explicit deployment operations only. Phase 12.4 consumes this
+authority through immutable request snapshots; governance itself does not load
+an adapter, change RAG retrieval, or mutate deployment state during a request.
 
 ## Separate authorities
 
@@ -89,5 +90,7 @@ Phase 12.1E-B purge fences active governance operations and references, while
 Phase 12.1E-C release rejects active or reappeared governance authority. A
 retained adapter is never deleted by a deployment worker; release is explicit,
 audited, and still does not remove registry bytes, backups, or historical audit
-events. Phase 12.4 runtime loading, request snapshots, fail-closed routing, and
-explicit runtime rollback remain unstarted.
+events. Phase 12.4 runtime loading and request snapshots are documented in
+[adapter-runtime-routing.md](adapter-runtime-routing.md). The separate
+production runtime fails closed and never performs an implicit rollback; the
+existing explicit rollback-to-base operation remains the only rollback path.

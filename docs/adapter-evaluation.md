@@ -78,7 +78,8 @@ Phase 12.2 does not train models, invoke LlamaFactory, create or modify
 adapters, approve or promote adapters, route production requests through an
 adapter, add a public evaluation/search/RAG endpoint, persist evaluation
 content, add an LLM judge, or change feedback, retrieval, prompt, generation,
-or quality-gate behavior. Phase 12.3 now provides separate review,
+or quality-gate behavior. Phase 12.3 provides separate review,
 promotion, rollback, retention, and deployment-event metadata authorities; it
-still does not load or route adapters. Phase 12.4 runtime routing remains
-unstarted.
+still does not load adapters. Phase 12.4 consumes only this reviewed authority
+through immutable request snapshots and a separate production runtime; it does
+not change evaluation behavior.

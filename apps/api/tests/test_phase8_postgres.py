@@ -101,6 +101,9 @@ def db(engine) -> Session:
         session.execute(delete(RagAnswerFeedbackReason))
         session.execute(delete(RagAnswerFeedback))
         session.execute(delete(RagAnswerCitation))
+        from app.models import RagAnswerRuntimeSnapshot
+
+        session.execute(delete(RagAnswerRuntimeSnapshot))
         session.execute(delete(RagAnswerRun))
         session.execute(delete(DocumentVectorIndexing))
         session.execute(delete(DocumentChunk))
@@ -128,7 +131,7 @@ def test_00_migration_paths_schema_and_orm_sync(engine) -> None:
     command.upgrade(config, "head")
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "0016_phase12_adapter_governance"
+            "0017_phase12_adapter_runtime_routing"
         )
     inspector = inspect(engine)
     tables = {

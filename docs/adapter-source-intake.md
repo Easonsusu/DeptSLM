@@ -10,10 +10,10 @@ publishing the private registry artifact. Phase 12.1D now adds only the
 metadata-only PostgreSQL registry read boundary. Phase 12.1E-A now provides
 separate artifact reconciliation only; it does not purge this source or release
 dependencies. Phase 12.1E-B is the completed separate purge boundary. Phase
-12.1E-C is completed, Phase 12.2 is completed, and Phase 12.3 is the current
-reviewed governance boundary for explicit review, approval, deployment,
-promotion, rollback, retention, and immutable events. Phase 12.4 and Phase 13
-remain unstarted.
+12.1E-C, Phase 12.2, and Phase 12.3 are completed. Phase 12.4 is the current
+reviewed generation-routing boundary: it consumes only exact approved registry
+authority through immutable request snapshots and a separate private runtime.
+Phase 13 remains unstarted.
 
 ## Command boundary
 

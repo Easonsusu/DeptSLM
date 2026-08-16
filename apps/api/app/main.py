@@ -57,6 +57,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     # Tests may inject reviewed fakes. Production constructs short-lived clients
     # inside the answer service so no external call occurs during application startup.
     application.state.rag_runtime_client = None
+    application.state.adapter_runtime_client = None
     application.state.rag_qdrant = None
     try:
         yield
