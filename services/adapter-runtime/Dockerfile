@@ -22,4 +22,5 @@ RUN pip install --no-cache-dir --disable-pip-version-check --no-deps /build/api 
     && rm -rf /build
 
 USER deptslm
+EXPOSE 8012
 CMD ["uvicorn", "deptslm_adapter_runtime.main:app", "--host", "0.0.0.0", "--port", "8012", "--no-access-log"]
