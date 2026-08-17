@@ -388,6 +388,17 @@ registry-write storage. Runtime caches are keyed by department, adapter and
 version, publication/attempt authority, base revision, and config/model
 digest/size, so no cross-department or stale-target reuse is permitted.
 
+The API transport envelope is separate from the Phase 7 base-runtime timeout:
+`DEPTSLM_RAG_REQUEST_TIMEOUT_SECONDS` remains bounded at 1–300 seconds, while
+`DEPTSLM_ADAPTER_RUNTIME_REQUEST_TIMEOUT_SECONDS` is server-owned, bounded at
+450–600 seconds, and defaults to 450 seconds for the adapter's 300-second
+target-load plus 120-second generation clocks and fixed margin. No request
+parameter can extend it. Manifest authority is descriptor-bound from initial
+verification through copy and final return; the retained manifest identity,
+directory association, canonical digest, and parsed fields are rechecked, as
+are the config/model descriptors and final directory identity. A mismatch
+cleans the private copy and cannot route a model.
+
 Phase 12.4 does not make base RAG depend on adapter-runtime health. Query
 embedding and retrieval remain on the existing base runtime. A required
 adapter failure is a safe request failure, never a base fallback or automatic

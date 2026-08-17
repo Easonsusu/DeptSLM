@@ -340,7 +340,7 @@ def answer_question(
         adapter_runtime_client = AdapterRuntimeClient(
             settings.adapter_runtime_url,
             settings.adapter_runtime_token,
-            settings.request_timeout_seconds,
+            settings.adapter_runtime_request_timeout_seconds,
         )
     runtime_client = RoutedRagRuntime(base_runtime, adapter_runtime_client, started.runtime_target)
     owned_qdrant = qdrant is None

@@ -2,28 +2,61 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 import test_phase7_postgres as phase7_tests
+import test_phase12_3_postgres as phase12_3_tests
 from alembic.config import Config
 from sqlalchemy import inspect, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 from test_phase7_postgres import _client, _headers, _hit, _seed
 
 from alembic import command
+from app.adapter_purge import _finalize_operation, _mark_operation_deleting, _register_or_resume
 from app.database import create_database_engine
 from app.main import app
 from app.models import (
+    Adapter,
+    AdapterEvaluationEvidence,
+    AdapterEvaluationRun,
+    AdapterImportAttempt,
+    AdapterImportSource,
+    AdapterPurgeItem,
+    AdapterPurgeOperation,
+    AdapterPurgeReservation,
+    AdapterRegistryAttempt,
+    AdapterReview,
+    AdapterUpstreamDependency,
     Department,
     DepartmentAdapterDeployment,
+    Document,
+    DocumentChunk,
+    DocumentExtraction,
+    DocumentVectorIndexing,
+    EvaluationSuite,
+    PersistentAuditEvent,
     RagAnswerRun,
     RagAnswerRuntimeSnapshot,
     UserIdentity,
+)
+from app.rag_answer_services import _start_run
+from app.rag_runtime_router import RoutedRagRuntime
+from app.services import ServiceError
+from app.vector_index_domain import (
+    EMBEDDING_DIMENSION,
+    EMBEDDING_DISTANCE,
+    EMBEDDING_MODEL_ID,
+    EMBEDDING_MODEL_REVISION,
+    EMBEDDING_PIPELINE_VERSION,
+    QDRANT_COLLECTION,
+    VECTOR_SCHEMA_VERSION,
 )
 
 pytestmark = pytest.mark.postgres
@@ -51,6 +84,11 @@ def clean_db(engine):
     return engine
 
 
+@pytest.fixture
+def factory(engine):
+    return sessionmaker(engine)
+
+
 def _seed_unique(session, tmp_path: Path):
     original = phase7_tests._identity
 
@@ -62,6 +100,94 @@ def _seed_unique(session, tmp_path: Path):
         return _seed(session, tmp_path)
     finally:
         phase7_tests._identity = original
+
+
+def _seed_adapter_rag_source(session: Session, authority, tmp_path: Path):
+    """Add one real Phase 7 source to the Phase 12.3 authority department."""
+
+    department = session.get(Department, authority.department_id)
+    actor = session.get(UserIdentity, authority.admin_id)
+    assert department is not None and actor is not None
+    source = b"The deployed adapter policy is approved for testing."
+    document = Document(
+        department_id=department.id,
+        uploaded_by_user_id=actor.id,
+        original_filename="adapter-policy.txt",
+        media_type="text/plain",
+        byte_size=len(source),
+        sha256=hashlib.sha256(source).hexdigest(),
+    )
+    session.add(document)
+    session.flush()
+    now = datetime.now(UTC)
+    extraction = DocumentExtraction(
+        department_id=department.id,
+        document_id=document.id,
+        requested_by_user_id=actor.id,
+        status="succeeded",
+        pipeline_version="phase5-extraction-v1",
+        parser_name="python-utf8",
+        parser_version="3.12",
+        normalization_version="phase5-normalization-v1",
+        chunking_version="phase5-character-chunker-v1",
+        source_sha256=document.sha256,
+        source_byte_size=document.byte_size,
+        normalized_sha256=document.sha256,
+        normalized_byte_size=document.byte_size,
+        output_byte_size=1,
+        chunk_count=1,
+        worker_id=uuid4(),
+        claim_token=uuid4(),
+        claimed_at=now,
+        started_at=now,
+        finished_at=now,
+    )
+    session.add(extraction)
+    session.flush()
+    chunk = DocumentChunk(
+        department_id=department.id,
+        document_id=document.id,
+        extraction_id=extraction.id,
+        ordinal=0,
+        char_start=0,
+        char_end=len(source.decode()),
+        byte_size=len(source),
+        content_sha256=document.sha256,
+        provenance_kind="line",
+        line_start=1,
+        line_end=1,
+    )
+    session.add(chunk)
+    session.flush()
+    indexing = DocumentVectorIndexing(
+        department_id=department.id,
+        document_id=document.id,
+        extraction_id=extraction.id,
+        requested_by_user_id=actor.id,
+        status="succeeded",
+        embedding_pipeline_version=EMBEDDING_PIPELINE_VERSION,
+        embedding_model_id=EMBEDDING_MODEL_ID,
+        embedding_model_revision=EMBEDDING_MODEL_REVISION,
+        embedding_dimension=EMBEDDING_DIMENSION,
+        distance=EMBEDDING_DISTANCE,
+        vector_schema_version=VECTOR_SCHEMA_VERSION,
+        qdrant_collection=QDRANT_COLLECTION,
+        expected_chunk_count=1,
+        point_count=1,
+        worker_id=uuid4(),
+        claim_token=uuid4(),
+        vector_attempt_id=uuid4(),
+        claimed_at=now,
+        started_at=now,
+        finished_at=now,
+    )
+    session.add(indexing)
+    session.flush()
+    extraction.output_byte_size = phase7_tests._write_artifact(
+        tmp_path, department, document, extraction, chunk, source
+    )
+    session.commit()
+    return department, document, extraction, chunk, indexing
 
 
 def test_phase12_4_migration_cycle_has_one_head_and_content_free_snapshot(clean_db) -> None:
@@ -286,6 +412,528 @@ def test_explicit_base_admission_is_server_owned(clean_db, monkeypatch, tmp_path
         assert snapshot.deployment_id is not None
         assert snapshot.deployment_version == 1
         assert snapshot.deployment_row_version == 1
+
+
+def test_valid_adapter_admission_freezes_exact_authority_and_calls_adapter_runtime(
+    clean_db, factory, monkeypatch, tmp_path: Path
+) -> None:
+    authority, operation = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    with Session(clean_db) as session:
+        department, document, extraction, chunk, indexing = _seed_adapter_rag_source(
+            session, authority, tmp_path
+        )
+        hit = _hit(document, extraction, chunk, indexing)
+
+    class AdapterRuntime:
+        calls = 0
+
+        def generate(self, target, _question, _evidence):
+            assert target.target_kind == "adapter"
+            self.calls += 1
+            return {
+                "status": "answered",
+                "answer": "Approved by adapter [S1].",
+                "citations": ["S1"],
+            }
+
+    adapter_runtime = AdapterRuntime()
+    with _client(monkeypatch, tmp_path) as client:
+        app.state.rag_runtime_client = _Runtime()
+        app.state.adapter_runtime_client = adapter_runtime
+        app.state.rag_qdrant = _Qdrant(hit)
+        response = client.post(
+            f"/departments/{department.id}/rag/answers",
+            headers=_headers(authority.subject),
+            json={"question": "What is approved?"},
+        )
+    assert response.status_code == 200
+    assert adapter_runtime.calls == 1
+    with Session(clean_db) as session:
+        run = session.query(RagAnswerRun).filter_by(department_id=department.id).one()
+        snapshot = session.query(RagAnswerRuntimeSnapshot).filter_by(run_id=run.id).one()
+        assert run.status == "answered"
+        assert snapshot.target_kind == "adapter"
+        assert snapshot.adapter_id == operation["target_adapter_id"]
+        assert snapshot.adapter_version == operation["target_adapter_version"]
+        assert snapshot.review_id == operation["target_review_id"]
+        assert snapshot.evaluation_id == operation["target_evaluation_id"]
+        assert snapshot.suite_id == operation["suite_id"]
+        assert snapshot.registry_attempt_id == operation["registry_attempt_id"]
+        assert snapshot.dependency_id == operation["dependency_id"]
+        assert (
+            session.query(PersistentAuditEvent)
+            .filter_by(
+                department_id=department.id,
+                action="rag.answer.start",
+                resource_id=str(run.id),
+            )
+            .count()
+            == 1
+        )
+
+
+def _start_snapshot(factory, authority):
+    return _start_run(
+        factory,
+        SimpleNamespace(minimum_score=Decimal("0.45")),
+        phase12_3_tests._principal(authority),
+        phase12_3_tests._scope(authority),
+        1,
+    )
+
+
+def test_inflight_base_snapshot_stays_base_after_adapter_promotion(factory, tmp_path: Path) -> None:
+    authority, operation = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+    started_base = _start_snapshot(factory, authority)
+    assert started_base.runtime_target.target_kind == "base"
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+
+    class Base:
+        def generate(self, question, evidence, **_kwargs):
+            return ("base", question, evidence)
+
+    class Adapter:
+        def generate(self, target, question, evidence):
+            return ("adapter", target.adapter_id, question, evidence)
+
+    routed = RoutedRagRuntime(Base(), Adapter(), started_base.runtime_target)
+    assert routed.generate("q", ()) == ("base", "q", ())
+    started_adapter = _start_snapshot(factory, authority)
+    assert started_adapter.runtime_target.target_kind == "adapter"
+    assert started_adapter.runtime_target.adapter_id == operation["target_adapter_id"]
+    assert RoutedRagRuntime(Base(), Adapter(), started_adapter.runtime_target).generate(
+        "q", ()
+    ) == ("adapter", operation["target_adapter_id"], "q", ())
+
+
+def test_inflight_adapter_snapshot_stays_a_after_b_promotion(factory, tmp_path: Path) -> None:
+    authority, operation_a = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    started_a = _start_snapshot(factory, authority)
+    adapter_b_id, adapter_b_version = phase12_3_tests._clone_adapter_authority(
+        factory, authority, operation_a["target_adapter_id"]
+    )
+    phase12_3_tests._prepare_registry_final(tmp_path, factory, authority, adapter_id=adapter_b_id)
+    with factory() as session:
+        suite_a = session.get(EvaluationSuite, operation_a["suite_id"])
+        assert suite_a is not None
+    suite_b = phase12_3_tests._clone_suite(factory, suite_a)
+    operation_b = phase12_3_tests._prepare_approved_promotion_for_suite(
+        factory,
+        tmp_path,
+        authority,
+        adapter_id=adapter_b_id,
+        suite_id=suite_b.id,
+        expected_deployment_version=1,
+    )
+    assert operation_b["target_adapter_version"] == adapter_b_version
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    assert started_a.runtime_target.adapter_id == operation_a["target_adapter_id"]
+
+    class Base:
+        def generate(self, question, evidence, **_kwargs):
+            return ("base", question, evidence)
+
+    class Adapter:
+        def generate(self, target, question, evidence):
+            return ("adapter", target.adapter_id, question, evidence)
+
+    assert RoutedRagRuntime(Base(), Adapter(), started_a.runtime_target).generate("q", ()) == (
+        "adapter",
+        operation_a["target_adapter_id"],
+        "q",
+        (),
+    )
+    started_b = _start_snapshot(factory, authority)
+    assert started_b.runtime_target.adapter_id == adapter_b_id
+    assert started_b.runtime_target.adapter_version == operation_b["target_adapter_version"]
+
+
+def test_inflight_adapter_snapshot_stays_a_after_base_rollback(factory, tmp_path: Path) -> None:
+    authority, operation = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    started_a = _start_snapshot(factory, authority)
+    with factory.begin() as session:
+        phase12_3_tests.enqueue_rollback(
+            session,
+            phase12_3_tests._principal(authority),
+            phase12_3_tests._scope(authority),
+            target="base",
+            adapter_id=None,
+            expected_adapter_version=None,
+            retention_id=None,
+            expected_retention_version=None,
+            expected_deployment_version=1,
+        )
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    assert started_a.runtime_target.adapter_id == operation["target_adapter_id"]
+    started_base = _start_snapshot(factory, authority)
+    assert started_base.runtime_target.target_kind == "base"
+
+
+@pytest.mark.parametrize("terminal_status", ["answered", "insufficient_information", "failed"])
+def test_terminal_runtime_requests_do_not_fence_eb_registration(
+    factory, tmp_path: Path, terminal_status: str
+) -> None:
+    authority, _operation = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    started = _start_snapshot(factory, authority)
+    with factory.begin() as session:
+        run = session.get(RagAnswerRun, started.id)
+        assert run is not None
+        now = datetime.now(UTC)
+        run.status = terminal_status
+        run.finished_at = now
+        run.version += 1
+        if terminal_status == "answered":
+            run.retrieval_candidate_count = 1
+            run.retrieval_authorized_count = 1
+            run.selected_source_count = 1
+        elif terminal_status == "insufficient_information":
+            run.retrieval_candidate_count = 0
+            run.retrieval_authorized_count = 0
+            run.selected_source_count = 0
+        else:
+            run.error_code = "generation_failed"
+    operation_id, item_ids = _register_or_resume(
+        factory,
+        department_id=authority.department_id,
+        adapter_id=started.runtime_target.adapter_id,
+        actor_issuer=authority.issuer,
+        actor_subject=authority.subject,
+        limit=1,
+        item_limit=2,
+        apply=True,
+    )
+    assert operation_id is not None and len(item_ids) == 2
+
+
+def test_running_runtime_snapshot_blocks_eb_registration_and_finalization(
+    factory, tmp_path: Path
+) -> None:
+    authority, operation = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    started = _start_snapshot(factory, authority)
+    adapter_id = operation["target_adapter_id"]
+
+    # Registration is the real E-B path and is fenced by the running snapshot.
+    with pytest.raises(ServiceError, match="active RAG runtime snapshot"):
+        _register_or_resume(
+            factory,
+            department_id=authority.department_id,
+            adapter_id=adapter_id,
+            actor_issuer=authority.issuer,
+            actor_subject=authority.subject,
+            limit=1,
+            item_limit=2,
+            apply=True,
+        )
+
+    # Create the durable E-B operation only after temporarily terminalizing the
+    # test request; then restore its exact snapshot to running so finalization
+    # exercises the independent E-B finalization fence.
+    with factory.begin() as session:
+        run = session.get(RagAnswerRun, started.id)
+        assert run is not None
+        run.status = "failed"
+        run.finished_at = datetime.now(UTC)
+        run.error_code = "generation_failed"
+        run.version += 1
+    operation_id, item_ids = _register_or_resume(
+        factory,
+        department_id=authority.department_id,
+        adapter_id=adapter_id,
+        actor_issuer=authority.issuer,
+        actor_subject=authority.subject,
+        limit=1,
+        item_limit=2,
+        apply=True,
+    )
+    assert operation_id is not None and len(item_ids) == 2
+    _mark_operation_deleting(factory, operation_id, authority.department_id)
+    with factory.begin() as session:
+        run = session.get(RagAnswerRun, started.id)
+        assert run is not None
+        run.status = "running"
+        run.finished_at = None
+        run.error_code = None
+        run.retrieval_candidate_count = None
+        run.retrieval_authorized_count = None
+        run.selected_source_count = None
+        run.version += 1
+        for item in session.query(AdapterPurgeItem).filter_by(
+            operation_id=operation_id, department_id=authority.department_id
+        ):
+            item.status = "completed"
+            item.completed_at = datetime.now(UTC)
+            item.version += 1
+        for reservation in session.query(AdapterPurgeReservation).filter_by(
+            operation_id=operation_id, department_id=authority.department_id
+        ):
+            reservation.status = "completed"
+            reservation.completed_at = datetime.now(UTC)
+            reservation.version += 1
+    with pytest.raises(ServiceError, match="active RAG runtime snapshot"):
+        _finalize_operation(
+            factory,
+            data_dir=tmp_path,
+            operation_id=operation_id,
+            department_id=authority.department_id,
+            actor_issuer=authority.issuer,
+            actor_subject=authority.subject,
+        )
+    with factory() as session:
+        persisted = session.get(AdapterPurgeOperation, operation_id)
+        assert persisted is not None and persisted.status == "deleting"
+        run = session.get(RagAnswerRun, started.id)
+        assert run is not None and run.status == "running"
+
+    # Once the request is terminal, the same completed operation can finalize.
+    with factory.begin() as session:
+        run = session.get(RagAnswerRun, started.id)
+        assert run is not None
+        run.status = "failed"
+        run.finished_at = datetime.now(UTC)
+        run.error_code = "generation_failed"
+        run.version += 1
+    _finalize_operation(
+        factory,
+        data_dir=tmp_path,
+        operation_id=operation_id,
+        department_id=authority.department_id,
+        actor_issuer=authority.issuer,
+        actor_subject=authority.subject,
+    )
+    with factory() as session:
+        persisted = session.get(AdapterPurgeOperation, operation_id)
+        assert persisted is not None and persisted.status == "completed"
+        assert (
+            session.query(PersistentAuditEvent)
+            .filter_by(
+                department_id=authority.department_id,
+                action="adapter.purge",
+                resource_id=str(operation_id),
+            )
+            .count()
+            == 1
+        )
+
+
+def _invalidate_adapter_authority(
+    session: Session, operation: dict[str, object], kind: str
+) -> None:
+    adapter = session.get(Adapter, operation["target_adapter_id"])
+    review = session.get(AdapterReview, operation["target_review_id"])
+    evaluation = session.get(AdapterEvaluationRun, operation["target_evaluation_id"])
+    suite = session.get(EvaluationSuite, operation["suite_id"])
+    registry = session.get(AdapterRegistryAttempt, operation["registry_attempt_id"])
+    dependency = session.get(AdapterUpstreamDependency, operation["dependency_id"])
+    evidence = (
+        session.query(AdapterEvaluationEvidence)
+        .filter_by(run_id=operation["target_evaluation_id"], target="candidate")
+        .one()
+    )
+    assert all(
+        value is not None for value in (adapter, review, evaluation, suite, registry, dependency)
+    )
+    deployment = (
+        session.query(DepartmentAdapterDeployment)
+        .filter_by(department_id=adapter.department_id)
+        .one()
+    )
+    now = datetime.now(UTC)
+    if kind == "adapter_version":
+        deployment.adapter_version += 1
+    elif kind == "adapter_purge_pending":
+        adapter.status = "purge_pending"
+    elif kind == "review_rejected":
+        review.status = "rejected"
+    elif kind == "review_version":
+        deployment.review_version += 1
+    elif kind == "evaluation_failed":
+        evaluation.status = "failed"
+        evaluation.gate_status = "pending"
+        evaluation.error_code = "candidate_runtime_unavailable"
+        evaluation.finished_at = now
+    elif kind == "candidate_gate":
+        evaluation.gate_status = "failed"
+        evidence.gate_status = "failed"
+        evidence.failed_gate_count = 1
+    elif kind == "suite_archived":
+        suite.status = "archived"
+        suite.archived_at = now
+    elif kind == "registry_failed":
+        registry.status = "failed"
+        registry.error_code = "registry_artifact_mismatch"
+        registry.finished_at = now
+    elif kind == "registry_version":
+        adapter.registry_attempt_version += 1
+    elif kind == "publication_attempt":
+        adapter.registry_publication_attempt_id = uuid4()
+    elif kind == "execution_scope":
+        registry.execution_scope_id = uuid4()
+    elif kind == "manifest_digest":
+        adapter.registry_manifest_sha256 = "0" * 64
+    elif kind == "config_digest":
+        adapter.registry_adapter_config_sha256 = "0" * 64
+    elif kind == "config_size":
+        adapter.registry_adapter_config_byte_size += 1
+    elif kind == "model_digest":
+        adapter.registry_adapter_model_sha256 = "0" * 64
+    elif kind == "model_size":
+        adapter.registry_adapter_model_byte_size += 1
+    elif kind == "dependency_released":
+        dependency.status = "released"
+        dependency.released_at = now
+    elif kind == "dependency_version":
+        adapter.dependency_version += 1
+    elif kind == "base_model":
+        deployment.base_model_id = "unreviewed/base"
+    elif kind == "base_revision":
+        deployment.base_model_revision = "unreviewed-revision"
+    elif kind == "active_purge":
+        # The active E-B operation is registered outside this mutation
+        # transaction so the real purge registration path is exercised.
+        return
+    else:  # pragma: no cover - the parameter list below is closed
+        raise AssertionError(kind)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "adapter_version",
+        "adapter_purge_pending",
+        "review_rejected",
+        "review_version",
+        "evaluation_failed",
+        "candidate_gate",
+        "suite_archived",
+        "registry_failed",
+        "registry_version",
+        "publication_attempt",
+        "execution_scope",
+        "manifest_digest",
+        "config_digest",
+        "config_size",
+        "model_digest",
+        "model_size",
+        "dependency_released",
+        "dependency_version",
+        "base_model",
+        "base_revision",
+        "active_purge",
+    ],
+)
+def test_invalid_adapter_authority_creates_no_run_snapshot_audit_or_runtime_call(
+    clean_db, factory, monkeypatch, tmp_path: Path, mutation: str
+) -> None:
+    authority, operation = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    with Session(clean_db) as session:
+        identity = session.get(UserIdentity, authority.admin_id)
+        assert identity is not None
+        identity.issuer = phase7_tests.ISSUER
+        _invalidate_adapter_authority(session, operation, mutation)
+        session.commit()
+    if mutation == "active_purge":
+        # Preserve the valid deployed target while inserting only the
+        # content-free active E-B authority row.  The dedicated fence test
+        # above exercises the real registration path; this matrix mutation
+        # isolates the admission-time active-operation lookup.
+        with factory.begin() as session:
+            adapter = session.get(Adapter, operation["target_adapter_id"])
+            source = session.get(AdapterImportSource, operation["source_bundle_id"])
+            assert adapter is not None and source is not None
+            source_attempt = session.get(
+                AdapterImportAttempt, adapter.source_authoritative_attempt_id
+            )
+            registry_attempt = session.get(AdapterRegistryAttempt, operation["registry_attempt_id"])
+            assert source_attempt is not None and registry_attempt is not None
+            session.add(
+                AdapterPurgeOperation(
+                    id=uuid4(),
+                    department_id=authority.department_id,
+                    adapter_id=adapter.id,
+                    source_bundle_id=source.id,
+                    requested_by_user_id=authority.admin_id,
+                    limit_value=1,
+                    item_limit_value=2,
+                    status="registered",
+                    expected_adapter_version=adapter.version,
+                    expected_source_version=source.version,
+                    expected_source_attempt_version=source_attempt.version,
+                    expected_registry_attempt_version=registry_attempt.version,
+                    source_authoritative_attempt_id=source_attempt.id,
+                    source_publication_attempt_id=source_attempt.publication_attempt_id,
+                    source_attempt_number=source_attempt.attempt_number,
+                    registry_attempt_id=registry_attempt.id,
+                    registry_publication_attempt_id=registry_attempt.publication_attempt_id,
+                    registry_attempt_number=registry_attempt.attempt_number,
+                    authority_snapshot={},
+                    eligible_item_count=0,
+                )
+            )
+    with clean_db.connect() as connection:
+        before = {
+            "runs": connection.execute(
+                text("SELECT count(*) FROM rag_answer_runs WHERE department_id = :department_id"),
+                {"department_id": str(authority.department_id)},
+            ).scalar_one(),
+            "snapshots": connection.execute(
+                text(
+                    "SELECT count(*) FROM rag_answer_runtime_snapshots "
+                    "WHERE department_id = :department_id"
+                ),
+                {"department_id": str(authority.department_id)},
+            ).scalar_one(),
+            "audits": connection.execute(
+                text(
+                    "SELECT count(*) FROM audit_events "
+                    "WHERE department_id = :department_id AND action = 'rag.answer.start'"
+                ),
+                {"department_id": str(authority.department_id)},
+            ).scalar_one(),
+        }
+    with _client(monkeypatch, tmp_path) as client:
+        app.state.rag_runtime_client = _Runtime()
+        app.state.adapter_runtime_client = _Runtime()
+        app.state.rag_qdrant = _Qdrant()
+        response = client.post(
+            f"/departments/{authority.department_id}/rag/answers",
+            headers=_headers(authority.subject),
+            json={"question": "Must be rejected"},
+        )
+    assert response.status_code == 503
+    with clean_db.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT count(*) FROM rag_answer_runs WHERE department_id = :department_id"),
+                {"department_id": str(authority.department_id)},
+            ).scalar_one()
+            == before["runs"]
+        )
+        assert (
+            connection.execute(
+                text(
+                    "SELECT count(*) FROM rag_answer_runtime_snapshots "
+                    "WHERE department_id = :department_id"
+                ),
+                {"department_id": str(authority.department_id)},
+            ).scalar_one()
+            == before["snapshots"]
+        )
+        assert (
+            connection.execute(
+                text(
+                    "SELECT count(*) FROM audit_events "
+                    "WHERE department_id = :department_id AND action = 'rag.answer.start'"
+                ),
+                {"department_id": str(authority.department_id)},
+            ).scalar_one()
+            == before["audits"]
+        )
 
 
 class _Runtime:

@@ -156,7 +156,7 @@ def verify_and_copy_adapter(
         1 <= expected_model_byte_size <= 44_040_192
     ):
         raise AdapterRuntimeError("adapter_artifact_mismatch")
-    root_fd = department_fd = final_fd = config_fd = model_fd = None
+    root_fd = department_fd = final_fd = manifest_fd = config_fd = model_fd = None
     directory: Path | None = None
     try:
         root_fd = _open_private_directory(registry_root)
@@ -170,23 +170,17 @@ def verify_and_copy_adapter(
         }:
             raise AdapterRuntimeError("adapter_authority_changed")
         manifest_fd = _open_private_file(final_fd, "manifest.json")
-        try:
-            manifest_meta = os.fstat(manifest_fd)
-            if not 1 <= manifest_meta.st_size <= 256 * 1024:
-                raise AdapterRuntimeError("adapter_artifact_mismatch")
-            manifest_raw = os.pread(manifest_fd, manifest_meta.st_size, 0)
-            manifest = parse_registry_manifest(manifest_raw)
-            _verify_entry(final_fd, "manifest.json", manifest_fd)
-        finally:
-            os.close(manifest_fd)
-        if (
-            hashlib.sha256(canonical_json_bytes(manifest)).hexdigest() != expected_manifest_sha256
-            or manifest.get("department_id") != str(department_id)
-            or manifest.get("adapter_id") != str(adapter_id)
-            or manifest.get("publication_attempt_id") != str(registry_publication_attempt_id)
-            or manifest.get("attempt_number") != registry_attempt_number
-        ):
-            raise AdapterRuntimeError("adapter_authority_changed")
+        manifest_identity = SourceIdentity.capture(manifest_fd, os.fstat(manifest_fd).st_size)
+        manifest = _read_manifest_descriptor(manifest_fd)
+        _verify_entry(final_fd, "manifest.json", manifest_fd)
+        _verify_manifest_authority(
+            manifest,
+            expected_manifest_sha256=expected_manifest_sha256,
+            department_id=department_id,
+            adapter_id=adapter_id,
+            registry_publication_attempt_id=registry_publication_attempt_id,
+            registry_attempt_number=registry_attempt_number,
+        )
         files = manifest.get("files")
         if not isinstance(files, dict):
             raise AdapterRuntimeError("adapter_authority_changed")
@@ -227,8 +221,29 @@ def verify_and_copy_adapter(
         )
         if copy_hook is not None:
             copy_hook(directory, "after-copy")
-        if not config_identity.matches(config_fd) or not model_identity.matches(model_fd):
+        if (
+            not manifest_identity.matches(manifest_fd)
+            or not config_identity.matches(config_fd)
+            or not model_identity.matches(model_fd)
+        ):
             raise AdapterRuntimeError("adapter_authority_changed")
+        # Keep the manifest descriptor open through copy and final-directory
+        # verification.  No path reopen is used to establish authority: the
+        # retained descriptor, its original identity, and its current
+        # directory-entry association are all checked immediately before the
+        # private copy is returned.
+        final_manifest = _read_manifest_descriptor(manifest_fd)
+        _verify_manifest_authority(
+            final_manifest,
+            expected_manifest_sha256=expected_manifest_sha256,
+            department_id=department_id,
+            adapter_id=adapter_id,
+            registry_publication_attempt_id=registry_publication_attempt_id,
+            registry_attempt_number=registry_attempt_number,
+        )
+        if canonical_json_bytes(final_manifest) != canonical_json_bytes(manifest):
+            raise AdapterRuntimeError("adapter_authority_changed")
+        _verify_entry(final_fd, "manifest.json", manifest_fd)
         _verify_copy(
             directory,
             expected_config_sha256,
@@ -256,7 +271,14 @@ def verify_and_copy_adapter(
             shutil.rmtree(directory, ignore_errors=True)
         raise AdapterRuntimeError("adapter_artifact_mismatch") from error
     finally:
-        for descriptor in (config_fd, model_fd, final_fd, department_fd, root_fd):
+        for descriptor in (
+            config_fd,
+            model_fd,
+            manifest_fd,
+            final_fd,
+            department_fd,
+            root_fd,
+        ):
             if descriptor is not None:
                 try:
                     os.close(descriptor)
@@ -356,6 +378,38 @@ def _open_private_file(parent: int, name: str) -> int:
     except Exception:
         os.close(descriptor)
         raise
+
+
+def _read_manifest_descriptor(descriptor: int) -> dict[str, object]:
+    metadata = os.fstat(descriptor)
+    if not 1 <= metadata.st_size <= 256 * 1024:
+        raise AdapterRuntimeError("adapter_artifact_mismatch")
+    raw = os.pread(descriptor, metadata.st_size, 0)
+    if len(raw) != metadata.st_size or os.pread(descriptor, 1, metadata.st_size):
+        raise AdapterRuntimeError("adapter_authority_changed")
+    try:
+        return parse_registry_manifest(raw)
+    except Exception as error:
+        raise AdapterRuntimeError("adapter_authority_changed") from error
+
+
+def _verify_manifest_authority(
+    manifest: dict[str, object],
+    *,
+    expected_manifest_sha256: str,
+    department_id: UUID,
+    adapter_id: UUID,
+    registry_publication_attempt_id: UUID,
+    registry_attempt_number: int,
+) -> None:
+    if (
+        hashlib.sha256(canonical_json_bytes(manifest)).hexdigest() != expected_manifest_sha256
+        or manifest.get("department_id") != str(department_id)
+        or manifest.get("adapter_id") != str(adapter_id)
+        or manifest.get("publication_attempt_id") != str(registry_publication_attempt_id)
+        or manifest.get("attempt_number") != registry_attempt_number
+    ):
+        raise AdapterRuntimeError("adapter_authority_changed")
 
 
 def _require_private_directory(descriptor: int) -> None:

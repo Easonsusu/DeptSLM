@@ -33,6 +33,7 @@ class RagSettings:
     max_evidence_chars: int
     minimum_score: Decimal
     request_timeout_seconds: int
+    adapter_runtime_request_timeout_seconds: int
 
     @classmethod
     def optional_from_environment(cls, environment: str) -> RagSettings | None:
@@ -111,6 +112,13 @@ class RagSettings:
             max_evidence_chars=_bounded("DEPTSLM_RAG_MAX_EVIDENCE_CHARS", 6000, 1200, 6000),
             minimum_score=_score(),
             request_timeout_seconds=_bounded("DEPTSLM_RAG_REQUEST_TIMEOUT_SECONDS", 30, 1, 300),
+            # The adapter runtime owns separate 300-second target-load and
+            # 120-second generation clocks.  Keep the API envelope distinct
+            # from the Phase 7 request timeout and require enough fixed margin
+            # for transport and response framing.
+            adapter_runtime_request_timeout_seconds=_bounded(
+                "DEPTSLM_ADAPTER_RUNTIME_REQUEST_TIMEOUT_SECONDS", 450, 450, 600
+            ),
         )
 
 

@@ -193,7 +193,10 @@ runtime, receives only read-only model-cache and registry-final mounts, and
 verifies/copies registry artifacts before PEFT loading. A target fingerprint
 binds the API snapshot, runtime request, and successful response. Target change
 retires the old child rather than hot-switching tenants; runtime errors never
-call base generation or mutate deployment state. See
+call base generation or mutate deployment state. The API keeps the Phase 7
+base transport timeout separate from a bounded 450-second adapter envelope,
+and the manifest descriptor remains retained and revalidated through the
+private copy boundary. See
 [adapter-runtime-routing.md](adapter-runtime-routing.md).
 
 ### Qwen3 and Qwen3-Embedding

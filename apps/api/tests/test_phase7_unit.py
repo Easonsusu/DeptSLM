@@ -120,6 +120,8 @@ def test_rag_settings_accept_exact_defaults(monkeypatch: pytest.MonkeyPatch) -> 
         6000,
     )
     assert float(settings.minimum_score) == pytest.approx(0.45)
+    assert settings.request_timeout_seconds == 30
+    assert settings.adapter_runtime_request_timeout_seconds == 450
 
 
 @pytest.mark.parametrize(
@@ -135,6 +137,8 @@ def test_rag_settings_accept_exact_defaults(monkeypatch: pytest.MonkeyPatch) -> 
         ("DEPTSLM_RAG_MAX_EVIDENCE_CHARS", "6001"),
         ("DEPTSLM_RAG_MIN_SCORE", "nan"),
         ("DEPTSLM_RAG_REQUEST_TIMEOUT_SECONDS", "301"),
+        ("DEPTSLM_ADAPTER_RUNTIME_REQUEST_TIMEOUT_SECONDS", "449"),
+        ("DEPTSLM_ADAPTER_RUNTIME_REQUEST_TIMEOUT_SECONDS", "601"),
     ],
 )
 def test_rag_settings_reject_malformed_or_out_of_contract_values(

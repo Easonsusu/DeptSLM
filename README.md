@@ -46,8 +46,11 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > adapter runtime after exact Phase 12.3 authority checks. Query embedding,
 > retrieval, evidence selection, prompt, citations, and PostgreSQL final
 > authority remain the Phase 7 contracts. The production runtime verifies and
-> privately copies the exact registry final, never falls back to base, and
-> never changes deployment governance. Phase 13 is not started.
+> privately copies the exact registry final through a retained manifest
+> descriptor, never falls back to base, and never changes deployment governance.
+> The API uses a separate bounded adapter transport envelope for the runtime's
+> 300-second target load and 120-second generation clocks; the Phase 7 base
+> timeout remains unchanged. Phase 13 is not started.
 
 The governance worker is deliberately narrower than the API: its dedicated
 settings loader requires PostgreSQL plus only the external read-only

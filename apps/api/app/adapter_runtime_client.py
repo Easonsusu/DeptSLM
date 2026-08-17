@@ -60,9 +60,18 @@ class AdapterRuntimeClient:
 
     def _post(self, payload: dict[str, Any]) -> Any:
         try:
+            # The outer API envelope must cover the adapter runtime's separate
+            # target-load and generation clocks.  Connect, write, and pool
+            # setup remain short and cannot be extended by request payloads.
+            timeout = httpx.Timeout(
+                connect=10.0,
+                read=float(self._timeout),
+                write=10.0,
+                pool=5.0,
+            )
             with httpx.Client(
                 base_url=self._base_url,
-                timeout=self._timeout,
+                timeout=timeout,
                 follow_redirects=False,
                 trust_env=False,
                 transport=self._transport,

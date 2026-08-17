@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -229,6 +230,55 @@ def test_adapter_runtime_client_requires_served_fingerprint_and_closed_response(
         failed.generate(target, "question", evidence)
 
 
+def test_adapter_transport_timeout_is_separate_bounded_and_maps_timeout(monkeypatch) -> None:
+    target = _target()
+    evidence = (EvidenceSource("S1", "approved"),)
+    captured: dict[str, object] = {}
+
+    class Client:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def stream(self, *_args, **_kwargs):
+            return nullcontext(
+                httpx.Response(
+                    200,
+                    json={
+                        "status": "answered",
+                        "answer": "Approved [S1]",
+                        "citations": ["S1"],
+                        "served_target_fingerprint": target.fingerprint,
+                    },
+                )
+            )
+
+    monkeypatch.setattr("app.adapter_runtime_client.httpx.Client", Client)
+    client = AdapterRuntimeClient(
+        "http://adapter-runtime:8012", "x" * 32, 450, transport=httpx.MockTransport(lambda _: None)
+    )
+    assert client.generate(target, "question", evidence)["status"] == "answered"
+    timeout = captured["timeout"]
+    assert isinstance(timeout, httpx.Timeout)
+    assert timeout.read == 450
+    assert timeout.connect == 10
+    assert timeout.write == 10
+    assert timeout.pool == 5
+
+    class TimeoutClient(Client):
+        def stream(self, *_args, **_kwargs):
+            raise httpx.ReadTimeout("outer adapter deadline")
+
+    monkeypatch.setattr("app.adapter_runtime_client.httpx.Client", TimeoutClient)
+    with pytest.raises(RagContractError, match="adapter_runtime_timeout"):
+        client.generate(target, "question", evidence)
+
+
 def test_runtime_http_request_is_exact_and_rejects_client_controls() -> None:
     target = _target()
     payload = {
@@ -242,7 +292,16 @@ def test_runtime_http_request_is_exact_and_rejects_client_controls() -> None:
     }
     assert _validate_request(payload)["target_fingerprint"] == target.fingerprint
     assert _validate_generation(payload) == ("question", payload["evidence"])
-    for forbidden in ("seed", "temperature", "adapter_path", "model_path", "fallback"):
+    for forbidden in (
+        "seed",
+        "temperature",
+        "adapter_path",
+        "model_path",
+        "fallback",
+        "timeout",
+        "request_timeout",
+        "adapter_runtime_request_timeout_seconds",
+    ):
         invalid = {**payload, forbidden: 1}
         with pytest.raises(Exception):
             _validate_request(invalid)

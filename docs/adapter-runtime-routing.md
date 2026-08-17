@@ -57,6 +57,14 @@ base, mutates the deployment pointer, enqueues rollback, or invokes rollback
 automatically. An administrator may use the existing explicit rollback-to-base
 operation later.
 
+The API keeps the Phase 7 `DEPTSLM_RAG_REQUEST_TIMEOUT_SECONDS` contract for
+the base runtime (30 seconds by default). Adapter generation has a separate
+server-owned `DEPTSLM_ADAPTER_RUNTIME_REQUEST_TIMEOUT_SECONDS` envelope,
+bounded to 450–600 seconds and defaulting to 450 seconds. That envelope covers
+the adapter runtime's 300-second target-load clock, 120-second generation clock,
+and a fixed transport margin. HTTP connect, write, and pool setup remain
+short-bounded; no public request field can select or extend either timeout.
+
 The production request is a closed internal contract containing the target
 authority, contract version, fingerprint, bounded question and labeled evidence,
 prompt version, and answer contract version. It accepts no seed, sampling
@@ -84,7 +92,11 @@ department/adapter path, manifest authority, base revision, publication and
 attempt identity, config/model digests and sizes, canonical Phase 12.1A config,
 and the complete reviewed safetensors header contract. It copies bytes through
 retained descriptors into a private ephemeral directory and verifies the copy
-before PEFT sees it. The external registry path is never handed to PEFT.
+before PEFT sees it. The manifest descriptor remains open for the complete
+operation: its identity, directory entry, canonical digest, and parsed
+authority are revalidated after config/model copying and before success. A
+manifest or final-directory substitution fails closed and removes the private
+copy. The external registry path is never handed to PEFT.
 
 The fixed model contract is `Qwen/Qwen3-0.6B` at revision
 `c1899de289a04d12100db370d81485cdf75e47ca`, local files only,
