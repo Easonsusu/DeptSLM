@@ -426,6 +426,12 @@ def test_valid_adapter_admission_freezes_exact_authority_and_calls_adapter_runti
         )
         department_id = department.id
         hit = _hit(document, extraction, chunk, indexing)
+        identity = session.get(UserIdentity, authority.admin_id)
+        assert identity is not None
+        # The Phase 12.3 authority uses its own issuer; the shared Phase 7
+        # HTTP fixture signs tokens with its fixed test issuer.
+        identity.issuer = phase7_tests.ISSUER
+        session.commit()
 
     class AdapterRuntime:
         calls = 0
@@ -827,7 +833,7 @@ def _invalidate_adapter_authority(
     elif kind == "registry_version":
         registry.version += 1
     elif kind == "publication_attempt":
-        registry.publication_attempt_id = uuid4()
+        adapter.publication_attempt_id = uuid4()
     elif kind == "execution_scope":
         registry.execution_scope_id = uuid4()
     elif kind == "manifest_digest":
