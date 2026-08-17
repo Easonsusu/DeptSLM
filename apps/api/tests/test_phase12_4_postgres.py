@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -16,7 +18,13 @@ from test_phase7_postgres import _client, _headers, _hit, _seed
 from alembic import command
 from app.database import create_database_engine
 from app.main import app
-from app.models import DepartmentAdapterDeployment, RagAnswerRuntimeSnapshot
+from app.models import (
+    Department,
+    DepartmentAdapterDeployment,
+    RagAnswerRun,
+    RagAnswerRuntimeSnapshot,
+    UserIdentity,
+)
 
 pytestmark = pytest.mark.postgres
 
@@ -88,6 +96,124 @@ def test_phase12_4_migration_cycle_has_one_head_and_content_free_snapshot(clean_
         "vector",
         "adapter_bytes",
     }
+
+
+def test_phase12_4_downgrade_maps_populated_runtime_error_codes(clean_db) -> None:
+    config = Config("alembic.ini")
+    command.downgrade(config, "0016_phase12_adapter_governance")
+    command.upgrade(config, "0017_phase12_adapter_runtime_routing")
+    codes = (
+        "adapter_runtime_timeout",
+        "adapter_runtime_unavailable",
+        "adapter_load_failed",
+        "adapter_runtime_target_mismatch",
+        "deployment_authority_changed",
+    )
+    with Session(clean_db) as session:
+        department = Department(slug=f"migration-{uuid4().hex[:8]}", display_name="Migration proof")
+        identity = UserIdentity(
+            issuer="https://phase12-4.invalid",
+            subject=f"migration-{uuid4().hex}",
+            status="active",
+        )
+        session.add_all([department, identity])
+        session.flush()
+        session.add(
+            DepartmentAdapterDeployment(
+                department_id=department.id,
+                target_kind="base",
+                base_model_id="Qwen/Qwen3-0.6B",
+                base_model_revision="c1899de289a04d12100db370d81485cdf75e47ca",
+                deployment_version=1,
+                version=1,
+            )
+        )
+        runs = [
+            RagAnswerRun(
+                department_id=department.id,
+                requested_by_user_id=identity.id,
+                status="failed",
+                question_char_count=1,
+                query_embedding_pipeline_version="phase7-qwen3-query-embedding-v1",
+                query_embedding_model_id="Qwen/Qwen3-Embedding-0.6B",
+                query_embedding_model_revision="d23109d65ca9fdf61eef614209744716f337f50f",
+                generation_model_id="Qwen/Qwen3-0.6B",
+                generation_model_revision="c1899de289a04d12100db370d81485cdf75e47ca",
+                prompt_version="phase7-grounded-answer-prompt-v1",
+                answer_contract_version="phase7-grounded-answer-v1",
+                minimum_score=Decimal("0.100"),
+                error_code=code,
+                started_at=datetime.now(UTC),
+                finished_at=datetime.now(UTC),
+                version=1,
+            )
+            for code in (*codes, "runtime_timeout")
+        ]
+        session.add_all(runs)
+        session.flush()
+        session.add(
+            RagAnswerRuntimeSnapshot(
+                run_id=runs[0].id,
+                department_id=department.id,
+                target_kind="base",
+                deployment_id=None,
+                deployment_version=0,
+                deployment_row_version=None,
+                base_model_id="Qwen/Qwen3-0.6B",
+                base_model_revision="c1899de289a04d12100db370d81485cdf75e47ca",
+                runtime_contract_version="phase12-adapter-runtime-routing-v1",
+                target_fingerprint="a" * 64,
+            )
+        )
+        session.commit()
+        run_ids = tuple(run.id for run in runs)
+        department_id = department.id
+
+    command.downgrade(config, "0016_phase12_adapter_governance")
+    expected = {
+        "adapter_runtime_timeout": "runtime_timeout",
+        "adapter_runtime_unavailable": "runtime_unavailable",
+        "adapter_load_failed": "runtime_unavailable",
+        "adapter_runtime_target_mismatch": "runtime_unavailable",
+        "deployment_authority_changed": "runtime_unavailable",
+        "runtime_timeout": "runtime_timeout",
+    }
+    with Session(clean_db) as session:
+        values = {
+            run.id: run.error_code
+            for run in session.query(RagAnswerRun).filter(RagAnswerRun.id.in_(run_ids))
+        }
+        assert [values[run_id] for run_id in run_ids] == [
+            expected[code] for code in (*codes, "runtime_timeout")
+        ]
+        assert (
+            session.query(DepartmentAdapterDeployment)
+            .filter_by(department_id=department_id)
+            .count()
+            == 1
+        )
+
+    command.upgrade(config, "0017_phase12_adapter_runtime_routing")
+    with Session(clean_db) as session:
+        restored = RagAnswerRuntimeSnapshot(
+            run_id=run_ids[0],
+            department_id=department_id,
+            target_kind="base",
+            deployment_id=None,
+            deployment_version=0,
+            deployment_row_version=None,
+            base_model_id="Qwen/Qwen3-0.6B",
+            base_model_revision="c1899de289a04d12100db370d81485cdf75e47ca",
+            runtime_contract_version="phase12-adapter-runtime-routing-v1",
+            target_fingerprint="b" * 64,
+        )
+        session.add(restored)
+        session.commit()
+        assert session.get(RagAnswerRuntimeSnapshot, restored.id) is not None
+    with clean_db.connect() as connection:
+        assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+            "0017_phase12_adapter_runtime_routing"
+        )
 
 
 def test_implicit_base_admission_creates_base_snapshot(

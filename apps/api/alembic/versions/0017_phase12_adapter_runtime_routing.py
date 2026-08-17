@@ -136,6 +136,24 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_constraint("ck_rag_run_error_code", "rag_answer_runs", type_="check")
+    # 0017 adds adapter-runtime error codes which are not valid in the Phase 7
+    # constraint restored below.  Map them deterministically before recreating
+    # that constraint so a populated Phase 12.4 database can downgrade safely.
+    op.execute(
+        sa.text(
+            "UPDATE rag_answer_runs SET error_code = CASE error_code "
+            "WHEN 'adapter_runtime_timeout' THEN 'runtime_timeout' "
+            "WHEN 'adapter_runtime_unavailable' THEN 'runtime_unavailable' "
+            "WHEN 'adapter_load_failed' THEN 'runtime_unavailable' "
+            "WHEN 'adapter_runtime_target_mismatch' THEN 'runtime_unavailable' "
+            "WHEN 'deployment_authority_changed' THEN 'runtime_unavailable' "
+            "ELSE error_code END "
+            "WHERE error_code IN ("
+            "'adapter_runtime_timeout','adapter_runtime_unavailable',"
+            "'adapter_load_failed','adapter_runtime_target_mismatch',"
+            "'deployment_authority_changed')"
+        )
+    )
     op.create_check_constraint(
         "ck_rag_run_error_code",
         "rag_answer_runs",

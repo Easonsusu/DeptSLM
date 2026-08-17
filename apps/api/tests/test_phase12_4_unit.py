@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import httpx
@@ -19,13 +21,25 @@ for _name in tuple(sys.modules):
         del sys.modules[_name]
 sys.path.insert(0, str(SERVICE_ROOT))
 
-from deptslm_adapter_runtime.child import _validate_generation  # noqa: E402
+from deptslm_adapter_runtime import child as adapter_child  # noqa: E402
+from deptslm_adapter_runtime import supervisor as adapter_supervisor  # noqa: E402
+from deptslm_adapter_runtime.child import (  # noqa: E402
+    ChildError,
+    Session,
+    _validate_generation,
+)
 from deptslm_adapter_runtime.main import _validate_request  # noqa: E402
 from deptslm_adapter_runtime.settings import (  # noqa: E402
     AdapterRuntimeConfigurationError,
     AdapterRuntimeSettings,
 )  # noqa: E402
-from deptslm_adapter_runtime.supervisor import _target_key  # noqa: E402
+from deptslm_adapter_runtime.supervisor import (  # noqa: E402
+    AdapterRuntimeSupervisor,
+    AdapterRuntimeSupervisorError,
+    _encode_frame,
+    _target_authority,
+    _target_key,
+)
 
 from app.adapter_runtime_client import AdapterRuntimeClient  # noqa: E402
 from app.adapter_runtime_contract import RuntimeTarget  # noqa: E402
@@ -34,6 +48,7 @@ from app.rag_domain import (  # noqa: E402
     PROMPT_VERSION,
     EvidenceSource,
     RagContractError,
+    runtime_generation_request,
 )
 from app.rag_runtime_router import RoutedRagRuntime  # noqa: E402
 
@@ -289,3 +304,314 @@ def test_supervisor_target_key_includes_department_and_artifact_authority() -> N
     assert key[0] == str(target.department_id)
     assert key[1] == str(target.adapter_id)
     assert key[-1] == target.fingerprint
+
+
+def test_target_authority_is_closed_and_child_requires_target_load(monkeypatch, tmp_path) -> None:
+    target = _target().adapter_request_fields()
+    authority = _target_authority(target)
+    assert authority["target"] == "adapter"
+    assert set(authority) == {
+        "target",
+        "runtime_contract_version",
+        "target_fingerprint",
+        *target.keys(),
+    }
+
+    class Copy:
+        def close(self):
+            return None
+
+    settings = AdapterRuntimeSettings(
+        data_dir=tmp_path,
+        model_cache=tmp_path / "model_cache",
+        registry=tmp_path / "registry",
+        token="",
+        provider="fake",
+    )
+    session = Session(settings)
+    calls = 0
+
+    def verify(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return Copy()
+
+    monkeypatch.setattr(adapter_child, "verify_and_copy_adapter", verify)
+    with pytest.raises(ChildError, match="adapter_runtime_target_mismatch"):
+        session.generate({"operation": "generate", **target})
+    assert (
+        session.load_target(authority)["loaded_target_fingerprint"] == target["target_fingerprint"]
+    )
+    assert session.load_target(authority)["status"] == "target_ready"
+    assert calls == 1
+    response = session.generate(
+        {
+            "operation": "generate",
+            "target": "adapter",
+            **target,
+            **runtime_generation_request("question", (EvidenceSource("S1", "approved"),)),
+        }
+    )
+    assert response["served_target_fingerprint"] == target["target_fingerprint"]
+    session.close()
+
+
+def test_real_target_load_passes_one_exact_generation_path_to_both_loaders(monkeypatch, tmp_path):
+    target = _target().adapter_request_fields()
+    generation_path = tmp_path / "model_cache" / "qwen3-0.6b-reviewed"
+    generation_path.mkdir(parents=True)
+    settings = AdapterRuntimeSettings(
+        data_dir=tmp_path,
+        model_cache=tmp_path / "model_cache",
+        registry=tmp_path / "registry",
+        token="",
+        provider="real",
+    )
+
+    class Copy:
+        def close(self):
+            return None
+
+    loaded = []
+    monkeypatch.setattr(adapter_child, "verify_and_copy_adapter", lambda *_args, **_kwargs: Copy())
+    monkeypatch.setattr(
+        adapter_child,
+        "validate_generation_model_store",
+        lambda data_dir: (
+            loaded.append(("validate", data_dir)) or SimpleNamespace(path=generation_path)
+        ),
+    )
+    monkeypatch.setattr(
+        adapter_child,
+        "_load_tokenizer",
+        lambda path: loaded.append(("tokenizer", path)) or SimpleNamespace(model_max_length=8192),
+    )
+    monkeypatch.setattr(
+        adapter_child,
+        "load_adapter_model",
+        lambda _copy, path, *, tokenizer_limit: (
+            loaded.append(("model", path, tokenizer_limit)) or object()
+        ),
+    )
+    session = Session(settings)
+    result = session.load_target(_target_authority(target))
+    assert result == {
+        "status": "target_ready",
+        "loaded_target_fingerprint": target["target_fingerprint"],
+    }
+    assert loaded == [
+        ("validate", tmp_path),
+        ("tokenizer", generation_path),
+        ("model", generation_path, 8192),
+    ]
+    assert settings.model_cache != generation_path
+    session.close()
+
+
+class _ControlledRuntimeStdin:
+    def __init__(self, process, *, load_delay=0.0, generation_delay=0.0):
+        self.process = process
+        self.load_delay = load_delay
+        self.generation_delay = generation_delay
+        self.closed = False
+
+    def write(self, frame: bytes) -> None:
+        request = json.loads(frame[4:].decode())
+        self.process.operation = request["operation"]
+        self.process.target = request["target"]
+
+    async def drain(self) -> None:
+        delay = (
+            self.load_delay if self.process.operation == "load_target" else self.generation_delay
+        )
+        if delay:
+            await asyncio.sleep(delay)
+        if self.closed:
+            return
+        if self.process.operation == "load_target":
+            value = {
+                "status": "target_ready",
+                "loaded_target_fingerprint": self.process.target["target_fingerprint"],
+            }
+        else:
+            value = {
+                "status": "answered",
+                "answer": "Approved [S1]",
+                "citations": ["S1"],
+                "served_target_fingerprint": self.process.target["target_fingerprint"],
+            }
+        self.process.stdout.feed_data(_encode_frame(value))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _ControlledRuntimeProcess:
+    _next_pid = 50_000
+
+    def __init__(self, *, load_delay=0.0, generation_delay=0.0):
+        _ControlledRuntimeProcess._next_pid += 1
+        self.pid = _ControlledRuntimeProcess._next_pid
+        self.returncode = None
+        self.stdout = asyncio.StreamReader()
+        self.operation = None
+        self.target = None
+        self.stdin = _ControlledRuntimeStdin(
+            self, load_delay=load_delay, generation_delay=generation_delay
+        )
+        self.waited = False
+
+    async def wait(self):
+        self.waited = True
+        self.returncode = 0
+        self.stdout.feed_eof()
+        return 0
+
+
+def test_supervised_target_load_has_its_own_clock_and_retires_changed_targets(monkeypatch):
+    async def scenario():
+        created = []
+        delays = iter(((0.02, 0.0), (0.0, 0.0)))
+
+        async def create(*_args, **_kwargs):
+            load_delay, generation_delay = next(delays)
+            process = _ControlledRuntimeProcess(
+                load_delay=load_delay, generation_delay=generation_delay
+            )
+            process.stdout.feed_data(_encode_frame({"ready": True}))
+            created.append(process)
+            return process
+
+        monkeypatch.setattr(adapter_supervisor.asyncio, "create_subprocess_exec", create)
+        monkeypatch.setattr(adapter_supervisor.os, "killpg", lambda *_args: None)
+        settings = SimpleNamespace(child_environment=lambda: {})
+        supervisor = AdapterRuntimeSupervisor(
+            settings,
+            startup_timeout_seconds=0.1,
+            target_load_timeout_seconds=0.1,
+            generation_timeout_seconds=0.1,
+        )
+        target = _target().adapter_request_fields()
+        await supervisor.start()
+        assert supervisor.ready and not supervisor.target_ready
+        result = await supervisor.request({"target": target})
+        assert result["served_target_fingerprint"] == target["target_fingerprint"]
+        assert supervisor.target_ready and len(created) == 1
+        await supervisor.request({"target": target})
+        assert len(created) == 1
+        changed = _target(adapter_version=4).adapter_request_fields()
+        await supervisor.request({"target": changed})
+        assert len(created) == 2
+        assert created[0].waited
+        await supervisor.close()
+        assert created[1].waited
+
+    asyncio.run(scenario())
+
+
+def test_supervised_target_load_timeout_reaps_without_fallback(monkeypatch):
+    async def scenario():
+        process = _ControlledRuntimeProcess(load_delay=0.2)
+        process.stdout.feed_data(_encode_frame({"ready": True}))
+
+        async def create(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(adapter_supervisor.asyncio, "create_subprocess_exec", create)
+        monkeypatch.setattr(adapter_supervisor.os, "killpg", lambda *_args: None)
+        supervisor = AdapterRuntimeSupervisor(
+            SimpleNamespace(child_environment=lambda: {}),
+            startup_timeout_seconds=0.1,
+            target_load_timeout_seconds=0.01,
+            generation_timeout_seconds=0.1,
+        )
+        with pytest.raises(AdapterRuntimeSupervisorError, match="adapter_runtime_timeout"):
+            await supervisor.request({"target": _target().adapter_request_fields()})
+        assert process.waited
+        assert not supervisor.ready and not supervisor.target_ready
+        await supervisor.close()
+
+    asyncio.run(scenario())
+
+
+def test_supervised_generation_timeout_is_separate_and_reaps(monkeypatch):
+    async def scenario():
+        process = _ControlledRuntimeProcess(generation_delay=0.2)
+        process.stdout.feed_data(_encode_frame({"ready": True}))
+
+        async def create(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(adapter_supervisor.asyncio, "create_subprocess_exec", create)
+        monkeypatch.setattr(adapter_supervisor.os, "killpg", lambda *_args: None)
+        supervisor = AdapterRuntimeSupervisor(
+            SimpleNamespace(child_environment=lambda: {}),
+            startup_timeout_seconds=0.1,
+            target_load_timeout_seconds=0.1,
+            generation_timeout_seconds=0.01,
+        )
+        with pytest.raises(AdapterRuntimeSupervisorError, match="adapter_runtime_timeout"):
+            await supervisor.request({"target": _target().adapter_request_fields()})
+        assert process.waited
+        assert not supervisor.ready and not supervisor.target_ready
+
+    asyncio.run(scenario())
+
+
+def test_supervised_target_load_cancellation_reaps_child(monkeypatch):
+    async def scenario():
+        process = _ControlledRuntimeProcess(load_delay=0.2)
+        process.stdout.feed_data(_encode_frame({"ready": True}))
+
+        async def create(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(adapter_supervisor.asyncio, "create_subprocess_exec", create)
+        monkeypatch.setattr(adapter_supervisor.os, "killpg", lambda *_args: None)
+        supervisor = AdapterRuntimeSupervisor(
+            SimpleNamespace(child_environment=lambda: {}),
+            startup_timeout_seconds=0.1,
+            target_load_timeout_seconds=0.5,
+            generation_timeout_seconds=0.1,
+        )
+        task = asyncio.create_task(
+            supervisor.request({"target": _target().adapter_request_fields()})
+        )
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert process.waited
+        assert not supervisor.ready and not supervisor.target_ready
+        await supervisor.close()
+
+    asyncio.run(scenario())
+
+
+def test_supervised_target_load_shutdown_reaps_child(monkeypatch):
+    async def scenario():
+        process = _ControlledRuntimeProcess(load_delay=0.2)
+        process.stdout.feed_data(_encode_frame({"ready": True}))
+
+        async def create(*_args, **_kwargs):
+            return process
+
+        monkeypatch.setattr(adapter_supervisor.asyncio, "create_subprocess_exec", create)
+        monkeypatch.setattr(adapter_supervisor.os, "killpg", lambda *_args: None)
+        supervisor = AdapterRuntimeSupervisor(
+            SimpleNamespace(child_environment=lambda: {}),
+            startup_timeout_seconds=0.1,
+            target_load_timeout_seconds=0.5,
+            generation_timeout_seconds=0.1,
+        )
+        task = asyncio.create_task(
+            supervisor.request({"target": _target().adapter_request_fields()})
+        )
+        await asyncio.sleep(0.01)
+        await supervisor.close()
+        with pytest.raises(AdapterRuntimeSupervisorError):
+            await task
+        assert process.waited
+        assert not supervisor.ready and not supervisor.target_ready
+
+    asyncio.run(scenario())

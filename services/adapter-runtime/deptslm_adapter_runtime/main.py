@@ -87,7 +87,7 @@ def health() -> dict[str, str]:
 async def generate(request: Request) -> dict[str, object]:
     _authorize(request)
     value = await _body(request)
-    target = _validate_request(value)
+    _validate_request(value)
     try:
         result = await request.app.state.supervisor.request(
             {"operation": "generate", "target": value}
@@ -96,7 +96,9 @@ async def generate(request: Request) -> dict[str, object]:
         if error.code == "adapter_runtime_target_mismatch":
             return JSONResponse(status_code=503, content={"code": error.code})
         return JSONResponse(status_code=503, content={"code": error.code})
-    return {**result, "served_target_fingerprint": target["target_fingerprint"]}
+    # The supervisor has already compared this fingerprint with the loaded
+    # child/session state.  Do not manufacture it by echoing the request.
+    return result
 
 
 def _authorize(request: Request) -> None:

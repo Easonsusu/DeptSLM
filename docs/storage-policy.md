@@ -377,9 +377,12 @@ The public API stores only the immutable, content-free
 versions, registry digests/sizes, fixed model revision, contract, and target
 fingerprint. It never stores adapter bytes, paths, prompts, evidence, model
 output, tokens, or exception text. The production `adapter-runtime` mounts
-only `model_cache:ro` and `adapters/registry:ro`; it copies verified registry
-bytes into a private short-lived `/tmp/adapter-runtime` directory and removes
-the copy when its single target child retires. It receives no database,
+only `model_cache:ro` and `adapters/registry:ro`; it calls the shared model
+store validator once and passes the exact returned generation directory to
+both tokenizer and base-model loading, never the `model_cache` root. It copies
+verified registry bytes into a private short-lived `/tmp/adapter-runtime`
+directory and removes the copy when its single target child retires (including
+supervisor cleanup after forced termination). It receives no database,
 Qdrant, uploads, extraction, evaluation, dataset, training, export, or
 registry-write storage. Runtime caches are keyed by department, adapter and
 version, publication/attempt authority, base revision, and config/model

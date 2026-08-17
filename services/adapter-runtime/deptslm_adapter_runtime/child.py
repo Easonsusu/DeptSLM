@@ -23,6 +23,7 @@ from app.generation_contract import (
     GenerationContractError,
     tokenize_generation_input,
 )
+from app.model_store import validate_generation_model_store
 from app.rag_domain import (
     ANSWER_CONTRACT_VERSION,
     GENERATION_NEW_TOKEN_RESERVE,
@@ -84,6 +85,7 @@ class Session:
     def __init__(self, settings: AdapterRuntimeSettings) -> None:
         self.settings = settings
         self.key: tuple[object, ...] | None = None
+        self.loaded_target_fingerprint: str | None = None
         self.copy: VerifiedAdapterCopy | None = None
         self.model: Any = None
         self.tokenizer: Any = None
@@ -98,40 +100,62 @@ class Session:
                 pass
         self.copy = None
         self.key = None
+        self.loaded_target_fingerprint = None
+
+    def load_target(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Verify and load one target before the child accepts generation."""
+
+        target = _validate_target(payload)
+        key = _session_key(target)
+        if key == self.key and self.loaded_target_fingerprint == target["target_fingerprint"]:
+            return {
+                "status": "target_ready",
+                "loaded_target_fingerprint": self.loaded_target_fingerprint,
+            }
+        self.close()
+        try:
+            self.copy = verify_and_copy_adapter(
+                self.settings.registry,
+                department_id=UUID(target["department_id"]),
+                adapter_id=UUID(target["adapter_id"]),
+                adapter_version=target["adapter_version"],
+                registry_publication_attempt_id=UUID(target["registry_publication_attempt_id"]),
+                registry_attempt_number=target["registry_attempt_number"],
+                expected_manifest_sha256=target["registry_manifest_sha256"],
+                expected_config_sha256=target["adapter_config_sha256"],
+                expected_config_byte_size=target["adapter_config_byte_size"],
+                expected_model_sha256=target["adapter_model_sha256"],
+                expected_model_byte_size=target["adapter_model_byte_size"],
+            )
+            if self.settings.provider == "real":
+                # Resolve the reviewed generation store once.  The exact
+                # validated directory is passed to both tokenizer and model
+                # loaders; the shared model-cache root is never a load target.
+                generation = validate_generation_model_store(self.settings.data_dir)
+                self.tokenizer = _load_tokenizer(generation.path)
+                self.model = load_adapter_model(
+                    self.copy,
+                    generation.path,
+                    tokenizer_limit=self.tokenizer.model_max_length,
+                )
+            self.key = key
+            self.loaded_target_fingerprint = target["target_fingerprint"]
+            return {
+                "status": "target_ready",
+                "loaded_target_fingerprint": self.loaded_target_fingerprint,
+            }
+        except AdapterRuntimeError as error:
+            self.close()
+            raise ChildError(error.code) from error
+        except Exception as error:
+            self.close()
+            raise ChildError("adapter_load_failed") from error
 
     def generate(self, payload: dict[str, Any]) -> dict[str, Any]:
         target = _validate_target(payload)
-        key = tuple(target[field] for field in _TARGET_FIELDS) + (payload["target_fingerprint"],)
-        if key != self.key:
-            self.close()
-            self.key = key
-            try:
-                self.copy = verify_and_copy_adapter(
-                    self.settings.registry,
-                    department_id=UUID(target["department_id"]),
-                    adapter_id=UUID(target["adapter_id"]),
-                    adapter_version=target["adapter_version"],
-                    registry_publication_attempt_id=UUID(target["registry_publication_attempt_id"]),
-                    registry_attempt_number=target["registry_attempt_number"],
-                    expected_manifest_sha256=target["registry_manifest_sha256"],
-                    expected_config_sha256=target["adapter_config_sha256"],
-                    expected_config_byte_size=target["adapter_config_byte_size"],
-                    expected_model_sha256=target["adapter_model_sha256"],
-                    expected_model_byte_size=target["adapter_model_byte_size"],
-                )
-                if self.settings.provider == "real":
-                    self.tokenizer = _load_tokenizer(self.settings.model_cache)
-                    self.model = load_adapter_model(
-                        self.copy,
-                        self.settings.data_dir,
-                        tokenizer_limit=self.tokenizer.model_max_length,
-                    )
-            except AdapterRuntimeError as error:
-                self.close()
-                raise ChildError(error.code) from error
-            except Exception as error:
-                self.close()
-                raise ChildError("adapter_load_failed") from error
+        key = _session_key(target)
+        if key != self.key or self.loaded_target_fingerprint != target["target_fingerprint"]:
+            raise ChildError("adapter_runtime_target_mismatch")
         question, evidence = _validate_generation(payload)
         if self.settings.provider == "fake":
             label = evidence[0]["source_id"]
@@ -155,6 +179,7 @@ class Session:
             "status": result.status,
             "answer": result.answer,
             "citations": list(result.citations),
+            "served_target_fingerprint": self.loaded_target_fingerprint,
         }
 
     def _real_generate(self, question: str, evidence: list[dict[str, str]]) -> dict[str, Any]:
@@ -318,11 +343,15 @@ def _validate_generation(value: dict[str, Any]) -> tuple[str, list[dict[str, str
         raise ChildError("adapter_runtime_target_mismatch") from error
 
 
-def _load_tokenizer(model_cache: Path):
+def _session_key(target: dict[str, Any]) -> tuple[object, ...]:
+    return tuple(target[field] for field in _TARGET_FIELDS) + (target["target_fingerprint"],)
+
+
+def _load_tokenizer(generation_path: Path):
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(
-        str(model_cache), local_files_only=True, trust_remote_code=False
+        str(generation_path), local_files_only=True, trust_remote_code=False
     )
 
 
@@ -365,11 +394,15 @@ def main() -> int:
                 if (
                     not isinstance(request, dict)
                     or set(request) != {"operation", "target"}
-                    or request["operation"] != "generate"
                     or not isinstance(request["target"], dict)
+                    or request["operation"] not in {"load_target", "generate"}
                 ):
                     raise ChildError("adapter_runtime_target_mismatch")
-                response = session.generate(request["target"])
+                response = (
+                    session.load_target(request["target"])
+                    if request["operation"] == "load_target"
+                    else session.generate(request["target"])
+                )
                 _write_frame(sys.stdout.buffer, response, 256 * 1024)
             except ChildError as error:
                 _write_frame(sys.stdout.buffer, {"error": error.code}, 4096)

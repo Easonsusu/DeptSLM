@@ -91,21 +91,41 @@ The fixed model contract is `Qwen/Qwen3-0.6B` at revision
 `trust_remote_code=false`, safetensors only, the existing Phase 7 tokenizer and
 context contract, and the existing sampling values (thinking disabled, 512
 new-token reserve, temperature 0.7, top-p 0.8, top-k 20, min-p 0.0). PEFT
-`0.18.1`, Transformers `4.55.0`, and safetensors `0.7.0` are pinned. Fake mode
-is test-only and still runs target/static verification; normal workers never
-download weights.
+`0.18.1`, Transformers `4.55.0`, and safetensors `0.7.0` are pinned. The
+runtime calls `validate_generation_model_store(data_dir)` once per target load
+and passes that exact returned `generation.path` to both the tokenizer and base
+model loaders; the `model_cache` root is never treated as a model directory.
+Fake mode is test-only and still runs the same target/static verification and
+target-ready transition; normal workers never download weights.
 
 ## Process and cache isolation
 
-One production child serves one target at a time. The session key includes
-department, adapter/version, base revision, registry publication/attempt,
-config/model digest and size, and the target fingerprint. An exact-key request
-may reuse the child. Any target change retires and reaps the old process group,
-removes its private copy, and starts a clean child. A failed replacement does
-not keep the prior adapter serving. IPC is bounded and framed, descriptors are
-closed, the child has an exact secret-free environment, and timeout,
-cancellation, disconnect, protocol, load, generation, and shutdown paths use
-SIGTERM/SIGKILL escalation plus guaranteed reaping.
+One production child serves one target at a time. Startup reaches only
+`process_ready`; a separate supervised `load_target` operation must complete
+registry verification, private-copy verification, model-store validation,
+tokenizer/base/PEFT loading, and context checks before the child records
+`target_ready(loaded_target_fingerprint)`. Only that loaded session state may
+produce `served_target_fingerprint`; request bytes cannot manufacture it. The
+fixed clocks are 30 seconds for process/IPC startup, 300 seconds for target
+loading, and 120 seconds for generation. An exact-key request may reuse the
+child. Any change to department, adapter, deployment, publication, execution
+scope, digest, size, or other target authority retires and reaps the old
+process group before a clean replacement is loaded. A failed replacement does
+not keep the prior adapter serving and leaves no orphan child or private copy.
+IPC is bounded and framed, descriptors are closed, the child has an exact
+secret-free environment, and timeout, cancellation, disconnect, protocol,
+load, generation, and shutdown paths use SIGTERM/SIGKILL escalation plus
+guaranteed reaping.
+
+## Migration downgrade compatibility
+
+Revision `0017_phase12_adapter_runtime_routing` extends the content-free
+`rag_answer_runs.error_code` allowlist. Its downgrade maps
+`adapter_runtime_timeout` to `runtime_timeout`; `adapter_runtime_unavailable`,
+`adapter_load_failed`, `adapter_runtime_target_mismatch`, and
+`deployment_authority_changed` to `runtime_unavailable` before recreating the
+Phase 7 constraint. The mapping is deterministic and data-safe for populated
+databases; no follow-up migration is required.
 
 ## Deployment changes and purge
 

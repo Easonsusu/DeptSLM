@@ -23,7 +23,6 @@ from app.adapter_contract import (
 )
 from app.adapter_registry_domain import canonical_json_bytes, parse_registry_manifest
 from app.generation_contract import validate_generation_context_contract
-from app.model_store import validate_generation_model_store
 
 
 class AdapterRuntimeError(RuntimeError):
@@ -265,16 +264,21 @@ def verify_and_copy_adapter(
                     pass
 
 
-def load_adapter_model(copy: VerifiedAdapterCopy, data_dir: Path, *, tokenizer_limit=None):
-    """Load the fixed local base plus the verified private adapter only."""
+def load_adapter_model(copy: VerifiedAdapterCopy, generation_path: Path, *, tokenizer_limit=None):
+    """Load the fixed local base plus the verified private adapter only.
+
+    ``generation_path`` must be the exact directory returned by
+    ``validate_generation_model_store``.  Keeping that validated path as an
+    explicit argument prevents the tokenizer and base model from accidentally
+    resolving different entries beneath the shared model-cache root.
+    """
 
     try:
         from peft import PeftModel
         from transformers import AutoModelForCausalLM
 
-        generation = validate_generation_model_store(data_dir)
         base = AutoModelForCausalLM.from_pretrained(
-            str(generation.path),
+            str(generation_path),
             local_files_only=True,
             trust_remote_code=False,
             use_safetensors=True,
@@ -300,7 +304,9 @@ def _private_copy_directory() -> Path:
         or stat.S_IMODE(metadata.st_mode) != 0o700
     ):
         raise AdapterRuntimeError("adapter_authority_changed")
-    path = Path(tempfile.mkdtemp(prefix="target-", dir=scratch))
+    # Include the child PID so the supervisor can remove a private copy even
+    # when SIGKILL interrupts the child before its ``finally`` cleanup runs.
+    path = Path(tempfile.mkdtemp(prefix=f"target-{os.getpid()}-", dir=scratch))
     os.chmod(path, 0o700)
     return path
 
