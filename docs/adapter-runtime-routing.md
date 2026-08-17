@@ -153,11 +153,13 @@ after the deployment pointer moves away and rollback retention is released. A
 terminal answered, insufficient-information, or failed run no longer blocks by
 itself. Phase 12.1E-C remains metadata-only lifecycle release.
 
-An administrator may durably register the exact E-B purge authority while the
-adapter is still the deployment target; that reservation changes the adapter
-out of admission authority but does not delete bytes. Each move and finalization
-transaction rechecks the deployment pointer, so byte-retention work remains
-blocked until deployment has moved away.
+The exact current deployment is an E-B registration-time fence: an
+administrator cannot register purge authority for the deployed adapter and
+version. Every existing purge operation also revalidates its immutable
+original target version before registry-byte movement, and finalization checks
+that version again. Once deployment has moved away and rollback retention and
+other byte-retention references are released, a running Phase 12.4 request is
+the remaining E-B fence. No automatic fallback or rollback is introduced.
 
 PostgreSQL, external files, and runtime processes are not one atomic system.
 An already in-flight request cannot be retroactively fenced by PostgreSQL, and

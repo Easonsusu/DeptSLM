@@ -22,7 +22,14 @@ from sqlalchemy.orm import Session, sessionmaker
 from test_phase7_postgres import _client, _headers, _hit, _seed
 
 from alembic import command
-from app.adapter_purge import _finalize_operation, _mark_operation_deleting, _register_or_resume
+from app.adapter_maintenance_artifacts import AdapterPurgeArtifactStore
+from app.adapter_purge import (
+    _execute_item,
+    _finalize_operation,
+    _mark_operation_deleting,
+    _register_or_resume,
+    purge_adapter_artifacts,
+)
 from app.database import create_database_engine
 from app.main import app
 from app.models import (
@@ -52,7 +59,7 @@ from app.models import (
     RagAnswerRuntimeSnapshot,
     UserIdentity,
 )
-from app.rag_answer_services import _start_run
+from app.rag_answer_services import _fail_run, _start_run
 from app.rag_runtime_router import RoutedRagRuntime
 from app.services import ServiceError
 from app.vector_index_domain import (
@@ -708,7 +715,77 @@ def _run_ordered_race(
     return outcomes, errors
 
 
-def _assert_successful_race(outcomes: dict[str, object], errors: dict[str, BaseException]) -> None:
+def _run_terminalization_registration_race(
+    engine,
+    terminalize: Callable[[], object],
+    register: Callable[[], object],
+    *,
+    first: str,
+) -> tuple[dict[str, object], dict[str, BaseException]]:
+    """Order real terminalization and E-B registration at the runtime fence."""
+
+    if first not in {"terminalization", "registration"}:  # pragma: no cover
+        raise AssertionError(first)
+    runtime_checked = threading.Event()
+    terminalized = threading.Event()
+    outcomes: dict[str, object] = {}
+    errors: dict[str, BaseException] = {}
+
+    def runtime_fence_observed(_connection, _cursor, statement, _parameters, _context, _many):
+        normalized = " ".join(statement.lower().split())
+        if "rag_answer_runtime_snapshots" in normalized and "rag_answer_runs" in normalized:
+            runtime_checked.set()
+
+    def invoke(label: str, function: Callable[[], object]) -> None:
+        try:
+            outcomes[label] = function()
+        except BaseException as error:  # noqa: BLE001 - surfaced by the test below
+            errors[label] = error
+
+    def terminalization_call() -> object:
+        if first == "registration":
+            _wait_for(runtime_checked, "registration runtime-fence query")
+        result = terminalize()
+        terminalized.set()
+        return result
+
+    def registration_call() -> object:
+        if first == "terminalization":
+            _wait_for(terminalized, "terminalization commit")
+        return register()
+
+    event.listen(engine, "after_cursor_execute", runtime_fence_observed)
+    threads = [
+        threading.Thread(
+            target=invoke,
+            args=("terminalization", terminalization_call),
+            name="phase12-4-terminalization",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=invoke,
+            args=("registration", registration_call),
+            name="phase12-4-registration",
+            daemon=True,
+        ),
+    ]
+    try:
+        with _bounded_race_database(engine):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(_RACE_WAIT_SECONDS + 5)
+    finally:
+        event.remove(engine, "after_cursor_execute", runtime_fence_observed)
+    assert all(not thread.is_alive() for thread in threads), "race worker remained alive"
+    return outcomes, errors
+
+
+def _assert_successful_race(
+    outcomes: dict[str, object],
+    errors: dict[str, BaseException],
+    expected_labels: tuple[str, ...] = ("admission", "governance"),
+) -> None:
     if errors:
         details = "; ".join(
             f"{label}: {type(error).__name__}: {error}" for label, error in errors.items()
@@ -716,7 +793,7 @@ def _assert_successful_race(outcomes: dict[str, object], errors: dict[str, BaseE
         pytest.fail(
             f"PostgreSQL race failed; deadlocks/timeouts are not business outcomes: {details}"
         )
-    assert set(outcomes) == {"admission", "governance"}
+    assert set(outcomes) == set(expected_labels)
 
 
 def _admission_counts(session: Session, department_id) -> dict[str, int]:
@@ -823,6 +900,16 @@ def _assert_one_admission(session: Session, department_id) -> RagAnswerRuntimeSn
     snapshot = session.query(RagAnswerRuntimeSnapshot).filter_by(run_id=run.id).one()
     assert run.status == "running"
     return snapshot
+
+
+def _filesystem_snapshot(root: Path) -> dict[str, bytes]:
+    if not root.exists():
+        return {}
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
 
 
 def _assert_deployment_operation_succeeded(session: Session, operation_id, event_type: str) -> None:
@@ -989,25 +1076,76 @@ def test_concurrent_admission_on_a_vs_a_to_base_rollback(
 
 
 @pytest.mark.parametrize("winner", ["admission", "registration"])
-def test_concurrent_admission_on_a_vs_eb_registration(
-    engine, factory, tmp_path: Path, winner: str
+def test_concurrent_admission_on_current_a_vs_eb_registration(
+    engine, factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winner: str
 ) -> None:
-    """Admission and E-B registration serialize before either can cross authority."""
+    """Current A/V blocks E-B registration in either department-lock order."""
 
     authority, operation = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
     assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    adapter_id = operation["target_adapter_id"]
+    registry_root = (
+        tmp_path / "adapters" / "registry" / str(authority.department_id) / str(adapter_id)
+    )
+    tombstone_root = (
+        tmp_path
+        / "adapters"
+        / ".purge-deleting"
+        / "registry_final"
+        / str(authority.department_id)
+        / str(adapter_id)
+    )
+    before_registry = _filesystem_snapshot(registry_root)
+    before_tombstone = _filesystem_snapshot(tombstone_root)
+    with factory() as session:
+        before_adapter = session.get(Adapter, adapter_id)
+        before_pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
+            )
+        )
+        assert before_adapter is not None and before_pointer is not None
+        before_adapter_state = (before_adapter.status, before_adapter.version)
+        before_pointer_state = (
+            before_pointer.id,
+            before_pointer.target_kind,
+            before_pointer.adapter_id,
+            before_pointer.adapter_version,
+            before_pointer.deployment_version,
+            before_pointer.version,
+        )
+        before_events = (
+            session.query(AdapterDeploymentEvent)
+            .filter_by(department_id=authority.department_id)
+            .count()
+        )
+
+    moved = False
+    original_move = AdapterPurgeArtifactStore.move_verified_surface_to_tombstone
+
+    def forbidden_move(*args, **kwargs):
+        nonlocal moved
+        moved = True
+        return original_move(*args, **kwargs)
+
+    monkeypatch.setattr(
+        AdapterPurgeArtifactStore, "move_verified_surface_to_tombstone", forbidden_move
+    )
 
     def registration():
-        return _register_or_resume(
-            factory,
-            department_id=authority.department_id,
-            adapter_id=operation["target_adapter_id"],
-            actor_issuer=authority.issuer,
-            actor_subject=authority.subject,
-            limit=1,
-            item_limit=2,
-            apply=True,
-        )
+        try:
+            return _register_or_resume(
+                factory,
+                department_id=authority.department_id,
+                adapter_id=adapter_id,
+                actor_issuer=authority.issuer,
+                actor_subject=authority.subject,
+                limit=1,
+                item_limit=2,
+                apply=True,
+            )
+        except ServiceError as error:
+            return error
 
     def admission():
         return _start_snapshot(factory, authority)
@@ -1015,54 +1153,400 @@ def test_concurrent_admission_on_a_vs_eb_registration(
     first = "admission" if winner == "admission" else "governance"
     with _bounded_race_database(engine):
         outcomes, errors = _run_ordered_race(engine, admission, registration, winner=first)
+    _assert_successful_race(outcomes, errors)
+    assert isinstance(outcomes["governance"], ServiceError)
+    assert outcomes["governance"].status_code == 409
+    assert str(outcomes["governance"]) == (
+        "Adapter purge conflicts with current adapter deployment"
+    )
+    assert not moved
     with factory() as session:
         pointer = session.scalar(
             select(DepartmentAdapterDeployment).where(
                 DepartmentAdapterDeployment.department_id == authority.department_id
             )
         )
-        assert pointer is not None
-        assert pointer.target_kind == "adapter"
-        counts = _admission_counts(session, authority.department_id)
-        purge_count = (
+        adapter = session.get(Adapter, adapter_id)
+        assert adapter is not None and pointer is not None
+        assert (adapter.status, adapter.version) == before_adapter_state
+        assert (
+            pointer.id,
+            pointer.target_kind,
+            pointer.adapter_id,
+            pointer.adapter_version,
+            pointer.deployment_version,
+            pointer.version,
+        ) == before_pointer_state
+        assert (
             session.query(AdapterPurgeOperation)
+            .filter_by(department_id=authority.department_id, adapter_id=adapter_id)
+            .count()
+            == 0
+        )
+        assert (
+            session.query(AdapterPurgeReservation)
+            .filter_by(department_id=authority.department_id, adapter_id=adapter_id)
+            .count()
+            == 0
+        )
+        assert (
+            session.query(AdapterPurgeItem)
+            .filter_by(department_id=authority.department_id, adapter_id=adapter_id)
+            .count()
+            == 0
+        )
+        assert (
+            session.query(AdapterDeploymentEvent)
+            .filter_by(department_id=authority.department_id)
+            .count()
+            == before_events
+        )
+        assert (
+            session.query(PersistentAuditEvent)
             .filter_by(
                 department_id=authority.department_id,
-                adapter_id=operation["target_adapter_id"],
+                action="adapter.purge",
             )
             .count()
+            == 0
         )
-        if winner == "admission":
-            assert set(outcomes) == {"admission"}
-            assert set(errors) == {"governance"}
-            assert isinstance(errors.get("governance"), ServiceError)
-            assert str(errors["governance"]) == (
-                "Adapter purge conflicts with active RAG runtime snapshot"
-            )
-            assert counts == {"runs": 1, "snapshots": 1, "start_audits": 1}
+        if "admission" in outcomes:
             snapshot = _assert_one_admission(session, authority.department_id)
             _assert_adapter_snapshot_matches_pointer(session, snapshot, pointer)
-            assert purge_count == 0
-        else:
-            assert set(outcomes) == {"governance"}
-            assert set(errors) == {"admission"}
-            assert isinstance(errors.get("admission"), ServiceError)
-            assert counts == {"runs": 0, "snapshots": 0, "start_audits": 0}
-            assert purge_count == 1
-            registered_operation_id, registered_item_ids = outcomes["governance"]
-            assert registered_operation_id is not None and len(registered_item_ids) == 2
-            purge = (
-                session.query(AdapterPurgeOperation)
-                .filter_by(
-                    department_id=authority.department_id,
-                    adapter_id=operation["target_adapter_id"],
-                )
-                .one()
+    assert _filesystem_snapshot(registry_root) == before_registry
+    assert _filesystem_snapshot(tombstone_root) == before_tombstone
+
+
+def test_register_purge_current_deployment_fails_without_mutation(
+    factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real E-B entry point rejects the exact current adapter/version."""
+
+    authority, operation = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    adapter_id = operation["target_adapter_id"]
+    registry_root = (
+        tmp_path / "adapters" / "registry" / str(authority.department_id) / str(adapter_id)
+    )
+    tombstone_root = (
+        tmp_path
+        / "adapters"
+        / ".purge-deleting"
+        / "registry_final"
+        / str(authority.department_id)
+        / str(adapter_id)
+    )
+    before_registry = _filesystem_snapshot(registry_root)
+    before_tombstone = _filesystem_snapshot(tombstone_root)
+    with factory() as session:
+        adapter = session.get(Adapter, adapter_id)
+        pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
             )
-            assert purge.status == "registered"
-            adapter = session.get(Adapter, operation["target_adapter_id"])
+        )
+        assert adapter is not None and pointer is not None
+        adapter_state = (adapter.status, adapter.version)
+        pointer_state = (
+            pointer.id,
+            pointer.adapter_id,
+            pointer.adapter_version,
+            pointer.deployment_version,
+            pointer.version,
+        )
+        event_count = (
+            session.query(AdapterDeploymentEvent)
+            .filter_by(department_id=authority.department_id)
+            .count()
+        )
+
+    moved = False
+
+    def forbidden_move(*_args, **_kwargs):
+        nonlocal moved
+        moved = True
+        raise AssertionError("current deployment reached byte movement")
+
+    monkeypatch.setattr(
+        AdapterPurgeArtifactStore, "move_verified_surface_to_tombstone", forbidden_move
+    )
+    with pytest.raises(ServiceError, match="current adapter deployment") as error:
+        purge_adapter_artifacts(
+            factory,
+            data_dir=tmp_path,
+            department_id=authority.department_id,
+            adapter_id=adapter_id,
+            actor_issuer=authority.issuer,
+            actor_subject=authority.subject,
+            apply=True,
+        )
+    assert error.value.status_code == 409
+    assert not moved
+    with factory() as session:
+        adapter = session.get(Adapter, adapter_id)
+        pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
+            )
+        )
+        assert adapter is not None and pointer is not None
+        assert (adapter.status, adapter.version) == adapter_state
+        assert (
+            pointer.id,
+            pointer.adapter_id,
+            pointer.adapter_version,
+            pointer.deployment_version,
+            pointer.version,
+        ) == pointer_state
+        assert (
+            session.query(AdapterPurgeOperation)
+            .filter_by(department_id=authority.department_id, adapter_id=adapter_id)
+            .count()
+            == 0
+        )
+        assert (
+            session.query(AdapterPurgeReservation)
+            .filter_by(department_id=authority.department_id, adapter_id=adapter_id)
+            .count()
+            == 0
+        )
+        assert (
+            session.query(AdapterPurgeItem)
+            .filter_by(department_id=authority.department_id, adapter_id=adapter_id)
+            .count()
+            == 0
+        )
+        assert (
+            session.query(AdapterDeploymentEvent)
+            .filter_by(department_id=authority.department_id)
+            .count()
+            == event_count
+        )
+        assert (
+            session.query(PersistentAuditEvent)
+            .filter_by(
+                department_id=authority.department_id,
+                action="adapter.purge",
+            )
+            .count()
+            == 0
+        )
+    assert _filesystem_snapshot(registry_root) == before_registry
+    assert _filesystem_snapshot(tombstone_root) == before_tombstone
+
+
+def test_legacy_purge_current_deployment_is_fenced_before_registry_move(
+    factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An inconsistent durable operation cannot move current A/V registry bytes."""
+
+    authority, operation = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    adapter_id = operation["target_adapter_id"]
+    adapter_version = operation["target_adapter_version"]
+    _rollback_adapter_to_base_and_release_retention(
+        factory,
+        authority,
+        tmp_path,
+        adapter_id,
+        adapter_version,
+    )
+    operation_id, item_ids = _register_or_resume(
+        factory,
+        department_id=authority.department_id,
+        adapter_id=adapter_id,
+        actor_issuer=authority.issuer,
+        actor_subject=authority.subject,
+        limit=1,
+        item_limit=2,
+        apply=True,
+    )
+    assert operation_id is not None and len(item_ids) == 2
+    registry_root = (
+        tmp_path / "adapters" / "registry" / str(authority.department_id) / str(adapter_id)
+    )
+    before_registry = _filesystem_snapshot(registry_root)
+    with factory.begin() as session:
+        pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
+            )
+        )
+        purge = session.get(AdapterPurgeOperation, operation_id)
+        assert pointer is not None and purge is not None
+        # This is deliberately test-seeded impossible state: a legacy purge
+        # operation exists while its immutable target is current again.
+        pointer.target_kind = "adapter"
+        pointer.adapter_id = adapter_id
+        pointer.adapter_version = adapter_version
+        pointer.review_id = operation["target_review_id"]
+        pointer.review_version = operation["target_review_version"]
+        pointer.evaluation_id = operation["target_evaluation_id"]
+        pointer.evaluation_version = operation["target_evaluation_version"]
+        pointer.suite_id = operation["suite_id"]
+        pointer.deployment_version += 1
+        pointer.version += 1
+
+    moved = False
+
+    def forbidden_move(*_args, **_kwargs):
+        nonlocal moved
+        moved = True
+        raise AssertionError("legacy current deployment reached byte movement")
+
+    monkeypatch.setattr(
+        AdapterPurgeArtifactStore, "move_verified_surface_to_tombstone", forbidden_move
+    )
+    with factory() as session:
+        registry_item_id = session.scalar(
+            select(AdapterPurgeItem.id).where(
+                AdapterPurgeItem.operation_id == operation_id,
+                AdapterPurgeItem.department_id == authority.department_id,
+                AdapterPurgeItem.surface_type == "registry_final",
+            )
+        )
+    assert registry_item_id is not None
+    _mark_operation_deleting(factory, operation_id, authority.department_id)
+    with pytest.raises(ServiceError, match="current adapter deployment"):
+        _execute_item(
+            factory,
+            data_dir=tmp_path,
+            operation_id=operation_id,
+            item_id=registry_item_id,
+            department_id=authority.department_id,
+            actor_issuer=authority.issuer,
+            actor_subject=authority.subject,
+        )
+    assert not moved
+    with factory() as session:
+        pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
+            )
+        )
+        adapter = session.get(Adapter, adapter_id)
+        purge = session.get(AdapterPurgeOperation, operation_id)
+        assert pointer is not None and adapter is not None and purge is not None
+        assert pointer.target_kind == "adapter"
+        assert pointer.adapter_id == adapter_id
+        assert pointer.adapter_version == adapter_version
+        assert adapter.status == "purge_pending"
+        assert purge.status == "deleting"
+        assert (
+            session.query(PersistentAuditEvent)
+            .filter_by(
+                department_id=authority.department_id,
+                action="adapter.purge",
+                resource_id=str(operation_id),
+            )
+            .count()
+            == 0
+        )
+    assert _filesystem_snapshot(registry_root) == before_registry
+
+
+@pytest.mark.parametrize("first", ["registration", "terminalization"])
+def test_terminalization_vs_eb_registration_after_deployment_move(
+    engine, factory, tmp_path: Path, first: str
+) -> None:
+    """After deployment moves away, the running request is the final E-B fence."""
+
+    authority, operation = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    started = _start_snapshot(factory, authority)
+    adapter_id = operation["target_adapter_id"]
+    _rollback_adapter_to_base_and_release_retention(
+        factory,
+        authority,
+        tmp_path,
+        adapter_id,
+        operation["target_adapter_version"],
+    )
+
+    def terminalize():
+        _fail_run(
+            factory,
+            started.id,
+            phase12_3_tests._scope(authority).department,
+            "generation_failed",
+            candidate_count=0,
+            authorized_count=0,
+        )
+        with factory() as session:
+            run = session.get(RagAnswerRun, started.id)
+            assert run is not None and run.status == "failed"
+        return "terminalized"
+
+    def register():
+        try:
+            return _register_or_resume(
+                factory,
+                department_id=authority.department_id,
+                adapter_id=adapter_id,
+                actor_issuer=authority.issuer,
+                actor_subject=authority.subject,
+                limit=1,
+                item_limit=2,
+                apply=True,
+            )
+        except ServiceError as error:
+            return error
+
+    outcomes, errors = _run_terminalization_registration_race(
+        engine,
+        terminalize,
+        register,
+        first=first,
+    )
+    _assert_successful_race(outcomes, errors, ("terminalization", "registration"))
+    with factory() as session:
+        run = session.get(RagAnswerRun, started.id)
+        pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
+            )
+        )
+        assert run is not None and pointer is not None
+        assert pointer.target_kind == "base"
+        purge_count = (
+            session.query(AdapterPurgeOperation)
+            .filter_by(department_id=authority.department_id, adapter_id=adapter_id)
+            .count()
+        )
+        reservation_count = (
+            session.query(AdapterPurgeReservation)
+            .filter_by(department_id=authority.department_id, adapter_id=adapter_id)
+            .count()
+        )
+        if first == "registration":
+            assert isinstance(outcomes["registration"], ServiceError)
+            assert outcomes["registration"].status_code == 409
+            assert str(outcomes["registration"]) == (
+                "Adapter purge conflicts with active RAG runtime snapshot"
+            )
+            assert run.status == "failed"
+            assert purge_count == 0
+            assert reservation_count == 0
+        else:
+            registered_operation_id, item_ids = outcomes["registration"]
+            assert registered_operation_id is not None and len(item_ids) == 2
+            assert not isinstance(outcomes["registration"], ServiceError)
+            assert run.status == "failed"
+            assert purge_count == 1
+            assert reservation_count == 2
+            purge = session.get(AdapterPurgeOperation, registered_operation_id)
+            adapter = session.get(Adapter, adapter_id)
+            assert purge is not None and purge.status == "registered"
             assert adapter is not None and adapter.status == "purge_pending"
-            assert pointer.target_kind == "adapter"
+        assert (
+            session.query(PersistentAuditEvent)
+            .filter_by(
+                department_id=authority.department_id,
+                action="adapter.purge",
+            )
+            .count()
+            == 0
+        )
 
 
 def test_inflight_base_snapshot_stays_base_after_adapter_promotion(factory, tmp_path: Path) -> None:
