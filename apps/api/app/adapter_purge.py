@@ -230,7 +230,13 @@ def _authority_snapshot(authority: _Authority) -> dict[str, object]:
     }
 
 
-def _load_authority(session: Session, department_id: UUID, adapter_id: UUID) -> _Authority:
+def _load_authority(
+    session: Session,
+    department_id: UUID,
+    adapter_id: UUID,
+    *,
+    registration: bool = False,
+) -> _Authority:
     adapter = session.execute(
         select(Adapter)
         .where(Adapter.id == adapter_id, Adapter.department_id == department_id)
@@ -271,11 +277,22 @@ def _load_authority(session: Session, department_id: UUID, adapter_id: UUID) -> 
     if source is None or source_attempt is None or registry_attempt is None:
         raise ServiceError(409, "Adapter purge authority is unavailable")
     authority = _Authority(adapter, source, source_attempt, registry_attempt)
-    _assert_eligible(session, authority, department_id)
+    _assert_eligible(
+        session,
+        authority,
+        department_id,
+        allow_active_deployment=registration,
+    )
     return authority
 
 
-def _assert_eligible(session: Session, authority: _Authority, department_id: UUID) -> None:
+def _assert_eligible(
+    session: Session,
+    authority: _Authority,
+    department_id: UUID,
+    *,
+    allow_active_deployment: bool = False,
+) -> None:
     adapter = authority.adapter
     source = authority.source
     source_attempt = authority.source_attempt
@@ -319,7 +336,12 @@ def _assert_eligible(session: Session, authority: _Authority, department_id: UUI
     )
     if active_reconcile is not None:
         raise ServiceError(409, "Adapter purge conflicts with reconciliation")
-    _assert_governance_fences(session, adapter, department_id)
+    _assert_governance_fences(
+        session,
+        adapter,
+        department_id,
+        check_active_deployment=not allow_active_deployment,
+    )
     if adapter.status == "validated" and source.status == "consumed":
         active_purge = session.scalar(
             select(AdapterPurgeOperation.id).where(
@@ -338,6 +360,7 @@ def _assert_governance_fences(
     department_id: UUID,
     *,
     target_adapter_version: int | None = None,
+    check_active_deployment: bool = True,
 ) -> None:
     """Keep E-B registration and finalization fenced by governance metadata."""
 
@@ -362,16 +385,17 @@ def _assert_governance_fences(
     )
     if active_review is not None:
         raise ServiceError(409, "Adapter purge conflicts with pending review")
-    deployment = session.scalar(
-        select(DepartmentAdapterDeployment.id).where(
-            DepartmentAdapterDeployment.department_id == department_id,
-            DepartmentAdapterDeployment.target_kind == "adapter",
-            DepartmentAdapterDeployment.adapter_id == adapter.id,
-            DepartmentAdapterDeployment.adapter_version == adapter.version,
+    if check_active_deployment:
+        deployment = session.scalar(
+            select(DepartmentAdapterDeployment.id).where(
+                DepartmentAdapterDeployment.department_id == department_id,
+                DepartmentAdapterDeployment.target_kind == "adapter",
+                DepartmentAdapterDeployment.adapter_id == adapter.id,
+                DepartmentAdapterDeployment.adapter_version == adapter.version,
+            )
         )
-    )
-    if deployment is not None:
-        raise ServiceError(409, "Adapter purge conflicts with active deployment")
+        if deployment is not None:
+            raise ServiceError(409, "Adapter purge conflicts with active deployment")
     retention = session.scalar(
         select(AdapterRollbackRetention.id).where(
             AdapterRollbackRetention.department_id == department_id,
@@ -500,7 +524,15 @@ def _register_or_resume(
                 raise ServiceError(404, "Adapter not found")
             if selected.status == "purged":
                 return None, ()
-            authority = _load_authority(session, department_id, adapter_id)
+            # Registration may reserve the exact authority while it remains
+            # deployed; move/finalization paths reapply the deployment fence
+            # before any byte-retention mutation.
+            authority = _load_authority(
+                session,
+                department_id,
+                adapter_id,
+                registration=apply,
+            )
             if not apply:
                 return None, (uuid4(), uuid4())
             if item_limit < 2:

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
+from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -14,7 +17,7 @@ import pytest
 import test_phase7_postgres as phase7_tests
 import test_phase12_3_postgres as phase12_3_tests
 from alembic.config import Config
-from sqlalchemy import inspect, select, text
+from sqlalchemy import event, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 from test_phase7_postgres import _client, _headers, _hit, _seed
 
@@ -24,6 +27,8 @@ from app.database import create_database_engine
 from app.main import app
 from app.models import (
     Adapter,
+    AdapterDeploymentEvent,
+    AdapterDeploymentOperation,
     AdapterEvaluationEvidence,
     AdapterEvaluationRun,
     AdapterImportAttempt,
@@ -530,6 +535,534 @@ def _rollback_adapter_to_base_and_release_retention(
             expected_retention_version=retention_version,
         )
         assert released["status"] == "released"
+
+
+_RACE_WAIT_SECONDS = 20
+
+
+@contextmanager
+def _bounded_race_database(engine):
+    """Apply bounded PostgreSQL lock/query clocks to every race connection."""
+
+    def on_checkout(dbapi_connection, _connection_record, _connection_proxy):
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SET lock_timeout = '3s'")
+            cursor.execute("SET statement_timeout = '15s'")
+        finally:
+            cursor.close()
+
+    event.listen(engine, "checkout", on_checkout)
+    try:
+        yield
+    finally:
+        event.remove(engine, "checkout", on_checkout)
+
+
+class _DepartmentLockHooks:
+    """Test-only SQL hooks for deterministic department-lock serialization."""
+
+    def __init__(self, engine) -> None:
+        self._local = threading.local()
+        self._engine = engine
+        self._before: dict[str, Callable[[], None]] = {}
+        self._after: dict[str, Callable[[], None]] = {}
+        self._before_seen: set[str] = set()
+        self._after_seen: set[str] = set()
+        self._guard = threading.Lock()
+
+    def install(self) -> None:
+        event.listen(self._engine, "before_cursor_execute", self._before_cursor_execute)
+        event.listen(self._engine, "after_cursor_execute", self._after_cursor_execute)
+
+    def uninstall(self) -> None:
+        event.remove(self._engine, "before_cursor_execute", self._before_cursor_execute)
+        event.remove(self._engine, "after_cursor_execute", self._after_cursor_execute)
+
+    def participant(self, value: str) -> None:
+        self._local.participant = value
+
+    def clear_participant(self) -> None:
+        self._local.participant = None
+
+    def before(self, participant: str, callback: Callable[[], None]) -> None:
+        self._before[participant] = callback
+
+    def after(self, participant: str, callback: Callable[[], None]) -> None:
+        self._after[participant] = callback
+
+    @staticmethod
+    def _is_department_lock(statement: str) -> bool:
+        normalized = " ".join(statement.lower().split())
+        return "from departments" in normalized and "for update" in normalized
+
+    def _dispatch(
+        self,
+        callbacks: dict[str, Callable[[], None]],
+        seen: set[str],
+    ) -> None:
+        participant = getattr(self._local, "participant", None)
+        if participant is None or participant not in callbacks:
+            return
+        with self._guard:
+            if participant in seen:
+                return
+            seen.add(participant)
+        callbacks[participant]()
+
+    def _before_cursor_execute(
+        self, _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        if self._is_department_lock(statement):
+            self._dispatch(self._before, self._before_seen)
+
+    def _after_cursor_execute(
+        self, _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        if self._is_department_lock(statement):
+            self._dispatch(self._after, self._after_seen)
+
+
+def _wait_for(event_value: threading.Event, label: str) -> None:
+    if not event_value.wait(_RACE_WAIT_SECONDS):
+        raise AssertionError(f"timed out waiting for {label}")
+
+
+def _run_race_worker(
+    hooks: _DepartmentLockHooks,
+    outcomes: dict[str, object],
+    errors: dict[str, BaseException],
+    label: str,
+    function: Callable[[], object],
+) -> threading.Thread:
+    def run() -> None:
+        hooks.participant(label)
+        try:
+            outcomes[label] = function()
+        except BaseException as error:  # noqa: BLE001 - surfaced by the test below
+            errors[label] = error
+        finally:
+            hooks.clear_participant()
+
+    thread = threading.Thread(target=run, name=f"phase12-4-{label}", daemon=True)
+    thread.start()
+    return thread
+
+
+def _run_ordered_race(
+    engine,
+    admission: Callable[[], object],
+    governance: Callable[[], object],
+    *,
+    winner: str,
+) -> tuple[dict[str, object], dict[str, BaseException]]:
+    """Run two real transactions with one deterministic lock winner.
+
+    The SQLAlchemy after-cursor hook fires while the department row lock is
+    held. The losing participant's before-cursor hook then blocks its own
+    department-lock query until the winner commits. This exercises the
+    department-first order used by admission, governance workers, and E-B
+    registration without sleeps or direct deployment-row mutation.
+    """
+
+    hooks = _DepartmentLockHooks(engine)
+    outcomes: dict[str, object] = {}
+    errors: dict[str, BaseException] = {}
+    admission_locked = threading.Event()
+    admission_attempted = threading.Event()
+    governance_locked = threading.Event()
+    governance_attempted = threading.Event()
+
+    if winner == "admission":
+        hooks.after(
+            "admission",
+            lambda: (admission_locked.set(), _wait_for(governance_attempted, "governance attempt")),
+        )
+        hooks.before("governance", governance_attempted.set)
+    elif winner == "governance":
+        hooks.after(
+            "governance",
+            lambda: (governance_locked.set(), _wait_for(admission_attempted, "admission attempt")),
+        )
+        hooks.before("admission", admission_attempted.set)
+    else:  # pragma: no cover - closed test parameter
+        raise AssertionError(winner)
+
+    hooks.install()
+    threads: list[threading.Thread] = []
+    try:
+        if winner == "admission":
+            threads.append(_run_race_worker(hooks, outcomes, errors, "admission", admission))
+            _wait_for(admission_locked, "admission department lock")
+            threads.append(_run_race_worker(hooks, outcomes, errors, "governance", governance))
+        else:
+            threads.append(_run_race_worker(hooks, outcomes, errors, "governance", governance))
+            _wait_for(governance_locked, "governance department lock")
+            threads.append(_run_race_worker(hooks, outcomes, errors, "admission", admission))
+    finally:
+        for thread in threads:
+            thread.join(_RACE_WAIT_SECONDS + 5)
+        hooks.uninstall()
+
+    assert all(not thread.is_alive() for thread in threads), "race worker remained alive"
+    return outcomes, errors
+
+
+def _assert_successful_race(outcomes: dict[str, object], errors: dict[str, BaseException]) -> None:
+    if errors:
+        details = "; ".join(
+            f"{label}: {type(error).__name__}: {error}" for label, error in errors.items()
+        )
+        pytest.fail(
+            f"PostgreSQL race failed; deadlocks/timeouts are not business outcomes: {details}"
+        )
+    assert set(outcomes) == {"admission", "governance"}
+
+
+def _admission_counts(session: Session, department_id) -> dict[str, int]:
+    return {
+        "runs": session.query(RagAnswerRun).filter_by(department_id=department_id).count(),
+        "snapshots": session.query(RagAnswerRuntimeSnapshot)
+        .filter_by(department_id=department_id)
+        .count(),
+        "start_audits": session.query(PersistentAuditEvent)
+        .filter_by(department_id=department_id, action="rag.answer.start")
+        .count(),
+    }
+
+
+def _assert_adapter_snapshot_matches_pointer(session: Session, snapshot, pointer) -> None:
+    assert snapshot.target_kind == "adapter"
+    assert snapshot.deployment_id == pointer.id
+    assert snapshot.deployment_version == pointer.deployment_version
+    assert snapshot.deployment_row_version == pointer.version
+    assert snapshot.adapter_id == pointer.adapter_id
+    assert snapshot.adapter_version == pointer.adapter_version
+    assert snapshot.review_id == pointer.review_id
+    assert snapshot.review_version == pointer.review_version
+    assert snapshot.evaluation_id == pointer.evaluation_id
+    assert snapshot.evaluation_version == pointer.evaluation_version
+    assert snapshot.suite_id == pointer.suite_id
+    adapter = session.get(Adapter, pointer.adapter_id)
+    review = session.get(AdapterReview, pointer.review_id)
+    run = session.get(AdapterEvaluationRun, pointer.evaluation_id)
+    suite = session.get(EvaluationSuite, pointer.suite_id)
+    assert adapter is not None and review is not None and run is not None and suite is not None
+    registry = session.get(AdapterRegistryAttempt, run.registry_attempt_id)
+    dependency = session.get(AdapterUpstreamDependency, run.dependency_id)
+    assert registry is not None and dependency is not None
+    assert snapshot.suite_version == suite.version == run.suite_version
+    assert snapshot.registry_attempt_id == registry.id == run.registry_attempt_id
+    assert snapshot.registry_attempt_version == registry.version == run.registry_attempt_version
+    assert snapshot.registry_publication_attempt_id == registry.publication_attempt_id
+    assert (
+        snapshot.registry_attempt_number == registry.attempt_number == run.registry_attempt_number
+    )
+    assert (
+        snapshot.registry_execution_scope_id
+        == registry.execution_scope_id
+        == adapter.execution_scope_id
+    )
+    assert (
+        snapshot.registry_manifest_sha256
+        == adapter.registry_manifest_sha256
+        == run.registry_manifest_sha256
+    )
+    assert (
+        snapshot.adapter_config_sha256
+        == adapter.registry_adapter_config_sha256
+        == run.registry_adapter_config_sha256
+    )
+    assert (
+        snapshot.adapter_config_byte_size
+        == adapter.registry_adapter_config_byte_size
+        == run.registry_adapter_config_byte_size
+    )
+    assert (
+        snapshot.adapter_model_sha256
+        == adapter.registry_adapter_model_sha256
+        == run.registry_adapter_model_sha256
+    )
+    assert (
+        snapshot.adapter_model_byte_size
+        == adapter.registry_adapter_model_byte_size
+        == run.registry_adapter_model_byte_size
+    )
+    assert snapshot.dependency_id == dependency.id == run.dependency_id
+    assert snapshot.dependency_version == dependency.version == run.dependency_version
+    assert snapshot.base_model_id == run.base_model_id
+    assert snapshot.base_model_revision == run.base_model_revision
+
+
+def _assert_base_snapshot(snapshot) -> None:
+    assert snapshot.target_kind == "base"
+    assert snapshot.adapter_id is None
+    assert snapshot.adapter_version is None
+    assert snapshot.review_id is None
+    assert snapshot.review_version is None
+    assert snapshot.evaluation_id is None
+    assert snapshot.evaluation_version is None
+    assert snapshot.suite_id is None
+    assert snapshot.suite_version is None
+    assert snapshot.registry_attempt_id is None
+    assert snapshot.registry_attempt_version is None
+    assert snapshot.registry_publication_attempt_id is None
+    assert snapshot.registry_attempt_number is None
+    assert snapshot.registry_execution_scope_id is None
+    assert snapshot.registry_manifest_sha256 is None
+    assert snapshot.adapter_config_sha256 is None
+    assert snapshot.adapter_config_byte_size is None
+    assert snapshot.adapter_model_sha256 is None
+    assert snapshot.adapter_model_byte_size is None
+
+
+def _assert_one_admission(session: Session, department_id) -> RagAnswerRuntimeSnapshot:
+    counts = _admission_counts(session, department_id)
+    assert counts == {"runs": 1, "snapshots": 1, "start_audits": 1}
+    run = session.query(RagAnswerRun).filter_by(department_id=department_id).one()
+    snapshot = session.query(RagAnswerRuntimeSnapshot).filter_by(run_id=run.id).one()
+    assert run.status == "running"
+    return snapshot
+
+
+def _assert_deployment_operation_succeeded(session: Session, operation_id, event_type: str) -> None:
+    operation = session.get(AdapterDeploymentOperation, operation_id)
+    assert operation is not None and operation.status == "succeeded"
+    assert (
+        session.query(AdapterDeploymentEvent)
+        .filter_by(operation_id=operation_id, event_type=event_type)
+        .count()
+        == 1
+    )
+    assert (
+        session.query(PersistentAuditEvent)
+        .filter_by(action="adapter.deployment.success", resource_id=str(operation_id))
+        .count()
+        == 1
+    )
+
+
+@pytest.mark.parametrize("winner", ["admission", "governance"])
+def test_concurrent_admission_vs_first_base_to_a_promotion(
+    engine, factory, tmp_path: Path, winner: str
+) -> None:
+    """Base admission and the real first promotion serialize on department lock."""
+
+    authority, operation = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+
+    def admission():
+        return _start_snapshot(factory, authority)
+
+    def promotion():
+        return phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4())
+
+    with _bounded_race_database(engine):
+        outcomes, errors = _run_ordered_race(engine, admission, promotion, winner=winner)
+    _assert_successful_race(outcomes, errors)
+    with factory() as session:
+        snapshot = _assert_one_admission(session, authority.department_id)
+        pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
+            )
+        )
+        assert pointer is not None and pointer.target_kind == "adapter"
+        _assert_deployment_operation_succeeded(session, operation["id"], "promote")
+        if winner == "admission":
+            _assert_base_snapshot(snapshot)
+        else:
+            _assert_adapter_snapshot_matches_pointer(session, snapshot, pointer)
+
+
+@pytest.mark.parametrize("winner", ["admission", "governance"])
+def test_concurrent_admission_on_a_vs_a_to_b_promotion(
+    engine, factory, tmp_path: Path, winner: str
+) -> None:
+    """A admission and the real A-to-B promotion publish one complete target."""
+
+    authority, operation_a = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    with factory() as session:
+        pointer_a = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
+            )
+        )
+        assert pointer_a is not None and pointer_a.target_kind == "adapter"
+    adapter_b_id, adapter_b_version = phase12_3_tests._clone_adapter_authority(
+        factory, authority, operation_a["target_adapter_id"]
+    )
+    phase12_3_tests._prepare_registry_final(tmp_path, factory, authority, adapter_id=adapter_b_id)
+    with factory() as session:
+        suite_a = session.get(EvaluationSuite, operation_a["suite_id"])
+        assert suite_a is not None
+    suite_b = phase12_3_tests._clone_suite(factory, suite_a)
+    operation_b = phase12_3_tests._prepare_approved_promotion_for_suite(
+        factory,
+        tmp_path,
+        authority,
+        adapter_id=adapter_b_id,
+        suite_id=suite_b.id,
+        expected_deployment_version=1,
+    )
+    assert operation_b["target_adapter_version"] == adapter_b_version
+
+    def admission():
+        return _start_snapshot(factory, authority)
+
+    def promotion():
+        return phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4())
+
+    with _bounded_race_database(engine):
+        outcomes, errors = _run_ordered_race(engine, admission, promotion, winner=winner)
+    _assert_successful_race(outcomes, errors)
+    with factory() as session:
+        snapshot = _assert_one_admission(session, authority.department_id)
+        pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
+            )
+        )
+        assert pointer is not None and pointer.target_kind == "adapter"
+        _assert_adapter_snapshot_matches_pointer(
+            session,
+            snapshot,
+            pointer_a if winner == "admission" else pointer,
+        )
+        assert pointer.adapter_id in {
+            operation_a["target_adapter_id"],
+            operation_b["target_adapter_id"],
+        }
+        _assert_deployment_operation_succeeded(session, operation_b["id"], "promote")
+
+
+@pytest.mark.parametrize("winner", ["admission", "governance"])
+def test_concurrent_admission_on_a_vs_a_to_base_rollback(
+    engine, factory, tmp_path: Path, winner: str
+) -> None:
+    """A admission and the real explicit rollback serialize without mixed NULLs."""
+
+    authority, operation_a = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+    with factory() as session:
+        pointer_a = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
+            )
+        )
+        assert pointer_a is not None and pointer_a.target_kind == "adapter"
+    with factory.begin() as session:
+        rollback = phase12_3_tests.enqueue_rollback(
+            session,
+            phase12_3_tests._principal(authority),
+            phase12_3_tests._scope(authority),
+            target="base",
+            adapter_id=None,
+            expected_adapter_version=None,
+            retention_id=None,
+            expected_retention_version=None,
+            expected_deployment_version=1,
+        )
+
+    def admission():
+        return _start_snapshot(factory, authority)
+
+    def rollback_worker():
+        return phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4())
+
+    with _bounded_race_database(engine):
+        outcomes, errors = _run_ordered_race(engine, admission, rollback_worker, winner=winner)
+    _assert_successful_race(outcomes, errors)
+    with factory() as session:
+        snapshot = _assert_one_admission(session, authority.department_id)
+        pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
+            )
+        )
+        assert pointer is not None and pointer.target_kind == "base"
+        _assert_deployment_operation_succeeded(session, rollback["id"], "rollback_base")
+        if winner == "admission":
+            _assert_adapter_snapshot_matches_pointer(session, snapshot, pointer_a)
+        else:
+            _assert_base_snapshot(snapshot)
+
+
+@pytest.mark.parametrize("winner", ["admission", "registration"])
+def test_concurrent_admission_on_a_vs_eb_registration(
+    engine, factory, tmp_path: Path, winner: str
+) -> None:
+    """Admission and E-B registration serialize before either can cross authority."""
+
+    authority, operation = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
+    assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
+
+    def registration():
+        return _register_or_resume(
+            factory,
+            department_id=authority.department_id,
+            adapter_id=operation["target_adapter_id"],
+            actor_issuer=authority.issuer,
+            actor_subject=authority.subject,
+            limit=1,
+            item_limit=2,
+            apply=True,
+        )
+
+    def admission():
+        return _start_snapshot(factory, authority)
+
+    first = "admission" if winner == "admission" else "governance"
+    with _bounded_race_database(engine):
+        outcomes, errors = _run_ordered_race(engine, admission, registration, winner=first)
+    with factory() as session:
+        pointer = session.scalar(
+            select(DepartmentAdapterDeployment).where(
+                DepartmentAdapterDeployment.department_id == authority.department_id
+            )
+        )
+        assert pointer is not None
+        assert pointer.target_kind == "adapter"
+        counts = _admission_counts(session, authority.department_id)
+        purge_count = (
+            session.query(AdapterPurgeOperation)
+            .filter_by(
+                department_id=authority.department_id,
+                adapter_id=operation["target_adapter_id"],
+            )
+            .count()
+        )
+        if winner == "admission":
+            assert set(outcomes) == {"admission"}
+            assert set(errors) == {"governance"}
+            assert isinstance(errors.get("governance"), ServiceError)
+            assert str(errors["governance"]) == (
+                "Adapter purge conflicts with active RAG runtime snapshot"
+            )
+            assert counts == {"runs": 1, "snapshots": 1, "start_audits": 1}
+            snapshot = _assert_one_admission(session, authority.department_id)
+            _assert_adapter_snapshot_matches_pointer(session, snapshot, pointer)
+            assert purge_count == 0
+        else:
+            assert set(outcomes) == {"governance"}
+            assert set(errors) == {"admission"}
+            assert isinstance(errors.get("admission"), ServiceError)
+            assert counts == {"runs": 0, "snapshots": 0, "start_audits": 0}
+            assert purge_count == 1
+            registered_operation_id, registered_item_ids = outcomes["governance"]
+            assert registered_operation_id is not None and len(registered_item_ids) == 2
+            purge = (
+                session.query(AdapterPurgeOperation)
+                .filter_by(
+                    department_id=authority.department_id,
+                    adapter_id=operation["target_adapter_id"],
+                )
+                .one()
+            )
+            assert purge.status == "registered"
+            adapter = session.get(Adapter, operation["target_adapter_id"])
+            assert adapter is not None and adapter.status == "purge_pending"
+            assert pointer.target_kind == "adapter"
 
 
 def test_inflight_base_snapshot_stays_base_after_adapter_promotion(factory, tmp_path: Path) -> None:
