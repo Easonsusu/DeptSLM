@@ -14,7 +14,7 @@ import pytest
 import test_phase7_postgres as phase7_tests
 import test_phase12_3_postgres as phase12_3_tests
 from alembic.config import Config
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 from test_phase7_postgres import _client, _headers, _hit, _seed
 
@@ -33,6 +33,7 @@ from app.models import (
     AdapterPurgeReservation,
     AdapterRegistryAttempt,
     AdapterReview,
+    AdapterRollbackRetention,
     AdapterUpstreamDependency,
     Department,
     DepartmentAdapterDeployment,
@@ -423,6 +424,7 @@ def test_valid_adapter_admission_freezes_exact_authority_and_calls_adapter_runti
         department, document, extraction, chunk, indexing = _seed_adapter_rag_source(
             session, authority, tmp_path
         )
+        department_id = department.id
         hit = _hit(document, extraction, chunk, indexing)
 
     class AdapterRuntime:
@@ -443,14 +445,14 @@ def test_valid_adapter_admission_freezes_exact_authority_and_calls_adapter_runti
         app.state.adapter_runtime_client = adapter_runtime
         app.state.rag_qdrant = _Qdrant(hit)
         response = client.post(
-            f"/departments/{department.id}/rag/answers",
+            f"/departments/{department_id}/rag/answers",
             headers=_headers(authority.subject),
             json={"question": "What is approved?"},
         )
     assert response.status_code == 200
     assert adapter_runtime.calls == 1
     with Session(clean_db) as session:
-        run = session.query(RagAnswerRun).filter_by(department_id=department.id).one()
+        run = session.query(RagAnswerRun).filter_by(department_id=department_id).one()
         snapshot = session.query(RagAnswerRuntimeSnapshot).filter_by(run_id=run.id).one()
         assert run.status == "answered"
         assert snapshot.target_kind == "adapter"
@@ -464,7 +466,7 @@ def test_valid_adapter_admission_freezes_exact_authority_and_calls_adapter_runti
         assert (
             session.query(PersistentAuditEvent)
             .filter_by(
-                department_id=department.id,
+                department_id=department_id,
                 action="rag.answer.start",
                 resource_id=str(run.id),
             )
@@ -481,6 +483,47 @@ def _start_snapshot(factory, authority):
         phase12_3_tests._scope(authority),
         1,
     )
+
+
+def _rollback_adapter_to_base_and_release_retention(
+    factory, authority, root: Path, adapter_id, adapter_version
+) -> None:
+    """Move the pointer away from an adapter before exercising E-B fences."""
+
+    with factory.begin() as session:
+        phase12_3_tests.enqueue_rollback(
+            session,
+            phase12_3_tests._principal(authority),
+            phase12_3_tests._scope(authority),
+            target="base",
+            adapter_id=None,
+            expected_adapter_version=None,
+            retention_id=None,
+            expected_retention_version=None,
+            expected_deployment_version=1,
+        )
+    assert phase12_3_tests.run_once(factory, data_dir=root, worker_id=uuid4()) is True
+    with factory() as session:
+        retention = session.scalar(
+            select(AdapterRollbackRetention).where(
+                AdapterRollbackRetention.department_id == authority.department_id,
+                AdapterRollbackRetention.adapter_id == adapter_id,
+                AdapterRollbackRetention.status == "active",
+            )
+        )
+        assert retention is not None
+        retention_id, retention_version = retention.id, retention.version
+    with factory.begin() as session:
+        released = phase12_3_tests.release_rollback_retention(
+            session,
+            phase12_3_tests._principal(authority),
+            phase12_3_tests._scope(authority),
+            adapter_id=adapter_id,
+            retention_id=retention_id,
+            expected_adapter_version=adapter_version,
+            expected_retention_version=retention_version,
+        )
+        assert released["status"] == "released"
 
 
 def test_inflight_base_snapshot_stays_base_after_adapter_promotion(factory, tmp_path: Path) -> None:
@@ -579,6 +622,13 @@ def test_terminal_runtime_requests_do_not_fence_eb_registration(
     authority, _operation = phase12_3_tests._prepare_approved_promotion(factory, tmp_path)
     assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
     started = _start_snapshot(factory, authority)
+    _rollback_adapter_to_base_and_release_retention(
+        factory,
+        authority,
+        tmp_path,
+        started.runtime_target.adapter_id,
+        started.runtime_target.adapter_version,
+    )
     with factory.begin() as session:
         run = session.get(RagAnswerRun, started.id)
         assert run is not None
@@ -616,6 +666,13 @@ def test_running_runtime_snapshot_blocks_eb_registration_and_finalization(
     assert phase12_3_tests.run_once(factory, data_dir=tmp_path, worker_id=uuid4()) is True
     started = _start_snapshot(factory, authority)
     adapter_id = operation["target_adapter_id"]
+    _rollback_adapter_to_base_and_release_retention(
+        factory,
+        authority,
+        tmp_path,
+        adapter_id,
+        operation["target_adapter_version"],
+    )
 
     # Registration is the real E-B path and is fenced by the running snapshot.
     with pytest.raises(ServiceError, match="active RAG runtime snapshot"):
@@ -765,12 +822,12 @@ def _invalidate_adapter_authority(
         suite.archived_at = now
     elif kind == "registry_failed":
         registry.status = "failed"
-        registry.error_code = "registry_artifact_mismatch"
+        registry.error_code = "adapter_registry_manifest_invalid"
         registry.finished_at = now
     elif kind == "registry_version":
-        adapter.registry_attempt_version += 1
+        registry.version += 1
     elif kind == "publication_attempt":
-        adapter.registry_publication_attempt_id = uuid4()
+        registry.publication_attempt_id = uuid4()
     elif kind == "execution_scope":
         registry.execution_scope_id = uuid4()
     elif kind == "manifest_digest":
@@ -781,13 +838,15 @@ def _invalidate_adapter_authority(
         adapter.registry_adapter_config_byte_size += 1
     elif kind == "model_digest":
         adapter.registry_adapter_model_sha256 = "0" * 64
+        adapter.source_adapter_model_sha256 = "0" * 64
     elif kind == "model_size":
         adapter.registry_adapter_model_byte_size += 1
+        adapter.source_adapter_model_byte_size += 1
     elif kind == "dependency_released":
         dependency.status = "released"
         dependency.released_at = now
     elif kind == "dependency_version":
-        adapter.dependency_version += 1
+        dependency.version += 1
     elif kind == "base_model":
         deployment.base_model_id = "unreviewed/base"
     elif kind == "base_revision":
@@ -844,7 +903,8 @@ def test_invalid_adapter_authority_creates_no_run_snapshot_audit_or_runtime_call
         # isolates the admission-time active-operation lookup.
         with factory.begin() as session:
             adapter = session.get(Adapter, operation["target_adapter_id"])
-            source = session.get(AdapterImportSource, operation["source_bundle_id"])
+            assert adapter is not None
+            source = session.get(AdapterImportSource, adapter.source_bundle_id)
             assert adapter is not None and source is not None
             source_attempt = session.get(
                 AdapterImportAttempt, adapter.source_authoritative_attempt_id
@@ -947,7 +1007,7 @@ class _Runtime:
 
 
 class _Qdrant:
-    def __init__(self, hit):
+    def __init__(self, hit=None):
         self.hit = hit
 
     def verify_collection(self):
