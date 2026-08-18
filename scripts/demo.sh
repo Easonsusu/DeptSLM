@@ -214,7 +214,18 @@ curl_json() {
   curl --fail --silent --show-error --header "Authorization: Bearer ${token_a}" "$@"
 }
 
-curl_json "http://127.0.0.1:${api_port}/health" >/dev/null
+api_ready=0
+for _ in $(seq 1 90); do
+  if curl_json "http://127.0.0.1:${api_port}/health" >/dev/null 2>&1; then
+    api_ready=1
+    break
+  fi
+  sleep 1
+done
+if [[ "${api_ready}" -ne 1 ]]; then
+  printf 'Synthetic API did not become ready.\n' >&2
+  exit 1
+fi
 curl_json "http://127.0.0.1:${api_port}/version" >/dev/null
 curl_json "http://127.0.0.1:${api_port}/auth/me" >/dev/null
 
