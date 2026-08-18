@@ -18,6 +18,15 @@ services:
     depends_on:
       api:
         condition: service_started
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    networks:
+      - web-internal
 
   api:
     build:
@@ -54,6 +63,13 @@ services:
       ENVIRONMENT: "${ENVIRONMENT:-development}"
     ports:
       - "127.0.0.1:${API_PORT:-8000}:8000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
     volumes:
       - type: bind
         source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/uploads"
@@ -74,8 +90,11 @@ services:
       rag-runtime:
         condition: service_started
     networks:
-      - default
-      - rag-internal
+      - web-internal
+      - postgres-internal
+      - qdrant-internal
+      - rag-base-internal
+      - adapter-prod-internal
 
   postgres:
     image: postgres:16-alpine
@@ -96,6 +115,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    networks:
+      - postgres-internal
 
   qdrant:
     image: qdrant/qdrant:v1.13.4
@@ -110,6 +131,8 @@ services:
         target: /qdrant/storage
         bind:
           create_host_path: false
+    networks:
+      - qdrant-internal
 
   rag-worker:
     build:
@@ -149,6 +172,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - postgres-internal
 
   indexing-worker:
     build:
@@ -194,6 +219,9 @@ services:
         condition: service_healthy
       qdrant:
         condition: service_started
+    networks:
+      - postgres-internal
+      - qdrant-internal
 
   evaluator-worker:
     build:
@@ -249,8 +277,9 @@ services:
       rag-runtime:
         condition: service_started
     networks:
-      - default
-      - rag-internal
+      - postgres-internal
+      - qdrant-internal
+      - rag-base-internal
 
   model-admin:
     profiles: ["admin"]
@@ -274,6 +303,8 @@ services:
         target: /runtime/deptslm/model_cache
         bind:
           create_host_path: false
+    networks:
+      - model-egress
 
   adapter-evaluator:
     profiles: ["adapter-evaluation"]
@@ -328,8 +359,10 @@ services:
       adapter-eval-runtime:
         condition: service_started
     networks:
-      - default
-      - rag-internal
+      - postgres-internal
+      - qdrant-internal
+      - rag-base-internal
+      - adapter-eval-internal
 
   adapter-eval-runtime:
     profiles: ["adapter-evaluation"]
@@ -365,7 +398,7 @@ services:
         bind:
           create_host_path: false
     networks:
-      - rag-internal
+      - adapter-eval-internal
 
   vector-admin:
     profiles: ["admin"]
@@ -388,6 +421,8 @@ services:
     depends_on:
       qdrant:
         condition: service_started
+    networks:
+      - qdrant-internal
 
   rag-runtime:
     build:
@@ -416,7 +451,7 @@ services:
         bind:
           create_host_path: false
     networks:
-      - rag-internal
+      - rag-base-internal
 
   adapter-runtime:
     build:
@@ -451,7 +486,7 @@ services:
         bind:
           create_host_path: false
     networks:
-      - rag-internal
+      - adapter-prod-internal
 
   training-worker:
     build:
@@ -479,6 +514,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - postgres-internal
 
   training-job-worker:
     build:
@@ -507,6 +544,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - postgres-internal
 
   adapter-registry-worker:
     build:
@@ -551,6 +590,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - postgres-internal
 
   adapter-governance-worker:
     build:
@@ -576,6 +617,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - postgres-internal
 
   adapter-maintenance:
     profiles: ["maintenance"]
@@ -602,7 +645,21 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - postgres-internal
 
 networks:
-  rag-internal:
+  web-internal:
     internal: true
+  postgres-internal:
+    internal: true
+  qdrant-internal:
+    internal: true
+  rag-base-internal:
+    internal: true
+  adapter-prod-internal:
+    internal: true
+  adapter-eval-internal:
+    internal: true
+  model-egress:
+    internal: false

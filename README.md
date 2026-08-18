@@ -40,8 +40,8 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > keeps the reservation active. Review changes are rejected while a reservation
 > is active. This is a reviewed boundary, not training execution.
 
-> **Phase 12 status:** Phase 12.0 through Phase 12.3 are completed. Phase 12.4
-> is the current reviewed scope: it captures one immutable deployment target
+> **Phase 12 status:** Phase 12.0 through Phase 12.4 are completed. Phase 12.4
+> captures one immutable deployment target
 > per public RAG request and routes generation only to a separate, private
 > adapter runtime after exact Phase 12.3 authority checks. Query embedding,
 > retrieval, evidence selection, prompt, citations, and PostgreSQL final
@@ -50,7 +50,9 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > descriptor, never falls back to base, and never changes deployment governance.
 > The API uses a separate bounded adapter transport envelope for the runtime's
 > 300-second target load and 120-second generation clocks; the Phase 7 base
-> timeout remains unchanged. Phase 13 is not started.
+> timeout remains unchanged. Phase 13 is the final security, Docker-demo, and
+> documentation hardening scope represented by this revision; no Phase 14 is
+> defined by the current roadmap.
 
 The governance worker is deliberately narrower than the API: its dedicated
 settings loader requires PostgreSQL plus only the external read-only
@@ -205,7 +207,9 @@ Prerequisites for the complete local stack are Git, Docker Desktop with Docker C
 3. Create a local environment file and replace the example storage path with the value printed by the script:
 
    ```bash
+   umask 077
    cp .env.example .env
+   chmod 600 .env
    ```
 
    Never commit `.env`.
@@ -244,6 +248,20 @@ Stop the stack with:
 ```bash
 ./scripts/compose.sh down
 ```
+
+### Synthetic Docker demo
+
+To exercise the reviewed upload, extraction, fake-indexing, citation, and
+cross-department authorization path without using `.env` or Google Drive, run:
+
+```bash
+./scripts/demo.sh
+```
+
+The demo uses a fresh external temporary directory and a unique Compose
+project, downloads no model weights, and removes its own containers, volumes,
+secrets, and runtime data on exit. See [Synthetic local Docker demo](docs/local-demo.md)
+for the exact scope and limitations.
 
 Run at most one extraction job or poll continuously with:
 
@@ -338,12 +356,15 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 - [Evaluation metrics](docs/evaluation-metrics.md)
 - [Evaluation quality gates](docs/evaluation-quality-gates.md)
 - [Evaluation artifacts](docs/evaluation-artifacts.md)
+- [Security model](docs/security.md)
+- [Synthetic local Docker demo](docs/local-demo.md)
+- [Recovery guide](docs/recovery.md)
 
 ## Current non-goals
 
 Phase 9 does not implement LLM judging, semantic grading, public raw results, a frontend dashboard, feedback-derived cases, automatic threshold or RAG changes, training datasets, SFT, adapters, model promotion, cross-department benchmarking, production OAuth/OIDC/SSO, or production deployment.
 
-Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 through Phase 12.3 are complete. Phase 12.4 is the current reviewed, administrator-governed runtime boundary: it snapshots exact deployment authority and routes only adapter generation through a separate private runtime; retrieval remains Phase 7, and runtime errors never fall back to base or mutate governance. Phase 13 remains unstarted. Google Drive storage is an external development runtime location, not a production object store or backup.
+Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 through Phase 12.4 are complete. Phase 12.4 is the reviewed, administrator-governed runtime boundary: it snapshots exact deployment authority and routes only adapter generation through a separate private runtime; retrieval remains Phase 7, and runtime errors never fall back to base or mutate governance. Phase 13 is the final security, Docker-demo, and documentation hardening scope; no Phase 14 is defined by the current roadmap. Google Drive storage is an external development runtime location, not a production object store or backup.
 
 ## License
 

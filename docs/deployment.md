@@ -2,9 +2,9 @@
 
 ## Phase 12 status
 
-DeptSLM is not a production deployment. Phase 9 completed the internal evaluation runner with external immutable suites, content-free result artifacts, and PostgreSQL-backed leases. It reuses the completed Phase 7 grounded-answer boundary; it is not a public evaluation API. Phase 10 completed an isolated dataset-builder worker that writes only private external SFT dataset artifacts. Phase 11 completed a separate worker that generates immutable LlamaFactory configuration bundles only; it does not install or execute LlamaFactory, train models, or create adapters. Phase 12.0 through Phase 12.3 are completed. Phase 12.4 is the current reviewed scope: the API captures immutable deployment snapshots and routes only adapter-target generation to a separate private runtime. It verifies the exact registry final through a read-only mount; query embedding and retrieval remain on the existing base runtime. Public vector search, conversations, history, streaming, reranking, scheduled evaluation, malware scanning, OCR, training, production identity/storage, secrets management, backups, clustering, and production operations remain deferred. Phase 13 is not started.
+DeptSLM is not a production deployment. Phase 9 completed the internal evaluation runner with external immutable suites, content-free result artifacts, and PostgreSQL-backed leases. It reuses the completed Phase 7 grounded-answer boundary; it is not a public evaluation API. Phase 10 completed an isolated dataset-builder worker that writes only private external SFT dataset artifacts. Phase 11 completed a separate worker that generates immutable LlamaFactory configuration bundles only; it does not install or execute LlamaFactory, train models, or create adapters. Phase 12.0 through Phase 12.4 are completed. Phase 12.4 captures immutable deployment snapshots and routes only adapter-target generation to a separate private runtime. It verifies the exact registry final through a read-only mount; query embedding and retrieval remain on the existing base runtime. Public vector search, conversations, history, streaming, reranking, scheduled evaluation, malware scanning, OCR, training, production identity/storage, secrets management, backups, clustering, and production operations remain deferred. Phase 13 is the final security, Docker-demo, and documentation hardening scope represented by this revision.
 
-Phase 12.1D, E-A, E-B, and E-C are complete; Phase 12.2 and Phase 12.3 are complete and Phase 12.4 is under review. The public adapter API remains limited to closed content-free metadata reads, evaluation metadata, and explicit governance metadata; the existing RAG answer route is the only public generation surface and exposes no deployment selector. The source CLI is administrator-controlled and dry-run by default. The registry, evaluation, and governance workers are internal PostgreSQL-enqueued workers; governance verifies a read-only registry final and does not load or route an adapter. The separate maintenance profile runs E-A reconciliation, E-B purge, or E-C lifecycle release only when explicitly invoked; it has no model, Qdrant, dataset, training-job, or runtime mount. PostgreSQL, external storage, and runtime processes remain non-atomic.
+Phase 12.1D, E-A, E-B, and E-C are complete; Phase 12.2, Phase 12.3, and Phase 12.4 are complete. The public adapter API remains limited to closed content-free metadata reads, evaluation metadata, and explicit governance metadata; the existing RAG answer route is the only public generation surface and exposes no deployment selector. The source CLI is administrator-controlled and dry-run by default. The registry, evaluation, and governance workers are internal PostgreSQL-enqueued workers; governance verifies a read-only registry final and does not load or route an adapter. The separate maintenance profile runs E-A reconciliation, E-B purge, or E-C lifecycle release only when explicitly invoked; it has no model, Qdrant, dataset, training-job, or runtime mount. PostgreSQL, external storage, and runtime processes remain non-atomic.
 
 The planned intake begins with an administrator-controlled CLI that creates an
 immutable server-ID-derived import bundle from only the two payload files.
@@ -115,8 +115,16 @@ It detects the existing personal-drive folder (`My Drive` or the localized `æˆ‘ç
 Create a local, untracked environment file:
 
 ```bash
+umask 077
 cp .env.example .env
+chmod 600 .env
 ```
+
+`scripts/compose.sh` rejects a symlink, non-regular, foreign-owned, or
+group/other-readable `.env`. `./scripts/compose.sh config` first validates the
+resolved Compose graph silently, then displays only a non-interpolated safe
+configuration; `config --environment` is refused because it can disclose
+interpolation values. Secret values are never a normal wrapper output.
 
 Set these values as appropriate for the local environment:
 

@@ -2,7 +2,7 @@
 
 ## Status
 
-The Phase 8 API preserves the completed grounded-answer boundary and adds structured feedback submission and review metadata. Phase 11 exposes metadata for completed immutable training-job bundles only; it never executes LlamaFactory or creates adapters. Phase 12.0 through Phase 12.3 are complete, and Phase 12.4 is the current reviewed scope. Phase 12.2 adds administrator-scoped enqueue/cancel/list/detail metadata routes for paired adapter evaluation; Phase 12.3 adds explicit review, approval, deployment, rollback, retention, and event metadata routes. Phase 12.4 adds no public route: the existing grounded-answer endpoint resolves deployment authority server-side and routes only its generation lane. These routes return no question, answer, prompt, evidence, vector, path, model output, adapter bytes, or runtime identity. Feedback and governance use PostgreSQL metadata only. There is no public vector search, query-vector API, conversation history, streaming, reranking, adapter upload/download, production identity integration, automatic approval/promotion, or client adapter selector.
+The Phase 8 API preserves the completed grounded-answer boundary and adds structured feedback submission and review metadata. Phase 11 exposes metadata for completed immutable training-job bundles only; it never executes LlamaFactory or creates adapters. Phase 12.0 through Phase 12.4 are complete. Phase 12.2 adds administrator-scoped enqueue/cancel/list/detail metadata routes for paired adapter evaluation; Phase 12.3 adds explicit review, approval, deployment, rollback, retention, and event metadata routes. Phase 12.4 adds no public route: the existing grounded-answer endpoint resolves deployment authority server-side and routes only its generation lane. These routes return no question, answer, prompt, evidence, vector, path, model output, adapter bytes, or runtime identity. Feedback and governance use PostgreSQL metadata only. There is no public vector search, query-vector API, conversation history, streaming, reranking, adapter upload/download, production identity integration, automatic approval/promotion, or client adapter selector. Phase 13 adds transport hardening but no business endpoint.
 
 For the default local configuration, the base URL is:
 
@@ -11,6 +11,14 @@ http://localhost:8000
 ```
 
 `API_PORT` may change the host port used by Docker Compose.
+
+Before ordinary FastAPI body decoding, the API enforces a closed
+`MAX_NON_UPLOAD_REQUEST_BODY_BYTES` limit of 65,536 bytes. Declared or streamed
+oversize bodies receive `413` without persistence or logging. The only
+exemption is the exact `POST /departments/{valid_department_uuid}/documents`
+Phase 4 raw streaming upload, which retains its own configured document limit
+and never buffers the request body. Smaller feedback, evaluation, SFT, and
+training limits remain authoritative.
 
 ## Current endpoints
 

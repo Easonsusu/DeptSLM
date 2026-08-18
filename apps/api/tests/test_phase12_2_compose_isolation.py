@@ -21,4 +21,6 @@ def test_phase12_2_compose_services_have_isolated_mounts_and_networks():
     assert "/model_cache" in runtime and "/adapters/registry" in runtime
     assert "/eval_results" not in runtime and "DATABASE_URL" not in runtime
     assert "ports:" not in runtime
-    assert "rag-internal" in evaluator and "rag-internal" in runtime
+    assert "rag-base-internal" in evaluator
+    assert "adapter-eval-internal" in evaluator
+    assert "adapter-eval-internal" in runtime

@@ -13,6 +13,7 @@ from app import __version__
 from app.audit import LoggingAuditSink
 from app.auth import AuthenticatedPrincipal, build_token_verifier
 from app.authorization import require_authenticated_principal
+from app.body_limit import MAX_NON_UPLOAD_REQUEST_BODY_BYTES, NonUploadBodyLimitMiddleware
 from app.database import create_database_engine, create_session_factory
 from app.document_storage import DocumentStorage
 from app.membership_resolver import SQLAlchemyMembershipResolver
@@ -70,6 +71,10 @@ app = FastAPI(
     description="Backend API for the DeptSLM departmental assistant platform.",
     version=__version__,
     lifespan=lifespan,
+)
+app.add_middleware(
+    NonUploadBodyLimitMiddleware,
+    limit=MAX_NON_UPLOAD_REQUEST_BODY_BYTES,
 )
 app.include_router(department_router)
 
