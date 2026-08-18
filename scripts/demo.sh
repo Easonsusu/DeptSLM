@@ -221,15 +221,19 @@ api_call() {
   local response_file="${output}.http"
   local status
   if [[ -n "${input_file}" ]]; then
-    compose exec --no-TTY -e "DEMO_TOKEN=${token_a}" indexing-worker python -c \
+    if ! compose exec --no-TTY -e "DEMO_TOKEN=${token_a}" indexing-worker python -c \
       'import httpx,os,sys; method,path,content_type=sys.argv[1:4]; data=sys.stdin.buffer.read(); headers={"Authorization":"Bearer "+os.environ["DEMO_TOKEN"]}; content_type and headers.__setitem__("Content-Type",content_type); response=httpx.request(method,"http://api:8000"+path,headers=headers,content=data,timeout=30.0); print(response.status_code); sys.stdout.write(response.text)' \
-      "${method}" "${path}" "${content_type}" <"${input_file}" >"${response_file}"
+      "${method}" "${path}" "${content_type}" <"${input_file}" >"${response_file}"; then
+      return 1
+    fi
   else
-    compose exec --no-TTY -e "DEMO_TOKEN=${token_a}" indexing-worker python -c \
+    if ! compose exec --no-TTY -e "DEMO_TOKEN=${token_a}" indexing-worker python -c \
       'import httpx,os,sys; method,path=sys.argv[1:3]; response=httpx.request(method,"http://api:8000"+path,headers={"Authorization":"Bearer "+os.environ["DEMO_TOKEN"]},timeout=30.0); print(response.status_code); sys.stdout.write(response.text)' \
-      "${method}" "${path}" >"${response_file}"
+      "${method}" "${path}" >"${response_file}"; then
+      return 1
+    fi
   fi
-  status=$(sed -n '1p' "${response_file}")
+  status=$(sed -n '1p' "${response_file}" | tr -d '\r')
   tail -n +2 "${response_file}" >"${output}"
   rm -f -- "${response_file}"
   if [[ "${expected}" == "2xx" ]]; then
