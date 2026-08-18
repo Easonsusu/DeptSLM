@@ -111,13 +111,20 @@ probe_python_dns() {
   local service="$1"
   local target="$2"
   local expected="$3"
+  local attempts=20
   local result=0
-  compose exec --no-TTY "$service" python -c \
-    'import socket,sys; socket.getaddrinfo(sys.argv[1], None)' "${target}" >/dev/null 2>&1 || result=$?
-  if [[ "${expected}" == "yes" && ${result} -ne 0 ]] || [[ "${expected}" == "no" && ${result} -eq 0 ]]; then
-    printf 'Unexpected DNS reachability: %s -> %s (%s).\n' "${service}" "${target}" "${expected}" >&2
-    exit 1
-  fi
+  while (( attempts > 0 )); do
+    result=0
+    compose exec --no-TTY "$service" python -c \
+      'import socket,sys; socket.getaddrinfo(sys.argv[1], None)' "${target}" >/dev/null 2>&1 || result=$?
+    if [[ "${expected}" == "yes" && ${result} -eq 0 ]] || [[ "${expected}" == "no" && ${result} -ne 0 ]]; then
+      return 0
+    fi
+    attempts=$((attempts - 1))
+    (( attempts > 0 )) && sleep 0.5
+  done
+  printf 'Unexpected DNS reachability: %s -> %s (%s).\n' "${service}" "${target}" "${expected}" >&2
+  exit 1
 }
 
 probe_node_dns() {
