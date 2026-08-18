@@ -210,40 +210,64 @@ fi
 
 token_a=$(compose run --rm --no-deps api python -c \
   'import os,time,jwt; print(jwt.encode({"sub":"phase13-admin-a","iss":os.environ["DEPTSLM_AUTH_ISSUER"],"aud":os.environ["DEPTSLM_AUTH_AUDIENCE"],"exp":int(time.time())+900}, os.environ["DEPTSLM_AUTH_SECRET"], algorithm="HS256"))')
-curl_json() {
-  curl --fail --silent --show-error --header "Authorization: Bearer ${token_a}" "$@"
+
+api_call() {
+  local expected="$1"
+  local method="$2"
+  local path="$3"
+  local output="$4"
+  local input_file="${5:-}"
+  local content_type="${6:-}"
+  local response_file="${output}.http"
+  local status
+  if [[ -n "${input_file}" ]]; then
+    compose exec --no-TTY -e "DEMO_TOKEN=${token_a}" indexing-worker python -c \
+      'import httpx,os,sys; method,path,content_type=sys.argv[1:4]; data=sys.stdin.buffer.read(); headers={"Authorization":"Bearer "+os.environ["DEMO_TOKEN"]}; content_type and headers.__setitem__("Content-Type",content_type); response=httpx.request(method,"http://api:8000"+path,headers=headers,content=data,timeout=30.0); print(response.status_code); sys.stdout.write(response.text)' \
+      "${method}" "${path}" "${content_type}" <"${input_file}" >"${response_file}"
+  else
+    compose exec --no-TTY -e "DEMO_TOKEN=${token_a}" indexing-worker python -c \
+      'import httpx,os,sys; method,path=sys.argv[1:3]; response=httpx.request(method,"http://api:8000"+path,headers={"Authorization":"Bearer "+os.environ["DEMO_TOKEN"]},timeout=30.0); print(response.status_code); sys.stdout.write(response.text)' \
+      "${method}" "${path}" >"${response_file}"
+  fi
+  status=$(sed -n '1p' "${response_file}")
+  tail -n +2 "${response_file}" >"${output}"
+  rm -f -- "${response_file}"
+  if [[ "${expected}" == "2xx" ]]; then
+    [[ "${status}" =~ ^2[0-9][0-9]$ ]]
+  else
+    [[ "${status}" == "${expected}" ]]
+  fi
 }
 
 api_ready=0
 for _ in $(seq 1 90); do
-  if curl_json "http://127.0.0.1:${api_port}/health" >/dev/null 2>&1; then
+  if api_call 2xx GET /health "${runtime_root}/health.json"; then
     api_ready=1
     break
   fi
   sleep 1
 done
 if [[ "${api_ready}" -ne 1 ]]; then
-  compose ps >&2 || true
+  compose ps --all >&2 || true
   compose logs --no-color api >&2 || true
   printf 'Synthetic API did not become ready.\n' >&2
   exit 1
 fi
-curl_json "http://127.0.0.1:${api_port}/version" >/dev/null
-curl_json "http://127.0.0.1:${api_port}/auth/me" >/dev/null
+api_call 2xx GET /version "${runtime_root}/version.json"
+api_call 2xx GET /auth/me "${runtime_root}/auth-me.json"
 
 printf 'Phase 13 synthetic source: department-scoped runtime boundary.\n' >"${source_file}"
 upload_response="${runtime_root}/upload-response.json"
-curl_json -X POST -H 'Content-Type: text/plain; charset=utf-8' \
-  --data-binary "@${source_file}" \
-  "http://127.0.0.1:${api_port}/departments/${department_a}/documents" >"${upload_response}"
+api_call 2xx POST "/departments/${department_a}/documents" "${upload_response}" \
+  "${source_file}" 'text/plain; charset=utf-8'
 document_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "${upload_response}")
 
 extraction_response="${runtime_root}/extraction-response.json"
-curl_json -X POST "http://127.0.0.1:${api_port}/departments/${department_a}/documents/${document_id}/extractions" >"${extraction_response}"
+api_call 2xx POST "/departments/${department_a}/documents/${document_id}/extractions" "${extraction_response}"
 extraction_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "${extraction_response}")
 extraction_status=""
 for _ in $(seq 1 90); do
-  curl_json "http://127.0.0.1:${api_port}/departments/${department_a}/documents/${document_id}/extractions" >"${runtime_root}/extractions.json"
+  api_call 2xx GET "/departments/${department_a}/documents/${document_id}/extractions" "${runtime_root}/extractions.json"
   extraction_status=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(x["status"] for x in d["items"] if x["id"]==sys.argv[2]))' "${runtime_root}/extractions.json" "${extraction_id}")
   [[ "${extraction_status}" == "succeeded" ]] && break
   [[ "${extraction_status}" == "failed" ]] && break
@@ -255,11 +279,11 @@ compose run --detach --no-deps indexing-worker \
   python -m deptslm_worker.indexer --poll >/dev/null
 
 indexing_response="${runtime_root}/indexing-response.json"
-curl_json -X POST "http://127.0.0.1:${api_port}/departments/${department_a}/documents/${document_id}/extractions/${extraction_id}/indexings" >"${indexing_response}"
+api_call 2xx POST "/departments/${department_a}/documents/${document_id}/extractions/${extraction_id}/indexings" "${indexing_response}"
 indexing_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "${indexing_response}")
 indexing_status=""
 for _ in $(seq 1 120); do
-  curl_json "http://127.0.0.1:${api_port}/departments/${department_a}/documents/${document_id}/extractions/${extraction_id}/indexings" >"${runtime_root}/indexings.json"
+  api_call 2xx GET "/departments/${department_a}/documents/${document_id}/extractions/${extraction_id}/indexings" "${runtime_root}/indexings.json"
   indexing_status=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(x["status"] for x in d["items"] if x["id"]==sys.argv[2]))' "${runtime_root}/indexings.json" "${indexing_id}")
   [[ "${indexing_status}" == "succeeded" ]] && break
   [[ "${indexing_status}" == "failed" ]] && break
@@ -268,16 +292,16 @@ done
 [[ "${indexing_status}" == "succeeded" ]] || { printf 'Synthetic indexing did not succeed.\n' >&2; exit 1; }
 
 answer_response="${runtime_root}/answer-response.json"
-printf '{"question":"%s"}\n' "${question_sentinel}" | curl_json -X POST \
-  -H 'Content-Type: application/json' --data-binary @- \
-  "http://127.0.0.1:${api_port}/departments/${department_a}/rag/answers" >"${answer_response}"
+answer_request="${runtime_root}/answer-request.json"
+printf '{"question":"%s"}\n' "${question_sentinel}" >"${answer_request}"
+api_call 2xx POST "/departments/${department_a}/rag/answers" "${answer_response}" \
+  "${answer_request}" 'application/json'
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["status"]=="answered"; assert d["citations"]' "${answer_response}"
 
-cross_status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-  --header "Authorization: Bearer ${token_a}" \
-  "http://127.0.0.1:${api_port}/departments/${department_b}/documents")
-[[ "${cross_status}" == "403" ]] || { printf 'Cross-department demo denial failed.\n' >&2; exit 1; }
-curl --fail --silent "http://127.0.0.1:${web_port}/" >/dev/null
+cross_response="${runtime_root}/cross-department.json"
+api_call 403 GET "/departments/${department_b}/documents" "${cross_response}"
+compose run --rm --no-deps web node -e \
+  'fetch("http://api:8000/health").then(response => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))' >/dev/null
 
 compose logs --no-color >"${runtime_root}/compose.log" 2>&1 || true
 if grep -F -e "${auth_secret}" -e "${qdrant_key}" -e "${rag_token}" -e "${adapter_token}" -e "${adapter_eval_token}" -e "${question_sentinel}" "${runtime_root}/compose.log" >/dev/null; then
