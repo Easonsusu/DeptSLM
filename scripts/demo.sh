@@ -218,6 +218,7 @@ api_call() {
   local output="$4"
   local input_file="${5:-}"
   local content_type="${6:-}"
+  local report_failure="${7:-1}"
   local response_file="${output}.http"
   local status
   if [[ -n "${input_file}" ]]; then
@@ -237,15 +238,23 @@ api_call() {
   tail -n +2 "${response_file}" >"${output}"
   rm -f -- "${response_file}"
   if [[ "${expected}" == "2xx" ]]; then
-    [[ "${status}" =~ ^2[0-9][0-9]$ ]]
+    if [[ "${status}" =~ ^2[0-9][0-9]$ ]]; then
+      return 0
+    fi
   else
-    [[ "${status}" == "${expected}" ]]
+    if [[ "${status}" == "${expected}" ]]; then
+      return 0
+    fi
   fi
+  if [[ "${report_failure}" == "1" ]]; then
+    printf 'Synthetic API check failed: %s %s (HTTP %s).\n' "${method}" "${path}" "${status:-unknown}" >&2
+  fi
+  return 1
 }
 
 api_ready=0
 for _ in $(seq 1 90); do
-  if api_call 2xx GET /health "${runtime_root}/health.json"; then
+  if api_call 2xx GET /health "${runtime_root}/health.json" "" "" 0; then
     api_ready=1
     break
   fi
