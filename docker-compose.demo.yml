@@ -1,11 +1,15 @@
 services:
   web:
     user: "${DEPTSLM_DEMO_UID:-1001}:${DEPTSLM_DEMO_GID:-1001}"
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
     environment:
       API_URL: "http://api:8000"
 
   api:
     user: "${DEPTSLM_DEMO_UID:-1001}:${DEPTSLM_DEMO_GID:-1001}"
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
     tmpfs:
       - /runtime/deptslm:rw,noexec,nosuid,size=16m,uid=${DEPTSLM_DEMO_UID:-1001},gid=${DEPTSLM_DEMO_GID:-1001},mode=700
     environment:
