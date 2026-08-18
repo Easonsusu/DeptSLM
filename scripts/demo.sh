@@ -223,6 +223,8 @@ for _ in $(seq 1 90); do
   sleep 1
 done
 if [[ "${api_ready}" -ne 1 ]]; then
+  compose ps >&2 || true
+  compose logs --no-color api >&2 || true
   printf 'Synthetic API did not become ready.\n' >&2
   exit 1
 fi
