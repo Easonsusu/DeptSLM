@@ -26,7 +26,6 @@ api_port=${DEPTSLM_DEMO_API_PORT:-18000}
 web_port=${DEPTSLM_DEMO_WEB_PORT:-13000}
 status_before=$(mktemp "${tmp_parent%/}/deptslm-demo-status.XXXXXX")
 status_after=$(mktemp "${tmp_parent%/}/deptslm-demo-status.XXXXXX")
-indexing_pid=""
 
 mkdir -p "${runtime_root}"/{uploads,extracted_text,vector_snapshots,training_datasets,model_cache,eval_results,logs,exports}
 mkdir -p "${runtime_root}/training_datasets/jobs" "${runtime_root}/adapters"/{imports,registry,.staging/imports,.staging/registry}
@@ -96,10 +95,6 @@ compose() {
 
 cleanup() {
   set +e
-  if [[ -n "${indexing_pid}" ]]; then
-    kill "${indexing_pid}" >/dev/null 2>&1 || true
-    wait "${indexing_pid}" >/dev/null 2>&1 || true
-  fi
   compose down --volumes --remove-orphans >/dev/null 2>&1
   rm -f -- "${env_file}" "${source_file}" "${status_before}" "${status_after}"
   case "${runtime_root}" in
@@ -304,10 +299,8 @@ for _ in $(seq 1 60); do
 done
 [[ "${qdrant_ready}" -eq 1 ]] || { printf 'Synthetic Qdrant collection was not ready for indexing.\n' >&2; exit 1; }
 
-indexing_worker_log="${runtime_root}/indexing-worker.log"
-compose run --rm --no-deps indexing-worker \
-  python -m deptslm_worker.indexer --poll >"${indexing_worker_log}" 2>&1 &
-indexing_pid=$!
+compose exec --detach --no-TTY indexing-worker \
+  python -m deptslm_worker.indexer --poll >/dev/null
 
 indexing_response="${runtime_root}/indexing-response.json"
 api_call 2xx POST "/departments/${department_a}/documents/${document_id}/extractions/${extraction_id}/indexings" "${indexing_response}"
@@ -317,20 +310,15 @@ for _ in $(seq 1 120); do
   api_call 2xx GET "/departments/${department_a}/documents/${document_id}/extractions/${extraction_id}/indexings" "${runtime_root}/indexings.json"
   indexing_status=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(next(x["status"] for x in d["items"] if x["id"]==sys.argv[2]))' "${runtime_root}/indexings.json" "${indexing_id}")
   [[ "${indexing_status}" == "succeeded" ]] && break
-  if [[ "${indexing_status}" == "failed" ]]; then
-    tail -n 80 "${indexing_worker_log}" >&2 || true
-    break
-  fi
+  [[ "${indexing_status}" == "failed" ]] && break
   sleep 1
 done
 if [[ "${indexing_status}" != "succeeded" ]]; then
-  tail -n 80 "${indexing_worker_log}" >&2 || true
+  compose ps --all >&2 || true
+  compose logs --no-color indexing-worker >&2 || true
   printf 'Synthetic indexing did not succeed.\n' >&2
   exit 1
 fi
-kill "${indexing_pid}" >/dev/null 2>&1 || true
-wait "${indexing_pid}" >/dev/null 2>&1 || true
-indexing_pid=""
 
 answer_response="${runtime_root}/answer-response.json"
 answer_request="${runtime_root}/answer-request.json"
