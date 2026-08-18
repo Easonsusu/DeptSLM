@@ -25,6 +25,7 @@ services:
     user: "${DEPTSLM_DEMO_UID:-1001}:${DEPTSLM_DEMO_GID:-1001}"
     tmpfs:
       - /runtime/deptslm:rw,noexec,nosuid,size=16m,uid=${DEPTSLM_DEMO_UID:-1001},gid=${DEPTSLM_DEMO_GID:-1001},mode=700
+    command: ["python", "-c", "import time; time.sleep(3600)"]
     environment:
       DEPTSLM_EMBEDDING_PROVIDER: "fake"
 

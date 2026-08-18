@@ -238,6 +238,9 @@ for _ in $(seq 1 90); do
 done
 [[ "${extraction_status}" == "succeeded" ]] || { printf 'Synthetic extraction did not succeed.\n' >&2; exit 1; }
 
+compose run --detach --no-deps indexing-worker \
+  python -m deptslm_worker.indexer --poll >/dev/null
+
 indexing_response="${runtime_root}/indexing-response.json"
 curl_json -X POST "http://127.0.0.1:${api_port}/departments/${department_a}/documents/${document_id}/extractions/${extraction_id}/indexings" >"${indexing_response}"
 indexing_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "${indexing_response}")
