@@ -28,6 +28,9 @@ services:
     environment:
       DEPTSLM_EMBEDDING_PROVIDER: "fake"
 
+  evaluator-worker:
+    command: ["python", "-c", "import time; time.sleep(3600)"]
+
   adapter-evaluator:
     user: "${DEPTSLM_DEMO_UID:-1001}:${DEPTSLM_DEMO_GID:-1001}"
     tmpfs:
