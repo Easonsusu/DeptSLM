@@ -30,6 +30,7 @@ from app.models import (
     PersistentAuditEvent,
     RagAnswerCitation,
     RagAnswerRun,
+    RagAnswerRuntimeSnapshot,
     UserIdentity,
 )
 from app.vector_index_domain import (
@@ -70,6 +71,7 @@ def engine():
 def db(engine) -> Session:
     with Session(engine) as session:
         session.execute(delete(RagAnswerCitation))
+        session.execute(delete(RagAnswerRuntimeSnapshot))
         session.execute(delete(RagAnswerRun))
         session.execute(delete(DocumentVectorIndexing))
         session.execute(delete(DocumentChunk))
@@ -93,7 +95,7 @@ def test_00_migration_cycle_and_content_free_schema(engine) -> None:
     command.upgrade(config, "head")
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "0016_phase12_adapter_governance"
+            "0017_phase12_adapter_runtime_routing"
         )
     run_columns = {column["name"] for column in inspect(engine).get_columns("rag_answer_runs")}
     citation_columns = {

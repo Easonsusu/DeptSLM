@@ -1365,7 +1365,7 @@ def test_phase12_3_migration_cycle_preserves_phase12_2_rows(engine) -> None:
                 evaluation_count
             )
     finally:
-        command.upgrade(config, "0016_phase12_adapter_governance")
+        command.upgrade(config, "head")
     inspector = inspect(engine)
     assert {
         "adapter_reviews",

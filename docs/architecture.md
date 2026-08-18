@@ -2,7 +2,7 @@
 
 ## Status and boundaries
 
-Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 completed the internal department-scoped evaluation runner; Phase 10 completed the metadata-only builder for human-authored supervised fine-tuning dataset artifacts; Phase 11 completed the isolated LlamaFactory job-bundle generator that never executes training. Phase 12.0 through Phase 12.2 are complete, and Phase 12.3 is the current reviewed scope. Phase 12.2 compares one exact validated adapter with the exact Phase 7 baseline through one shared Phase 9 retrieval/prompt/seed context and publishes only content-free numeric evidence. Phase 12.3 adds separate review, approval, deployment, promotion, rollback, retention, and immutable event metadata authorities without loading or routing adapters. Runtime routing remains unimplemented. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or either evaluation runtime. Public vector search, conversations, streaming, reranking, training, adapter loading, or automatic approval/promotion remain unimplemented.
+Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 completed the internal department-scoped evaluation runner; Phase 10 completed the metadata-only builder for human-authored supervised fine-tuning dataset artifacts; Phase 11 completed the isolated LlamaFactory job-bundle generator that never executes training. Phase 12.0 through Phase 12.3 are complete, and Phase 12.4 is the current reviewed scope. Phase 12.2 compares one exact validated adapter with the exact Phase 7 baseline through one shared Phase 9 retrieval/prompt/seed context and publishes only content-free numeric evidence. Phase 12.3 adds separate review, approval, deployment, promotion, rollback, retention, and immutable event metadata authorities without loading or routing adapters. Phase 12.4 adds only server-owned generation routing through a separate private runtime and immutable request snapshots; retrieval remains the Phase 7 path. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or either evaluation runtime. Public vector search, conversations, streaming, reranking, training, or automatic approval/promotion remain unimplemented.
 
 Phase 9 publication is deliberately non-atomic across PostgreSQL and external storage. A server-generated publication UUID and exact positive run attempt number bind each staged and final result manifest to the department, suite, run, and code revision. Result staging and publication run in killable leased children; PostgreSQL writes the succeeded state only after descriptor-relative no-follow final-artifact verification. Reclaim and the administrator-only `reconcile-artifacts` command delete only an exact manifest-proven, non-succeeded attempt. Reconciliation records a durable content-free batch before filesystem mutation and terminalizes the owned run or suite metadata with one batch audit, so a later authorized invocation can resume a crash window. They never delete unknown, mismatched, succeeded, or committed artifacts. A crash after an external rename can therefore leave an untrusted orphan, but never an authoritative result.
 
@@ -39,7 +39,7 @@ flowchart TB
         ExternalAdapter["Untrusted adapter files"]
     end
 
-    subgraph AdapterBoundary["Phase 12 adapter governance (under review)"]
+    subgraph AdapterBoundary["Phase 12 adapter governance and runtime (under review)"]
         SourceImport["Administrator source import"]
         ImportBundle["Immutable external adapter source bundle"]
         Intake["Isolated adapter intake and validation"]
@@ -47,7 +47,7 @@ flowchart TB
         Evidence["Adapter evaluation evidence"]
         Review["Review and approval"]
         Deployment["Department deployment pointer"]
-        Load["Fail-closed runtime adapter loading"]
+        Load["Fail-closed adapter-runtime loading"]
     end
 
     Drive[("External runtime storage\nDEPTSLM_DATA_DIR on Google Drive")]
@@ -105,7 +105,7 @@ Phase 11 consumes exactly one succeeded, approved, unpurged Phase 10 dataset in 
 
 The worker receives only PostgreSQL and `training_datasets`; it has no model, tokenizer, LlamaFactory package, Hugging Face token, Qdrant, RAG runtime, upload, extraction, evaluation, adapter, or cloud configuration. It never runs the generated configuration. Stale cleanup, authority loading, descriptor hashing, stage preparation, child execution, publication steps, and final source reauthorization retain independent parent lease checkpoints. The parent renews a fresh lease guard before, never inside, the final locked transaction; that transaction uses PostgreSQL server time for the final ownership check. Purge uses a durable review-fencing reservation binding the exact succeeded attempt, content-free manifest, and UUID tombstone namespace. Stages must complete before final-deletion authorization; a short committed `deletion_authorized` move-intent transaction precedes the no-replace filesystem move. A separate short transaction records the exact parent, directory, and fixed-file identities as `tombstone_bound` before cleanup. Retries reject any replacement or unbound partial tombstone; only a durably in-flight exact unlink may be absent. A purge operation records per-job progress and emits at most one success audit after its active reservations close. A pre-move ownership failure leaves the final intact; a post-move cleanup failure leaves the reservation active. PostgreSQL and external storage remain non-atomic: an already in-flight rename cannot be fenced retroactively, and an artifact without committed succeeded PostgreSQL authority is not eligible for review or future adapter use.
 
-## Phase 12 adapter registry, evaluation, and governance boundary (under review)
+## Phase 12 adapter registry, evaluation, governance, and runtime boundary (under review)
 
 Phase 12.0 defines the external adapter threat model. Phase 12.1A adds the
 source-controlled, model-free static compatibility contract in
@@ -123,12 +123,12 @@ validated. The reviewed base contract is `Qwen/Qwen3-0.6B` revision
 LlamaFactory `0.9.5`.
 
 Future intake, evaluation evidence, review, approval, promotion, supersession,
-rollback, and deployment events remain separate metadata boundaries. A
-deployment will point to one exact immutable adapter version, and a department
-will have at most one active deployment. Runtime routing must use one immutable
-request snapshot, reject cross-department or base-revision mismatches, return a
-safe failure when a required adapter cannot load, and never silently fall back
-to the base model. Rollback-to-base must be explicit.
+rollback, and deployment events remain separate metadata boundaries. Phase
+12.4 now captures one exact immutable deployment target per public RAG request.
+The routed generation lane rejects cross-department or base-revision
+mismatches, returns a safe failure when a required adapter cannot load, and
+never silently falls back to the base model. Query embedding and retrieval stay
+on the Phase 7 base runtime. Rollback-to-base remains explicit.
 
 The registry, import-source, and `.staging` surfaces live
 only beneath `DEPTSLM_DATA_DIR/adapters`, use private UUID-derived paths and
@@ -142,7 +142,8 @@ ownership through independent reservations; it does not delete Phase 10
 datasets, Phase 11 job bundles, backups, or audit history. Phase 12.1E-C
 separately releases only the exact upstream retention dependency after
 read-only proof of completed E-B authority; it never mutates artifact storage.
-Future deployment fencing remains a later lifecycle requirement. See
+Phase 12.1E-B fences a running adapter-target request by its exact runtime
+snapshot before registry/source purge. See
 [adapter-registry.md](adapter-registry.md) for the full contract.
 
 The static contract fixes the Qwen3-0.6B/PEFT/safetensors compatibility metadata
@@ -183,6 +184,20 @@ The extraction path stream-copies each canonical source into a private verified 
 For Phase 7, the API uses the same reviewed Qdrant adapter and PostgreSQL retrieval authority, then incrementally reads only selected exact chunks. It sends bounded evidence with server-owned labels to a private runtime, validates strict citations, and reauthorizes plus revalidates every supplied source before success; only the cited subset is returned and persisted. The runtime HTTP process supervises one persistent model child through bounded framed IPC. Startup and operation clocks are separate. Over-token inputs preserve the healthy loaded child; fatal operations terminate and reap it, then launch one bounded shared background replacement while readiness is false and new work fails fast. Disconnect/cancellation cannot leave a child or cancel that shared recovery. The model child receives a strict secret-free environment without the runtime bearer token. LlamaIndex is not introduced.
 
 Retrieved text is untrusted content. Prompt assembly must delimit it as evidence, prevent instructions in it from overriding higher-priority policy, and include only sources from the authorized department. If retrieval does not yield usable evidence, the assistant must state that it does not have enough information rather than generate a department-specific claim.
+
+Phase 12.4 wraps this boundary with `RoutedRagRuntime`: query embedding always
+uses `rag-runtime`, while generation uses that base service for implicit or
+explicit base snapshots and only `adapter-runtime` for an exact adapter
+snapshot. The production service is isolated from the base and evaluation
+runtime, receives only read-only model-cache and registry-final mounts, and
+verifies/copies registry artifacts before PEFT loading. A target fingerprint
+binds the API snapshot, runtime request, and successful response. Target change
+retires the old child rather than hot-switching tenants; runtime errors never
+call base generation or mutate deployment state. The API keeps the Phase 7
+base transport timeout separate from a bounded 450-second adapter envelope,
+and the manifest descriptor remains retained and revalidated through the
+private copy boundary. See
+[adapter-runtime-routing.md](adapter-runtime-routing.md).
 
 ### Qwen3 and Qwen3-Embedding
 
@@ -329,5 +344,5 @@ PostgreSQL claims, Qdrant retrieval, Phase 5 artifacts, result publication, and 
 - Hybrid retrieval, reranking, and relevance thresholds beyond the Phase 5 character chunker
 - Production retention, physical purge, reconciliation, and tamper-resistant audit requirements
 - Phase 12.3 adapter review, registry lifecycle, and deployment governance are
-  the current reviewed scope; Phase 12.4 runtime deployment remains unstarted
+  complete; Phase 12.4 immutable runtime routing is the current reviewed scope
 - Production topology, secrets, observability, backup, and disaster recovery

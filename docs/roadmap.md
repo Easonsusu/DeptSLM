@@ -62,7 +62,7 @@ This roadmap separates foundational safety work from product implementation. A l
 
 - Phase 11 merged its reviewed, immutable department-scoped LoRA and QLoRA job-bundle boundary from one approved Phase 10 dataset. It does not invoke LlamaFactory, train a model, create adapters, or place datasets, logs, or weights in Git.
 
-## Phase 12 — LoRA adapter registry (Phase 12.3 under review)
+## Phase 12 — LoRA adapter registry (Phase 12.4 under review)
 
 - Phase 12.0 (completed) defines the adapter-registry threat model, immutable administrator-controlled source boundary, closed artifact and metadata contracts, governance-lineage versus training-provenance limits, and future lifecycle, evaluation, promotion, rollback, reconciliation, and purge design.
 - Phase 12.1 (completed): immutable external adapter intake, registry publication, metadata-only reads, reconciliation, purge, and lifecycle-release foundations; no runtime loading.
@@ -127,13 +127,18 @@ This roadmap separates foundational safety work from product implementation. A l
   external `eval_results`. Queue leases, cancellation, reclaim, final
   PostgreSQL authority, and the Phase 12.1E-B purge fence remain mandatory.
   Evaluation does not approve, promote, route, or change production behavior.
-- Phase 12.3 (current; under review): adds separate review and approval
-  authorities, department deployment metadata, explicit promotion and rollback
-  operations, rollback-retention references and release, immutable deployment
-  event history, and exact evaluation/registry/artifact authority fencing. It
-  does not overload `Adapter.status`, load or route adapters, or approve or
-  promote automatically.
-- Phase 12.4 (not started): department-bound runtime routing, immutable request snapshots, fail-closed loading, and explicit rollback-to-base.
+- Phase 12.3 (completed): adds separate review and approval authorities,
+  department deployment metadata, explicit promotion and rollback operations,
+  rollback-retention references and release, immutable deployment event history,
+  and exact evaluation/registry/artifact authority fencing. It does not overload
+  `Adapter.status`, load or route adapters, or approve or promote automatically.
+- Phase 12.4 (current; under review): captures an immutable content-free
+  deployment target at RAG admission, preserves every Phase 7 retrieval and
+  final-authority contract, and routes generation for adapter targets only to a
+  separate private production runtime. It uses exact Phase 12.3 authority,
+  descriptor-verified registry copies, target fingerprints, killable single-
+  target children, no silent base fallback, and a running-request E-B purge
+  fence. It does not change deployment governance or start Phase 13.
 
 ## Phase 13 — Security hardening, Docker demo, and final documentation (not started)
 

@@ -2,7 +2,15 @@
 
 ## Boundary
 
-`services/rag-runtime` is a private, non-root, read-only container on an internal Compose network. It has no host port, database URL, Qdrant URL or key, API JWT secret, Google Drive credentials, tools, or outbound model-download behavior. It mounts only `DEPTSLM_DATA_DIR/model_cache` read-only and runs with Hugging Face and Transformers offline flags.
+`services/rag-runtime` is the unchanged Phase 7 base runtime: a private,
+non-root, read-only container on an internal Compose network. It has no host
+port, database URL, Qdrant URL or key, API JWT secret, Google Drive
+credentials, tools, adapter registry mount, PEFT adapter-loading path, or
+outbound model-download behavior. It mounts only
+`DEPTSLM_DATA_DIR/model_cache` read-only and runs with Hugging Face and
+Transformers offline flags. Phase 12.4 uses a separate `adapter-runtime` for
+approved adapter generation; it never makes query embedding depend on that
+service.
 
 The API authenticates to it with a long untracked bearer token using two narrow endpoints:
 
@@ -32,6 +40,12 @@ A deterministic fake provider is permitted only with exact `ENVIRONMENT=test` an
 The real two-model smoke test is opt-in only. It requires both exact model directories already prepared under an external temporary/test data root, an explicit switch, and offline environment. Missing assets cause a skip, never a download.
 
 Phase 9 evaluation uses the same runtime endpoints, prompt contract, non-thinking generation parameters, token limits, validation, and child isolation. The optional server-owned per-case seed is transmitted only on the private generation call; the model child applies reviewed Python and model RNG seeds before generation. Public RAG calls preserve the existing unseeded contract. Fixed seeds improve repeatability but cannot guarantee bit-identical output across hardware, libraries, or kernels. The evaluator receives the runtime URL/token but no model mount, model dependency, or Hugging Face credential.
+
+The production Phase 12.4 adapter runtime is a distinct image, bearer token,
+process supervisor, and storage boundary. It receives only read-only
+`model_cache` and `adapters/registry`, verifies a target fingerprint and exact
+registry contract, and never serves base generation as a fallback. See
+[adapter-runtime-routing.md](adapter-runtime-routing.md).
 
 ## Limitations
 

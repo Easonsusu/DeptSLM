@@ -392,6 +392,7 @@ def _validate_review_start(
         or run.base_model_revision != _BASE_MODEL_REVISION
         or run.registry_attempt_version != registry.version
         or run.registry_attempt_id != registry.id
+        or adapter.publication_attempt_id != registry.publication_attempt_id
         or run.registry_manifest_sha256 != adapter.registry_manifest_sha256
         or run.registry_adapter_config_sha256 != adapter.registry_adapter_config_sha256
         or run.registry_adapter_config_byte_size != adapter.registry_adapter_config_byte_size

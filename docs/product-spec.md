@@ -2,7 +2,7 @@
 
 ## Document status
 
-This document describes the product direction and separates completed Phase 0–12.2 boundaries from the planned scope. Phase 12.0 through Phase 12.2 are completed, and Phase 12.3 is the current reviewed, metadata-only adapter-governance boundary. It records explicit review, approval, deployment, promotion, rollback, retention, and event authorities but does not load or route an adapter. Phase 12.4 and Phase 13 remain unimplemented. Unless a capability is explicitly labeled as completed, it is not implemented.
+This document describes the product direction and separates completed Phase 0–12.3 boundaries from the planned scope. Phase 12.0 through Phase 12.3 are completed, and Phase 12.4 is the current reviewed adapter-runtime routing boundary. It records an immutable content-free target snapshot for each public grounded-answer request and routes only the generation lane through a separate private runtime; retrieval and governance remain unchanged. Phase 13 remains unimplemented. Unless a capability is explicitly labeled as completed, it is not implemented.
 
 ## Product summary
 
@@ -67,18 +67,19 @@ Students may become an end-user group in a future deployment, but only after a d
 
 - Build reviewed department-specific training datasets.
 - Phase 11 generates immutable LoRA or QLoRA LlamaFactory job bundles; it does not execute training or create adapters.
-- Phase 12.1B stores externally produced adapters outside the repository, and Phase 12.1C records a department-scoped, verified governance association to one exact Phase 10 dataset and Phase 11 job plus the reviewed base-model and closed artifact contracts. Phase 12.2 evaluates one exact adapter; Phase 12.3 records explicit human review and deployment decisions. Runtime loading remains future work.
+- Phase 12.1B stores externally produced adapters outside the repository, and Phase 12.1C records a department-scoped, verified governance association to one exact Phase 10 dataset and Phase 11 job plus the reviewed base-model and closed artifact contracts. Phase 12.2 evaluates one exact adapter; Phase 12.3 records explicit human review and deployment decisions. Phase 12.4 routes an approved deployment only after exact admission authority, with no silent fallback, no public selector, and no change to retrieval.
 - Evaluation and explicit review approval are required before promotion or runtime use. Adaptation remains optional and must demonstrate value beyond the approved base/RAG behavior.
 
 ### Phase 12 governance boundary
 
 Phase 12.0 defines the external adapter threat model, immutable artifact and
 governance-lineage contracts, metadata-only registry, evaluation evidence,
-review, promotion, rollback, and eventual fail-closed runtime routing. Phase
+review, promotion, rollback, and fail-closed runtime routing. Phase
 12.1C adds only the internal migration and administrator-enqueued worker for
 immutable registry publication. Phase 12.1D adds only the two department-scoped
-metadata GETs, Phase 12.2 adds paired evaluation, and Phase 12.3 adds separate
-review/deployment authorities; none loads or routes an adapter. An imported
+metadata GETs, Phase 12.2 adds paired evaluation, Phase 12.3 adds separate
+review/deployment authorities, and Phase 12.4 adds a department-bound immutable
+generation route. An imported
 adapter is not approved, an approved adapter is not promoted, and promotion is
 not proof of safety or quality. Cross-department fallback and silent fallback
 to the base model are prohibited; rollback-to-base must be explicit. See

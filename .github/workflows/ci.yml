@@ -129,6 +129,7 @@ jobs:
             apps/api/requirements-dev.txt
             services/rag-worker/pyproject.toml
             services/rag-runtime/pyproject.toml
+            services/adapter-runtime/pyproject.toml
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
         working-directory: apps/api
@@ -138,8 +139,8 @@ jobs:
       - name: Lint API
         working-directory: apps/api
         run: |
-          python -m ruff check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime ../../services/adapter-eval-runtime/deptslm_adapter_runtime
-          python -m ruff format --check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime ../../services/adapter-eval-runtime/deptslm_adapter_runtime
+          python -m ruff check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime ../../services/adapter-eval-runtime/deptslm_adapter_runtime ../../services/adapter-runtime/deptslm_adapter_runtime
+          python -m ruff format --check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime ../../services/adapter-eval-runtime/deptslm_adapter_runtime ../../services/adapter-runtime/deptslm_adapter_runtime
       - name: Run API tests with temporary storage
         working-directory: apps/api
         run: |
@@ -158,7 +159,7 @@ jobs:
             sleep 1
           done
           python -m alembic upgrade head
-          test "$(python -m alembic current | awk '{print $1}')" = "0016_phase12_adapter_governance"
+          test "$(python -m alembic current | awk '{print $1}')" = "0017_phase12_adapter_runtime_routing"
           python -m pytest
       - name: Run one-shot worker smoke test
         working-directory: apps/api
@@ -279,6 +280,66 @@ jobs:
         run: |
           export PYTHONPATH="$GITHUB_WORKSPACE/apps/api:$GITHUB_WORKSPACE/services/rag-worker:$GITHUB_WORKSPACE/services/rag-runtime"
           python tests/phase12_3_container_smoke.py verify
+      - name: Build production adapter runtime image for Phase 12.4 smoke
+        run: docker build --tag deptslm-adapter-runtime-smoke --file services/adapter-runtime/Dockerfile .
+      - name: Prepare actual Phase 12.4 production runtime smoke
+        working-directory: apps/api
+        env:
+          DEPTSLM_DATA_DIR: ${{ runner.temp }}/deptslm-governance-operation
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE/apps/api:$GITHUB_WORKSPACE/services/rag-worker:$GITHUB_WORKSPACE/services/rag-runtime"
+          python tests/phase12_4_container_smoke.py prepare
+          chmod 700 "$DEPTSLM_DATA_DIR" "$DEPTSLM_DATA_DIR/adapters" "$DEPTSLM_DATA_DIR/adapters/registry"
+      - name: Run actual Phase 12.4 production runtime container smoke
+        working-directory: apps/api
+        env:
+          DEPTSLM_DATA_DIR: ${{ runner.temp }}/deptslm-governance-operation
+          DEPTSLM_ADAPTER_RUNTIME_TOKEN: phase12-ci-production-runtime-token-0123456789
+          DEPTSLM_ADAPTER_RUNTIME_BASE_REVISION: c1899de289a04d12100db370d81485cdf75e47ca
+          DEPTSLM_ADAPTER_RUNTIME_PROVIDER: fake
+          ENVIRONMENT: test
+        run: |
+          runtime_uid="$(id -u)"
+          runtime_gid="$(id -g)"
+          container_id="$(docker run --detach --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --publish 127.0.0.1:18012:8012 \
+            --user "${runtime_uid}:${runtime_gid}" \
+            --tmpfs "/tmp/adapter-runtime:rw,noexec,nosuid,size=512m,uid=${runtime_uid},gid=${runtime_gid},mode=700" \
+            --volume "$DEPTSLM_DATA_DIR/model_cache:/runtime/deptslm/model_cache:ro" \
+            --volume "$DEPTSLM_DATA_DIR/adapters/registry:/runtime/deptslm/adapters/registry:ro" \
+            --env DEPTSLM_DATA_DIR=/runtime/deptslm \
+            --env DEPTSLM_ADAPTER_RUNTIME_TOKEN \
+            --env DEPTSLM_ADAPTER_RUNTIME_BASE_REVISION \
+            --env DEPTSLM_ADAPTER_RUNTIME_PROVIDER \
+            --env ENVIRONMENT \
+            deptslm-adapter-runtime-smoke)"
+          trap 'docker rm --force "$container_id" >/dev/null 2>&1 || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18012/healthz >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" == "30" ]]; then
+              echo "Phase 12.4 adapter runtime fake smoke did not become ready." >&2
+              docker logs "$container_id" >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+          curl --fail --silent \
+            --header 'Authorization: Bearer phase12-ci-production-runtime-token-0123456789' \
+            --header 'Content-Type: application/json' \
+            --data-binary @"$RUNNER_TEMP/deptslm-adapter-runtime-request.json" \
+            http://127.0.0.1:18012/internal/v1/generate \
+            > "$RUNNER_TEMP/deptslm-adapter-runtime-response.json"
+          curl --fail --silent \
+            --header 'Authorization: Bearer phase12-ci-production-runtime-token-0123456789' \
+            --header 'Content-Type: application/json' \
+            --data-binary @"$RUNNER_TEMP/deptslm-adapter-runtime-request-b.json" \
+            http://127.0.0.1:18012/internal/v1/generate \
+            > "$RUNNER_TEMP/deptslm-adapter-runtime-response-b.json"
+          python tests/phase12_4_container_smoke.py verify
+          docker rm --force "$container_id" >/dev/null
+          trap - EXIT
       - name: Verify API checks leave the checkout clean
         shell: bash
         run: |
@@ -320,6 +381,8 @@ jobs:
           test -s services/adapter-governance-worker/Dockerfile
           test -s services/adapter-eval-runtime/Dockerfile
           test -s services/adapter-eval-runtime/pyproject.toml
+          test -s services/adapter-runtime/Dockerfile
+          test -s services/adapter-runtime/pyproject.toml
       - name: Build and inspect API migration image
         run: |
           docker build --tag deptslm-api-ci --file apps/api/Dockerfile .
@@ -347,6 +410,7 @@ jobs:
           assert pathlib.Path("/app/alembic/versions/0014_phase12_adapter_purge.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0015_phase12_adapter_evaluation.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0016_phase12_adapter_governance.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0017_phase12_adapter_runtime_routing.py").is_file()
           import app.evaluation_admin
           import app.evaluation_services
           import app.sft_services
@@ -520,6 +584,25 @@ jobs:
           '
           if docker image inspect deptslm-adapter-eval-runtime-ci --format '{{json .Config.ExposedPorts}}' | grep -F '8011/tcp' >/dev/null; then :; else exit 1; fi
           if docker image inspect deptslm-adapter-eval-runtime-ci --format '{{json .Config.Env}}' | grep -E 'DATABASE_URL|DEPTSLM_QDRANT|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|HTTP_PROXY|HTTPS_PROXY' >/dev/null; then exit 1; fi
+      - name: Build and inspect production adapter runtime image
+        run: |
+          docker build --tag deptslm-adapter-runtime-ci --file services/adapter-runtime/Dockerfile .
+          docker run --rm --entrypoint python deptslm-adapter-runtime-ci -I -c '
+          import peft, safetensors, transformers
+          import deptslm_adapter_runtime.main
+          import deptslm_adapter_runtime.loader
+          import deptslm_adapter_runtime.supervisor
+          assert peft.__version__ == "0.18.1"
+          assert transformers.__version__ == "4.55.0"
+          assert safetensors.__version__ == "0.7.0"
+          '
+          if docker image inspect deptslm-adapter-runtime-ci --format '{{json .Config.ExposedPorts}}' | grep -F '8012/tcp' >/dev/null; then :; else exit 1; fi
+          if docker image inspect deptslm-adapter-runtime-ci --format '{{json .Config.Env}}' | grep -E 'DATABASE_URL|DEPTSLM_QDRANT|DEPTSLM_AUTH|DEPTSLM_RAG_RUNTIME_TOKEN|DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|HTTP_PROXY|HTTPS_PROXY' >/dev/null; then exit 1; fi
+          weight_matches="$(docker run --rm --entrypoint sh deptslm-adapter-runtime-ci -c 'find / -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) ! -path "/usr/local/lib/python3.12/site-packages/distutils-precedence.pth" -print 2>/dev/null || true')"
+          if [[ -n "$weight_matches" ]]; then
+            printf 'Forbidden model-weight-like files in adapter runtime image:\n%s\n' "$weight_matches" >&2
+            exit 1
+          fi
       - name: Build and inspect internal RAG runtime image
         run: |
           docker build --tag deptslm-rag-runtime-ci --file services/rag-runtime/Dockerfile .
@@ -740,14 +823,39 @@ jobs:
           ! grep -E 'qdrant|model_cache|uploads|extracted_text|training_datasets|eval_results|exports|rag-internal|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|DEPTSLM_AUTH|PROXY' <<<"$governance_compose"
           ! grep -E '@router\.(get|post|put|patch|delete).*search|/search|query_vector' apps/api/app/routes.py
           ! grep -E 'adapter_selector|runtime_adapter|model_path|qdrant_url' apps/api/app/adapter_governance_*.py
-          ! grep -R --include='*.py' -E 'DepartmentAdapterDeployment|adapter_selector|runtime_adapter|peft|PEFT' apps/api/app/rag_answer_services.py services/rag-runtime/deptslm_runtime
+          ! grep -R --include='*.py' -E 'DepartmentAdapterDeployment|adapter_selector|runtime_adapter|peft|PEFT' apps/api/app/adapter_evaluation_policy.py apps/api/app/adapter_evaluation_*.py services/rag-worker/deptslm_worker/adapter_evaluation_*.py services/rag-worker/deptslm_worker/evaluation_*.py
           grep -F 'Phase 12.4' docs/adapter-governance.md >/dev/null
+      - name: Check Phase 12.4 runtime routing isolation
+        run: |
+          grep -F 'DepartmentAdapterDeployment' apps/api/app/rag_answer_services.py apps/api/app/adapter_deployment_authority.py >/dev/null
+          grep -F 'RagAnswerRuntimeSnapshot' apps/api/app/rag_answer_services.py apps/api/app/models.py >/dev/null
+          grep -F 'RoutedRagRuntime' apps/api/app/rag_answer_services.py >/dev/null
+          grep -F 'query_embedding' apps/api/app/rag_runtime_router.py >/dev/null
+          grep -F 'adapter_runtime_target_mismatch' apps/api/app/adapter_runtime_client.py apps/api/app/rag_domain.py >/dev/null
+          runtime_sources="$(find services/adapter-runtime/deptslm_adapter_runtime -type f -name '*.py' ! -name settings.py -print)"
+          if [[ -n "$runtime_sources" ]] && grep -E 'adapter-eval-runtime|DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN' apps/api/app/rag_answer_services.py apps/api/app/adapter_runtime_client.py $runtime_sources; then
+            exit 1
+          fi
+          grep -F 'DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN' services/adapter-runtime/deptslm_adapter_runtime/settings.py >/dev/null
+          ! grep -E 'adapter_selector|deployment_selector' apps/api/app/routes.py apps/api/app/schemas.py
+          api_compose="$(sed -n '/^  api:/,/^  postgres:/p' docker-compose.yml)"
+          ! grep -E '/adapters|adapters/|model_cache' <<<"$api_compose"
+          rag_compose="$(sed -n '/^  rag-runtime:/,/^  adapter-runtime:/p' docker-compose.yml)"
+          ! grep -E '/adapters|adapters/|peft|PEFT' <<<"$rag_compose"
+          adapter_compose="$(sed -n '/^  adapter-runtime:/,/^  training-worker:/p' docker-compose.yml)"
+          grep -F '/model_cache' <<<"$adapter_compose" >/dev/null
+          grep -F '/adapters/registry' <<<"$adapter_compose" >/dev/null
+          grep -F 'rag-internal' <<<"$adapter_compose" >/dev/null
+          ! grep -E 'DATABASE_URL|QDRANT|DEPTSLM_AUTH|DEPTSLM_ADAPTER_EVAL|uploads|extracted_text|eval_results|training_datasets|exports|proxy|HF_TOKEN|HUGGING_FACE_HUB_TOKEN' <<<"$adapter_compose"
+          ! grep -E '^\s+ports:' <<<"$adapter_compose"
+          grep -F 'Phase 12.4' docs/adapter-runtime-routing.md >/dev/null
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then
             export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-data"
             export DEPTSLM_QDRANT_API_KEY="phase6-ci-compose-key-0123456789"
             export DEPTSLM_RAG_RUNTIME_TOKEN="phase7-ci-runtime-token-0123456789-abcdef"
+            export DEPTSLM_ADAPTER_RUNTIME_TOKEN="phase12-ci-production-runtime-token-0123456789"
             export DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN="phase12-ci-adapter-runtime-token-0123456789"
             export DEPTSLM_EVALUATION_CODE_REVISION="9999999999999999999999999999999999999999"
             export DEPTSLM_SFT_CODE_REVISION="8888888888888888888888888888888888888888"

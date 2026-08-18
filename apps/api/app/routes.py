@@ -825,6 +825,7 @@ async def post_rag_answer(
             request_scope,
             body.question,
             runtime=getattr(request.app.state, "rag_runtime_client", None),
+            adapter_runtime=getattr(request.app.state, "adapter_runtime_client", None),
             qdrant=getattr(request.app.state, "rag_qdrant", None),
         )
     except ServiceError as error:

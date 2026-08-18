@@ -367,8 +367,44 @@ from the Phase 12.2 evaluation. Promotion, rollback, base rollback, and
 retention release are explicit, same-department administrator operations with
 optimistic versions, PostgreSQL-server-time leases, and immutable content-free
 events. Approval never promotes automatically. Phase 12.1E-B purge and E-C
-release fence active governance operations; PostgreSQL and external storage
-remain non-atomic and no runtime routing is implemented.
+release fence active governance operations; PostgreSQL, external storage, and
+runtime processes remain non-atomic.
+
+### Phase 12.4 adapter runtime
+
+The public API stores only the immutable, content-free
+`rag_answer_runtime_snapshots` authority: deployment and governance IDs,
+versions, registry digests/sizes, fixed model revision, contract, and target
+fingerprint. It never stores adapter bytes, paths, prompts, evidence, model
+output, tokens, or exception text. The production `adapter-runtime` mounts
+only `model_cache:ro` and `adapters/registry:ro`; it calls the shared model
+store validator once and passes the exact returned generation directory to
+both tokenizer and base-model loading, never the `model_cache` root. It copies
+verified registry bytes into a private short-lived `/tmp/adapter-runtime`
+directory and removes the copy when its single target child retires (including
+supervisor cleanup after forced termination). It receives no database,
+Qdrant, uploads, extraction, evaluation, dataset, training, export, or
+registry-write storage. Runtime caches are keyed by department, adapter and
+version, publication/attempt authority, base revision, and config/model
+digest/size, so no cross-department or stale-target reuse is permitted.
+
+The API transport envelope is separate from the Phase 7 base-runtime timeout:
+`DEPTSLM_RAG_REQUEST_TIMEOUT_SECONDS` remains bounded at 1–300 seconds, while
+`DEPTSLM_ADAPTER_RUNTIME_REQUEST_TIMEOUT_SECONDS` is server-owned, bounded at
+450–600 seconds, and defaults to 450 seconds for the adapter's 300-second
+target-load plus 120-second generation clocks and fixed margin. No request
+parameter can extend it. Manifest authority is descriptor-bound from initial
+verification through copy and final return; the retained manifest identity,
+directory association, canonical digest, and parsed fields are rechecked, as
+are the config/model descriptors and final directory identity. A mismatch
+cleans the private copy and cannot route a model.
+
+Phase 12.4 does not make base RAG depend on adapter-runtime health. Query
+embedding and retrieval remain on the existing base runtime. A required
+adapter failure is a safe request failure, never a base fallback or automatic
+rollback. PostgreSQL, external files, and runtime processes are not
+transactionally atomic; activated bytes without committed succeeded authority
+remain untrusted.
 
 ## Google Drive limitations
 

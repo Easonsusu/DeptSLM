@@ -46,6 +46,8 @@ from app.models import (
     AdapterReview,
     AdapterRollbackRetention,
     DepartmentAdapterDeployment,
+    RagAnswerRun,
+    RagAnswerRuntimeSnapshot,
 )
 from app.services import ServiceError, append_mutation_audit, authorize_transaction
 
@@ -131,6 +133,7 @@ class _MoveContext:
     expected_manifest_sha256: str | None
     expected_manifest_byte_size: int | None
     expected_tombstone_namespace: dict[str, object]
+    target_adapter_version: int
     expected_resource_version: int
     expected_attempt_version: int
     item_version: int
@@ -228,7 +231,23 @@ def _authority_snapshot(authority: _Authority) -> dict[str, object]:
     }
 
 
-def _load_authority(session: Session, department_id: UUID, adapter_id: UUID) -> _Authority:
+def _target_adapter_version(snapshot: object) -> int:
+    """Return the immutable adapter version captured before E-B registration."""
+
+    if not isinstance(snapshot, dict):
+        raise ServiceError(409, "Adapter purge authority changed")
+    adapter = snapshot.get("adapter")
+    version = adapter.get("version") if isinstance(adapter, dict) else None
+    if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+        raise ServiceError(409, "Adapter purge authority changed")
+    return version
+
+
+def _load_authority(
+    session: Session,
+    department_id: UUID,
+    adapter_id: UUID,
+) -> _Authority:
     adapter = session.execute(
         select(Adapter)
         .where(Adapter.id == adapter_id, Adapter.department_id == department_id)
@@ -273,7 +292,13 @@ def _load_authority(session: Session, department_id: UUID, adapter_id: UUID) -> 
     return authority
 
 
-def _assert_eligible(session: Session, authority: _Authority, department_id: UUID) -> None:
+def _assert_eligible(
+    session: Session,
+    authority: _Authority,
+    department_id: UUID,
+    *,
+    target_adapter_version: int | None = None,
+) -> None:
     adapter = authority.adapter
     source = authority.source
     source_attempt = authority.source_attempt
@@ -317,7 +342,12 @@ def _assert_eligible(session: Session, authority: _Authority, department_id: UUI
     )
     if active_reconcile is not None:
         raise ServiceError(409, "Adapter purge conflicts with reconciliation")
-    _assert_governance_fences(session, adapter, department_id)
+    _assert_governance_fences(
+        session,
+        adapter,
+        department_id,
+        target_adapter_version=target_adapter_version,
+    )
     if adapter.status == "validated" and source.status == "consumed":
         active_purge = session.scalar(
             select(AdapterPurgeOperation.id).where(
@@ -330,7 +360,13 @@ def _assert_eligible(session: Session, authority: _Authority, department_id: UUI
             raise ServiceError(409, "Adapter purge is already active")
 
 
-def _assert_governance_fences(session: Session, adapter: Adapter, department_id: UUID) -> None:
+def _assert_governance_fences(
+    session: Session,
+    adapter: Adapter,
+    department_id: UUID,
+    *,
+    target_adapter_version: int | None = None,
+) -> None:
     """Keep E-B registration and finalization fenced by governance metadata."""
 
     active_evaluation = session.scalar(
@@ -359,11 +395,12 @@ def _assert_governance_fences(session: Session, adapter: Adapter, department_id:
             DepartmentAdapterDeployment.department_id == department_id,
             DepartmentAdapterDeployment.target_kind == "adapter",
             DepartmentAdapterDeployment.adapter_id == adapter.id,
-            DepartmentAdapterDeployment.adapter_version == adapter.version,
+            DepartmentAdapterDeployment.adapter_version
+            == (adapter.version if target_adapter_version is None else target_adapter_version),
         )
     )
     if deployment is not None:
-        raise ServiceError(409, "Adapter purge conflicts with active deployment")
+        raise ServiceError(409, "Adapter purge conflicts with current adapter deployment")
     retention = session.scalar(
         select(AdapterRollbackRetention.id).where(
             AdapterRollbackRetention.department_id == department_id,
@@ -386,6 +423,25 @@ def _assert_governance_fences(session: Session, adapter: Adapter, department_id:
     )
     if deployment_operation is not None:
         raise ServiceError(409, "Adapter purge conflicts with deployment operation")
+    active_runtime = session.scalar(
+        select(RagAnswerRuntimeSnapshot.id)
+        .join(
+            RagAnswerRun,
+            (RagAnswerRun.id == RagAnswerRuntimeSnapshot.run_id)
+            & (RagAnswerRun.department_id == RagAnswerRuntimeSnapshot.department_id),
+        )
+        .where(
+            RagAnswerRuntimeSnapshot.department_id == department_id,
+            RagAnswerRuntimeSnapshot.target_kind == "adapter",
+            RagAnswerRuntimeSnapshot.adapter_id == adapter.id,
+            RagAnswerRuntimeSnapshot.adapter_version
+            == (adapter.version if target_adapter_version is None else target_adapter_version),
+            RagAnswerRun.status == "running",
+        )
+        .limit(1)
+    )
+    if active_runtime is not None:
+        raise ServiceError(409, "Adapter purge conflicts with active RAG runtime snapshot")
 
 
 def _address(
@@ -454,6 +510,13 @@ def _register_or_resume(
                 .with_for_update()
             ).scalar_one_or_none()
             if existing is not None:
+                authority = _load_authority_allow_pending(session, department_id, adapter_id)
+                _assert_governance_fences(
+                    session,
+                    authority.adapter,
+                    department_id,
+                    target_adapter_version=_target_adapter_version(existing.authority_snapshot),
+                )
                 items = session.scalars(
                     select(AdapterPurgeItem.id)
                     .where(
@@ -802,6 +865,7 @@ def _move_context_for(
     reservation: AdapterPurgeReservation,
     authority: _Authority,
     department_id: UUID,
+    target_adapter_version: int,
 ) -> _MoveContext:
     resource_id = (
         current.source_bundle_id if current.surface_type == "source_final" else current.adapter_id
@@ -820,6 +884,7 @@ def _move_context_for(
             "resource_id": str(resource_id),
             "item_id": str(current.id),
         },
+        target_adapter_version=target_adapter_version,
         expected_resource_version=(
             authority.source.version
             if current.surface_type == "source_final"
@@ -845,7 +910,12 @@ def _assert_move_context(
 ) -> None:
     """Prove the short authorization transaction still owns the inspected state."""
 
-    _assert_eligible(session, authority, department_id)
+    _assert_eligible(
+        session,
+        authority,
+        department_id,
+        target_adapter_version=context.target_adapter_version,
+    )
     if (
         current.status != "registered"
         or reservation.status != "registered"
@@ -895,10 +965,31 @@ def _capture_registered_context(
             )
             .with_for_update()
         ).scalar_one()
-        authority = _load_authority(session, department_id, current.adapter_id)
+        operation = session.execute(
+            select(AdapterPurgeOperation)
+            .where(
+                AdapterPurgeOperation.id == operation_id,
+                AdapterPurgeOperation.department_id == department_id,
+            )
+            .with_for_update()
+        ).scalar_one()
+        authority = _load_authority_allow_pending(session, department_id, current.adapter_id)
+        target_adapter_version = _target_adapter_version(operation.authority_snapshot)
+        _assert_eligible(
+            session,
+            authority,
+            department_id,
+            target_adapter_version=target_adapter_version,
+        )
         if current.status != "registered" or reservation.status != "registered":
             raise AdapterMaintenanceArtifactError("artifact_authority_changed")
-        return _move_context_for(current, reservation, authority, department_id)
+        return _move_context_for(
+            current,
+            reservation,
+            authority,
+            department_id,
+            target_adapter_version,
+        )
 
 
 def _persist_move_intent(
@@ -933,7 +1024,7 @@ def _persist_move_intent(
             )
             .with_for_update()
         ).scalar_one()
-        authority = _load_authority(session, department_id, current.adapter_id)
+        authority = _load_authority_allow_pending(session, department_id, current.adapter_id)
         _assert_move_context(session, current, reservation, authority, context, department_id)
         current.observed_identity = dict(inspected.observed_identity)
         current.deletion_plan = list(inspected.deletion_plan)
@@ -951,6 +1042,53 @@ def _persist_move_intent(
         session.flush()
         session.expunge(current)
         return current
+
+
+def _assert_verified_move_context(
+    factory: sessionmaker[Session],
+    *,
+    operation_id: UUID,
+    item_id: UUID,
+    department_id: UUID,
+) -> None:
+    """Recheck the immutable target immediately before moving retained bytes."""
+
+    with factory.begin() as session:
+        current = session.execute(
+            select(AdapterPurgeItem)
+            .where(
+                AdapterPurgeItem.id == item_id,
+                AdapterPurgeItem.operation_id == operation_id,
+                AdapterPurgeItem.department_id == department_id,
+            )
+            .with_for_update()
+        ).scalar_one()
+        reservation = session.execute(
+            select(AdapterPurgeReservation)
+            .where(
+                AdapterPurgeReservation.operation_id == operation_id,
+                AdapterPurgeReservation.department_id == department_id,
+                AdapterPurgeReservation.surface_type == current.surface_type,
+            )
+            .with_for_update()
+        ).scalar_one()
+        operation = session.execute(
+            select(AdapterPurgeOperation)
+            .where(
+                AdapterPurgeOperation.id == operation_id,
+                AdapterPurgeOperation.department_id == department_id,
+            )
+            .with_for_update()
+        ).scalar_one()
+        if current.status != "verified" or reservation.status != "deletion_authorized":
+            raise AdapterMaintenanceArtifactError("artifact_authority_changed")
+        authority = _load_authority_allow_pending(session, department_id, current.adapter_id)
+        _assert_eligible(
+            session,
+            authority,
+            department_id,
+            target_adapter_version=_target_adapter_version(operation.authority_snapshot),
+        )
 
 
 def _bind_move_intent(
@@ -982,6 +1120,14 @@ def _bind_move_intent(
             )
             .with_for_update()
         ).scalar_one()
+        operation = session.execute(
+            select(AdapterPurgeOperation)
+            .where(
+                AdapterPurgeOperation.id == operation_id,
+                AdapterPurgeOperation.department_id == department_id,
+            )
+            .with_for_update()
+        ).scalar_one()
         if current.status == "tombstone_bound":
             if current.tombstone_identity != bound.tombstone_identity:
                 raise AdapterMaintenanceArtifactError("artifact_authority_changed")
@@ -989,7 +1135,13 @@ def _bind_move_intent(
             return current
         if current.status != "verified" or reservation.status != "deletion_authorized":
             raise AdapterMaintenanceArtifactError("artifact_authority_changed")
-        authority = _load_authority(session, department_id, current.adapter_id)
+        authority = _load_authority_allow_pending(session, department_id, current.adapter_id)
+        _assert_eligible(
+            session,
+            authority,
+            department_id,
+            target_adapter_version=_target_adapter_version(operation.authority_snapshot),
+        )
         expected_snapshot = reservation.authority_snapshot
         if (
             not isinstance(expected_snapshot, dict)
@@ -1050,6 +1202,12 @@ def _execute_item(
     if item.status == "verified":
         inspected = _item_inspection(item)
         expected_namespace = item.expected_tombstone_namespace or {}
+        _assert_verified_move_context(
+            factory,
+            operation_id=operation_id,
+            item_id=item_id,
+            department_id=department_id,
+        )
         with AdapterPurgeArtifactStore(data_dir) as store:
             try:
                 bound = store.move_verified_surface_to_tombstone(
@@ -1341,7 +1499,18 @@ def _finalize_operation(
             if blocked:
                 return
             authority = _load_authority_allow_pending(session, department_id, operation.adapter_id)
-            _assert_governance_fences(session, authority.adapter, department_id)
+            snapshot = (
+                operation.authority_snapshot
+                if isinstance(operation.authority_snapshot, dict)
+                else {}
+            )
+            target_adapter_version = _target_adapter_version(snapshot)
+            _assert_governance_fences(
+                session,
+                authority.adapter,
+                department_id,
+                target_adapter_version=target_adapter_version,
+            )
             _assert_operation_authority(operation, authority, department_id)
             authority.source.status = "purged"
             authority.source.purged_at = operation.completed_at

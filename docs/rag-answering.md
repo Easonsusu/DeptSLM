@@ -10,7 +10,7 @@ POST /departments/{department_id}/rag/answers
 
 All five active same-department roles may call it. The path value is only a selector: the API resolves the exact issuer/subject and current membership in PostgreSQL at admission and again before completion. `system_admin` has no cross-department bypass. The endpoint does not expose vector search, query vectors, chunks, prompts, or model controls.
 
-The request contains only `question`, normalized with Unicode NFC, trimmed, checked by the shared Unicode policy, and limited to 2,000 characters. The policy rejects format controls and citation-spoofing characters while retaining variation selectors, ordinary accents, and ordinary emoji. The response is either an answered result with reviewed citation metadata or the exact insufficient-information message. There is no conversation, message history, streaming, reranking, adapter selection, or training behavior. Phase 8 feedback is a separate structured PostgreSQL workflow: it stores no question or answer and cannot change this retrieval or generation path.
+The request contains only `question`, normalized with Unicode NFC, trimmed, checked by the shared Unicode policy, and limited to 2,000 characters. The policy rejects format controls and citation-spoofing characters while retaining variation selectors, ordinary accents, and ordinary emoji. The response is either an answered result with reviewed citation metadata or the exact insufficient-information message. There is no conversation, message history, streaming, reranking, client adapter selection, or training behavior. Phase 8 feedback is a separate structured PostgreSQL workflow: it stores no question or answer and cannot change this retrieval or generation path. Phase 12.4 changes only the server-owned generation lane after the same reviewed retrieval/evidence selection, records an immutable content-free deployment snapshot, and leaves query embedding and retrieval unchanged.
 
 ## Retrieval and selection
 
@@ -32,6 +32,26 @@ After generation, the API reloads the complete evidence set and requires byte-id
 
 The supplied-evidence set and cited subset are intentionally distinct. `selected_source_count` records how many sources were supplied to generation, including a generated insufficient-information result; `rag_answer_citations` and the public response contain only labels actually referenced by the validated answer. A no-evidence insufficient result records zero selected sources.
 
+## Phase 12.4 generation routing
+
+Admission resolves the exact department deployment under the existing
+department-first authorization lock and stores a closed
+`rag_answer_runtime_snapshots` row with the deployment, governance lineage,
+registry digest/size authority, and target fingerprint. An absent pointer is
+implicit base; an explicit reviewed base pointer is also base. An adapter target
+must still pass the exact Phase 12.3 review, evaluation, suite, registry, and
+dependency authority checks. A later promotion or explicit rollback does not
+rewrite an already admitted request.
+
+`RoutedRagRuntime.query_embedding()` always calls the Phase 7 base runtime.
+Base snapshots call only that runtime for generation. Adapter snapshots call
+only the private production `adapter-runtime`; unavailable, timeout, load, or
+fingerprint failures return a safe 503 and never retry through base or mutate
+deployment governance. The production service is separate from the Phase 12.2
+evaluation runtime, verifies and copies the exact registry final before PEFT,
+and retires its single-target child when the target key changes. See
+[adapter-runtime-routing.md](adapter-runtime-routing.md).
+
 ## Persistence and consistency
 
 Revision `0005_phase7_rag_answers` stores content-free run and citation provenance metadata. It stores counts, fixed model/prompt contracts, safe status/error codes, source labels, IDs, ranks, scores, and page/line provenance. It never stores question or answer text, prompts, evidence, chunk text, vectors, hashes, paths, tokens, model output, or dependency URLs.
@@ -42,7 +62,8 @@ The internal model supervisor treats an over-token request as recoverable and ke
 
 ## Insufficient information
 
-When no authorized source meets the threshold, the API does not call generation. It returns:
+When no authorized source meets the threshold, the API does not call either
+generation runtime. It returns:
 
 ```text
 I do not have enough information in the authorized department sources to answer that question.
