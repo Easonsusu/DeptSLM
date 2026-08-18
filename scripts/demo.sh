@@ -106,8 +106,26 @@ trap cleanup EXIT INT TERM
 
 compose config --quiet
 compose --profile adapter-evaluation up --detach --build \
-  postgres qdrant rag-runtime api rag-worker indexing-worker evaluator-worker web \
-  adapter-evaluator adapter-runtime adapter-eval-runtime >/dev/null
+  postgres qdrant rag-runtime adapter-runtime adapter-eval-runtime >/dev/null
+
+qdrant_ready=0
+for _ in $(seq 1 60); do
+  if curl --fail --silent --show-error \
+    --header "api-key: ${qdrant_key}" \
+    "http://127.0.0.1:6333/collections" >/dev/null 2>&1; then
+    qdrant_ready=1
+    break
+  fi
+  sleep 1
+done
+if [[ "${qdrant_ready}" -ne 1 ]]; then
+  printf 'Synthetic Qdrant did not become ready.\n' >&2
+  exit 1
+fi
+
+compose --profile admin run --rm --no-deps vector-admin bootstrap >/dev/null
+compose --profile adapter-evaluation up --detach --build \
+  api rag-worker indexing-worker evaluator-worker web adapter-evaluator >/dev/null
 
 probe_python_dns() {
   local service="$1"
