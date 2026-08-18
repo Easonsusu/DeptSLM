@@ -105,7 +105,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 compose config --quiet
-compose up --detach --build postgres qdrant rag-runtime api rag-worker indexing-worker web >/dev/null
+compose --profile adapter-evaluation up --detach --build \
+  postgres qdrant rag-runtime api rag-worker indexing-worker web \
+  adapter-evaluator adapter-runtime adapter-eval-runtime >/dev/null
 
 probe_python_dns() {
   local service="$1"
@@ -140,16 +142,10 @@ probe_node_dns() {
   fi
 }
 
-# Check the base web boundary before adding the optional adapter-evaluation
-# profile; that profile intentionally recreates rag-runtime and can briefly
-# churn shared Docker DNS state without changing the base network contract.
 probe_node_dns api yes
 probe_node_dns postgres no
 probe_node_dns qdrant no
 probe_node_dns rag-runtime no
-
-compose --profile adapter-evaluation up --detach --build \
-  adapter-evaluator adapter-runtime adapter-eval-runtime >/dev/null
 
 probe_python_dns api postgres yes
 probe_python_dns api qdrant yes
