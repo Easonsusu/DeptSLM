@@ -127,7 +127,7 @@ probe_node_dns() {
   local expected="$2"
   local result=0
   compose exec --no-TTY web node -e \
-    'require("dns").lookup(process.argv[1], (error) => process.exit(error ? 1 : 0))' \
+    'const dns=require("dns").promises; const target=process.argv[1]; let attempts=20; const probe=async()=>{try{const addresses=await dns.resolve4(target); if(addresses.length) process.exit(0);}catch(_){} if(--attempts===0) process.exit(1); setTimeout(probe,500);}; probe();' \
     "${target}" >/dev/null 2>&1 || result=$?
   if [[ "${expected}" == "yes" && ${result} -ne 0 ]] || [[ "${expected}" == "no" && ${result} -eq 0 ]]; then
     printf 'Unexpected web DNS reachability: web -> %s (%s).\n' "${target}" "${expected}" >&2
