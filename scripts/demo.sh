@@ -294,6 +294,16 @@ for _ in $(seq 1 90); do
 done
 [[ "${extraction_status}" == "succeeded" ]] || { printf 'Synthetic extraction did not succeed.\n' >&2; exit 1; }
 
+qdrant_ready=0
+for _ in $(seq 1 60); do
+  if compose --profile admin run --rm --no-deps vector-admin bootstrap >/dev/null 2>&1; then
+    qdrant_ready=1
+    break
+  fi
+  sleep 1
+done
+[[ "${qdrant_ready}" -eq 1 ]] || { printf 'Synthetic Qdrant collection was not ready for indexing.\n' >&2; exit 1; }
+
 indexing_worker_log="${runtime_root}/indexing-worker.log"
 compose run --rm --no-deps indexing-worker \
   python -m deptslm_worker.indexer --poll >"${indexing_worker_log}" 2>&1 &
