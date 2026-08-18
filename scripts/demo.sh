@@ -291,7 +291,7 @@ done
 
 qdrant_ready=0
 for _ in $(seq 1 60); do
-  if compose --profile admin run --rm --no-deps vector-admin bootstrap >/dev/null 2>&1; then
+  if compose exec --no-TTY indexing-worker python -m deptslm_worker.vector_admin bootstrap >/dev/null 2>&1; then
     qdrant_ready=1
     break
   fi
