@@ -6,8 +6,8 @@ the completed Phase 12.1C immutable registry-publication implementation, the
 completed Phase 12.1D metadata-only registry read boundary, the completed
 Phase 12.1E-A reconciliation foundation, and the completed Phase 12.1E-B
 purge authority, and the completed Phase 12.1E-C lifecycle-release scope.
-Phase 12.2 and Phase 12.3 are completed, and Phase 12.4 is the current
-reviewed adapter-runtime routing scope.
+Phase 12.2, Phase 12.3, and Phase 12.4 are completed, including the reviewed
+adapter-runtime routing scope.
 It also records future metadata, evaluation, review, deployment, and runtime contracts. The
 separate Phase 12.1A static compatibility contract is documented in
 [adapter-static-contract.md](adapter-static-contract.md).
@@ -16,7 +16,7 @@ separate Phase 12.1A static compatibility contract is documented in
 
 - Phase 11 is completed. Its reviewed output is an immutable, department-scoped
   LlamaFactory job bundle; it does not execute training or create an adapter.
-- Phase 12.0 through Phase 12.3 are completed; Phase 12.4 is under review.
+- Phase 12.0 through Phase 12.4 are completed.
 - Phase 12.0 is completed: it defines contracts and the threat model.
 - Phase 12.1 is completed. Phase 12.1A, Phase 12.1B, and Phase 12.1C are
   completed. Phase 12.1C binds one exact committed source to one approved succeeded Phase 11
@@ -41,11 +41,11 @@ separate Phase 12.1A static compatibility contract is documented in
 - Phase 12.3 is completed. It adds separate review, approval, deployment,
   promotion, rollback, retention, and immutable event authorities without
   changing `Adapter.status` or loading an adapter.
-- Phase 12.4 is the current reviewed scope. It captures immutable content-free
+- Phase 12.4 is completed. It captures immutable content-free
   deployment snapshots for public RAG requests and routes only adapter
   generation through a separate private runtime; retrieval and evaluation
   runtime semantics remain unchanged.
-- Phase 13 has not started.
+- Phase 13 is the final security, Docker-demo, and documentation hardening scope.
 
 The Phase 12.1D, Phase 12.2, and Phase 12.3 metadata routes remain the only
 public adapter metadata surfaces today. Phase 12.4 adds no adapter selector or
@@ -240,7 +240,7 @@ behaviors remain Phase 12.4. The governance worker receives only PostgreSQL
 and a read-only registry-final mount, while Phase 12.1E purge and lifecycle
 release remain fenced against active governance operations.
 
-### Phase 12.4 — runtime routing (current; under review)
+### Phase 12.4 — runtime routing (completed)
 
 - Route only generation for a department request through one immutable
   deployment snapshot; query embedding and retrieval remain Phase 7.
@@ -249,7 +249,7 @@ release remain fenced against active governance operations.
 - Fail closed on load or contract errors, with no base retry or fallback.
 - Support explicit rollback-to-base; do not use an implicit fallback.
 
-### Phase 13 (not started)
+### Phase 13 — final security and documentation hardening
 
 Phase 13 remains the separate security-hardening, Docker demonstration, and
 final-documentation phase.
@@ -846,7 +846,7 @@ Phase 12 as a whole is complete only when tests prove that:
   sensitive content;
 - reconciliation and purge are crash-resumable;
 - normal CI downloads no real models or adapters; and
-- Phase 13 remains unstarted.
+- Phase 13 supplies the final security, Docker-demo, and documentation hardening scope.
 
 Until these criteria are met, an adapter is not available for runtime use.
 

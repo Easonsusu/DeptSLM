@@ -1,7 +1,6 @@
 # Phase 12.4 adapter runtime routing
 
-Phase 12.4 is the current reviewed scope. Phases 12.0 through 12.3 are
-complete; Phase 13 has not started. This phase activates the reviewed
+Phase 12.4 is completed. Phases 12.0 through 12.3 are complete. This phase activates the reviewed
 department deployment pointer for the existing one-turn endpoint:
 
 `POST /departments/{department_id}/rag/answers`
@@ -77,7 +76,7 @@ compares it and strips it before validation/publication.
 
 `adapter-runtime` is a separate service and security domain from both
 `rag-runtime` and `adapter-eval-runtime`. It has no host port and joins only
-`rag-internal`. Its only storage mounts are read-only `model_cache` and
+`adapter-prod-internal`. Its only storage mounts are read-only `model_cache` and
 `adapters/registry`, plus a private `0700` `/tmp/adapter-runtime` tmpfs. It has
 a read-only root filesystem, drops all capabilities, and uses
 `no-new-privileges`. It receives no database, Qdrant, API-auth, evaluation,

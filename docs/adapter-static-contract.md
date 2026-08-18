@@ -12,8 +12,8 @@ separate PostgreSQL metadata-read boundary; Phase 12.1E-A separately adds the
 administrator-only artifact reconciliation foundation. Phase 12.1E-B is the
 completed separate purge authority and does not change this static contract;
 Phase 12.1E-C is the completed reviewed metadata-only lifecycle-release boundary.
-Phase 12.2 and Phase 12.3 are completed; Phase 12.4 is the current reviewed
-adapter-runtime routing scope and Phase 13 is not started.
+Phase 12.2, Phase 12.3, and Phase 12.4 are completed. Phase 13 is the final
+security, Docker-demo, and documentation hardening scope.
 
 The static-contract implementation itself adds no intake command, database model,
 migration, API route, queue, worker, registry, storage directory,

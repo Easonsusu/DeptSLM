@@ -2,7 +2,7 @@
 
 ## Document status
 
-This document describes the product direction and separates completed Phase 0–12.3 boundaries from the planned scope. Phase 12.0 through Phase 12.3 are completed, and Phase 12.4 is the current reviewed adapter-runtime routing boundary. It records an immutable content-free target snapshot for each public grounded-answer request and routes only the generation lane through a separate private runtime; retrieval and governance remain unchanged. Phase 13 remains unimplemented. Unless a capability is explicitly labeled as completed, it is not implemented.
+This document describes the product direction and separates completed Phase 0–12.4 boundaries from the remaining hardening scope. Phase 12.0 through Phase 12.4 are completed. Phase 12.4 records an immutable content-free target snapshot for each public grounded-answer request and routes only the generation lane through a separate private runtime; retrieval and governance remain unchanged. Phase 13 is the final security, Docker-demo, and documentation hardening scope represented by this revision. Unless a capability is explicitly labeled as completed, it is not implemented.
 
 ## Product summary
 

@@ -6,7 +6,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "DeptSLM | Department AI, on your terms",
   description:
-    "DeptSLM is planned to help university departments build grounded, department-specific AI assistants.",
+    "DeptSLM is a local prototype for department-scoped source, retrieval, evaluation, and adapter-governance boundaries.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: ReactNode }>) {
