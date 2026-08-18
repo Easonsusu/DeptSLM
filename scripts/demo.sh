@@ -191,6 +191,10 @@ probe_python_dns adapter-eval-runtime rag-runtime no
 probe_python_dns adapter-eval-runtime adapter-runtime no
 probe_python_dns indexing-worker postgres yes
 probe_python_dns indexing-worker qdrant yes
+if ! compose exec --no-TTY indexing-worker python -c \
+  'import os,urllib.request; request=urllib.request.Request("http://qdrant:6333/collections",headers={"api-key":os.environ["DEPTSLM_QDRANT_API_KEY"]}); response=urllib.request.urlopen(request,timeout=5); print("Phase 13 Qdrant HTTP probe status:",response.status)' 2>/dev/null; then
+  printf 'Phase 13 Qdrant HTTP probe failed.\n' >&2
+fi
 compose --profile admin run --rm --no-deps --build --entrypoint python model-admin \
   -c $'import socket\nfor target in ("postgres", "qdrant", "api", "rag-runtime", "adapter-runtime"):\n    try: socket.getaddrinfo(target, None)\n    except OSError: continue\n    raise SystemExit(1)' >/dev/null 2>&1
 compose run --rm --no-deps api python -m alembic upgrade head >/dev/null
@@ -297,7 +301,11 @@ for _ in $(seq 1 60); do
   fi
   sleep 1
 done
-[[ "${qdrant_ready}" -eq 1 ]] || { printf 'Synthetic Qdrant collection was not ready for indexing.\n' >&2; exit 1; }
+if [[ "${qdrant_ready}" -ne 1 ]]; then
+  compose exec --no-TTY indexing-worker python -m deptslm_worker.vector_admin bootstrap >&2 || true
+  printf 'Synthetic Qdrant collection was not ready for indexing.\n' >&2
+  exit 1
+fi
 
 compose exec --detach --no-TTY indexing-worker \
   python -m deptslm_worker.indexer --poll >/dev/null
