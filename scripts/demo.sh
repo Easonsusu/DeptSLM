@@ -106,7 +106,7 @@ trap cleanup EXIT INT TERM
 
 compose config --quiet
 compose --profile adapter-evaluation up --detach --build \
-  postgres qdrant rag-runtime api rag-worker indexing-worker web \
+  postgres qdrant rag-runtime api rag-worker indexing-worker evaluator-worker web \
   adapter-evaluator adapter-runtime adapter-eval-runtime >/dev/null
 
 probe_python_dns() {
