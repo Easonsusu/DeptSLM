@@ -218,13 +218,14 @@ api_call() {
   local output="$4"
   local input_file="${5:-}"
   local content_type="${6:-}"
-  local report_failure="${7:-1}"
+  local content_disposition="${7:-}"
+  local report_failure="${8:-1}"
   local response_file="${output}.http"
   local status
   if [[ -n "${input_file}" ]]; then
     if ! compose exec --no-TTY -e "DEMO_TOKEN=${token_a}" indexing-worker python -c \
-      'import httpx,os,sys; method,path,content_type=sys.argv[1:4]; data=sys.stdin.buffer.read(); headers={"Authorization":"Bearer "+os.environ["DEMO_TOKEN"]}; content_type and headers.__setitem__("Content-Type",content_type); response=httpx.request(method,"http://api:8000"+path,headers=headers,content=data,timeout=30.0); print(response.status_code); sys.stdout.write(response.text)' \
-      "${method}" "${path}" "${content_type}" <"${input_file}" >"${response_file}"; then
+      'import httpx,os,sys; method,path,content_type,content_disposition=sys.argv[1:5]; data=sys.stdin.buffer.read(); headers={"Authorization":"Bearer "+os.environ["DEMO_TOKEN"]}; content_type and headers.__setitem__("Content-Type",content_type); content_disposition and headers.__setitem__("Content-Disposition",content_disposition); response=httpx.request(method,"http://api:8000"+path,headers=headers,content=data,timeout=30.0); print(response.status_code); sys.stdout.write(response.text)' \
+      "${method}" "${path}" "${content_type}" "${content_disposition}" <"${input_file}" >"${response_file}"; then
       return 1
     fi
   else
@@ -254,7 +255,7 @@ api_call() {
 
 api_ready=0
 for _ in $(seq 1 90); do
-  if api_call 2xx GET /health "${runtime_root}/health.json" "" "" 0; then
+  if api_call 2xx GET /health "${runtime_root}/health.json" "" "" "" 0; then
     api_ready=1
     break
   fi
@@ -272,7 +273,7 @@ api_call 2xx GET /auth/me "${runtime_root}/auth-me.json"
 printf 'Phase 13 synthetic source: department-scoped runtime boundary.\n' >"${source_file}"
 upload_response="${runtime_root}/upload-response.json"
 api_call 2xx POST "/departments/${department_a}/documents" "${upload_response}" \
-  "${source_file}" 'text/plain; charset=utf-8'
+  "${source_file}" 'text/plain; charset=utf-8' 'attachment; filename="phase13.txt"'
 document_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "${upload_response}")
 
 extraction_response="${runtime_root}/extraction-response.json"
