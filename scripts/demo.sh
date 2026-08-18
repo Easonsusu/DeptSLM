@@ -125,6 +125,9 @@ probe_python_dns() {
     attempts=$((attempts - 1))
     (( attempts > 0 )) && sleep 0.5
   done
+  compose ps >&2 || true
+  compose exec --no-TTY "${service}" python -c \
+    'import socket,sys; print(socket.getaddrinfo(sys.argv[1], None))' "${target}" >&2 || true
   printf 'Unexpected DNS reachability: %s -> %s (%s).\n' "${service}" "${target}" "${expected}" >&2
   exit 1
 }
