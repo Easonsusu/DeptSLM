@@ -192,14 +192,6 @@ probe_python_dns adapter-eval-runtime rag-runtime no
 probe_python_dns adapter-eval-runtime adapter-runtime no
 probe_python_dns indexing-worker postgres yes
 probe_python_dns indexing-worker qdrant yes
-if ! compose exec --no-TTY indexing-worker python -c \
-  'import os,urllib.request; request=urllib.request.Request("http://qdrant:6333/collections",headers={"api-key":os.environ["DEPTSLM_QDRANT_API_KEY"]}); response=urllib.request.urlopen(request,timeout=5); print("Phase 13 Qdrant HTTP probe status:",response.status)' 2>/dev/null; then
-  printf 'Phase 13 Qdrant HTTP probe failed.\n' >&2
-fi
-if ! compose exec --no-TTY indexing-worker python -c \
-  'import os,urllib.request; request=urllib.request.Request("http://qdrant:6333/collections/deptslm_chunks_qwen3_0_6b_1024_v1",headers={"api-key":os.environ["DEPTSLM_QDRANT_API_KEY"]}); response=urllib.request.urlopen(request,timeout=5); print("Phase 13 Qdrant collection HTTP status:",response.status)' 2>/dev/null; then
-  printf 'Phase 13 Qdrant collection HTTP probe failed.\n' >&2
-fi
 compose --profile admin run --rm --no-deps --build --entrypoint python model-admin \
   -c $'import socket\nfor target in ("postgres", "qdrant", "api", "rag-runtime", "adapter-runtime"):\n    try: socket.getaddrinfo(target, None)\n    except OSError: continue\n    raise SystemExit(1)' >/dev/null 2>&1
 compose run --rm --no-deps api python -m alembic upgrade head >/dev/null
@@ -271,15 +263,13 @@ for _ in $(seq 1 90); do
   sleep 1
 done
 if [[ "${api_ready}" -ne 1 ]]; then
-  compose ps --all >&2 || true
-  compose logs --no-color api >&2 || true
   printf 'Synthetic API did not become ready.\n' >&2
   exit 1
 fi
 api_call 2xx GET /version "${runtime_root}/version.json"
 api_call 2xx GET /auth/me "${runtime_root}/auth-me.json"
 
-printf 'Phase 13 synthetic source: department-scoped runtime boundary.\n' >"${source_file}"
+printf '%s\n' "${question_sentinel}" >"${source_file}"
 upload_response="${runtime_root}/upload-response.json"
 api_call 2xx POST "/departments/${department_a}/documents" "${upload_response}" \
   "${source_file}" 'text/plain; charset=utf-8' 'attachment; filename="phase13.txt"'
