@@ -284,7 +284,9 @@ fi
 api_call 2xx GET /version "${runtime_root}/version.json"
 api_call 2xx GET /auth/me "${runtime_root}/auth-me.json"
 
-printf '%s\n' "${question_sentinel}" >"${source_file}"
+printf '%s\nQuestion: %s' \
+  'Given a user question, retrieve passages from the authorized department documents that directly support an answer.' \
+  "${question_sentinel}" >"${source_file}"
 upload_response="${runtime_root}/upload-response.json"
 api_call 2xx POST "/departments/${department_a}/documents" "${upload_response}" \
   "${source_file}" 'text/plain; charset=utf-8' 'attachment; filename="phase13.txt"'
