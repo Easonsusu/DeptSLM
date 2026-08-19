@@ -109,6 +109,20 @@ compose config --quiet
 compose --profile adapter-evaluation up --detach --build \
   postgres qdrant rag-runtime adapter-runtime adapter-eval-runtime >/dev/null
 
+qdrant_http_ready=0
+for _ in $(seq 1 60); do
+  if curl --fail --silent --show-error --connect-timeout 1 --max-time 5 \
+    -H "api-key: ${qdrant_key}" "http://127.0.0.1:6333/collections" >/dev/null 2>&1; then
+    qdrant_http_ready=1
+    break
+  fi
+  sleep 1
+done
+if [[ "${qdrant_http_ready}" -ne 1 ]]; then
+  printf 'Synthetic Qdrant HTTP endpoint did not become ready.\n' >&2
+  exit 1
+fi
+
 compose --profile admin build vector-admin >/dev/null
 qdrant_ready=0
 for _ in $(seq 1 60); do
