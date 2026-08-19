@@ -109,10 +109,12 @@ compose config --quiet
 compose --profile adapter-evaluation up --detach --build \
   postgres qdrant rag-runtime adapter-runtime adapter-eval-runtime >/dev/null
 
+compose --profile admin build vector-admin >/dev/null
 qdrant_http_ready=0
 for _ in $(seq 1 60); do
-  if curl --fail --silent --show-error --connect-timeout 1 --max-time 5 \
-    -H "api-key: ${qdrant_key}" "http://127.0.0.1:6333/collections" >/dev/null 2>&1; then
+  if compose --profile admin run --rm --no-deps --entrypoint python vector-admin \
+    -c 'import os,urllib.request; request=urllib.request.Request("http://qdrant:6333/collections",headers={"api-key":os.environ["DEPTSLM_QDRANT_API_KEY"]}); response=urllib.request.urlopen(request,timeout=5); response.read(1)' \
+    >/dev/null 2>&1; then
     qdrant_http_ready=1
     break
   fi
@@ -123,7 +125,6 @@ if [[ "${qdrant_http_ready}" -ne 1 ]]; then
   exit 1
 fi
 
-compose --profile admin build vector-admin >/dev/null
 qdrant_ready=0
 for _ in $(seq 1 60); do
   if compose --profile admin run --rm --no-deps vector-admin bootstrap >/dev/null 2>&1; then
