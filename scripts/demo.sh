@@ -195,6 +195,10 @@ if ! compose exec --no-TTY indexing-worker python -c \
   'import os,urllib.request; request=urllib.request.Request("http://qdrant:6333/collections",headers={"api-key":os.environ["DEPTSLM_QDRANT_API_KEY"]}); response=urllib.request.urlopen(request,timeout=5); print("Phase 13 Qdrant HTTP probe status:",response.status)' 2>/dev/null; then
   printf 'Phase 13 Qdrant HTTP probe failed.\n' >&2
 fi
+if ! compose exec --no-TTY indexing-worker python -c \
+  'import os,urllib.request; request=urllib.request.Request("http://qdrant:6333/collections/deptslm_chunks_qwen3_0_6b_1024_v1",headers={"api-key":os.environ["DEPTSLM_QDRANT_API_KEY"]}); response=urllib.request.urlopen(request,timeout=5); print("Phase 13 Qdrant collection HTTP status:",response.status)' 2>/dev/null; then
+  printf 'Phase 13 Qdrant collection HTTP probe failed.\n' >&2
+fi
 compose --profile admin run --rm --no-deps --build --entrypoint python model-admin \
   -c $'import socket\nfor target in ("postgres", "qdrant", "api", "rag-runtime", "adapter-runtime"):\n    try: socket.getaddrinfo(target, None)\n    except OSError: continue\n    raise SystemExit(1)' >/dev/null 2>&1
 compose run --rm --no-deps api python -m alembic upgrade head >/dev/null
