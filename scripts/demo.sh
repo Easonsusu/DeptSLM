@@ -196,11 +196,11 @@ compose --profile admin run --rm --no-deps --build --entrypoint python model-adm
   -c $'import socket\nfor target in ("postgres", "qdrant", "api", "rag-runtime", "adapter-runtime"):\n    try: socket.getaddrinfo(target, None)\n    except OSError: continue\n    raise SystemExit(1)' >/dev/null 2>&1
 compose run --rm --no-deps api python -m alembic upgrade head >/dev/null
 
-bootstrap_output=$(compose run --rm --no-deps api python -m app.admin bootstrap-department \
+bootstrap_output=$(compose exec --no-TTY api python -m app.admin bootstrap-department \
   --slug phase13-a --display-name "Phase 13 Synthetic A" \
   --admin-issuer "${issuer}" --admin-subject phase13-admin-a)
 department_a=$(printf '%s\n' "${bootstrap_output}" | sed -nE 's/.*\(([0-9a-f-]{36})\).*/\1/p')
-bootstrap_output=$(compose run --rm --no-deps api python -m app.admin bootstrap-department \
+bootstrap_output=$(compose exec --no-TTY api python -m app.admin bootstrap-department \
   --slug phase13-b --display-name "Phase 13 Synthetic B" \
   --admin-issuer "${issuer}" --admin-subject phase13-admin-b)
 department_b=$(printf '%s\n' "${bootstrap_output}" | sed -nE 's/.*\(([0-9a-f-]{36})\).*/\1/p')
@@ -209,7 +209,7 @@ if [[ -z "${department_a}" || -z "${department_b}" ]]; then
   exit 1
 fi
 
-token_a=$(compose run --rm --no-deps api python -c \
+token_a=$(compose exec --no-TTY api python -c \
   'import os,time,jwt; print(jwt.encode({"sub":"phase13-admin-a","iss":os.environ["DEPTSLM_AUTH_ISSUER"],"aud":os.environ["DEPTSLM_AUTH_AUDIENCE"],"exp":int(time.time())+900}, os.environ["DEPTSLM_AUTH_SECRET"], algorithm="HS256"))')
 
 api_call() {
