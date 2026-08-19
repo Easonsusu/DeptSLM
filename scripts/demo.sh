@@ -62,6 +62,7 @@ DEPTSLM_AUTH_SECRET=${auth_secret}
 DEPTSLM_QDRANT_URL=http://qdrant:6333
 DEPTSLM_QDRANT_API_KEY=${qdrant_key}
 DEPTSLM_QDRANT_COLLECTION=deptslm_chunks_qwen3_0_6b_1024_v1
+DEPTSLM_QDRANT_TIMEOUT_SECONDS=5
 DEPTSLM_RAG_RUNTIME_URL=http://rag-runtime:8010
 DEPTSLM_RAG_RUNTIME_TOKEN=${rag_token}
 DEPTSLM_ADAPTER_RUNTIME_URL=http://adapter-runtime:8012
@@ -299,14 +300,16 @@ done
 
 qdrant_ready=0
 for _ in $(seq 1 60); do
-  if compose exec --no-TTY indexing-worker python -m deptslm_worker.vector_admin bootstrap >/dev/null 2>&1; then
+  if compose exec --no-TTY indexing-worker python -c \
+    'from deptslm_worker.index_settings import QdrantSettings; from deptslm_worker.qdrant_adapter import DepartmentQdrant; settings=QdrantSettings.from_environment(); client=DepartmentQdrant(settings.qdrant_url,settings.qdrant_api_key,settings.qdrant_timeout_seconds); client.verify_collection(); client.close()' >/dev/null 2>&1; then
     qdrant_ready=1
     break
   fi
   sleep 1
 done
 if [[ "${qdrant_ready}" -ne 1 ]]; then
-  compose exec --no-TTY indexing-worker python -m deptslm_worker.vector_admin bootstrap >&2 || true
+  compose exec --no-TTY indexing-worker python -c \
+    'from deptslm_worker.index_settings import QdrantSettings; from deptslm_worker.qdrant_adapter import DepartmentQdrant; settings=QdrantSettings.from_environment(); client=DepartmentQdrant(settings.qdrant_url,settings.qdrant_api_key,settings.qdrant_timeout_seconds); client.verify_collection(); client.close()' >&2 || true
   printf 'Synthetic Qdrant collection was not ready for indexing.\n' >&2
   exit 1
 fi
