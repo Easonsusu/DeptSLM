@@ -7,6 +7,7 @@ import hashlib
 import logging
 import os
 import re
+import shutil
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -72,6 +73,11 @@ def engine():
 
 
 def _seed_unique(db: Session, tmp_path: Path):
+    # Keep the returned seed objects usable after the helper's commit.  The
+    # integration tests intentionally close this session before exercising the
+    # real HTTP application, so expired ORM attributes would otherwise try to
+    # refresh through a detached PostgreSQL session.
+    db.expire_on_commit = False
     original = phase7_tests._identity
 
     def identity(session, department, role, subject):
@@ -121,6 +127,9 @@ def _client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, maximum: int | N
         "DEPTSLM_RAG_RUNTIME_URL": "http://localhost:8010",
         "DEPTSLM_RAG_RUNTIME_TOKEN": "phase13-test-runtime-token-0123456789-abcdef",
         "DEPTSLM_DEPARTMENT_DOCUMENT_QUOTA_BYTES": "300000",
+        # Keep the test configuration valid while exercising the independent
+        # non-upload middleware limit.  Upload tests override this explicitly.
+        "DEPTSLM_DOCUMENT_MAX_BYTES": str(MAX_NON_UPLOAD),
     }
     if maximum is not None:
         values["DEPTSLM_DOCUMENT_MAX_BYTES"] = str(maximum)
@@ -477,6 +486,10 @@ def test_rag_transient_sentinels_stay_out_of_postgres_external_forbidden_storage
         chunk.byte_size = document.byte_size
         chunk.char_start = 0
         chunk.char_end = len(source_text)
+        artifact_directory = (
+            tmp_path / "extracted_text" / str(department.id) / str(document.id) / str(extraction.id)
+        )
+        shutil.rmtree(artifact_directory)
         extraction.output_byte_size = phase7_tests._write_artifact(
             tmp_path, department, document, extraction, chunk, source_bytes
         )
