@@ -68,7 +68,7 @@ def _wait_socket(path: Path) -> None:
 
 
 def _socket_path(root: Path, label: str) -> Path:
-    parent = root / f"deptslm-runtime-{os.getpid()}-{uuid4().hex}-{label}"
+    parent = root / f"s-{label}"
     parent.mkdir(mode=0o700)
     return parent / "runtime.sock"
 
