@@ -191,9 +191,11 @@ def test_bad_hmac_and_non_directory_capability_are_rejected(tmp_path: Path) -> N
     file_path.write_bytes(b"x")
     descriptors.append(os.open(file_path, os.O_RDONLY))
     try:
-        tampered = bytearray(_frame(_request(), token))
-        tampered[-1] ^= 1
-        response, _mode = _send_request(socket_path, bytes(tampered), descriptors)
+        tampered = json.loads(_frame(_request(), token)[4:].decode("utf-8"))
+        tampered["mac"] = "0" * 64
+        tampered_payload = canonical_json_bytes(tampered)
+        tampered_frame = struct.pack("!I", len(tampered_payload)) + tampered_payload
+        response, _mode = _send_request(socket_path, tampered_frame, descriptors)
         assert response["error_code"] == "runtime_auth_failed"
     finally:
         for descriptor in descriptors:
