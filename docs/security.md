@@ -73,3 +73,31 @@ post-preparation model supply-chain compromise, malware scanning, or trusted
 external training execution. PostgreSQL and external files are not atomically
 committed. Runtime failure never triggers automatic base fallback; rollback to
 base remains explicit. No automatic model download occurs.
+
+## Future Phase 14 training-execution boundary
+
+Roadmap v2 Phase 14 begins with a contract-only design. The threat model adds
+malicious human-authored examples, malicious but schema-valid Phase 11 bundles,
+semantic configuration drift, arbitrary CLI or shell injection, environment
+inheritance, model-cache substitution, training dependency drift,
+path/symlink/hard-link substitution, output substitution, log exfiltration,
+external telemetry, accidental model downloads, network exfiltration, disk or
+RAM exhaustion, GPU OOM, process explosion, hung/orphan children, cancellation
+races, stale leases, host crashes, publication crashes, a compromised training
+runtime, and a compromised Docker host.
+
+The future control-plane worker may receive only PostgreSQL and a private
+training-runtime token. The private runtime receives no PostgreSQL, Qdrant,
+API-auth, membership, RAG, evaluation, adapter, or cloud credentials. It has
+no public port, Docker socket, host networking, or normal internet egress and
+must use a fixed executable/argv boundary, sanitized environment, process-group
+supervision, deadlines, byte/process/disk bounds, and complete tree reaping.
+The runtime consumes only a verified server-created snapshot of one approved
+Phase 11 bundle and cannot turn filesystem presence or a zero exit code into
+authority. No Phase 14 runtime exists yet.
+
+Phase 14 provides no hardware or cryptographic attestation. A compromised
+host or runtime can invalidate the supervised-execution provenance claim; this
+residual risk remains explicitly outside the contract. Real execution,
+training dependency pinning, numeric resource bounds, and hardware fingerprints
+require reviewed Phase 14.2 work.

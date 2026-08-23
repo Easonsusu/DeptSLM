@@ -13,3 +13,15 @@ A second authorized transaction revalidates the complete owner and reservation b
 Worker leases use PostgreSQL server time. Stale cleanup, dataset authority loading, retained-descriptor hashing, stage preparation, child execution, attempt registration, marker transition, rename/durability, post-rename hashing, and publication registration each receive a fresh parent deadline, heartbeat, cancellation, shutdown, and claim-loss guard. The parent uses another fresh guard to renew immediately before the short final metadata transaction; after that transaction starts it performs only local shutdown/deadline checks and validates the exact lease in that same transaction. It never opens a nested lease-renewal transaction while final row locks are held.
 
 No question, instruction, answer, provenance, filename, path, model output, vector, training log, model weight, adapter, token, or credential is persisted in PostgreSQL, public responses, audit events, logs, or the browser. Phase 11 does not install or invoke LlamaFactory, run a scheduler, create training logs, produce adapters, promote a model, or implement the Phase 12.1C registry worker. Phase 12.1C adds an active adapter retention dependency that fences purge of this exact job and dataset; Phase 11 purge never deletes registry or source bytes. Evaluation, approval, promotion, runtime loading, reconciliation, and adapter purge remain later phases.
+
+## Roadmap v2 handoff boundary
+
+Roadmap v1 Phase 0–13 is complete. Phase 14.0 defines a future controlled
+training execution contract in [training-execution.md](training-execution.md);
+it does not execute this bundle, install LlamaFactory, load a model, or create
+an adapter. Any future executor must freeze the complete Phase 11 authority,
+copy and verify the exact five files into a private attempt snapshot, preserve
+the reviewed semantic fields, and use a separately pinned training dependency
+lock. Phase 12 intake remains explicit and administrator-controlled; no
+automatic handoff, evaluation, approval, promotion, rollback, or routing is
+added by Phase 14.0.

@@ -50,9 +50,15 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > descriptor, never falls back to base, and never changes deployment governance.
 > The API uses a separate bounded adapter transport envelope for the runtime's
 > 300-second target load and 120-second generation clocks; the Phase 7 base
-> timeout remains unchanged. Phase 13 is the final security, Docker-demo, and
-> documentation hardening scope represented by this revision; no Phase 14 is
-> defined by the current roadmap.
+> timeout remains unchanged. Roadmap v1 Phase 13 was its final scope and is
+> complete; Roadmap v2 begins with the Phase 14.0 design contract.
+
+> **Phase 14.0 status:** Design only. Phase 11 still creates reviewable
+> LlamaFactory job bundles without executing training. Phase 14.0 defines a
+> future supervised, offline, descriptor-bound execution boundary but installs
+> no LlamaFactory, loads no model, adds no runtime, queue, API, migration, or
+> Compose service, and downloads no weights. Phase 14.1 implementation has not
+> started. See [the training execution contract](docs/training-execution.md).
 
 The governance worker is deliberately narrower than the API: its dedicated
 settings loader requires PostgreSQL plus only the external read-only
@@ -364,7 +370,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 
 Phase 9 does not implement LLM judging, semantic grading, public raw results, a frontend dashboard, feedback-derived cases, automatic threshold or RAG changes, training datasets, SFT, adapters, model promotion, cross-department benchmarking, production OAuth/OIDC/SSO, or production deployment.
 
-Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 through Phase 12.4 are complete. Phase 12.4 is the reviewed, administrator-governed runtime boundary: it snapshots exact deployment authority and routes only adapter generation through a separate private runtime; retrieval remains Phase 7, and runtime errors never fall back to base or mutate governance. Phase 13 is the final security, Docker-demo, and documentation hardening scope; no Phase 14 is defined by the current roadmap. Google Drive storage is an external development runtime location, not a production object store or backup.
+Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 through Phase 12.4 are complete. Phase 12.4 is the reviewed, administrator-governed runtime boundary: it snapshots exact deployment authority and routes only adapter generation through a separate private runtime; retrieval remains Phase 7, and runtime errors never fall back to base or mutate governance. Roadmap v1 Phase 13 is complete, and Roadmap v2 Phase 14.0 is contract-only with no training execution or automatic adapter handoff. Google Drive storage is an external development runtime location, not a production object store or backup.
 
 ## License
 
