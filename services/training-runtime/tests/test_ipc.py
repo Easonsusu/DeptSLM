@@ -78,6 +78,7 @@ def _send_request(
 ) -> tuple[dict[str, object], int]:
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     connection.connect(str(path))
+    socket_mode = stat.S_IMODE(path.stat().st_mode)
     try:
         ancillary = [
             (
@@ -93,7 +94,7 @@ def _send_request(
         body = connection.recv(size)
         while len(body) < size:
             body += connection.recv(size - len(body))
-        return json.loads(body.decode("utf-8")), stat.S_IMODE(path.stat().st_mode)
+        return json.loads(body.decode("utf-8")), socket_mode
     finally:
         connection.close()
 
@@ -147,7 +148,8 @@ def test_real_four_directory_capabilities_and_private_socket(tmp_path: Path) -> 
     assert len(seen) == 4
     payload = json.dumps(request)
     assert "/" not in payload or "Qwen/Qwen3-0.6B" in payload
-    assert all(str(descriptor) not in payload for descriptor in source)
+    assert "cap-" not in payload
+    assert str(tmp_path) not in payload
 
 
 @pytest.mark.parametrize("count", [3, 5])
