@@ -24,9 +24,7 @@ from deptslm_training_runtime.contract import (
 )
 from deptslm_training_runtime.ipc import TrainingRuntimeServer
 
-pytestmark = pytest.mark.skipif(
-    sys.platform != "linux", reason="real SCM_RIGHTS requires Linux CI"
-)
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="real SCM_RIGHTS requires Linux CI")
 
 
 def _request() -> dict[str, object]:
@@ -50,16 +48,12 @@ def _request() -> dict[str, object]:
     }
 
 
-def _frame(
-    request: dict[str, object], token: bytes, *, nonce: bytes | None = None
-) -> bytes:
+def _frame(request: dict[str, object], token: bytes, *, nonce: bytes | None = None) -> bytes:
     nonce = nonce or os.urandom(32)
     envelope = {
         "nonce": nonce.hex(),
         "request": request,
-        "mac": hmac.new(
-            token, canonical_json_bytes(request) + nonce, hashlib.sha256
-        ).hexdigest(),
+        "mac": hmac.new(token, canonical_json_bytes(request) + nonce, hashlib.sha256).hexdigest(),
     }
     payload = canonical_json_bytes(envelope)
     return struct.pack("!I", len(payload)) + payload
@@ -131,10 +125,7 @@ def test_real_four_directory_capabilities_and_private_socket(tmp_path: Path) -> 
             seen.append((actual.st_dev, actual.st_ino))
             assert (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino)
         ready.set()
-        return {
-            "classification": "execution_failed",
-            "error_code": "runtime_hardware_unsupported",
-        }
+        return {"classification": "execution_failed", "error_code": "runtime_hardware_unsupported"}
 
     thread = threading.Thread(
         target=TrainingRuntimeServer(socket_path, token.decode(), handler).serve_once,
@@ -166,18 +157,14 @@ def test_wrong_fd_count_is_rejected(tmp_path: Path, count: int) -> None:
     socket_path = _socket_path(tmp_path, str(count))
     token = b"runtime-token-" + b"x" * 40
     thread = threading.Thread(
-        target=TrainingRuntimeServer(
-            socket_path, token.decode(), lambda *_: {}
-        ).serve_once,
+        target=TrainingRuntimeServer(socket_path, token.decode(), lambda *_: {}).serve_once,
         daemon=True,
     )
     thread.start()
     _wait_socket(socket_path)
     descriptors = _directories(tmp_path, count)
     try:
-        response, _mode = _send_request(
-            socket_path, _frame(_request(), token), descriptors
-        )
+        response, _mode = _send_request(socket_path, _frame(_request(), token), descriptors)
         assert response["error_code"] == "runtime_protocol_invalid"
     finally:
         for descriptor in descriptors:
@@ -192,9 +179,7 @@ def test_bad_hmac_and_non_directory_capability_are_rejected(tmp_path: Path) -> N
     socket_path = _socket_path(tmp_path, "bad")
     token = b"runtime-token-" + b"x" * 40
     thread = threading.Thread(
-        target=TrainingRuntimeServer(
-            socket_path, token.decode(), lambda *_: {}
-        ).serve_once,
+        target=TrainingRuntimeServer(socket_path, token.decode(), lambda *_: {}).serve_once,
         daemon=True,
     )
     thread.start()
