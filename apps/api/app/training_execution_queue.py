@@ -189,11 +189,12 @@ def claim_next_training_execution(
             candidate = session.scalar(
                 select(TrainingExecution.id)
                 .where(
+                    TrainingExecution.execution_code_revision == code_revision,
                     (TrainingExecution.status == "queued")
                     | (
                         TrainingExecution.status.in_(("running", "cancel_requested"))
                         & (TrainingExecution.lease_expires_at <= func.clock_timestamp())
-                    )
+                    ),
                 )
                 .order_by(TrainingExecution.created_at, TrainingExecution.id)
                 .limit(1)

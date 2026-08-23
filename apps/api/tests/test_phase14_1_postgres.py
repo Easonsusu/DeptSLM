@@ -6,7 +6,7 @@ import os
 import threading
 from collections.abc import Callable
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -584,6 +584,7 @@ def test_phase14_1_active_execution_blocks_legacy_pre_byte_delete_fence(
 ) -> None:
     factory, department_id, issuer, subject, execution = _approved_execution(engine, tmp_path)
     runtime_root = tmp_path / "runtime"
+    deleting_before = set(runtime_root.rglob(".deleting"))
     with factory.begin() as session:
         job = session.get(TrainingJob, execution.training_job_id)
         assert job is not None and job.archived_at is None
@@ -634,7 +635,7 @@ def test_phase14_1_active_execution_blocks_legacy_pre_byte_delete_fence(
             actor_subject=principal.subject,
             operation_id=operation_id,
         )
-    assert not list(runtime_root.rglob(".deleting"))
+    assert set(runtime_root.rglob(".deleting")) == deleting_before
     with factory() as session:
         assert (
             session.scalar(
@@ -662,6 +663,9 @@ def _run_enqueue_archive_race(
             execution.id,
             expected_version=current.version,
         )
+    with factory() as session:
+        cancelled = session.get(TrainingExecution, execution.id)
+        assert cancelled is not None and cancelled.status == "cancelled"
 
     def enqueue() -> object:
         with factory.begin() as session:
@@ -781,6 +785,15 @@ def _run_enqueue_purge_registration_race(
             actor_subject=subject,
             apply=True,
         )
+        # Make the real archived job eligible for the reviewed retention
+        # window.  The production registration path must still observe this
+        # server-authoritative lifecycle state while the enqueue race is
+        # fenced by the job lock and version.
+        with factory.begin() as session:
+            job = session.get(TrainingJob, execution.training_job_id)
+            assert job is not None and job.review_status == "archived"
+            job.archived_at = datetime.now(UTC) - timedelta(days=31)
+            job.version += 1
         return _register_candidates(
             factory,
             department_id=department_id,

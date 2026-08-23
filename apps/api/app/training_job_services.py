@@ -291,6 +291,7 @@ def review_training_job(
                 is not None
             ):
                 raise ServiceError(409, "Training job has an active execution")
+            _require_no_active_purge_reservation(session, job)
         else:
             _require_no_active_purge_reservation(session, job)
         transitions = {
