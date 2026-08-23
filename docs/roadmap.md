@@ -2,6 +2,12 @@
 
 This roadmap separates foundational safety work from product implementation. A later phase may begin only after the prior phase's boundaries, tests, and limitations are documented.
 
+## Roadmap v1
+
+Roadmap v1 is the historical Phase 0–13 plan. All phases in that plan are
+complete; Phase 13 was its final scope. Phase 14 did not exist when Roadmap v1
+merged and is not retroactively part of that history.
+
 ## Phase 0 — Project initialization (completed)
 
 - Establish the monorepo, web and API skeletons, worker placeholders, documentation, and local Compose structure.
@@ -143,4 +149,38 @@ This roadmap separates foundational safety work from product implementation. A l
 ## Phase 13 — Security hardening, Docker demo, and final documentation (final scope)
 
 - Complete threat modeling, abuse and isolation tests, operational safeguards, a reviewed local Docker demonstration, and final setup and recovery documentation.
-- No Phase 14 is defined by the current roadmap.
+
+## Roadmap v2
+
+Roadmap v2 begins after the completed Roadmap v1. Its first phase is a design
+and contract gate; it does not claim that training is implemented.
+
+### Phase 14.0 — Controlled training execution contract (current; design only)
+
+- Define the threat model, immutable Phase 11 authority, worker/runtime split,
+  storage and output contract, lifecycle, retention fences, crash model,
+  hardware constraints, and supervised process boundary.
+- No training execution, model or tokenizer loading, LlamaFactory installation,
+  queue, worker, runtime service, migration, public API, or Phase 12 mutation.
+
+### Phase 14.1 — Execution control plane (planned)
+
+- Add PostgreSQL execution and attempt authority, enqueue/cancel/read lifecycle,
+  leases, reclaim, retention fences, and a fake training runtime only.
+- Do not execute LlamaFactory or load a real model.
+
+### Phase 14.2 — Isolated real training runtime (planned)
+
+- Add separately pinned LlamaFactory execution, exact local model-cache
+  authority, offline process supervision, and reviewed hardware capability
+  checks. Real training remains opt-in and normal CI remains model-free.
+
+### Phase 14.3 — Verified output publication and explicit adapter handoff (planned)
+
+- Add descriptor-bound output publication, reuse of the Phase 12.1A static
+  adapter validator, execution provenance metadata, explicit administrator
+  handoff into Phase 12 intake, purge, and reconciliation.
+- Do not add automatic evaluation, approval, promotion, or routing.
+
+Phase 15 has no implementation scope in this roadmap. A future web MVP may be
+identified separately, but it is not assigned implementation scope here.

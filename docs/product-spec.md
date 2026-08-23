@@ -173,3 +173,15 @@ These are roadmap candidates, not Phase 0 commitments.
 Phase 0 is complete when a new contributor can clone the repository, understand its boundaries, configure external runtime storage, inspect the web/API skeletons, validate the Compose configuration, and see unambiguous rules for future tenant isolation and grounded-answer safety.
 
 Future MVP success should be measured with explicit targets for retrieval quality, grounded-answer quality, citation correctness, insufficient-information accuracy, cross-department isolation, prompt-injection resistance, latency, reliability, and operator effort. Numerical targets require representative data and stakeholder agreement and are therefore not set in Phase 0.
+
+## Roadmap v2 Phase 14.0 status
+
+Roadmap v1 Phase 0–13 is complete. Roadmap v2 begins with a design-only
+controlled training execution contract. Phase 11 remains the source of one
+approved, immutable five-file LlamaFactory bundle; Phase 12 remains the
+explicit intake, evaluation, approval, promotion, rollback, and routing
+boundary for externally produced adapters. Phase 14.0 adds no training,
+LlamaFactory execution, model download, runtime service, queue, worker, API,
+migration, or automatic handoff. A future Phase 14.1/14.2/14.3 implementation
+must preserve department authority, offline model preparation, explicit human
+governance, and the existing Phase 12.1A static adapter contract.

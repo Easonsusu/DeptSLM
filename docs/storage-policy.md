@@ -406,6 +406,29 @@ rollback. PostgreSQL, external files, and runtime processes are not
 transactionally atomic; activated bytes without committed succeeded authority
 remain untrusted.
 
+### Future Phase 14 training execution storage
+
+Roadmap v2 reserves `DEPTSLM_DATA_DIR/training_runs` for a future Phase 14
+execution boundary. Phase 14.0 is contract-only and does not create this
+directory or any runtime files. The proposed server-derived layout is:
+
+```text
+training_runs/<department_uuid>/<execution_uuid>/
+  attempts/<attempt_uuid>/{input,scratch,logs,output_stage}/
+  final/
+```
+
+Only canonical UUIDs may form path components. Future directories and files
+must be private, descriptor-relative, no-follow, and free of symlink or
+hard-link adoption. The exact PostgreSQL execution attempt and its frozen Phase
+11 authority, not filesystem presence, own every surface. Scratch, logs, and
+staged output are non-authoritative; logs are private external artifacts and
+never PostgreSQL, API, audit, browser, or Git content. The authoritative final
+surface is limited to DeptSLM's execution manifest plus
+`adapter_config.json` and `adapter_model.safetensors`, subject to the existing
+Phase 12.1A validator. Physical directory creation, quotas, retention, and
+purge are deferred to reviewed Phase 14.1/14.2/14.3 implementation.
+
 ## Google Drive limitations
 
 Google Drive provides convenient local synchronization, not a production object store, database, queue, locking service, or backup policy. Concurrent writers and large model artifacts may create sync conflicts, partial uploads, quota pressure, or slow startup. Production storage will require a separately reviewed design; this policy does not claim that the local Google Drive layout is suitable for production deployment.
