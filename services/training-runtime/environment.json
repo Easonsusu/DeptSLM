@@ -2,7 +2,7 @@
   "environment_profile_id": "deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1",
   "python_version": "3.12",
   "llamafactory_version": "0.9.5",
-  "dependency_lock_sha256": "a8d07eb3c07a1f3e13027f8d39b496fbb659dfb22e9e40a60fbeecc529cea786",
+  "dependency_lock_sha256": "3d9587c56a5be5d257f39ed514062f48e354a02bc2adfe553ec4128b3a99b242",
   "supported_os": "Linux",
   "supported_architecture": "x86_64",
   "expected_cuda_runtime_family": "12.6",

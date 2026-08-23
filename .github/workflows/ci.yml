@@ -707,8 +707,8 @@ jobs:
           docker run --rm --entrypoint python deptslm-training-runtime-ci -I -m pip check
           lock_sha="$(docker run --rm --entrypoint sha256sum deptslm-training-runtime-ci /opt/llamafactory/requirements.lock | awk '{print $1}')"
           contract_sha="$(docker run --rm --entrypoint python deptslm-training-runtime-ci -I -c 'import hashlib,json; print(hashlib.sha256(json.dumps(json.load(open("/opt/llamafactory/environment.json")), sort_keys=True, separators=(",", ":")).encode()).hexdigest())')"
-          test "$lock_sha" = "a8d07eb3c07a1f3e13027f8d39b496fbb659dfb22e9e40a60fbeecc529cea786"
-          test "$contract_sha" = "3c32b171e730190d0ff1096ec1dcce7aad943e09f48c5e36eb99f8fd1e599d14"
+          test "$lock_sha" = "3d9587c56a5be5d257f39ed514062f48e354a02bc2adfe553ec4128b3a99b242"
+          test "$contract_sha" = "52251329cbe495b46ae419b6b1bbb489adb989b63604cc2587a5f2158d3627cc"
           if docker image inspect deptslm-training-runtime-ci --format '{{json .Config.ExposedPorts}}' | grep -v -E 'null|^{}$' >/dev/null; then
             echo 'training-runtime must not expose a port' >&2
             exit 1
@@ -948,8 +948,8 @@ jobs:
             export DEPTSLM_ADAPTER_RUNTIME_TOKEN="phase12-ci-production-runtime-token-0123456789"
             export DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN="phase12-ci-adapter-runtime-token-0123456789"
             export DEPTSLM_TRAINING_EXECUTION_CODE_REVISION="5555555555555555555555555555555555555555"
-            export DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256="a8d07eb3c07a1f3e13027f8d39b496fbb659dfb22e9e40a60fbeecc529cea786"
-            export DEPTSLM_TRAINING_ENVIRONMENT_FINGERPRINT="3c32b171e730190d0ff1096ec1dcce7aad943e09f48c5e36eb99f8fd1e599d14"
+            export DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256="3d9587c56a5be5d257f39ed514062f48e354a02bc2adfe553ec4128b3a99b242"
+            export DEPTSLM_TRAINING_ENVIRONMENT_FINGERPRINT="52251329cbe495b46ae419b6b1bbb489adb989b63604cc2587a5f2158d3627cc"
             export DEPTSLM_TRAINING_RUNTIME_TOKEN="phase14-ci-training-runtime-token-0123456789"
             export DEPTSLM_EVALUATION_CODE_REVISION="9999999999999999999999999999999999999999"
             export DEPTSLM_SFT_CODE_REVISION="8888888888888888888888888888888888888888"
