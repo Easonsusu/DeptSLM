@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from deptslm_runtime.models import RuntimeModels
 from starlette.testclient import TestClient
 
 from app.body_limit import (
@@ -127,6 +128,17 @@ def test_body_limit_constant_is_closed_and_not_environment_controlled() -> None:
     assert MAX_NON_UPLOAD_REQUEST_BODY_BYTES == 65_536
     source = (Path(__file__).parents[1] / "app" / "body_limit.py").read_text(encoding="utf-8")
     assert "os.getenv" not in source
+
+
+def test_fake_runtime_answer_sentinel_preserves_strict_contract(monkeypatch) -> None:
+    sentinel = "PHASE13_GENERATED_ANSWER_SENTINEL"
+    monkeypatch.setenv("DEPTSLM_RAG_FAKE_ANSWER_SENTINEL", sentinel)
+    result = RuntimeModels(Path("/not-used"), "fake").generate(
+        "question", [{"source_id": "S1", "text": "authorized evidence"}]
+    )
+    assert result["status"] == "answered"
+    assert result["answer"].startswith(sentinel)
+    assert result["citations"] == ["S1"]
 
 
 def test_compose_services_have_explicit_least_privilege_networks() -> None:

@@ -886,6 +886,34 @@ jobs:
     name: Phase 13 security and demo gate
     needs: [repository-policy, web, api, infrastructure]
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: deptslm_test
+          POSTGRES_PASSWORD: deptslm
+          POSTGRES_USER: deptslm
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U deptslm -d deptslm_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      qdrant:
+        image: qdrant/qdrant:v1.13.4
+        env:
+          QDRANT__SERVICE__API_KEY: phase13-ci-qdrant-key-0123456789
+        ports:
+          - 6333:6333
+    env:
+      DATABASE_URL: postgresql+psycopg://deptslm:deptslm@localhost:5432/deptslm_test
+      DATABASE_TEST_URL: postgresql+psycopg://deptslm:deptslm@localhost:5432/deptslm_test
+      DEPTSLM_REQUIRE_POSTGRES_TESTS: "1"
+      DEPTSLM_REQUIRE_QDRANT_TESTS: "1"
+      DEPTSLM_TEST_QDRANT_URL: http://localhost:6333
+      DEPTSLM_TEST_QDRANT_API_KEY: phase13-ci-qdrant-key-0123456789
+      DEPTSLM_TEST_QDRANT_ISOLATED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -908,7 +936,22 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
-          python -m pytest tests/test_phase13_security.py -q
+          export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-phase13-data"
+          mkdir -p "$DEPTSLM_DATA_DIR"/{uploads,extracted_text,vector_snapshots,training_datasets,adapters,model_cache,eval_results,logs,exports}
+          mkdir -p "$DEPTSLM_DATA_DIR"/service_state/{postgres,qdrant}
+          for attempt in {1..30}; do
+            if curl --fail --silent --header "api-key: $DEPTSLM_TEST_QDRANT_API_KEY" "$DEPTSLM_TEST_QDRANT_URL/healthz" >/dev/null; then
+              break
+            fi
+            if [[ "$attempt" -eq 30 ]]; then
+              echo "Qdrant did not become healthy." >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          python -m alembic upgrade head
+          test "$(python -m alembic current | awk '{print $1}')" = "0017_phase12_adapter_runtime_routing"
+          python -m pytest tests/test_phase13_security.py tests/test_phase13_integration.py -q
       - name: Run synthetic Phase 13 Docker demo
         run: ./scripts/demo.sh
       - name: Verify the demo leaves the checkout clean

@@ -46,9 +46,9 @@ and accidental disclosure by local operational commands.
 
 | Invariant | Enforcement boundary | Evidence | Residual limitation |
 | --- | --- | --- | --- |
-| No cross-department access, including `system_admin` | Server membership resolution and exact `DepartmentScope` checks | Phase 2–12 PostgreSQL suites and Phase 13 route inventory | A compromised host can bypass the application |
+| No cross-department access, including `system_admin` | Server membership resolution and exact `DepartmentScope` checks | Phase 2–12 PostgreSQL suites plus the Phase 13 PostgreSQL-backed current-surface route-family matrix (including A-system-admin to B denial) | A compromised host can bypass the application |
 | No public vector-search or query-vector route | Route surface and adapter boundaries | API route tests and CI static checks | Internal workers still use Qdrant |
-| No document, question, answer, prompt, evidence, or vector in PostgreSQL | Content-free schemas and service boundaries | Phase 4–12 persistence sentinels | Legitimate source bytes remain external |
+| No document, question, answer, prompt, evidence, or vector in PostgreSQL | Content-free schemas and service boundaries | Phase 4–12 persistence sentinels plus the Phase 13 real RAG transient-content scan | Legitimate source bytes remain external |
 | No evaluation generated-answer persistence | Evaluator result allowlist | Phase 9/12.2 tests | Process memory is not a durable secrecy boundary |
 | No dataset content in PostgreSQL or APIs | Phase 10 authority manifests | SFT tests and image isolation checks | External dataset operators remain trusted to protect files |
 | No adapter bytes in PostgreSQL/API | Registry metadata projection and private mounts | Phase 12.1D–12.4 tests | External registry storage is not transactionally atomic |
@@ -57,7 +57,9 @@ and accidental disclosure by local operational commands.
 | Exact E-B retention fence | PostgreSQL reservations and lifecycle checks | Phase 12.1E tests | In-flight filesystem/network requests cannot be retroactively fenced |
 | Model runtimes receive no DB/Qdrant/auth credentials | Compose mounts, environment allowlists, and private networks | Image and Compose matrix checks | Docker daemon compromise defeats isolation |
 | Runtime artifacts stay outside Git | `DEPTSLM_DATA_DIR`, ignore rules, and policy job | Repository artifact-policy job | Local host or Google Drive compromise remains possible |
-| Non-upload bodies are bounded | ASGI transport middleware before FastAPI decoding | Phase 13 middleware tests | Uploads retain their separate configured streaming limit |
+| Non-upload bodies are bounded | ASGI transport middleware before FastAPI decoding | Phase 13 real FastAPI/PostgreSQL declared-length and streamed-body integration tests, exact-limit and malformed-body regressions | Uploads retain their separate configured streaming limit |
+| Secrets and transient RAG content are not disclosed in logs | Safe typed audit fields and content-free runtime boundaries | Phase 13 API/runtime/worker log-sentinel integration scan plus the synthetic Docker demo log scan | Logs are not a cryptographic secrecy boundary |
+| The Phase 4 raw upload exemption remains narrow and streaming | Exact UUID upload-path predicate and the existing incremental upload service | Phase 13 real >65,536-byte upload regression and upload-own-limit 413 regression | Upload storage and PostgreSQL commit remain non-atomic |
 
 These controls are reviewed engineering boundaries, not formal verification.
 

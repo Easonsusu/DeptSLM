@@ -43,6 +43,7 @@ CHILD_ENVIRONMENT_NAMES = frozenset(
     {
         "DEPTSLM_DATA_DIR",
         "DEPTSLM_RAG_RUNTIME_PROVIDER",
+        "DEPTSLM_RAG_FAKE_ANSWER_SENTINEL",
         "DEPTSLM_EMBEDDING_MODEL_REVISION",
         "DEPTSLM_GENERATION_MODEL_REVISION",
         "ENVIRONMENT",
@@ -123,6 +124,15 @@ class RuntimeSettings:
         provider = os.getenv("DEPTSLM_RAG_RUNTIME_PROVIDER", "real").strip().lower()
         if provider not in {"real", "fake"} or (provider == "fake" and environment != "test"):
             raise RuntimeConfigurationError("Fake model runtime is test-only.")
+        answer_sentinel = os.getenv("DEPTSLM_RAG_FAKE_ANSWER_SENTINEL", "")
+        if answer_sentinel and (
+            provider != "fake"
+            or environment != "test"
+            or not answer_sentinel.isascii()
+            or not 1 <= len(answer_sentinel) <= 256
+            or any(character.isspace() for character in answer_sentinel)
+        ):
+            raise RuntimeConfigurationError("Fake answer sentinel is test-only and bounded.")
         if os.getenv("DEPTSLM_EMBEDDING_MODEL_REVISION", "") != EMBEDDING_MODEL_REVISION:
             raise RuntimeConfigurationError("Embedding revision does not match the contract.")
         if os.getenv("DEPTSLM_GENERATION_MODEL_REVISION", "") != GENERATION_MODEL_REVISION:
@@ -154,6 +164,9 @@ class RuntimeSettings:
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
         }
+        answer_sentinel = os.getenv("DEPTSLM_RAG_FAKE_ANSWER_SENTINEL", "")
+        if answer_sentinel:
+            values["DEPTSLM_RAG_FAKE_ANSWER_SENTINEL"] = answer_sentinel
         source_path = _source_pythonpath(Path(__file__).resolve())
         if source_path is not None:
             values["PYTHONPATH"] = source_path

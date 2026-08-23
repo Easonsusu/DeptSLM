@@ -46,6 +46,9 @@ adapter_eval_token=$(random_value)
 issuer="https://phase13-demo.invalid"
 audience="deptslm-phase13-demo"
 question_sentinel="PHASE13_DEMO_QUESTION_SENTINEL"
+generated_answer_sentinel="PHASE13_DEMO_GENERATED_ANSWER_SENTINEL"
+evidence_sentinel="PHASE13_DEMO_EVIDENCE_SENTINEL"
+question_payload="${question_sentinel} ${evidence_sentinel}"
 
 cat >"${env_file}" <<EOF
 DEPTSLM_DATA_DIR=${runtime_root}
@@ -69,6 +72,7 @@ DEPTSLM_ADAPTER_RUNTIME_URL=http://adapter-runtime:8012
 DEPTSLM_ADAPTER_RUNTIME_TOKEN=${adapter_token}
 DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN=${adapter_eval_token}
 DEPTSLM_RAG_RUNTIME_PROVIDER=fake
+DEPTSLM_RAG_FAKE_ANSWER_SENTINEL=${generated_answer_sentinel}
 DEPTSLM_EMBEDDING_PROVIDER=fake
 DEPTSLM_RAG_MIN_SCORE=0.01
 DEPTSLM_EMBEDDING_MODEL_REVISION=d23109d65ca9fdf61eef614209744716f337f50f
@@ -286,7 +290,7 @@ api_call 2xx GET /auth/me "${runtime_root}/auth-me.json"
 
 printf '%s\nQuestion: %s' \
   'Given a user question, retrieve passages from the authorized department documents that directly support an answer.' \
-  "${question_sentinel}" >"${source_file}"
+  "${question_payload}" >"${source_file}"
 upload_response="${runtime_root}/upload-response.json"
 api_call 2xx POST "/departments/${department_a}/documents" "${upload_response}" \
   "${source_file}" 'text/plain; charset=utf-8' 'attachment; filename="phase13.txt"'
@@ -344,10 +348,10 @@ fi
 
 answer_response="${runtime_root}/answer-response.json"
 answer_request="${runtime_root}/answer-request.json"
-printf '{"question":"%s"}\n' "${question_sentinel}" >"${answer_request}"
+printf '{"question":"%s"}\n' "${question_payload}" >"${answer_request}"
 api_call 2xx POST "/departments/${department_a}/rag/answers" "${answer_response}" \
   "${answer_request}" 'application/json'
-python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["status"]=="answered"; assert d["citations"]' "${answer_response}"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["status"]=="answered"; assert d["citations"]; assert d["answer"].startswith(sys.argv[2])' "${answer_response}" "${generated_answer_sentinel}"
 
 cross_response="${runtime_root}/cross-department.json"
 api_call 403 GET "/departments/${department_b}/documents" "${cross_response}"
@@ -355,8 +359,8 @@ compose run --rm --no-deps web node -e \
   'fetch("http://api:8000/health").then(response => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))' >/dev/null
 
 compose logs --no-color >"${runtime_root}/compose.log" 2>&1 || true
-if grep -F -e "${auth_secret}" -e "${qdrant_key}" -e "${rag_token}" -e "${adapter_token}" -e "${adapter_eval_token}" -e "${question_sentinel}" "${runtime_root}/compose.log" >/dev/null; then
-  printf 'Synthetic demo logs contained a protected sentinel.\n' >&2
+if grep -F -e "${auth_secret}" -e "${qdrant_key}" -e "${rag_token}" -e "${adapter_token}" -e "${adapter_eval_token}" -e "${question_sentinel}" -e "${generated_answer_sentinel}" -e "${evidence_sentinel}" "${runtime_root}/compose.log" >/dev/null; then
+  printf 'Synthetic demo logs contained a protected sentinel class.\n' >&2
   exit 1
 fi
 

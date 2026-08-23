@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -108,12 +109,17 @@ class RuntimeModels:
         labels = tuple(item["source_id"] for item in evidence)
         messages = build_generation_messages(question, evidence)
         if self._provider == "fake":
+            answer_sentinel = os.getenv("DEPTSLM_RAG_FAKE_ANSWER_SENTINEL", "")
             value = (
                 {"status": "insufficient_information", "answer": "", "citations": []}
                 if not labels
                 else {
                     "status": "answered",
-                    "answer": f"The authorized evidence supports this answer [{labels[0]}].",
+                    "answer": (
+                        f"{answer_sentinel} [{labels[0]}]"
+                        if answer_sentinel
+                        else f"The authorized evidence supports this answer [{labels[0]}]."
+                    ),
                     "citations": [labels[0]],
                 }
             )
