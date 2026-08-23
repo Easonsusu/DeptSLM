@@ -359,7 +359,7 @@ compose run --rm --no-deps web node -e \
   'fetch("http://api:8000/health").then(response => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1))' >/dev/null
 
 compose logs --no-color >"${runtime_root}/compose.log" 2>&1 || true
-if grep -F -e "${auth_secret}" -e "${qdrant_key}" -e "${rag_token}" -e "${adapter_token}" -e "${adapter_eval_token}" -e "${question_sentinel}" -e "${generated_answer_sentinel}" -e "${evidence_sentinel}" "${runtime_root}/compose.log" >/dev/null; then
+if grep -F -e "${auth_secret}" -e "${qdrant_key}" -e "${rag_token}" -e "${adapter_token}" -e "${adapter_eval_token}" -e "${token_a}" -e "${question_sentinel}" -e "${generated_answer_sentinel}" -e "${evidence_sentinel}" "${runtime_root}/compose.log" >/dev/null; then
   printf 'Synthetic demo logs contained a protected sentinel class.\n' >&2
   exit 1
 fi

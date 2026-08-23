@@ -470,7 +470,6 @@ def test_rag_transient_sentinels_stay_out_of_postgres_external_forbidden_storage
     question = f"PHASE13_QUESTION_SENTINEL_{uuid4().hex}"
     answer = f"PHASE13_GENERATED_ANSWER_SENTINEL_{uuid4().hex}"
     evidence = f"PHASE13_EVIDENCE_SENTINEL_{uuid4().hex}"
-    bearer = f"PHASE13_BEARER_SENTINEL_{uuid4().hex}"
     source_text = f"Authorized evidence: {evidence}"
     with Session(engine) as db:
         identities, department, document, extraction, chunk, indexing = _seed_unique(db, tmp_path)
@@ -518,6 +517,8 @@ def test_rag_transient_sentinels_stay_out_of_postgres_external_forbidden_storage
         qdrant.bootstrap_collection()
         qdrant.upsert_staging(scope, (point,))
         qdrant.activate_attempt(scope, indexing.id, indexing.vector_attempt_id)
+        caller_token = _token(identities["student"].subject)
+        caller_headers = {"Authorization": f"Bearer {caller_token}"}
 
         class SentinelRuntime:
             def query_embedding(self, _question):
@@ -528,12 +529,11 @@ def test_rag_transient_sentinels_stay_out_of_postgres_external_forbidden_storage
 
         caplog.set_level(logging.INFO)
         with _client(monkeypatch, tmp_path) as client:
-            monkeypatch.setenv("DEPTSLM_RAG_RUNTIME_TOKEN", bearer)
             app.state.rag_runtime_client = SentinelRuntime()
             app.state.rag_qdrant = qdrant
             response = client.post(
                 f"/departments/{department.id}/rag/answers",
-                headers=_headers(identities["student"].subject),
+                headers=caller_headers,
                 json={"question": question},
             )
         assert response.status_code == 200, response.text
@@ -564,7 +564,10 @@ def test_rag_transient_sentinels_stay_out_of_postgres_external_forbidden_storage
                         == 0
                     )
                     assert (
-                        connection.execute(text(query), {"needle": f"%{bearer}%"}).scalar_one() == 0
+                        connection.execute(
+                            text(query), {"needle": f"%{caller_token}%"}
+                        ).scalar_one()
+                        == 0
                     )
         forbidden_roots = (
             "vector_snapshots",
@@ -581,9 +584,11 @@ def test_rag_transient_sentinels_stay_out_of_postgres_external_forbidden_storage
                 if candidate.is_file():
                     value = candidate.read_text(errors="ignore")
                     assert all(
-                        marker not in value for marker in (question, answer, evidence, bearer)
+                        marker not in value for marker in (question, answer, evidence, caller_token)
                     )
-        assert all(marker not in caplog.text for marker in (question, answer, evidence, bearer))
+        assert all(
+            marker not in caplog.text for marker in (question, answer, evidence, caller_token)
+        )
     finally:
         try:
             qdrant.delete_attempt(scope, indexing.id, indexing.vector_attempt_id)
