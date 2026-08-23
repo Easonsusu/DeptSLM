@@ -51,19 +51,19 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > The API uses a separate bounded adapter transport envelope for the runtime's
 > 300-second target load and 120-second generation clocks; the Phase 7 base
 > timeout remains unchanged. Roadmap v1 Phase 13 was its final scope and is
-> complete; Roadmap v2 begins with the Phase 14.0 design contract.
+> complete; Roadmap v2 Phase 14.0 and Phase 14.1 are complete, and Phase 14.2
+> is the current private runtime phase under review.
 
-> **Phase 14 status:** Phase 14.0 is complete and Phase 14.1 implements the
-> reviewed metadata-only execution control plane. It freezes one approved
-> Phase 11 authority snapshot, exposes department-scoped enqueue/read/cancel/
-> retry lifecycle, uses server-time leases and job-first retention fences, and
-> copies the exact five Phase 11 files through private descriptor-bound
-> attempt storage. The closed runtime protocol accepts only content-free
-> server-validated fields and keeps retained descriptors in separate
-> process-local handles; the production worker fails closed without a
-> separately reviewed runtime. It installs or invokes no LlamaFactory, loads no
-> model, downloads no weights, creates no adapter, and changes no Phase 12
-> governance. Phase 14.2 and later remain unstarted. See [the training
+> **Phase 14 status:** Phase 14.0 and Phase 14.1 are complete. Phase 14.2
+> adds the first reviewed real-training runtime behind the opt-in `training`
+> Compose profile: an exact LlamaFactory 0.9.5 lock, pinned Qwen3 cache,
+> offline Linux/NVIDIA/BF16 and NF4 preflight, private HMAC-authenticated Unix
+> SCM_RIGHTS transfer of one exact attempt, server-owned config
+> rematerialization, fixed process-group supervision, and sealed private
+> output-stage evidence. A real success may create candidate adapter bytes in
+> private staging, but it creates no authoritative or published adapter and
+> does not hand output to Phase 12. Normal CI remains model-free and downloads
+> no model weights. Phase 14.3 and Phase 15 remain unstarted. See [the training
 > execution contract](docs/training-execution.md).
 
 The governance worker is deliberately narrower than the API: its dedicated
@@ -376,7 +376,7 @@ Contribution workflow and validation guidance are in [CONTRIBUTING.md](CONTRIBUT
 
 Phase 9 does not implement LLM judging, semantic grading, public raw results, a frontend dashboard, feedback-derived cases, automatic threshold or RAG changes, training datasets, SFT, adapters, model promotion, cross-department benchmarking, production OAuth/OIDC/SSO, or production deployment.
 
-Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 through Phase 12.4 are complete. Phase 12.4 is the reviewed, administrator-governed runtime boundary: it snapshots exact deployment authority and routes only adapter generation through a separate private runtime; retrieval remains Phase 7, and runtime errors never fall back to base or mutate governance. Roadmap v1 Phase 13 is complete. Roadmap v2 Phase 14.0 is the completed contract and Phase 14.1 is the metadata-only execution control plane; no real training or automatic adapter handoff exists. Google Drive storage is an external development runtime location, not a production object store or backup.
+Phase 10 does not derive examples from feedback or evaluation suites, generate examples with a model, establish semantic entailment, guarantee two-person approval, train a model, invoke LLaMA-Factory, or create/promote adapters. Phase 12.0 through Phase 12.4 are complete. Phase 12.4 is the reviewed, administrator-governed runtime boundary: it snapshots exact deployment authority and routes only adapter generation through a separate private runtime; retrieval remains Phase 7, and runtime errors never fall back to base or mutate governance. Roadmap v1 Phase 13 is complete. Roadmap v2 Phase 14.0 is the completed contract, Phase 14.1 is the metadata control plane, and Phase 14.2 is the private pinned offline runtime; it creates no automatic Phase 12 handoff or authoritative adapter. Google Drive storage is an external development runtime location, not a production object store or backup.
 
 ## License
 

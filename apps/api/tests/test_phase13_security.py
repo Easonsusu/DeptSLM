@@ -174,6 +174,8 @@ def test_compose_services_have_explicit_least_privilege_networks() -> None:
         "adapter-registry-worker": {"postgres-internal"},
         "adapter-governance-worker": {"postgres-internal"},
         "adapter-maintenance": {"postgres-internal"},
+        "training-execution-worker": {"postgres-internal"},
+        "training-runtime": set(),
     }
     blocks = dict(
         re.findall(
@@ -185,7 +187,11 @@ def test_compose_services_have_explicit_least_privilege_networks() -> None:
     assert set(blocks) == set(expected)
     for service, networks in expected.items():
         block = blocks[service]
-        assert "\n    networks:\n" in block, service
+        if service == "training-runtime":
+            assert "network_mode: none" in block, service
+            assert "\n    networks:\n" not in block, service
+        else:
+            assert "\n    networks:\n" in block, service
         actual = set(re.findall(r"^      - ([a-z0-9-]+)$", block, re.MULTILINE))
         assert actual == networks, (service, actual)
     assert "  default:" not in compose
@@ -221,9 +227,16 @@ def test_compose_capability_matrix_has_no_implicit_or_secret_capabilities() -> N
         "adapter-registry-worker",
         "adapter-governance-worker",
         "adapter-maintenance",
+        "training-execution-worker",
+        "training-runtime",
     }
     for service, block in blocks.items():
-        assert "network_mode:" not in block, service
+        if service == "training-runtime":
+            assert "network_mode: none" in block, service
+            assert "\n    networks:\n" not in block, service
+        else:
+            assert "network_mode:" not in block, service
+            assert "\n    networks:\n" in block, service
         assert "/var/run/docker.sock" not in block, service
         if "ports:" in block:
             assert '"127.0.0.1:' in block, service
@@ -239,6 +252,19 @@ def test_compose_capability_matrix_has_no_implicit_or_secret_capabilities() -> N
             "model_cache",
         ),
         "model-admin": ("model-egress", "model_cache"),
+        "training-execution-worker": (
+            'profiles: ["training"]',
+            "training_runs",
+            "training-runtime-ipc",
+            "DEPTSLM_TRAINING_RUNTIME_TOKEN",
+        ),
+        "training-runtime": (
+            'profiles: ["training"]',
+            "network_mode: none",
+            "model_cache/qwen3-0.6b-c1899de289a04d12100db370d81485cdf75e47ca",
+            "training-runtime-ipc",
+            "capabilities: [gpu]",
+        ),
     }
     for service, required in expected_capabilities.items():
         block = blocks[service]
@@ -260,6 +286,15 @@ def test_compose_capability_matrix_has_no_implicit_or_secret_capabilities() -> N
             "DEPTSLM_ADAPTER_RUNTIME_TOKEN",
         ),
         "model-admin": ("DATABASE_URL", "DEPTSLM_QDRANT", "DEPTSLM_RAG_RUNTIME_TOKEN"),
+        "training-runtime": (
+            "DATABASE_URL",
+            "QDRANT",
+            "HF_TOKEN",
+            "HUGGING_FACE_HUB_TOKEN",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+        ),
     }
     for service, forbidden_values in forbidden.items():
         block = blocks[service]
@@ -328,6 +363,7 @@ def test_compose_wrapper_config_does_not_display_secret_sentinels() -> None:
             "phase13-adapter-sentinel",
             "phase13-eval-sentinel",
             "phase13-hf-sentinel",
+            "phase14-training-runtime-sentinel",
         )
         environment = os.environ.copy()
         environment.update(
@@ -340,6 +376,7 @@ def test_compose_wrapper_config_does_not_display_secret_sentinels() -> None:
                 "DEPTSLM_ADAPTER_RUNTIME_TOKEN": sentinels[3],
                 "DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN": sentinels[4],
                 "HF_TOKEN": sentinels[5],
+                "DEPTSLM_TRAINING_RUNTIME_TOKEN": sentinels[6],
             }
         )
         result = subprocess.run(

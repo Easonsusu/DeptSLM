@@ -130,6 +130,9 @@ jobs:
             services/rag-worker/pyproject.toml
             services/rag-runtime/pyproject.toml
             services/adapter-runtime/pyproject.toml
+            services/training-runtime/requirements.lock
+            services/training-runtime/requirements-test.txt
+            services/training-runtime/pyproject.toml
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
         working-directory: apps/api
@@ -139,8 +142,8 @@ jobs:
       - name: Lint API
         working-directory: apps/api
         run: |
-          python -m ruff check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime ../../services/adapter-eval-runtime/deptslm_adapter_runtime ../../services/adapter-runtime/deptslm_adapter_runtime
-          python -m ruff format --check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime ../../services/adapter-eval-runtime/deptslm_adapter_runtime ../../services/adapter-runtime/deptslm_adapter_runtime
+          python -m ruff check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime ../../services/adapter-eval-runtime/deptslm_adapter_runtime ../../services/adapter-runtime/deptslm_adapter_runtime ../../services/training-runtime/deptslm_training_runtime ../../services/training-runtime/tests
+          python -m ruff format --check app tests ../../services/rag-worker/deptslm_worker ../../services/rag-runtime/deptslm_runtime ../../services/adapter-eval-runtime/deptslm_adapter_runtime ../../services/adapter-runtime/deptslm_adapter_runtime ../../services/training-runtime/deptslm_training_runtime ../../services/training-runtime/tests
       - name: Run API tests with temporary storage
         working-directory: apps/api
         run: |
@@ -159,8 +162,13 @@ jobs:
             sleep 1
           done
           python -m alembic upgrade head
-          test "$(python -m alembic current | awk '{print $1}')" = "0018_phase14_training_execution_control_plane"
+          test "$(python -m alembic current | awk '{print $1}')" = "0019_phase14_training_runtime"
           python -m pytest
+      - name: Run pinned training-runtime protocol and supervision tests
+        working-directory: services/training-runtime
+        run: |
+          python -m pip install --requirement requirements-test.txt
+          python -m pytest -q tests
       - name: Run one-shot worker smoke test
         working-directory: apps/api
         run: |
@@ -412,6 +420,7 @@ jobs:
           assert pathlib.Path("/app/alembic/versions/0016_phase12_adapter_governance.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0017_phase12_adapter_runtime_routing.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0018_phase14_training_execution_control_plane.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0019_phase14_training_runtime.py").is_file()
           import app.evaluation_admin
           import app.evaluation_services
           import app.sft_services
@@ -657,6 +666,63 @@ jobs:
             | python -c 'import json,sys; value=json.load(sys.stdin); assert len(value["vector"]) == 1024'
           docker rm --force "$container_id" >/dev/null
           trap - EXIT
+      - name: Build and inspect Phase 14.2 execution worker image
+        run: |
+          docker build --tag deptslm-training-execution-worker-ci --file services/training-execution-worker/Dockerfile .
+          docker run --rm --entrypoint python deptslm-training-execution-worker-ci -I -c '
+          import importlib.util
+          import app.training_execution_worker
+          assert importlib.util.find_spec("torch") is None
+          assert importlib.util.find_spec("transformers") is None
+          assert importlib.util.find_spec("llamafactory") is None
+          assert importlib.util.find_spec("qdrant_client") is None
+          '
+          if docker image inspect deptslm-training-execution-worker-ci --format '{{json .Config.ExposedPorts}}' | grep -v -E 'null|^{}$' >/dev/null; then
+            echo 'training-execution-worker must not expose a port' >&2
+            exit 1
+          fi
+          worker_env="$(docker image inspect deptslm-training-execution-worker-ci --format '{{json .Config.Env}}')"
+          if grep -E 'HF_TOKEN|HUGGING_FACE_HUB_TOKEN|QDRANT|RAG_RUNTIME|ADAPTER|DEPTSLM_AUTH|DOCKER' <<<"$worker_env"; then
+            echo 'forbidden training-execution-worker environment found' >&2
+            exit 1
+          fi
+      - name: Build and inspect pinned Phase 14.2 training runtime image
+        run: |
+          docker build --tag deptslm-training-runtime-ci --file services/training-runtime/Dockerfile .
+          docker run --rm --entrypoint python deptslm-training-runtime-ci -I -c '
+          import importlib.metadata
+          import importlib.util
+          import llamafactory, torch, transformers, datasets, accelerate, peft, trl, safetensors
+          assert importlib.metadata.version("llamafactory") == "0.9.5"
+          assert torch.__version__.split("+")[0] == "2.7.1"
+          assert transformers.__version__ == "4.55.0"
+          assert datasets.__version__ == "4.0.0"
+          assert accelerate.__version__ == "1.9.0"
+          assert peft.__version__ == "0.18.1"
+          assert trl.__version__ == "0.19.1"
+          assert safetensors.__version__ == "0.7.0"
+          assert importlib.util.find_spec("llamafactory.cli") is not None
+          assert importlib.util.find_spec("psycopg") is None
+          '
+          docker run --rm --entrypoint python deptslm-training-runtime-ci -I -m pip check
+          lock_sha="$(docker run --rm --entrypoint sha256sum deptslm-training-runtime-ci /opt/llamafactory/requirements.lock | awk '{print $1}')"
+          contract_sha="$(docker run --rm --entrypoint python deptslm-training-runtime-ci -I -c 'import hashlib,json; print(hashlib.sha256(json.dumps(json.load(open("/opt/llamafactory/environment.json")), sort_keys=True, separators=(",", ":")).encode()).hexdigest())')"
+          test "$lock_sha" = "a8d07eb3c07a1f3e13027f8d39b496fbb659dfb22e9e40a60fbeecc529cea786"
+          test "$contract_sha" = "3c32b171e730190d0ff1096ec1dcce7aad943e09f48c5e36eb99f8fd1e599d14"
+          if docker image inspect deptslm-training-runtime-ci --format '{{json .Config.ExposedPorts}}' | grep -v -E 'null|^{}$' >/dev/null; then
+            echo 'training-runtime must not expose a port' >&2
+            exit 1
+          fi
+          runtime_env="$(docker image inspect deptslm-training-runtime-ci --format '{{json .Config.Env}}')"
+          if grep -E 'DATABASE_URL|QDRANT|RAG_RUNTIME|ADAPTER|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY' <<<"$runtime_env"; then
+            echo 'forbidden training-runtime image environment found' >&2
+            exit 1
+          fi
+          weight_matches="$(docker run --rm --entrypoint sh deptslm-training-runtime-ci -c 'find /opt/llamafactory -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) -print 2>/dev/null || true')"
+          if [[ -n "$weight_matches" ]]; then
+            printf 'Model-weight-like files unexpectedly present in training runtime image:\n%s\n' "$weight_matches" >&2
+            exit 1
+          fi
       - name: Check raw streaming upload boundary
         run: |
           ! grep -R -E 'UploadFile|python-multipart|request\.body\(' apps/api/app apps/api/requirements*.txt
@@ -853,6 +919,26 @@ jobs:
           ! grep -E 'DATABASE_URL|QDRANT|DEPTSLM_AUTH|DEPTSLM_ADAPTER_EVAL|uploads|extracted_text|eval_results|training_datasets|exports|proxy|HF_TOKEN|HUGGING_FACE_HUB_TOKEN' <<<"$adapter_compose"
           ! grep -E '^\s+ports:' <<<"$adapter_compose"
           grep -F 'Phase 12.4' docs/adapter-runtime-routing.md >/dev/null
+      - name: Check Phase 14.2 training runtime capability isolation
+        run: |
+          worker_compose="$(sed -n '/^  training-execution-worker:/,/^  training-runtime:/p' docker-compose.yml)"
+          grep -F 'profiles: ["training"]' <<<"$worker_compose" >/dev/null
+          grep -F 'postgres-internal' <<<"$worker_compose" >/dev/null
+          grep -F '/training_runs' <<<"$worker_compose" >/dev/null
+          grep -F 'training-runtime-ipc' <<<"$worker_compose" >/dev/null
+          grep -F 'DEPTSLM_TRAINING_RUNTIME_TOKEN' <<<"$worker_compose" >/dev/null
+          ! grep -E 'model_cache|QDRANT|RAG_RUNTIME|ADAPTER_RUNTIME|ADAPTER_EVAL|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|DEPTSLM_AUTH|docker.sock|ports:|network_mode:' <<<"$worker_compose"
+          runtime_compose="$(sed -n '/^  training-runtime:/,/^  [a-z][a-z-]*:/p' docker-compose.yml)"
+          grep -F 'profiles: ["training"]' <<<"$runtime_compose" >/dev/null
+          grep -F 'network_mode: none' <<<"$runtime_compose" >/dev/null
+          grep -F 'model_cache/qwen3-0.6b-c1899de289a04d12100db370d81485cdf75e47ca' <<<"$runtime_compose" >/dev/null
+          grep -F 'training-runtime-ipc' <<<"$runtime_compose" >/dev/null
+          grep -F 'read_only: true' <<<"$runtime_compose" >/dev/null
+          grep -F 'cap_drop:' <<<"$runtime_compose" >/dev/null
+          grep -F 'no-new-privileges:true' <<<"$runtime_compose" >/dev/null
+          grep -F 'count: 1' <<<"$runtime_compose" >/dev/null
+          grep -F 'size=256m' <<<"$runtime_compose" >/dev/null
+          ! grep -E '^\s+DEPTSLM_DATA_DIR:|DATABASE_URL|training_runs|training_datasets|uploads|extracted_text|eval_results|adapters|QDRANT|RAG_RUNTIME|ADAPTER|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|DEPTSLM_AUTH|docker.sock|ports:|networks:' <<<"$runtime_compose"
       - name: Validate Compose configuration when available
         run: |
           if docker compose version >/dev/null 2>&1; then
@@ -861,6 +947,10 @@ jobs:
             export DEPTSLM_RAG_RUNTIME_TOKEN="phase7-ci-runtime-token-0123456789-abcdef"
             export DEPTSLM_ADAPTER_RUNTIME_TOKEN="phase12-ci-production-runtime-token-0123456789"
             export DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN="phase12-ci-adapter-runtime-token-0123456789"
+            export DEPTSLM_TRAINING_EXECUTION_CODE_REVISION="5555555555555555555555555555555555555555"
+            export DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256="a8d07eb3c07a1f3e13027f8d39b496fbb659dfb22e9e40a60fbeecc529cea786"
+            export DEPTSLM_TRAINING_ENVIRONMENT_FINGERPRINT="3c32b171e730190d0ff1096ec1dcce7aad943e09f48c5e36eb99f8fd1e599d14"
+            export DEPTSLM_TRAINING_RUNTIME_TOKEN="phase14-ci-training-runtime-token-0123456789"
             export DEPTSLM_EVALUATION_CODE_REVISION="9999999999999999999999999999999999999999"
             export DEPTSLM_SFT_CODE_REVISION="8888888888888888888888888888888888888888"
             export DEPTSLM_TRAINING_JOB_CODE_REVISION="7777777777777777777777777777777777777777"
@@ -925,7 +1015,7 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: apps/api/requirements-dev.txt
-      - name: Verify Phase 13 scope and migration freeze
+      - name: Verify Phase 14.2 runtime scope and migration head
         shell: bash
         run: |
           set -euo pipefail
@@ -934,7 +1024,14 @@ jobs:
           test -s docs/recovery.md
           test -x scripts/demo.sh
           test -f apps/api/alembic/versions/0018_phase14_training_execution_control_plane.py
-          ! find apps/api/alembic/versions -maxdepth 1 -type f -name '0019*' -print | grep -q .
+          test -f apps/api/alembic/versions/0019_phase14_training_runtime.py
+          ! find apps/api/alembic/versions -maxdepth 1 -type f -name '0020*' -print | grep -q .
+          test -f services/training-runtime/Dockerfile
+          test -s services/training-runtime/requirements.lock
+          grep -F 'llamafactory==0.9.5' services/training-runtime/requirements.lock >/dev/null
+          grep -F 'network_mode: none' docker-compose.yml >/dev/null
+          grep -F 'profiles: ["training"]' docker-compose.yml >/dev/null
+          grep -F 'DEPTSLM_TRAINING_RUNTIME_TOKEN' docker-compose.yml .env.example >/dev/null
           ! grep -R -E '@router\.(get|post|put|patch|delete).*search|/query-vector|/adapter(s)?/(upload|download)' apps/api/app/routes.py
       - name: Run Phase 13 transport and route-surface tests
         working-directory: apps/api
@@ -955,8 +1052,8 @@ jobs:
             sleep 1
           done
           python -m alembic upgrade head
-          test "$(python -m alembic current | awk '{print $1}')" = "0018_phase14_training_execution_control_plane"
-          python -m pytest tests/test_phase13_security.py tests/test_phase13_integration.py -q
+          test "$(python -m alembic current | awk '{print $1}')" = "0019_phase14_training_runtime"
+          python -m pytest tests/test_phase13_security.py tests/test_phase13_integration.py tests/test_phase14_0_contract.py -q
       - name: Run synthetic Phase 13 Docker demo
         run: ./scripts/demo.sh
       - name: Verify the demo leaves the checkout clean

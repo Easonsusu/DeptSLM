@@ -8,6 +8,7 @@ contents in PostgreSQL, logs, or API responses.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 from dataclasses import dataclass
@@ -62,6 +63,15 @@ class TrainingExecutionAttemptStage:
 class InputSnapshot:
     fingerprint: str
     files: tuple[tuple[str, ArtifactDigest], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class OutputStageEvidence:
+    """Content-free evidence for one sealed private candidate output tree."""
+
+    fingerprint: str
+    file_count: int
+    total_bytes: int
 
 
 def _private_directory(descriptor: int) -> None:
@@ -305,9 +315,250 @@ class TrainingExecutionArtifactStore:
             if source is not None:
                 source.close()
 
+    @staticmethod
+    def inspect_output_stage(
+        output_stage_fd: int,
+        *,
+        max_files: int = 4096,
+        max_total_bytes: int = 8 * 1024 * 1024 * 1024,
+        max_file_bytes: int = 2 * 1024 * 1024 * 1024,
+        max_depth: int = 16,
+    ) -> OutputStageEvidence:
+        """Verify and fingerprint output through the retained directory FD.
+
+        The scan is descriptor-relative and refuses links, special files, and
+        identity replacement.  It returns no content, paths, or filenames to
+        the control plane; only the canonical tree digest and bounded totals are
+        retained.
+        """
+
+        if output_stage_fd < 0:
+            raise TrainingExecutionStorageError("output_invalid")
+        try:
+            _private_directory(output_stage_fd)
+            records: list[tuple[str, int, str]] = []
+            total = 0
+
+            def walk(parent_fd: int, prefix: str, depth: int) -> None:
+                nonlocal total
+                if depth > max_depth:
+                    raise TrainingExecutionStorageError("output_limit_exceeded")
+                try:
+                    names = sorted(os.listdir(parent_fd))
+                except OSError as error:
+                    raise TrainingExecutionStorageError("output_invalid") from error
+                for name in names:
+                    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+                        raise TrainingExecutionStorageError("output_invalid")
+                    relative = f"{prefix}/{name}" if prefix else name
+                    try:
+                        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    except OSError as error:
+                        raise TrainingExecutionStorageError("output_invalid") from error
+                    if stat.S_ISLNK(metadata.st_mode):
+                        raise TrainingExecutionStorageError("output_invalid")
+                    if stat.S_ISDIR(metadata.st_mode):
+                        if (
+                            stat.S_IMODE(metadata.st_mode) != 0o700
+                            or metadata.st_uid != os.getuid()
+                        ):
+                            raise TrainingExecutionStorageError("output_invalid")
+                        try:
+                            child_fd = os.open(
+                                name,
+                                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=parent_fd,
+                            )
+                        except OSError as error:
+                            raise TrainingExecutionStorageError("output_invalid") from error
+                        try:
+                            actual = os.fstat(child_fd)
+                            if (
+                                actual.st_dev != metadata.st_dev
+                                or actual.st_ino != metadata.st_ino
+                                or actual.st_uid != os.getuid()
+                            ):
+                                raise TrainingExecutionStorageError("output_invalid")
+                            walk(child_fd, relative, depth + 1)
+                        finally:
+                            os.close(child_fd)
+                        continue
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                        raise TrainingExecutionStorageError("output_invalid")
+                    if metadata.st_size > max_file_bytes:
+                        raise TrainingExecutionStorageError("output_limit_exceeded")
+                    try:
+                        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                    except OSError as error:
+                        raise TrainingExecutionStorageError("output_invalid") from error
+                    digest = hashlib.sha256()
+                    size = 0
+                    try:
+                        actual = os.fstat(descriptor)
+                        if (
+                            actual.st_dev != metadata.st_dev
+                            or actual.st_ino != metadata.st_ino
+                            or actual.st_size != metadata.st_size
+                            or actual.st_nlink != 1
+                        ):
+                            raise TrainingExecutionStorageError("output_invalid")
+                        while block := os.read(descriptor, 1024 * 1024):
+                            size += len(block)
+                            if size > max_file_bytes or total + size > max_total_bytes:
+                                raise TrainingExecutionStorageError("output_limit_exceeded")
+                            digest.update(block)
+                    finally:
+                        os.close(descriptor)
+                    if size != metadata.st_size:
+                        raise TrainingExecutionStorageError("output_invalid")
+                    total += size
+                    if total > max_total_bytes:
+                        raise TrainingExecutionStorageError("output_limit_exceeded")
+                    records.append((relative, size, digest.hexdigest()))
+                    if len(records) > max_files:
+                        raise TrainingExecutionStorageError("output_limit_exceeded")
+
+            walk(output_stage_fd, "", 0)
+            canonical = json.dumps(records, separators=(",", ":"), ensure_ascii=True).encode()
+            return OutputStageEvidence(hashlib.sha256(canonical).hexdigest(), len(records), total)
+        except TrainingExecutionStorageError:
+            raise
+        except (OSError, ValueError, TypeError) as error:
+            raise TrainingExecutionStorageError("output_invalid") from error
+
+    @staticmethod
+    def seal_output_stage(output_stage_fd: int) -> None:
+        """Make retained regular files read-only without changing the owner boundary."""
+
+        if output_stage_fd < 0:
+            raise TrainingExecutionStorageError("output_invalid")
+
+        def seal(parent_fd: int) -> None:
+            try:
+                names = sorted(os.listdir(parent_fd))
+            except OSError as error:
+                raise TrainingExecutionStorageError("output_invalid") from error
+            for name in names:
+                if not name or name in {".", ".."} or "/" in name or "\\" in name:
+                    raise TrainingExecutionStorageError("output_invalid")
+                try:
+                    metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                except OSError as error:
+                    raise TrainingExecutionStorageError("output_invalid") from error
+                if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != os.getuid():
+                    raise TrainingExecutionStorageError("output_invalid")
+                if stat.S_ISDIR(metadata.st_mode):
+                    child = os.open(
+                        name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=parent_fd,
+                    )
+                    try:
+                        actual = os.fstat(child)
+                        if (
+                            actual.st_dev != metadata.st_dev
+                            or actual.st_ino != metadata.st_ino
+                            or actual.st_uid != os.getuid()
+                        ):
+                            raise TrainingExecutionStorageError("output_invalid")
+                        seal(child)
+                        os.fchmod(child, 0o700)
+                    finally:
+                        os.close(child)
+                    continue
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise TrainingExecutionStorageError("output_invalid")
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                try:
+                    actual = os.fstat(descriptor)
+                    if (
+                        actual.st_dev != metadata.st_dev
+                        or actual.st_ino != metadata.st_ino
+                        or actual.st_nlink != 1
+                        or actual.st_uid != os.getuid()
+                    ):
+                        raise TrainingExecutionStorageError("output_invalid")
+                    os.fchmod(descriptor, 0o400)
+                finally:
+                    os.close(descriptor)
+
+        try:
+            _private_directory(output_stage_fd)
+            seal(output_stage_fd)
+        except TrainingExecutionStorageError:
+            raise
+        except OSError as error:
+            raise TrainingExecutionStorageError("output_invalid") from error
+
+    @staticmethod
+    def remove_nonretained_attempt_data(
+        stage: TrainingExecutionAttemptStage, *, retain_output_stage: bool = False
+    ) -> None:
+        """Remove exact transient attempt children, optionally retaining output bytes."""
+
+        parents = (stage.input_fd, stage.scratch_fd, stage.logs_fd)
+        if not retain_output_stage:
+            parents += (stage.output_stage_fd,)
+        for parent_fd in parents:
+            _remove_directory_contents(parent_fd)
+
+
+def _remove_directory_contents(parent_fd: int) -> None:
+    try:
+        names = tuple(os.listdir(parent_fd))
+    except OSError as error:
+        raise TrainingExecutionStorageError("runtime_cleanup_failed") from error
+    for name in names:
+        if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            raise TrainingExecutionStorageError("runtime_cleanup_failed")
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as error:
+            raise TrainingExecutionStorageError("runtime_cleanup_failed") from error
+        if stat.S_ISLNK(metadata.st_mode) or (
+            stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1
+        ):
+            raise TrainingExecutionStorageError("runtime_cleanup_failed")
+        if stat.S_ISDIR(metadata.st_mode):
+            child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            try:
+                actual = os.fstat(child)
+                if actual.st_dev != metadata.st_dev or actual.st_ino != metadata.st_ino:
+                    raise TrainingExecutionStorageError("runtime_cleanup_failed")
+                _remove_directory_contents(child)
+            finally:
+                os.close(child)
+            try:
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as error:
+                raise TrainingExecutionStorageError("runtime_cleanup_failed") from error
+            if (
+                current.st_dev != metadata.st_dev
+                or current.st_ino != metadata.st_ino
+                or not stat.S_ISDIR(current.st_mode)
+            ):
+                raise TrainingExecutionStorageError("runtime_cleanup_failed")
+            os.rmdir(name, dir_fd=parent_fd)
+        elif stat.S_ISREG(metadata.st_mode):
+            try:
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except OSError as error:
+                raise TrainingExecutionStorageError("runtime_cleanup_failed") from error
+            if (
+                current.st_dev != metadata.st_dev
+                or current.st_ino != metadata.st_ino
+                or current.st_nlink != 1
+                or not stat.S_ISREG(current.st_mode)
+            ):
+                raise TrainingExecutionStorageError("runtime_cleanup_failed")
+            os.unlink(name, dir_fd=parent_fd)
+        else:
+            raise TrainingExecutionStorageError("runtime_cleanup_failed")
+
 
 __all__ = [
     "InputSnapshot",
+    "OutputStageEvidence",
     "TrainingExecutionArtifactStore",
     "TrainingExecutionAttemptStage",
     "TrainingExecutionStorageError",

@@ -1,0 +1,36 @@
+# Phase 14.2 reviewed runtime lock. Every line is exact; this file is the
+# installation authority for the private Linux/NVIDIA runtime. Hashes are
+# added by the image build pipeline when the platform wheel set is selected.
+llamafactory==0.9.5
+torch==2.7.1
+torchvision==0.22.1
+torchaudio==2.7.1
+transformers==4.55.0
+datasets==4.0.0
+accelerate==1.9.0
+peft==0.18.1
+trl==0.19.1
+torchdata==0.11.0
+safetensors==0.7.0
+sentencepiece==0.2.0
+tiktoken==0.9.0
+bitsandbytes==0.46.1
+gradio==5.29.1
+matplotlib==3.10.3
+tyro==0.8.14
+einops==0.8.1
+numpy==2.2.6
+pandas==2.2.3
+scipy==1.15.3
+modelscope==1.27.0
+hf-transfer==0.1.9
+av==14.3.0
+fire==0.7.0
+omegaconf==2.3.0
+packaging==25.0
+protobuf==6.31.1
+pyyaml==6.0.2
+pydantic==2.11.5
+uvicorn==0.34.3
+fastapi==0.115.12
+sse-starlette==2.3.5

@@ -1,10 +1,9 @@
-# Database Model Through Phase 14.1
+# Database Model Through Phase 14.2
 
 DeptSLM uses PostgreSQL 16, SQLAlchemy 2, psycopg 3, and Alembic. Revision
-`0018_phase14_training_execution_control_plane` is the current head after
-`0013_phase12_adapter_reconciliation_cursor`, which follows
-`0012_phase12_adapter_reconciliation`. Alembic is the only schema-creation
-mechanism; runtime never calls `metadata.create_all`.
+`0019_phase14_training_runtime` is the current head after
+`0018_phase14_training_execution_control_plane`. Alembic is the only
+schema-creation mechanism; runtime never calls `metadata.create_all`.
 
 Phase 12.2 adds paired, department-scoped evaluation metadata in migration
 `0015_phase12_adapter_evaluation`; questions, answers, prompts, evidence, vectors,
@@ -24,7 +23,11 @@ attempt table records server-time leases, claim/reclaim identity, input-snapshot
 fingerprints, and closed result classifications. A partial unique index allows
 only one queued/running/cancel-requested execution for one job/profile. No
 dataset records, configuration bodies, paths, logs, model output, or adapter
-bytes are stored, and Phase 14.1 produces no authoritative adapter output.
+bytes are stored in PostgreSQL. Phase 14.2 extends the attempt with closed
+runtime/environment/hardware fingerprints, output-stage digest/count/size, and
+retention timestamps in migration `0019_phase14_training_runtime`. A successful
+real attempt keeps private candidate output fenced for later reviewed handoff;
+it is not an authoritative adapter.
 
 ## Entities
 

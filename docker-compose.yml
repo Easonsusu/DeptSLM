@@ -548,6 +548,80 @@ services:
     networks:
       - postgres-internal
 
+  training-execution-worker:
+    profiles: ["training"]
+    build:
+      context: .
+      dockerfile: services/training-execution-worker/Dockerfile
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DEPTSLM_DATA_DIR: /runtime/deptslm
+      DEPTSLM_TRAINING_EXECUTION_CODE_REVISION: "${DEPTSLM_TRAINING_EXECUTION_CODE_REVISION:?Set the exact lowercase 40-character code revision}"
+      DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256: "${DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256:?Set the reviewed training-runtime lock SHA-256}"
+      DEPTSLM_TRAINING_ENVIRONMENT_PROFILE_ID: "${DEPTSLM_TRAINING_ENVIRONMENT_PROFILE_ID:-deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1}"
+      DEPTSLM_TRAINING_ENVIRONMENT_FINGERPRINT: "${DEPTSLM_TRAINING_ENVIRONMENT_FINGERPRINT:?Set the reviewed training-runtime environment fingerprint}"
+      DEPTSLM_TRAINING_RUNTIME_SOCKET: /run/deptslm/training-runtime.sock
+      DEPTSLM_TRAINING_RUNTIME_TOKEN: "${DEPTSLM_TRAINING_RUNTIME_TOKEN:?Set a separate private training runtime token in the untracked .env file}"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/training_runs"
+        target: /runtime/deptslm/training_runs
+        bind:
+          create_host_path: false
+      - type: volume
+        source: training-runtime-ipc
+        target: /run/deptslm
+    depends_on:
+      postgres:
+        condition: service_healthy
+      training-runtime:
+        condition: service_started
+    networks:
+      - postgres-internal
+
+  training-runtime:
+    profiles: ["training"]
+    build:
+      context: .
+      dockerfile: services/training-runtime/Dockerfile
+    environment:
+      DEPTSLM_TRAINING_RUNTIME_TOKEN: "${DEPTSLM_TRAINING_RUNTIME_TOKEN:?Set a separate private training runtime token in the untracked .env file}"
+      DEPTSLM_TRAINING_RUNTIME_SOCKET: /run/deptslm/training-runtime.sock
+      DEPTSLM_TRAINING_MODEL_PATH: /runtime/deptslm/model_cache/qwen3-0.6b-c1899de289a04d12100db370d81485cdf75e47ca
+      DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256: "${DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256:?Set the reviewed training-runtime lock SHA-256}"
+      DEPTSLM_TRAINING_ENVIRONMENT_PROFILE_ID: "${DEPTSLM_TRAINING_ENVIRONMENT_PROFILE_ID:-deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1}"
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m,uid=1001,gid=1001,mode=700
+    volumes:
+      - type: bind
+        source: "${DEPTSLM_DATA_DIR:?DEPTSLM_DATA_DIR is required; run scripts/setup_google_drive_storage.sh}/model_cache/qwen3-0.6b-c1899de289a04d12100db370d81485cdf75e47ca"
+        target: /runtime/deptslm/model_cache/qwen3-0.6b-c1899de289a04d12100db370d81485cdf75e47ca
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: training-runtime-ipc
+        target: /run/deptslm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
   adapter-registry-worker:
     build:
       context: .
@@ -664,3 +738,7 @@ networks:
     internal: true
   model-egress:
     internal: false
+
+volumes:
+  training-runtime-ipc:
+    name: deptslm-training-runtime-ipc

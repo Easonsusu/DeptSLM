@@ -16,13 +16,14 @@ No question, instruction, answer, provenance, filename, path, model output, vect
 
 ## Roadmap v2 handoff boundary
 
-Roadmap v1 Phase 0–13 is complete. Phase 14.0 is complete and Phase 14.1
-defines the current metadata-only controlled execution plane in
-[training-execution.md](training-execution.md); it does not execute this
-bundle, install LlamaFactory, load a model, or create an adapter. Any executor
+Roadmap v1 Phase 0–13 is complete. Phase 14.0 and Phase 14.1 are complete;
+Phase 14.2 adds the current private pinned offline runtime described in
+[training-execution.md](training-execution.md). It does not accept arbitrary
+input or publish an authoritative adapter. Any executor
 must freeze the complete Phase 11 authority,
 copy and verify the exact five files into a private attempt snapshot, preserve
 the reviewed semantic fields, and use a separately pinned training dependency
-lock. Phase 12 intake remains explicit and administrator-controlled; no
-automatic handoff, evaluation, approval, promotion, rollback, or routing is
-added by Phase 14.1. Phase 14.2 and 14.3 remain unstarted.
+lock. Phase 12 intake remains explicit and administrator-controlled; Phase 14.2
+candidate bytes remain private and non-authoritative. No automatic handoff,
+evaluation, approval, promotion, rollback, or routing is added. Phase 14.3
+remains unstarted.

@@ -250,7 +250,7 @@ def _assert_only_expected_conflicts(
 def test_phase14_1_migration_cycle_and_schema_contract(engine, tmp_path: Path) -> None:
     config = Config("alembic.ini")
     command.downgrade(config, "0017_phase12_adapter_runtime_routing")
-    command.upgrade(config, "0018_phase14_training_execution_control_plane")
+    command.upgrade(config, "head")
 
     # Prove the downgrade from a populated Phase 14.1 schema, not only from
     # empty tables.  The queued parent and registered attempt exercise the
@@ -274,16 +274,52 @@ def test_phase14_1_migration_cycle_and_schema_contract(engine, tmp_path: Path) -
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM training_executions")) == 1
         assert connection.scalar(text("SELECT count(*) FROM training_execution_attempts")) == 1
+        connection.execute(
+            text(
+                "UPDATE training_execution_attempts SET status='succeeded', "
+                "worker_id='00000000-0000-0000-0000-000000000091', "
+                "claim_token='00000000-0000-0000-0000-000000000092', "
+                "claimed_at=clock_timestamp(), finished_at=clock_timestamp(), "
+                "runtime_kind='real', runtime_contract_version='phase14-training-runtime-v1', "
+                "runtime_dependency_lock_sha256=:digest, "
+                "runtime_environment_profile_id="
+                "'deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1', "
+                "runtime_environment_fingerprint=:digest, "
+                "runtime_hardware_profile_id='linux-x86_64-nvidia-cuda126-bf16-v1', "
+                "runtime_hardware_fingerprint=:digest, output_stage_fingerprint=:digest, "
+                "output_file_count=1, output_total_bytes=1, output_retained_at=clock_timestamp(), "
+                "input_snapshot_fingerprint=:digest, runtime_fingerprint=:digest, "
+                "result_classification='execution_succeeded', error_code=NULL"
+            ),
+            {"digest": "a" * 64},
+        )
+        connection.commit()
+
+    command.downgrade(config, "0018_phase14_training_execution_control_plane")
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0018_phase14_training_execution_control_plane"
+        )
+    legacy_inspector = inspect(engine)
+    legacy_attempt_columns = {
+        item["name"] for item in legacy_inspector.get_columns("training_execution_attempts")
+    }
+    assert "runtime_kind" not in legacy_attempt_columns
+    command.upgrade(config, "head")
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0019_phase14_training_runtime"
+        )
 
     command.downgrade(config, "0017_phase12_adapter_runtime_routing")
     inspector = inspect(engine)
     assert not inspector.has_table("training_execution_attempts")
     assert not inspector.has_table("training_executions")
 
-    command.upgrade(config, "0018_phase14_training_execution_control_plane")
+    command.upgrade(config, "head")
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0018_phase14_training_execution_control_plane"
+            "0019_phase14_training_runtime"
         )
     inspector = inspect(engine)
     execution_columns = {item["name"] for item in inspector.get_columns("training_executions")}
@@ -309,6 +345,18 @@ def test_phase14_1_migration_cycle_and_schema_contract(engine, tmp_path: Path) -
         "input_snapshot_fingerprint",
         "runtime_fingerprint",
         "result_classification",
+        "runtime_kind",
+        "runtime_contract_version",
+        "runtime_dependency_lock_sha256",
+        "runtime_environment_profile_id",
+        "runtime_environment_fingerprint",
+        "runtime_hardware_profile_id",
+        "runtime_hardware_fingerprint",
+        "output_stage_fingerprint",
+        "output_file_count",
+        "output_total_bytes",
+        "output_retained_at",
+        "output_purged_at",
     }.issubset(attempt_columns)
     assert any(
         index["name"] == "uq_training_execution_active_job_profile" and index["unique"]
@@ -325,7 +373,15 @@ def test_phase14_1_migration_cycle_and_schema_contract(engine, tmp_path: Path) -
     attempt_checks = {
         item["name"] for item in inspector.get_check_constraints("training_execution_attempts")
     }
-    assert "ck_training_execution_attempt_success_contract" in attempt_checks
+    assert {
+        "ck_training_execution_attempt_success_contract",
+        "ck_training_execution_attempt_runtime_kind",
+        "ck_training_execution_attempt_runtime_contract",
+        "ck_training_execution_attempt_runtime_hashes",
+        "ck_training_execution_attempt_output_bounds",
+        "ck_training_execution_attempt_real_success_contract",
+        "ck_training_execution_attempt_output_retention",
+    }.issubset(attempt_checks)
 
 
 def _approved_execution(
@@ -585,6 +641,54 @@ def test_phase14_1_expired_reclaim_fences_stale_owner_finalize(engine, tmp_path:
         ).all()
         assert row is not None and row.status == "succeeded"
         assert {attempt.status for attempt in attempts} == {"reclaimed", "succeeded"}
+
+
+def test_phase14_2_real_success_retains_phase11_fence(engine, tmp_path: Path) -> None:
+    factory, department_id, issuer, subject, execution = _approved_execution(engine, tmp_path)
+    claim = claim_next_training_execution(factory, uuid4(), 120, execution.execution_code_revision)
+    assert claim is not None
+    runtime_details = {
+        "runtime_kind": "real",
+        "runtime_contract_version": "phase14-training-runtime-v1",
+        "dependency_lock_sha256": "a" * 64,
+        "environment_profile_id": "deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1",
+        "environment_fingerprint": "b" * 64,
+        "hardware_profile_id": "linux-x86_64-nvidia-one-gpu-bf16",
+        "hardware_fingerprint": "c" * 64,
+        "output_stage_fingerprint": "d" * 64,
+        "output_file_count": 1,
+        "output_total_bytes": 1,
+    }
+    assert _finalize(
+        factory,
+        claim,
+        status="succeeded",
+        error_code=None,
+        classification="execution_succeeded",
+        runtime_fp="e" * 64,
+        input_fp="f" * 64,
+        runtime_details=runtime_details,
+    )
+    with factory() as session:
+        attempt = session.scalar(
+            select(TrainingExecutionAttempt).where(
+                TrainingExecutionAttempt.id == claim.attempt_id,
+                TrainingExecutionAttempt.department_id == department_id,
+            )
+        )
+        assert attempt is not None
+        assert attempt.runtime_kind == "real"
+        assert attempt.output_retained_at is not None
+        assert attempt.output_purged_at is None
+    with pytest.raises(ServiceError, match="active execution"):
+        archive_training_job(
+            factory,
+            department_id=department_id,
+            training_job_id=execution.training_job_id,
+            actor_issuer=issuer,
+            actor_subject=subject,
+            apply=True,
+        )
 
 
 def test_phase14_1_active_execution_blocks_legacy_pre_byte_delete_fence(

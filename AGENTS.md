@@ -146,43 +146,41 @@ If retrieval finds no source, only irrelevant sources, or sources below the appr
 
 ## 12. Roadmap v2 Phase 14 training execution
 
-Roadmap v1 Phase 0–13 is complete. Phase 14.0 is a completed design and
-contract gate. Phase 14.1 adds only a metadata control plane and must not
-install or invoke LlamaFactory, load a model or tokenizer, download weights or
-datasets, create an adapter, or change Phase 10/11/12 behavior. Its migration,
-department-scoped API, leases, descriptor-bound snapshots, and closed runtime
-protocol remain fail-closed; every mutation that locks both Phase 11 and Phase
-14.1 rows uses `TrainingJob -> Department (when needed) -> TrainingExecution ->
-TrainingExecutionAttempt`, followed by dependent purge rows. Phase 11 remains the immutable five-file bundle
-and Phase 12 remains the explicit adapter-intake and governance boundary.
+Roadmap v1 Phase 0–13 is complete. Phase 14.0 and Phase 14.1 are complete.
+Phase 14.2 adds only the private, pinned offline real-training runtime and
+must not publish an authoritative adapter or change Phase 10/11/12 behavior.
+Its migration, department-scoped control plane, leases, descriptor-bound
+snapshots, and closed runtime protocol remain fail-closed; every mutation that
+locks both Phase 11 and Phase 14 rows uses `TrainingJob -> Department (when
+needed) -> TrainingExecution -> TrainingExecutionAttempt`, followed by
+dependent purge rows. Phase 11 remains the immutable five-file bundle and Phase
+12 remains the explicit adapter-intake and governance boundary.
 
-A future executor may use only one exact same-department succeeded, approved,
-unpurged Phase 11 job and its complete captured Phase 10 authority snapshot.
-It must freeze the full content-free authority, create a private verified
-server-owned input snapshot, preserve all reviewed training semantics, and
-reject caller paths, YAML/JSON/config, model IDs, repositories, flags,
-environment variables, shell fragments, remote loaders, and arbitrary
-callbacks. The future model is the prepared local
-`Qwen/Qwen3-0.6B` revision
-`c1899de289a04d12100db370d81485cdf75e47ca`; normal execution is offline and
-has no Hugging Face token. LoRA and QLoRA NF4 support must fail closed on
-unreviewed hardware; no silent CPU, precision, quantization, or device fallback
-is allowed.
+The Phase 14.2 worker may use only one exact same-department succeeded,
+approved, unpurged Phase 11 job and its complete captured Phase 10 authority
+snapshot. It freezes the full content-free authority, creates a private
+verified server-owned input snapshot, preserves all reviewed training
+semantics, and rejects caller paths, YAML/JSON/config, model IDs, repositories,
+flags, environment variables, shell fragments, remote loaders, and arbitrary
+callbacks. The runtime uses the prepared local `Qwen/Qwen3-0.6B` revision
+`c1899de289a04d12100db370d81485cdf75e47ca`; execution is offline and has no
+Hugging Face token. LoRA and QLoRA NF4 support fail closed on unreviewed
+hardware; no silent CPU, precision, quantization, or device fallback is
+allowed.
 
-The Phase 14.1 control plane receives PostgreSQL and external training-run
-storage only. An eventual private runtime receives no PostgreSQL, Qdrant, API-auth, membership,
-RAG, evaluation, adapter, cloud, or Hugging Face credentials; it has no public
-port, Docker socket, host networking, or normal internet egress. Fixed argv,
-sanitized environment, dedicated process groups, shutdown/cancellation/claim-
-loss termination, deadlines, bounded output/log/disk/process resources, and
-complete child-tree reaping are mandatory. Its serialized request is
-content-free and contains no paths or file descriptors; retained input,
-scratch, log, and output descriptors stay in a separate process-local handle
-object that is never serialized, fingerprinted, persisted, or exposed.
-Filesystem presence and zero exit
-are never authority. Phase 14.1 creates no final adapter; success is not intake,
-evaluation, approval, promotion, deployment, or routing. Phase 14.2, Phase 14.3,
-and Phase 15 have not started.
+The Phase 14.2 control plane receives PostgreSQL and external training-run
+storage only. Its private runtime receives no PostgreSQL, Qdrant, API-auth,
+membership, RAG, evaluation, adapter, cloud, or Hugging Face credentials; it
+has no public port, Docker socket, host networking, or normal internet egress.
+Fixed argv, sanitized environment, dedicated process groups,
+shutdown/cancellation/claim-loss termination, deadlines, bounded
+output/log/disk/process resources, and complete child-tree reaping are
+mandatory. Its serialized request is content-free and contains no paths or
+file descriptors; descriptors transfer only through authenticated SCM_RIGHTS
+capabilities. Filesystem presence and zero exit are never authority. A real
+success may retain private non-authoritative candidate output and keeps the
+exact Phase 11 authority fenced until Phase 14.3. Phase 14.3 and Phase 15 have
+not started.
 
 Phase 12.1C hardening requires exact composite foreign keys for the source,
 Phase 11 attempt, and Phase 10 attempt snapshots. An evolving version is

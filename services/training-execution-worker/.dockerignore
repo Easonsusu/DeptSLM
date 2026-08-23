@@ -1,0 +1,10 @@
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/.venv
+**/.env
+**/runtime
+**/training_runs
+**/*.log
+**/*.db
+**/*.sqlite*

@@ -7,6 +7,16 @@ environment switch and no LlamaFactory/model dependency here.
 
 from __future__ import annotations
 
+import errno
+import hmac
+import json
+import os
+import re
+import secrets
+import select
+import socket
+import struct
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
@@ -14,9 +24,20 @@ from uuid import UUID
 
 from app.training_execution_domain import (
     EXECUTION_ERROR_CODES,
+    EXECUTION_MODEL_ID,
+    EXECUTION_MODEL_REVISION,
+    EXECUTION_PROFILES,
+    REAL_RUNTIME_CONTRACT_VERSION,
     TrainingExecutionError,
     runtime_fingerprint,
 )
+
+RUNTIME_SOCKET_ENV = "DEPTSLM_TRAINING_RUNTIME_SOCKET"
+RUNTIME_TOKEN_ENV = "DEPTSLM_TRAINING_RUNTIME_TOKEN"
+MAX_RUNTIME_IPC_FRAME_BYTES = 65_536
+RUNTIME_HANDSHAKE_TIMEOUT_SECONDS = 120.0
+RUNTIME_HEARTBEAT_INTERVAL_SECONDS = 30.0
+_FRAME_HEADER = struct.Struct("!I")
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +54,31 @@ class TrainingRuntimeRequest:
     base_model_id: str
     base_model_revision: str
     attempt_namespace: UUID
+    runtime_contract_version: str = ""
+    dependency_lock_sha256: str = ""
+    environment_profile_id: str = ""
+    expected_environment_fingerprint: str = ""
+    execution_code_revision: str = ""
+
+    def as_closed_mapping(self) -> dict[str, object]:
+        return {
+            "runtime_contract_version": self.runtime_contract_version,
+            "department_id": str(self.department_id),
+            "execution_id": str(self.execution_id),
+            "attempt_id": str(self.attempt_id),
+            "training_job_id": str(self.training_job_id),
+            "publication_attempt_id": str(self.publication_attempt_id),
+            "authority_fingerprint": self.authority_fingerprint,
+            "input_snapshot_fingerprint": self.input_snapshot_fingerprint,
+            "profile_id": self.profile_id,
+            "base_model_id": self.base_model_id,
+            "base_model_revision": self.base_model_revision,
+            "attempt_namespace": str(self.attempt_namespace),
+            "dependency_lock_sha256": self.dependency_lock_sha256,
+            "environment_profile_id": self.environment_profile_id,
+            "expected_environment_fingerprint": self.expected_environment_fingerprint,
+            "execution_code_revision": self.execution_code_revision,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,9 +102,19 @@ class TrainingRuntimeResult:
     runtime_fingerprint: str
     classification: str
     error_code: str | None = None
+    runtime_kind: str = "fake"
+    runtime_contract_version: str | None = None
+    dependency_lock_sha256: str | None = None
+    environment_profile_id: str | None = None
+    environment_fingerprint: str | None = None
+    hardware_profile_id: str | None = None
+    hardware_fingerprint: str | None = None
+    output_stage_fingerprint: str | None = None
+    output_file_count: int | None = None
+    output_total_bytes: int | None = None
 
     def as_closed_mapping(self) -> dict[str, object]:
-        return {
+        result = {
             "department_id": str(self.department_id),
             "execution_id": str(self.execution_id),
             "attempt_id": str(self.attempt_id),
@@ -69,6 +125,96 @@ class TrainingRuntimeResult:
             "classification": self.classification,
             "error_code": self.error_code,
         }
+        if self.runtime_kind != "fake":
+            result.update(
+                {
+                    "runtime_kind": self.runtime_kind,
+                    "runtime_contract_version": self.runtime_contract_version,
+                    "dependency_lock_sha256": self.dependency_lock_sha256,
+                    "environment_profile_id": self.environment_profile_id,
+                    "environment_fingerprint": self.environment_fingerprint,
+                    "hardware_profile_id": self.hardware_profile_id,
+                    "hardware_fingerprint": self.hardware_fingerprint,
+                    "output_stage_fingerprint": self.output_stage_fingerprint,
+                    "output_file_count": self.output_file_count,
+                    "output_total_bytes": self.output_total_bytes,
+                }
+            )
+        return result
+
+    @classmethod
+    def from_closed_mapping(cls, value: dict[str, object]) -> TrainingRuntimeResult:
+        if not isinstance(value, dict):
+            raise TrainingExecutionError("runtime_protocol_invalid")
+        base_keys = {
+            "department_id",
+            "execution_id",
+            "attempt_id",
+            "training_job_id",
+            "authority_fingerprint",
+            "input_snapshot_fingerprint",
+            "runtime_fingerprint",
+            "classification",
+            "error_code",
+        }
+        runtime_keys = base_keys | {
+            "runtime_kind",
+            "runtime_contract_version",
+            "dependency_lock_sha256",
+            "environment_profile_id",
+            "environment_fingerprint",
+            "hardware_profile_id",
+            "hardware_fingerprint",
+            "output_stage_fingerprint",
+            "output_file_count",
+            "output_total_bytes",
+        }
+        if value.get("runtime_kind", "fake") == "real":
+            if set(value) != runtime_keys:
+                raise TrainingExecutionError("runtime_protocol_invalid")
+        elif set(value) != base_keys:
+            raise TrainingExecutionError("runtime_protocol_invalid")
+        return cls(
+            department_id=UUID(str(value["department_id"])),
+            execution_id=UUID(str(value["execution_id"])),
+            attempt_id=UUID(str(value["attempt_id"])),
+            training_job_id=UUID(str(value["training_job_id"])),
+            authority_fingerprint=str(value["authority_fingerprint"]),
+            input_snapshot_fingerprint=str(value["input_snapshot_fingerprint"]),
+            runtime_fingerprint=str(value["runtime_fingerprint"]),
+            classification=str(value["classification"]),
+            error_code=value.get("error_code")
+            if isinstance(value.get("error_code"), str)
+            else None,
+            runtime_kind=str(value.get("runtime_kind", "fake")),
+            runtime_contract_version=value.get("runtime_contract_version")
+            if isinstance(value.get("runtime_contract_version"), str)
+            else None,
+            dependency_lock_sha256=value.get("dependency_lock_sha256")
+            if isinstance(value.get("dependency_lock_sha256"), str)
+            else None,
+            environment_profile_id=value.get("environment_profile_id")
+            if isinstance(value.get("environment_profile_id"), str)
+            else None,
+            environment_fingerprint=value.get("environment_fingerprint")
+            if isinstance(value.get("environment_fingerprint"), str)
+            else None,
+            hardware_profile_id=value.get("hardware_profile_id")
+            if isinstance(value.get("hardware_profile_id"), str)
+            else None,
+            hardware_fingerprint=value.get("hardware_fingerprint")
+            if isinstance(value.get("hardware_fingerprint"), str)
+            else None,
+            output_stage_fingerprint=value.get("output_stage_fingerprint")
+            if isinstance(value.get("output_stage_fingerprint"), str)
+            else None,
+            output_file_count=value.get("output_file_count")
+            if type(value.get("output_file_count")) is int
+            else None,
+            output_total_bytes=value.get("output_total_bytes")
+            if type(value.get("output_total_bytes")) is int
+            else None,
+        )
 
 
 class TrainingExecutionRuntime(Protocol):
@@ -111,6 +257,166 @@ class UnavailableTrainingRuntime:
         )
 
 
+class UnixTrainingRuntimeClient:
+    """Synchronous private UDS client with exact four-FD capability transfer."""
+
+    def __init__(
+        self,
+        socket_path: str,
+        token: str,
+        *,
+        timeout_seconds: float = RUNTIME_HANDSHAKE_TIMEOUT_SECONDS,
+        heartbeat_interval_seconds: float = RUNTIME_HEARTBEAT_INTERVAL_SECONDS,
+    ) -> None:
+        if not socket_path.startswith("/") or not token or len(token) < 32:
+            raise TrainingExecutionError("runtime_auth_failed")
+        self._socket_path = socket_path
+        self._token = token.encode("utf-8")
+        self._timeout = max(1.0, timeout_seconds)
+        self._heartbeat_interval = min(30.0, max(0.1, heartbeat_interval_seconds))
+
+    def run(
+        self,
+        request: TrainingRuntimeRequest,
+        *,
+        handles: TrainingRuntimeHandles,
+        should_stop: Callable[[], bool],
+        heartbeat: Callable[[], object],
+    ) -> TrainingRuntimeResult:
+        validate_runtime_request(request)
+        fds = (handles.input_fd, handles.scratch_fd, handles.logs_fd, handles.output_stage_fd)
+        if any(type(fd) is not int or fd < 0 for fd in fds) or len(set(fds)) != 4:
+            raise TrainingExecutionError("runtime_protocol_invalid")
+        nonce = secrets.token_bytes(32)
+        request_bytes = _canonical_json(request.as_closed_mapping())
+        envelope = {
+            "nonce": nonce.hex(),
+            "request": request.as_closed_mapping(),
+            "mac": hmac.new(self._token, request_bytes + nonce, "sha256").hexdigest(),
+        }
+        frame = _encode_frame(envelope)
+        deadline = time.monotonic() + self._timeout
+        last_heartbeat = time.monotonic()
+
+        def checkpoint() -> None:
+            nonlocal last_heartbeat
+            if should_stop():
+                raise TrainingExecutionError("claim_lost")
+            now = time.monotonic()
+            if now - last_heartbeat >= self._heartbeat_interval:
+                if heartbeat() is False:
+                    raise TrainingExecutionError("claim_lost")
+                last_heartbeat = now
+
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.setblocking(False)
+        try:
+            _connect_with_deadline(sock, self._socket_path, deadline, checkpoint)
+            _send_fd_frame(sock, frame, fds, deadline, checkpoint)
+            response = bytearray()
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    raise TrainingExecutionError("worker_timeout")
+                checkpoint()
+                ready, _, _ = select.select([sock], [], [], min(0.2, deadline - now))
+                if not ready:
+                    continue
+                chunk = sock.recv(16 * 1024)
+                if not chunk:
+                    raise TrainingExecutionError("runtime_disconnected")
+                response.extend(chunk)
+                if len(response) > MAX_RUNTIME_IPC_FRAME_BYTES + _FRAME_HEADER.size:
+                    raise TrainingExecutionError("runtime_protocol_invalid")
+                frame_value = _try_decode_frame(response)
+                if frame_value is not None:
+                    return TrainingRuntimeResult.from_closed_mapping(frame_value)
+        except TrainingExecutionError:
+            raise
+        except (OSError, ValueError, json.JSONDecodeError, struct.error) as error:
+            raise TrainingExecutionError("runtime_disconnected") from error
+        finally:
+            sock.close()
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _encode_frame(value: object) -> bytes:
+    payload = _canonical_json(value)
+    if not 1 <= len(payload) <= MAX_RUNTIME_IPC_FRAME_BYTES:
+        raise TrainingExecutionError("runtime_protocol_invalid")
+    return _FRAME_HEADER.pack(len(payload)) + payload
+
+
+def _try_decode_frame(buffer: bytearray) -> dict[str, object] | None:
+    if len(buffer) < _FRAME_HEADER.size:
+        return None
+    length = _FRAME_HEADER.unpack(buffer[: _FRAME_HEADER.size])[0]
+    if not 1 <= length <= MAX_RUNTIME_IPC_FRAME_BYTES:
+        raise TrainingExecutionError("runtime_protocol_invalid")
+    if len(buffer) < _FRAME_HEADER.size + length:
+        return None
+    if len(buffer) != _FRAME_HEADER.size + length:
+        raise TrainingExecutionError("runtime_protocol_invalid")
+    payload = bytes(buffer[_FRAME_HEADER.size : _FRAME_HEADER.size + length])
+    value = json.loads(payload.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise TrainingExecutionError("runtime_protocol_invalid")
+    return value
+
+
+def _connect_with_deadline(
+    sock: socket.socket,
+    path: str,
+    deadline: float,
+    checkpoint: Callable[[], None] | None = None,
+) -> None:
+    result = sock.connect_ex(path)
+    while result not in (0, errno.EISCONN):
+        if checkpoint is not None:
+            checkpoint()
+        if time.monotonic() >= deadline:
+            raise TrainingExecutionError("runtime_unavailable")
+        if result not in (errno.EINPROGRESS, errno.EALREADY, errno.EWOULDBLOCK):
+            raise OSError(result, os.strerror(result))
+        _, writable, _ = select.select([], [sock], [], min(0.2, deadline - time.monotonic()))
+        if writable:
+            result = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+
+
+def _send_fd_frame(
+    sock: socket.socket,
+    frame: bytes,
+    fds: tuple[int, ...],
+    deadline: float,
+    checkpoint: Callable[[], None] | None = None,
+) -> None:
+    ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("=4i", *fds))]
+    sent = 0
+    first_send = True
+    while sent < len(frame):
+        if checkpoint is not None:
+            checkpoint()
+        if time.monotonic() >= deadline:
+            raise TrainingExecutionError("worker_timeout")
+        try:
+            if first_send:
+                written = sock.sendmsg([frame[sent:]], ancillary)
+            else:
+                written = sock.send(frame[sent:])
+        except BlockingIOError:
+            written = 0
+        if written > 0:
+            sent += written
+            first_send = False
+            continue
+        _, writable, _ = select.select([], [sock], [], min(0.2, deadline - time.monotonic()))
+        if not writable:
+            continue
+
+
 def validate_runtime_request(request: TrainingRuntimeRequest) -> None:
     if (
         request.contract_version != "phase14-training-execution-v1"
@@ -120,10 +426,35 @@ def validate_runtime_request(request: TrainingRuntimeRequest) -> None:
         or not isinstance(request.training_job_id, UUID)
         or not isinstance(request.publication_attempt_id, UUID)
         or not isinstance(request.attempt_namespace, UUID)
-        or len(request.authority_fingerprint) != 64
-        or len(request.input_snapshot_fingerprint) != 64
+        or request.profile_id not in EXECUTION_PROFILES
+        or request.base_model_id != EXECUTION_MODEL_ID
+        or request.base_model_revision != EXECUTION_MODEL_REVISION
+        or re.fullmatch(r"[0-9a-f]{64}", request.authority_fingerprint) is None
+        or re.fullmatch(r"[0-9a-f]{64}", request.input_snapshot_fingerprint) is None
+        or any(
+            identifier.int == 0
+            for identifier in (
+                request.department_id,
+                request.execution_id,
+                request.attempt_id,
+                request.training_job_id,
+                request.publication_attempt_id,
+                request.attempt_namespace,
+            )
+        )
     ):
         raise TrainingExecutionError("runtime_protocol_invalid")
+    if request.runtime_contract_version:
+        if request.runtime_contract_version != REAL_RUNTIME_CONTRACT_VERSION:
+            raise TrainingExecutionError("runtime_protocol_invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", request.dependency_lock_sha256):
+            raise TrainingExecutionError("runtime_protocol_invalid")
+        if not request.environment_profile_id or not re.fullmatch(
+            r"[0-9a-f]{64}", request.expected_environment_fingerprint
+        ):
+            raise TrainingExecutionError("runtime_protocol_invalid")
+        if not re.fullmatch(r"[0-9a-f]{40}", request.execution_code_revision):
+            raise TrainingExecutionError("runtime_protocol_invalid")
 
 
 def validate_runtime_result_shape(
@@ -156,6 +487,7 @@ __all__ = [
     "TrainingRuntimeHandles",
     "TrainingRuntimeRequest",
     "TrainingRuntimeResult",
+    "UnixTrainingRuntimeClient",
     "UnavailableTrainingRuntime",
     "validate_runtime_request",
     "validate_runtime_result_shape",

@@ -1,0 +1,11 @@
+{
+  "environment_profile_id": "deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1",
+  "python_version": "3.12",
+  "llamafactory_version": "0.9.5",
+  "dependency_lock_sha256": "a8d07eb3c07a1f3e13027f8d39b496fbb659dfb22e9e40a60fbeecc529cea786",
+  "supported_os": "Linux",
+  "supported_architecture": "x86_64",
+  "expected_cuda_runtime_family": "12.6",
+  "runtime_contract_version": "phase14-training-runtime-v1",
+  "base_image": "nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04@sha256:8aef630a54bc5c5146ae5ce68e6af5caa3df0fb690bb91544175c91f307e4356"
+}
