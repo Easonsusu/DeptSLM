@@ -164,29 +164,31 @@ def test_phase14_1_captures_immutable_authority_and_enforces_active_uniqueness(
 def test_phase14_1_cancel_then_retry_creates_a_new_attempt_surface(engine, tmp_path: Path) -> None:
     factory, department_id, issuer, subject, execution = _approved_execution(engine, tmp_path)
     principal = AuthenticatedPrincipal(subject, issuer)
+    execution_id = execution.id
     with factory.begin() as session:
         cancelled = cancel_training_execution(
             session,
             principal,
             DepartmentRequestScope(DepartmentScope(department_id)),
-            execution.id,
+            execution_id,
             expected_version=execution.version,
         )
         assert cancelled.status == "cancelled"
+        cancelled_version = cancelled.version
     with factory.begin() as session:
         retried = retry_training_execution(
             session,
             principal,
             DepartmentRequestScope(DepartmentScope(department_id)),
-            execution.id,
-            expected_version=cancelled.version,
+            execution_id,
+            expected_version=cancelled_version,
         )
         assert retried.status == "queued"
         assert retried.current_attempt_number == 2
     with factory() as session:
         attempts = session.scalars(
             select(TrainingExecutionAttempt).where(
-                TrainingExecutionAttempt.execution_id == execution.id
+                TrainingExecutionAttempt.execution_id == execution_id
             )
         ).all()
         assert attempts == []
