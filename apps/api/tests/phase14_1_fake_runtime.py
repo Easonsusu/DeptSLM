@@ -9,7 +9,11 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from app.training_execution_domain import runtime_fingerprint
-from app.training_execution_runtime import TrainingRuntimeRequest, TrainingRuntimeResult
+from app.training_execution_runtime import (
+    TrainingRuntimeHandles,
+    TrainingRuntimeRequest,
+    TrainingRuntimeResult,
+)
 
 
 class FakeTrainingRuntime:
@@ -21,9 +25,11 @@ class FakeTrainingRuntime:
         self,
         request: TrainingRuntimeRequest,
         *,
+        handles: TrainingRuntimeHandles,
         should_stop: Callable[[], bool],
         heartbeat: Callable[[], None],
     ) -> TrainingRuntimeResult:
+        del handles
         heartbeat()
         if should_stop():
             return TrainingRuntimeResult(

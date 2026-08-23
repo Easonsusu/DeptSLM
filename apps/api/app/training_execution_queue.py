@@ -38,6 +38,7 @@ from app.training_execution_domain import (
 )
 from app.training_execution_runtime import (
     TrainingExecutionRuntime,
+    TrainingRuntimeHandles,
     TrainingRuntimeRequest,
     validate_runtime_request,
 )
@@ -81,6 +82,18 @@ def _server_now(session: Session) -> datetime:
 def _valid_claim(
     session: Session, claim: ClaimedTrainingExecution, *, lock: bool = False
 ) -> tuple[TrainingExecution, TrainingExecutionAttempt, TrainingJob] | None:
+    # All Phase 11/14.1 mutation paths use the same job-first order.  The
+    # immutable claim already carries training_job_id, so never lock the
+    # execution merely to discover its parent job.
+    job_query = select(TrainingJob).where(
+        TrainingJob.id == claim.training_job_id,
+        TrainingJob.department_id == claim.department_id,
+    )
+    if lock:
+        job_query = job_query.with_for_update()
+    job = session.execute(job_query).scalar_one_or_none()
+    if job is None:
+        return None
     execution_query = select(TrainingExecution).where(
         TrainingExecution.id == claim.execution_id,
         TrainingExecution.department_id == claim.department_id,
@@ -107,13 +120,6 @@ def _valid_claim(
     if lock:
         attempt_query = attempt_query.with_for_update()
     attempt = session.execute(attempt_query).scalar_one_or_none()
-    job_query = select(TrainingJob).where(
-        TrainingJob.id == claim.training_job_id,
-        TrainingJob.department_id == claim.department_id,
-    )
-    if lock:
-        job_query = job_query.with_for_update()
-    job = session.execute(job_query).scalar_one_or_none()
     if attempt is None or job is None:
         return None
     now = _server_now(session)
@@ -487,14 +493,16 @@ def process_training_execution(
                 base_model_id=claim.base_model_id,
                 base_model_revision=claim.base_model_revision,
                 attempt_namespace=claim.attempt_id,
-                input_descriptor=stage.input_fd,
-                scratch_descriptor=stage.scratch_fd,
-                logs_descriptor=stage.logs_fd,
-                output_stage_descriptor=stage.output_stage_fd,
             )
             validate_runtime_request(request)
             result = runtime.run(
                 request,
+                handles=TrainingRuntimeHandles(
+                    input_fd=stage.input_fd,
+                    scratch_fd=stage.scratch_fd,
+                    logs_fd=stage.logs_fd,
+                    output_stage_fd=stage.output_stage_fd,
+                ),
                 should_stop=lambda: should_stop() or execution_should_stop(factory, claim),
                 heartbeat=lambda: renew_execution_lease(factory, claim, lease_seconds),
             )

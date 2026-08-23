@@ -33,10 +33,16 @@ class TrainingRuntimeRequest:
     base_model_id: str
     base_model_revision: str
     attempt_namespace: UUID
-    input_descriptor: int
-    scratch_descriptor: int
-    logs_descriptor: int
-    output_stage_descriptor: int
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingRuntimeHandles:
+    """Process-local capabilities kept outside the closed runtime protocol."""
+
+    input_fd: int
+    scratch_fd: int
+    logs_fd: int
+    output_stage_fd: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +76,7 @@ class TrainingExecutionRuntime(Protocol):
         self,
         request: TrainingRuntimeRequest,
         *,
+        handles: TrainingRuntimeHandles,
         should_stop: Callable[[], bool],
         heartbeat: Callable[[], None],
     ) -> TrainingRuntimeResult | dict[str, object]: ...
@@ -82,10 +89,11 @@ class UnavailableTrainingRuntime:
         self,
         request: TrainingRuntimeRequest,
         *,
+        handles: TrainingRuntimeHandles,
         should_stop: Callable[[], bool],
         heartbeat: Callable[[], None],
     ) -> TrainingRuntimeResult:
-        del should_stop, heartbeat
+        del handles, should_stop, heartbeat
         return TrainingRuntimeResult(
             request.department_id,
             request.execution_id,
@@ -114,15 +122,6 @@ def validate_runtime_request(request: TrainingRuntimeRequest) -> None:
         or not isinstance(request.attempt_namespace, UUID)
         or len(request.authority_fingerprint) != 64
         or len(request.input_snapshot_fingerprint) != 64
-        or any(
-            not isinstance(value, int) or value < 0
-            for value in (
-                request.input_descriptor,
-                request.scratch_descriptor,
-                request.logs_descriptor,
-                request.output_stage_descriptor,
-            )
-        )
     ):
         raise TrainingExecutionError("runtime_protocol_invalid")
 
@@ -154,6 +153,7 @@ def validate_runtime_result_shape(
 
 __all__ = [
     "TrainingExecutionRuntime",
+    "TrainingRuntimeHandles",
     "TrainingRuntimeRequest",
     "TrainingRuntimeResult",
     "UnavailableTrainingRuntime",

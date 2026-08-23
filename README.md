@@ -59,7 +59,8 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > retry lifecycle, uses server-time leases and job-first retention fences, and
 > copies the exact five Phase 11 files through private descriptor-bound
 > attempt storage. The closed runtime protocol accepts only content-free
-> server-validated results; the production worker fails closed without a
+> server-validated fields and keeps retained descriptors in separate
+> process-local handles; the production worker fails closed without a
 > separately reviewed runtime. It installs or invokes no LlamaFactory, loads no
 > model, downloads no weights, creates no adapter, and changes no Phase 12
 > governance. Phase 14.2 and later remain unstarted. See [the training

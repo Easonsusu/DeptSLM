@@ -16,7 +16,11 @@ from app.training_execution_domain import (
     authority_fingerprint,
     validate_runtime_result,
 )
-from app.training_execution_runtime import TrainingRuntimeRequest, validate_runtime_request
+from app.training_execution_runtime import (
+    TrainingRuntimeHandles,
+    TrainingRuntimeRequest,
+    validate_runtime_request,
+)
 from app.training_execution_storage import (
     TrainingExecutionArtifactStore,
     TrainingExecutionStorageError,
@@ -39,7 +43,7 @@ def test_authority_fingerprint_is_canonical_and_content_free() -> None:
     assert EXECUTION_CONTRACT_VERSION == "phase14-training-execution-v1"
 
 
-def test_runtime_request_requires_descriptor_ids_and_closed_result() -> None:
+def test_runtime_request_is_closed_and_descriptor_free() -> None:
     department_id = uuid4()
     execution_id = uuid4()
     attempt_id = uuid4()
@@ -57,12 +61,20 @@ def test_runtime_request_requires_descriptor_ids_and_closed_result() -> None:
         "Qwen/Qwen3-0.6B",
         "c1899de289a04d12100db370d81485cdf75e47ca",
         attempt_id,
-        3,
-        4,
-        5,
-        6,
     )
     validate_runtime_request(request)
+    assert set(request.__dataclass_fields__).isdisjoint(
+        {
+            "input_descriptor",
+            "scratch_descriptor",
+            "logs_descriptor",
+            "output_stage_descriptor",
+            "path",
+            "argv",
+            "environment",
+            "configuration",
+        }
+    )
     with pytest.raises(Exception):
         validate_runtime_result(
             department_id=department_id,
@@ -104,6 +116,18 @@ def test_execution_routes_are_department_scoped_and_closed() -> None:
     assert all("/training/execute" not in path for path in paths)
 
 
+def test_claim_worker_source_locks_job_before_execution_and_attempt() -> None:
+    source = (
+        Path(__file__).resolve().parents[1] / "app" / "training_execution_queue.py"
+    ).read_text(encoding="utf-8")
+    assert source.index("job_query = select(TrainingJob)") < source.index(
+        "execution_query = select(TrainingExecution)"
+    )
+    assert source.index("execution_query = select(TrainingExecution)") < source.index(
+        "attempt_query = select(TrainingExecutionAttempt)"
+    )
+
+
 def test_fake_runtime_is_deterministic_and_content_free() -> None:
     department_id, execution_id, attempt_id, job_id = (uuid4() for _ in range(4))
     request = TrainingRuntimeRequest(
@@ -119,14 +143,11 @@ def test_fake_runtime_is_deterministic_and_content_free() -> None:
         "Qwen/Qwen3-0.6B",
         "c1899de289a04d12100db370d81485cdf75e47ca",
         attempt_id,
-        3,
-        4,
-        5,
-        6,
     )
     heartbeat_calls: list[bool] = []
     result = FakeTrainingRuntime().run(
         request,
+        handles=TrainingRuntimeHandles(3, 4, 5, 6),
         should_stop=lambda: False,
         heartbeat=lambda: heartbeat_calls.append(True),
     )

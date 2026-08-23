@@ -151,7 +151,9 @@ contract gate. Phase 14.1 adds only a metadata control plane and must not
 install or invoke LlamaFactory, load a model or tokenizer, download weights or
 datasets, create an adapter, or change Phase 10/11/12 behavior. Its migration,
 department-scoped API, leases, descriptor-bound snapshots, and closed runtime
-protocol remain fail-closed; Phase 11 remains the immutable five-file bundle
+protocol remain fail-closed; every mutation that locks both Phase 11 and Phase
+14.1 rows uses `TrainingJob -> Department (when needed) -> TrainingExecution ->
+TrainingExecutionAttempt`, followed by dependent purge rows. Phase 11 remains the immutable five-file bundle
 and Phase 12 remains the explicit adapter-intake and governance boundary.
 
 A future executor may use only one exact same-department succeeded, approved,
@@ -173,7 +175,11 @@ RAG, evaluation, adapter, cloud, or Hugging Face credentials; it has no public
 port, Docker socket, host networking, or normal internet egress. Fixed argv,
 sanitized environment, dedicated process groups, shutdown/cancellation/claim-
 loss termination, deadlines, bounded output/log/disk/process resources, and
-complete child-tree reaping are mandatory. Filesystem presence and zero exit
+complete child-tree reaping are mandatory. Its serialized request is
+content-free and contains no paths or file descriptors; retained input,
+scratch, log, and output descriptors stay in a separate process-local handle
+object that is never serialized, fingerprinted, persisted, or exposed.
+Filesystem presence and zero exit
 are never authority. Phase 14.1 creates no final adapter; success is not intake,
 evaluation, approval, promotion, deployment, or routing. Phase 14.2, Phase 14.3,
 and Phase 15 have not started.

@@ -205,6 +205,9 @@ def cancel_training_job(
     expected_version: int,
 ) -> TrainingJob:
     try:
+        # Keep the shared job -> department order used by execution and
+        # archive mutations; authorization is revalidated after the job lock.
+        job = _locked_job(session, request_scope, training_job_id)
         authorization = authorize_transaction(
             session,
             principal,
@@ -213,7 +216,6 @@ def cancel_training_job(
             lock=True,
             audit_action="training.job.cancel.authorization",
         )
-        job = _locked_job(session, request_scope, training_job_id)
         _version(job, expected_version)
         _require_no_active_purge_reservation(session, job)
         if job.status == "queued":
@@ -265,6 +267,7 @@ def review_training_job(
                 audit_action="training.job.review.authorization",
             )
         else:
+            job = _locked_job(session, request_scope, training_job_id)
             authorization = authorize_transaction(
                 session,
                 principal,
@@ -273,9 +276,23 @@ def review_training_job(
                 lock=True,
                 audit_action="training.job.review.authorization",
             )
-            job = _locked_job(session, request_scope, training_job_id)
         _version(job, expected_version)
-        _require_no_active_purge_reservation(session, job)
+        if action == "archive":
+            if (
+                session.scalar(
+                    select(TrainingExecution.id)
+                    .where(
+                        TrainingExecution.department_id == job.department_id,
+                        TrainingExecution.training_job_id == job.id,
+                        TrainingExecution.status.in_(("queued", "running", "cancel_requested")),
+                    )
+                    .with_for_update()
+                )
+                is not None
+            ):
+                raise ServiceError(409, "Training job has an active execution")
+        else:
+            _require_no_active_purge_reservation(session, job)
         transitions = {
             "approve": ("pending", "approved"),
             "reject": ("pending", "rejected"),
@@ -288,18 +305,6 @@ def review_training_job(
             else job.review_status != expected
         ):
             raise ServiceError(409, "Training job review transition is invalid")
-        if (
-            target == "archived"
-            and session.scalar(
-                select(TrainingExecution.id).where(
-                    TrainingExecution.department_id == job.department_id,
-                    TrainingExecution.training_job_id == job.id,
-                    TrainingExecution.status.in_(("queued", "running", "cancel_requested")),
-                )
-            )
-            is not None
-        ):
-            raise ServiceError(409, "Training job has an active execution")
         now = session.scalar(select(func.clock_timestamp()))
         job.review_status = target
         job.reviewed_by_user_id = authorization.identity.id

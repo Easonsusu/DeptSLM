@@ -251,7 +251,12 @@ active execution under the reviewed uniqueness rule. Job-first locking and
 server-time claim checks fence archive and purge races.
 
 Queued or running execution must fence purge and authority-invalidating
-mutation of its exact Phase 11 job. Phase 14.1 fake success creates no retained
+mutation of its exact Phase 11 job. All mutation paths that lock both records
+use one deterministic order: `TrainingJob`, then the department when that
+transaction needs the department lock, then `TrainingExecution`, then
+`TrainingExecutionAttempt`, followed by dependent purge rows. The worker uses
+the immutable claimed `training_job_id` and therefore never locks an execution
+first merely to discover its parent. Phase 14.1 fake success creates no retained
 output, so a terminal succeeded execution releases the active fence after its
 terminal transaction. A future execution phase with retained output must retain
 the exact Phase 11 job and upstream authority until that output is explicitly
@@ -272,13 +277,16 @@ output; later reconciliation and explicit adapter handoff remain deferred.
 
 ## 12. Closed future runtime envelopes
 
-The conceptual control-plane request contains only server-generated,
+The serialized control-plane request contains only server-generated,
 content-free fields: contract version; department, execution, attempt, and
 training-job IDs; Phase 11 publication identity; input fingerprint; profile;
 model display ID and immutable revision; execution profile; and server-owned
-attempt namespace. It contains no examples, arbitrary YAML, paths, argv,
-environment, identity/roles, database/Qdrant/API credentials, or deployment
-authority. A closed result reports `process_ready`, `execution_started`,
+attempt namespace. It contains no examples, arbitrary YAML, paths, file
+descriptors, argv, environment, identity/roles, database/Qdrant/API
+credentials, or deployment authority. Retained input, scratch, log, and output
+descriptors are carried separately in a process-local `TrainingRuntimeHandles`
+object; that object is never serialized, fingerprinted, persisted, or exposed
+through APIs, audits, or logs. A closed result reports `process_ready`, `execution_started`,
 `execution_succeeded`, `execution_failed`, or `execution_cancelled`, with exact
 IDs, input/runtime fingerprints, a safe fixed error code, and content-free
 output descriptor metadata. Phase 14.1 exposes only the closed worker protocol

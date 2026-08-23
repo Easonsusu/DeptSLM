@@ -365,6 +365,13 @@ The future output authority is only a DeptSLM execution manifest plus
 existing Phase 12.1A static contract. Training success is not adapter intake,
 evaluation, approval, promotion, deployment, or runtime authority. PostgreSQL
 and filesystem publication remain non-atomic; unknown output is never adopted.
-Queued/running executions fence Phase 11 purge and archive. Phase 14.1 creates
+Queued/running executions fence Phase 11 purge and archive. Every mutation that
+locks both Phase 11 and Phase 14.1 rows uses the deterministic order
+`TrainingJob -> Department (when needed) -> TrainingExecution ->
+TrainingExecutionAttempt`, followed by dependent purge rows. The worker uses
+the immutable claimed job identity and never locks an execution first merely to
+discover its parent. Its closed runtime request contains only content-free
+authority fields; retained descriptors are process-local handles outside that
+request and are never serialized or persisted. Phase 14.1 creates
 no final adapter and retains no training output authority; explicit reviewed
 handoff remains deferred. Phase 14.2/14.3 remain separate.

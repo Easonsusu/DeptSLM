@@ -127,6 +127,8 @@ def archive_training_job(
             if job is None:
                 raise ServiceError(404, "Training job not found")
             scope, authorization = _authorize(session, department_id, actor_issuer, actor_subject)
+            if has_active_training_execution(session, department_id, training_job_id, lock=True):
+                raise ServiceError(409, "Training job has an active execution")
             active_reservation = session.execute(
                 select(TrainingJobPurgeReservation)
                 .where(
@@ -140,8 +142,6 @@ def archive_training_job(
             ).scalar_one_or_none()
             if active_reservation is not None:
                 raise ServiceError(409, "Training job purge is in progress")
-            if has_active_training_execution(session, department_id, training_job_id, lock=True):
-                raise ServiceError(409, "Training job has an active execution")
             if job.status != "succeeded" or job.review_status not in {"approved", "rejected"}:
                 raise ServiceError(409, "Training job cannot be archived")
             if not apply:
@@ -825,6 +825,11 @@ def _assert_no_active_execution_before_bytes(
             if job is None:
                 raise ServiceError(409, "Training-job purge authority changed")
             _authorize(session, department_id, actor_issuer, actor_subject, lock=True)
+            # Lock the active execution fence before any dependent purge row.
+            # This is the same job -> department -> execution -> purge order
+            # used by every Phase 11/14.1 mutation path.
+            if has_active_training_execution(session, department_id, training_job_id, lock=True):
+                raise ServiceError(409, "Training job has an active execution")
             reservation = session.execute(
                 select(TrainingJobPurgeReservation)
                 .where(
@@ -845,8 +850,6 @@ def _assert_no_active_execution_before_bytes(
                 reservation,
                 session.scalar(select(func.clock_timestamp())),
             )
-            if has_active_training_execution(session, department_id, training_job_id, lock=True):
-                raise ServiceError(409, "Training job has an active execution")
     except ServiceError:
         raise
     except SQLAlchemyError as error:
@@ -1359,14 +1362,14 @@ def _authorize_final_deletion(
                 session, department_id, actor_issuer, actor_subject, lock=True
             )
             for reservation in reservations:
-                reservation = _lock_purge_reservation(session, reservation)
-                _reject_active_adapter_dependency(
-                    session, department_id, reservation.training_job_id
-                )
                 if has_active_training_execution(
                     session, department_id, reservation.training_job_id, lock=True
                 ):
                     raise ServiceError(409, "Training job has an active execution")
+                reservation = _lock_purge_reservation(session, reservation)
+                _reject_active_adapter_dependency(
+                    session, department_id, reservation.training_job_id
+                )
                 job, _attempts, items, owner = _assert_purge_authority(
                     session, department_id, reservation, now
                 )
@@ -1445,6 +1448,10 @@ def _persist_purge_final_outcomes(
                 training_job_id, attempt_id, surface = key
                 if surface != "final":
                     raise ServiceError(409, "Training-job purge authority changed")
+                if has_active_training_execution(
+                    session, department_id, training_job_id, lock=True
+                ):
+                    raise ServiceError(409, "Training job has an active execution")
                 reservation = session.execute(
                     select(TrainingJobPurgeReservation)
                     .where(
@@ -1462,8 +1469,6 @@ def _persist_purge_final_outcomes(
                     session, department_id, reservation, now
                 )
                 _reject_active_adapter_dependency(session, department_id, job.id)
-                if has_active_training_execution(session, department_id, job.id, lock=True):
-                    raise ServiceError(409, "Training job has an active execution")
                 if owner.attempt.publication_attempt_id != attempt_id:
                     raise ServiceError(409, "Training-job purge authority changed")
                 item = _locked_item(session, operation_id, department_id, *key)
