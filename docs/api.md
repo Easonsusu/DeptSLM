@@ -297,6 +297,27 @@ Phase 10 exposes content-free, department-scoped metadata only. It has no source
 
 `POST /departments/{department_id}/training/jobs` accepts a closed, stream-bounded request identifying one approved Phase 10 dataset, its expected metadata version, a fixed LoRA or QLoRA profile, and two affirmative governance attestations. `GET /departments/{department_id}/training/jobs` and `GET /departments/{department_id}/training/jobs/{training_job_id}` return safe lifecycle, profile, model contract, counts, timestamps, and version metadata. `POST .../cancel` and `PATCH .../review` use optimistic versions and constrained transitions. There is no endpoint for datasets, configs, manifests, hashes, paths, raw arguments, model files, adapters, logs, or execution. Jobs generate bundles only; they never invoke LlamaFactory or train a model.
 
+### Phase 14.1 execution control-plane metadata
+
+Phase 14.1 adds a closed, department-scoped control plane only:
+
+- `POST /departments/{department_id}/training/executions`
+- `GET /departments/{department_id}/training/executions`
+- `GET /departments/{department_id}/training/executions/{execution_id}`
+- `POST /departments/{department_id}/training/executions/{execution_id}/cancel`
+- `POST /departments/{department_id}/training/executions/{execution_id}/retry`
+
+The enqueue body is exactly `{ "training_job_id": "<uuid>",
+"expected_training_job_version": <integer> }`; cancel and retry bodies are
+exactly `{ "expected_version": <integer> }`. Unknown fields, paths, model or
+profile selectors, YAML/configuration, argv, environment, and runtime options
+are rejected. Same-department `system_admin` and `department_admin` may mutate;
+same-department `system_admin`, `department_admin`, and `instructor` may read.
+There is no cross-department administrator bypass and no public runtime,
+training, adapter, log, output, or model endpoint. The worker accepts only a
+test-injected closed fake result; production without a reviewed runtime fails
+closed with a fixed error.
+
 - `GET /departments/{department_id}/sft/sources`
 - `GET /departments/{department_id}/sft/sources/{source_bundle_id}`
 - `POST /departments/{department_id}/sft/sources/{source_bundle_id}/builds`

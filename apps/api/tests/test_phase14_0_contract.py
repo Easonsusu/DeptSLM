@@ -1,4 +1,4 @@
-"""Static guardrails proving Phase 14.0 remains design-only."""
+"""Static guardrails for the Phase 14.0/14.1 execution boundary."""
 
 from __future__ import annotations
 
@@ -10,24 +10,29 @@ ROOT = Path(__file__).resolve().parents[3]
 VERSIONS = ROOT / "apps" / "api" / "alembic" / "versions"
 
 
-def test_phase14_0_keeps_the_alembic_head_at_0017() -> None:
+def test_phase14_1_advances_the_alembic_head_once() -> None:
     revisions = sorted(path.stem for path in VERSIONS.glob("*.py"))
-    assert revisions[-1] == "0017_phase12_adapter_runtime_routing"
-    assert not any(path.name.startswith("0018") for path in VERSIONS.iterdir())
+    assert revisions[-1] == "0018_phase14_training_execution_control_plane"
+    migration = (VERSIONS / "0018_phase14_training_execution_control_plane.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'down_revision = "0017_phase12_adapter_runtime_routing"' in migration
+    assert "0019" not in migration
 
 
-def test_phase14_0_has_no_execution_service_or_public_route() -> None:
+def test_phase14_1_has_only_the_control_plane_and_no_runtime_service() -> None:
     assert not (ROOT / "services" / "training-execution").exists()
     assert not (ROOT / "services" / "training-runtime").exists()
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert not re.search(r"(?m)^\s+(?:training-execution|training-runtime):", compose)
 
     routes = (ROOT / "apps" / "api" / "app" / "routes.py").read_text(encoding="utf-8")
-    forbidden = ("/training-executions", "/training-runs", "/training/execute")
-    assert not any(route in routes for route in forbidden)
+    assert "/training/executions" in routes
+    assert "/training/executions/{execution_id}/cancel" in routes
+    assert "/training/executions/{execution_id}/retry" in routes
 
 
-def test_phase14_0_does_not_install_or_execute_llamafactory() -> None:
+def test_phase14_1_does_not_install_or_execute_llamafactory() -> None:
     api_requirements = (
         (ROOT / "apps" / "api" / "requirements.txt").read_text(encoding="utf-8").lower()
     )
@@ -49,7 +54,7 @@ def test_phase14_0_does_not_install_or_execute_llamafactory() -> None:
     )
 
 
-def test_phase14_0_does_not_add_training_credentials_or_docker_socket() -> None:
+def test_phase14_1_does_not_add_training_credentials_or_docker_socket() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     assert "/var/run/docker.sock" not in compose
     training_worker = compose.split("  training-worker:", 1)[1]
@@ -57,13 +62,14 @@ def test_phase14_0_does_not_add_training_credentials_or_docker_socket() -> None:
     assert "HUGGING_FACE_HUB_TOKEN" not in training_worker
 
 
-def test_phase14_0_contract_and_phase11_identity_are_documented() -> None:
+def test_phase14_1_contract_and_phase11_identity_are_documented() -> None:
     contract = (ROOT / "docs" / "training-execution.md").read_text(encoding="utf-8")
     roadmap = (ROOT / "docs" / "roadmap.md").read_text(encoding="utf-8")
     assert (
         "Phase 11 currently generates an immutable reviewable LlamaFactory job bundle." in contract
     )
-    assert "Phase 14.0 itself still performs no training." in contract
+    assert "Phase 14.0 is complete." in contract
+    assert "Phase 14.1 implements only the metadata control" in contract
     assert "## Roadmap v2" in roadmap
     assert "Phase 14.0" in roadmap
     assert "Phase 14.1" in roadmap
@@ -81,9 +87,9 @@ def test_phase14_0_contract_and_phase11_identity_are_documented() -> None:
         assert value in contract
 
 
-def test_phase14_0_reuses_static_adapter_validation_and_forbids_automation() -> None:
+def test_phase14_1_reuses_static_adapter_validation_and_forbids_automation() -> None:
     contract = (ROOT / "docs" / "training-execution.md").read_text(encoding="utf-8")
     assert "existing Phase 12.1A model-free static adapter validator" in contract
     assert re.search(r"automatic\s+adapter intake", contract)
     assert "automatic" in contract
-    assert "Phase 14.0 does not install or invoke LlamaFactory" in contract
+    assert "Phase 14.1 does not install or invoke LlamaFactory" in contract

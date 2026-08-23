@@ -15,7 +15,7 @@ Run it from the repository root:
 ```
 
 The script validates Compose, builds and starts only the required services,
-applies Alembic head `0017_phase12_adapter_runtime_routing`, bootstraps two
+applies Alembic head `0018_phase14_training_execution_control_plane`, bootstraps two
 synthetic departments through the local administrator command, creates a local
 HS256 identity, and exercises health/version/authentication, raw UTF-8 upload,
 extraction, fake embedding/indexing, succeeded metadata, and the public

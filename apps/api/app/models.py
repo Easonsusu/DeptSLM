@@ -87,6 +87,38 @@ VECTOR_INDEXING_ERROR_CODES = (
     "worker_shutdown",
     "database_unavailable",
 )
+TRAINING_EXECUTION_STATUSES = (
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "cancel_requested",
+    "cancelled",
+)
+TRAINING_EXECUTION_ATTEMPT_STATUSES = (
+    "registered",
+    "running",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "reclaimed",
+)
+TRAINING_EXECUTION_ERROR_CODES = (
+    "training_job_unavailable",
+    "training_job_authority_changed",
+    "training_job_artifact_missing",
+    "training_job_artifact_mismatch",
+    "input_snapshot_failed",
+    "runtime_unavailable",
+    "runtime_protocol_invalid",
+    "department_unavailable",
+    "requester_unauthorized",
+    "claim_lost",
+    "cancelled",
+    "worker_shutdown",
+    "worker_timeout",
+    "database_unavailable",
+)
 RAG_ANSWER_STATUSES = ("running", "answered", "insufficient_information", "failed")
 RAG_ANSWER_ERROR_CODES = (
     "runtime_unavailable",
@@ -4125,6 +4157,309 @@ class TrainingJobAttempt(Base):
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     cleanup_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class TrainingExecution(Base):
+    """Phase 14.1 content-free authority for one controlled execution."""
+
+    __tablename__ = "training_executions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["training_job_id", "department_id"],
+            ["training_jobs.id", "training_jobs.department_id"],
+            name="fk_training_execution_training_job_scope",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["current_attempt_id", "department_id"],
+            ["training_execution_attempts.id", "training_execution_attempts.department_id"],
+            name="fk_training_execution_current_attempt_scope",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("id", "department_id", name="uq_training_execution_scope"),
+        CheckConstraint(
+            "status IN ('queued','running','succeeded','failed','cancel_requested','cancelled')",
+            name="ck_training_execution_status",
+        ),
+        CheckConstraint(
+            "training_job_status = 'succeeded' AND training_job_review_status = 'approved'",
+            name="ck_training_execution_source_lifecycle",
+        ),
+        CheckConstraint(
+            "json_typeof(training_job_publication_manifest) = 'object'",
+            name="ck_training_execution_publication_manifest",
+        ),
+        CheckConstraint(
+            "profile_id IN ('phase11-qwen3-0.6b-lora-v1','phase11-qwen3-0.6b-qlora-nf4-v1')",
+            name="ck_training_execution_profile",
+        ),
+        CheckConstraint(
+            "base_model_id = 'Qwen/Qwen3-0.6B' AND "
+            "base_model_revision = 'c1899de289a04d12100db370d81485cdf75e47ca' AND "
+            "base_model_license = 'Apache-2.0' AND llamafactory_version = '0.9.5'",
+            name="ck_training_execution_model_contract",
+        ),
+        CheckConstraint(
+            "execution_contract_version = 'phase14-training-execution-v1'",
+            name="ck_training_execution_contract",
+        ),
+        CheckConstraint(
+            "execution_code_revision ~ '^[0-9a-f]{40}$'",
+            name="ck_training_execution_code_revision",
+        ),
+        CheckConstraint(
+            "authority_fingerprint ~ '^[0-9a-f]{64}$'",
+            name="ck_training_execution_authority_fingerprint",
+        ),
+        CheckConstraint(
+            "training_job_version > 0 AND training_job_attempt_number > 0 AND "
+            "current_attempt_number > 0 AND version > 0",
+            name="ck_training_execution_versions",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            "'training_job_unavailable','training_job_authority_changed',"
+            "'training_job_artifact_missing','training_job_artifact_mismatch',"
+            "'input_snapshot_failed','runtime_unavailable','runtime_protocol_invalid',"
+            "'department_unavailable','requester_unauthorized','claim_lost','cancelled',"
+            "'worker_shutdown','worker_timeout','database_unavailable')",
+            name="ck_training_execution_error_code",
+        ),
+        CheckConstraint(
+            "(status = 'queued' AND current_attempt_id IS NULL AND worker_id IS NULL "
+            "AND claim_token IS NULL AND lease_expires_at IS NULL AND started_at IS NULL "
+            "AND finished_at IS NULL AND cancellation_requested_at IS NULL AND error_code IS NULL) "
+            "OR (status IN ('running','cancel_requested') AND current_attempt_id IS NOT NULL "
+            "AND worker_id IS NOT NULL AND claim_token IS NOT NULL "
+            "AND lease_expires_at IS NOT NULL "
+            "AND started_at IS NOT NULL AND finished_at IS NULL "
+            "AND ((status = 'running' AND cancellation_requested_at IS NULL "
+            "AND error_code IS NULL) "
+            "OR (status = 'cancel_requested' AND cancellation_requested_at IS NOT NULL "
+            "AND error_code IS NULL))) "
+            "OR (status = 'succeeded' AND current_attempt_id IS NULL AND worker_id IS NULL "
+            "AND claim_token IS NULL AND lease_expires_at IS NULL AND finished_at IS NOT NULL "
+            "AND error_code IS NULL) "
+            "OR (status = 'failed' AND current_attempt_id IS NULL AND worker_id IS NULL "
+            "AND claim_token IS NULL AND lease_expires_at IS NULL AND finished_at IS NOT NULL "
+            "AND error_code IS NOT NULL) "
+            "OR (status = 'cancelled' AND current_attempt_id IS NULL AND worker_id IS NULL "
+            "AND claim_token IS NULL AND lease_expires_at IS NULL AND finished_at IS NOT NULL "
+            "AND error_code = 'cancelled')",
+            name="ck_training_execution_lifecycle",
+        ),
+        Index(
+            "uq_training_execution_active_job_profile",
+            "training_job_id",
+            "profile_id",
+            unique=True,
+            postgresql_where=text("status IN ('queued','running','cancel_requested')"),
+        ),
+        Index(
+            "ix_training_execution_department_status_created",
+            "department_id",
+            "status",
+            "created_at",
+        ),
+        Index(
+            "ix_training_execution_claim",
+            "status",
+            "lease_expires_at",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    training_job_id: Mapped[UUID] = mapped_column(nullable=False)
+    requested_by_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey(
+            "user_identities.id", name="fk_training_execution_requester", ondelete="RESTRICT"
+        ),
+        nullable=False,
+    )
+    training_job_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    training_job_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    training_job_review_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    training_job_publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    training_job_attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    training_job_code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    training_job_execution_scope_id: Mapped[UUID] = mapped_column(nullable=False)
+    training_job_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_job_manifest_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    training_job_publication_manifest: Mapped[dict[str, object]] = mapped_column(
+        JSON, nullable=False
+    )
+    training_job_config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_job_config_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    training_job_dataset_info_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_job_dataset_info_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    training_job_train_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_job_train_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    training_job_validation_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_job_validation_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    training_job_artifact_cleanup_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    training_job_purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    training_job_profile_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    training_job_base_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    training_job_base_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    training_job_base_model_license: Mapped[str] = mapped_column(String(40), nullable=False)
+    training_job_llamafactory_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    training_job_artifact_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    training_job_manifest_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    training_job_configuration_contract_version: Mapped[str] = mapped_column(
+        String(100), nullable=False
+    )
+    training_job_dataset_info_contract_version: Mapped[str] = mapped_column(
+        String(100), nullable=False
+    )
+    training_job_execution_profile_contract_version: Mapped[str] = mapped_column(
+        String(100), nullable=False
+    )
+    dataset_build_id: Mapped[UUID] = mapped_column(nullable=False)
+    dataset_build_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_source_bundle_id: Mapped[UUID] = mapped_column(nullable=False)
+    dataset_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    dataset_review_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    dataset_publication_attempt_id: Mapped[UUID] = mapped_column(nullable=False)
+    dataset_publication_attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    dataset_train_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_train_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    dataset_validation_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_validation_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    dataset_provenance_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_provenance_byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    dataset_train_example_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_validation_example_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_source_example_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_source_group_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_source_reference_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    dataset_rights_attested: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    evaluation_contamination_reviewed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    dataset_artifact_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    dataset_example_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    dataset_normalization_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    dataset_split_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    profile_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    base_model_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    base_model_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    base_model_license: Mapped[str] = mapped_column(String(40), nullable=False)
+    llamafactory_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    execution_contract_version: Mapped[str] = mapped_column(String(100), nullable=False)
+    execution_code_revision: Mapped[str] = mapped_column(String(40), nullable=False)
+    authority_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="queued")
+    current_attempt_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    current_attempt_id: Mapped[UUID | None] = mapped_column(nullable=True)
+    worker_id: Mapped[UUID | None] = mapped_column(nullable=True)
+    claim_token: Mapped[UUID | None] = mapped_column(nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    requested_at: Mapped[datetime] = utc_timestamp()
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = utc_timestamp()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
+class TrainingExecutionAttempt(Base):
+    """Immutable claim/reclaim history for one Phase 14 execution."""
+
+    __tablename__ = "training_execution_attempts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["execution_id", "department_id"],
+            ["training_executions.id", "training_executions.department_id"],
+            name="fk_training_execution_attempt_execution_scope",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("id", "department_id", name="uq_training_execution_attempt_scope"),
+        UniqueConstraint(
+            "execution_id", "attempt_number", name="uq_training_execution_attempt_number"
+        ),
+        CheckConstraint(
+            "status IN ('registered','running','succeeded','failed','cancelled','reclaimed')",
+            name="ck_training_execution_attempt_status",
+        ),
+        CheckConstraint(
+            "attempt_number > 0 AND version > 0",
+            name="ck_training_execution_attempt_versions",
+        ),
+        CheckConstraint(
+            "(status = 'registered' AND worker_id IS NULL AND claim_token IS NULL "
+            "AND claimed_at IS NULL AND lease_expires_at IS NULL AND started_at IS NULL "
+            "AND finished_at IS NULL) OR "
+            "(status = 'running' AND worker_id IS NOT NULL AND claim_token IS NOT NULL "
+            "AND claimed_at IS NOT NULL AND lease_expires_at IS NOT NULL "
+            "AND started_at IS NOT NULL AND finished_at IS NULL) OR "
+            "(status IN ('succeeded','failed','cancelled','reclaimed') "
+            "AND worker_id IS NOT NULL AND claim_token IS NOT NULL AND claimed_at IS NOT NULL "
+            "AND finished_at IS NOT NULL)",
+            name="ck_training_execution_attempt_lifecycle",
+        ),
+        CheckConstraint(
+            "error_code IS NULL OR error_code IN ("
+            "'training_job_unavailable','training_job_authority_changed',"
+            "'training_job_artifact_missing','training_job_artifact_mismatch',"
+            "'input_snapshot_failed','runtime_unavailable','runtime_protocol_invalid',"
+            "'department_unavailable','requester_unauthorized','claim_lost','cancelled',"
+            "'worker_shutdown','worker_timeout','database_unavailable')",
+            name="ck_training_execution_attempt_error_code",
+        ),
+        CheckConstraint(
+            "result_classification IS NULL OR result_classification IN "
+            "('process_ready','execution_started','execution_succeeded','execution_failed','execution_cancelled')",
+            name="ck_training_execution_attempt_result_classification",
+        ),
+        CheckConstraint(
+            "status <> 'succeeded' OR ("
+            "input_snapshot_fingerprint ~ '^[0-9a-f]{64}$' AND "
+            "runtime_fingerprint ~ '^[0-9a-f]{64}$' AND "
+            "result_classification = 'execution_succeeded' AND error_code IS NULL)",
+            name="ck_training_execution_attempt_success_contract",
+        ),
+        Index(
+            "uq_training_execution_attempt_active",
+            "execution_id",
+            unique=True,
+            postgresql_where=text("status IN ('registered','running')"),
+        ),
+        Index(
+            "ix_training_execution_attempt_claim",
+            "department_id",
+            "status",
+            "lease_expires_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    execution_id: Mapped[UUID] = mapped_column(nullable=False)
+    department_id: Mapped[UUID] = mapped_column(nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    worker_id: Mapped[UUID | None] = mapped_column()
+    claim_token: Mapped[UUID | None] = mapped_column()
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    input_snapshot_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    runtime_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    result_classification: Mapped[str | None] = mapped_column(String(32))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="registered")
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = utc_timestamp()
     updated_at: Mapped[datetime] = mapped_column(

@@ -159,7 +159,7 @@ jobs:
             sleep 1
           done
           python -m alembic upgrade head
-          test "$(python -m alembic current | awk '{print $1}')" = "0017_phase12_adapter_runtime_routing"
+          test "$(python -m alembic current | awk '{print $1}')" = "0018_phase14_training_execution_control_plane"
           python -m pytest
       - name: Run one-shot worker smoke test
         working-directory: apps/api
@@ -411,10 +411,14 @@ jobs:
           assert pathlib.Path("/app/alembic/versions/0015_phase12_adapter_evaluation.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0016_phase12_adapter_governance.py").is_file()
           assert pathlib.Path("/app/alembic/versions/0017_phase12_adapter_runtime_routing.py").is_file()
+          assert pathlib.Path("/app/alembic/versions/0018_phase14_training_execution_control_plane.py").is_file()
           import app.evaluation_admin
           import app.evaluation_services
           import app.sft_services
           import app.training_job_services
+          import app.training_execution_services
+          import app.training_execution_queue
+          import app.training_execution_worker
           import importlib.util
           assert importlib.util.find_spec("pypdf") is None
           assert importlib.util.find_spec("qdrant_client") is not None
@@ -929,7 +933,8 @@ jobs:
           test -s docs/local-demo.md
           test -s docs/recovery.md
           test -x scripts/demo.sh
-          ! find apps/api/alembic/versions -maxdepth 1 -type f -name '0018*' -print | grep -q .
+          test -f apps/api/alembic/versions/0018_phase14_training_execution_control_plane.py
+          ! find apps/api/alembic/versions -maxdepth 1 -type f -name '0019*' -print | grep -q .
           ! grep -R -E '@router\.(get|post|put|patch|delete).*search|/query-vector|/adapter(s)?/(upload|download)' apps/api/app/routes.py
       - name: Run Phase 13 transport and route-surface tests
         working-directory: apps/api
@@ -950,7 +955,7 @@ jobs:
             sleep 1
           done
           python -m alembic upgrade head
-          test "$(python -m alembic current | awk '{print $1}')" = "0017_phase12_adapter_runtime_routing"
+          test "$(python -m alembic current | awk '{print $1}')" = "0018_phase14_training_execution_control_plane"
           python -m pytest tests/test_phase13_security.py tests/test_phase13_integration.py -q
       - name: Run synthetic Phase 13 Docker demo
         run: ./scripts/demo.sh

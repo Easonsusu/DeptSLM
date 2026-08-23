@@ -571,6 +571,52 @@ class TrainingJobReviewRequest(BaseModel):
         return value
 
 
+class TrainingExecutionResponse(ORMResponse):
+    """Safe Phase 14.1 execution metadata without claims, paths, or content."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: UUID
+    department_id: UUID
+    training_job_id: UUID
+    profile_id: str
+    base_model_id: str
+    base_model_revision: str
+    llamafactory_version: str
+    execution_contract_version: str
+    status: str
+    current_attempt_number: int
+    error_code: str | None
+    cancellation_requested_at: datetime | None
+    requested_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    version: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class TrainingExecutionListResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[TrainingExecutionResponse]
+    limit: int
+    offset: int
+
+
+class TrainingExecutionCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    training_job_id: UUID
+    expected_training_job_version: StrictInt = Field(ge=1)
+
+
+class TrainingExecutionMutationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: StrictInt = Field(ge=1)
+
+
 class AdapterLineageResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -146,12 +146,13 @@ If retrieval finds no source, only irrelevant sources, or sources below the appr
 
 ## 12. Roadmap v2 Phase 14 training execution
 
-Roadmap v1 Phase 0–13 is complete. Phase 14.0 is a design and contract gate;
-it must not install or invoke LlamaFactory, load a model or tokenizer, download
-weights or datasets, create an adapter, add a queue/worker/runtime/API/UI,
-add a migration/dependency/Compose service, or change Phase 10/11/12 behavior.
-Phase 11 remains an immutable reviewable five-file bundle and Phase 12 remains
-the explicit adapter-intake and governance boundary.
+Roadmap v1 Phase 0–13 is complete. Phase 14.0 is a completed design and
+contract gate. Phase 14.1 adds only a metadata control plane and must not
+install or invoke LlamaFactory, load a model or tokenizer, download weights or
+datasets, create an adapter, or change Phase 10/11/12 behavior. Its migration,
+department-scoped API, leases, descriptor-bound snapshots, and closed runtime
+protocol remain fail-closed; Phase 11 remains the immutable five-file bundle
+and Phase 12 remains the explicit adapter-intake and governance boundary.
 
 A future executor may use only one exact same-department succeeded, approved,
 unpurged Phase 11 job and its complete captured Phase 10 authority snapshot.
@@ -166,17 +167,16 @@ has no Hugging Face token. LoRA and QLoRA NF4 support must fail closed on
 unreviewed hardware; no silent CPU, precision, quantization, or device fallback
 is allowed.
 
-The future control plane may receive PostgreSQL and a private runtime token
-only. The private runtime receives no PostgreSQL, Qdrant, API-auth, membership,
+The Phase 14.1 control plane receives PostgreSQL and external training-run
+storage only. An eventual private runtime receives no PostgreSQL, Qdrant, API-auth, membership,
 RAG, evaluation, adapter, cloud, or Hugging Face credentials; it has no public
 port, Docker socket, host networking, or normal internet egress. Fixed argv,
 sanitized environment, dedicated process groups, shutdown/cancellation/claim-
 loss termination, deadlines, bounded output/log/disk/process resources, and
 complete child-tree reaping are mandatory. Filesystem presence and zero exit
-are never authority. Final output is limited to the execution manifest and the
-existing Phase 12.1A-validated adapter pair; success is not intake, evaluation,
-approval, promotion, deployment, or routing. Phase 14.1 and Phase 15 have not
-started.
+are never authority. Phase 14.1 creates no final adapter; success is not intake,
+evaluation, approval, promotion, deployment, or routing. Phase 14.2, Phase 14.3,
+and Phase 15 have not started.
 
 Phase 12.1C hardening requires exact composite foreign keys for the source,
 Phase 11 attempt, and Phase 10 attempt snapshots. An evolving version is

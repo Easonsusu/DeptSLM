@@ -6,15 +6,17 @@
 > Phase 12 can intake and govern an externally produced adapter. That lineage
 > currently proves governance association, not trusted training execution.
 >
-> Phase 14 introduces a future reviewed supervised execution boundary.
+> Phase 14 introduces a reviewed supervised execution boundary.
 >
-> Phase 14.0 itself still performs no training.
+> Phase 14.0 is complete. Phase 14.1 implements only the metadata control
+> plane and still performs no training.
 
 This document is the authoritative design contract for Roadmap v2 Phase 14.
 It defines the authority, threat model, isolation, storage, lifecycle, and
-review gates that must exist before any real training is allowed. It adds no
-database schema, service, endpoint, worker, dependency, Compose service, or
-runtime behavior.
+review gates for supervised execution. Phase 14.1 adds only metadata
+execution/attempt authority, descriptor-bound input snapshots, leases,
+cancellation, retention fences, and a closed runtime protocol. It does not
+execute training.
 
 ## 1. Phase 11 is the only input authority
 
@@ -99,7 +101,7 @@ PostgreSQL + exact Phase 11 authority
 
 ### Control plane
 
-The future worker owns PostgreSQL authority, exact Phase 11 authorization,
+The Phase 14.1 control-plane worker owns PostgreSQL authority, exact Phase 11 authorization,
 execution lifecycle, leases, cancellation, retention fences, descriptor
 verification, bounded input-snapshot preparation, runtime requests, and final
 authority registration. Its credentials are PostgreSQL and, only if needed, a
@@ -125,7 +127,7 @@ to Compose.
 
 ## 4. Private input snapshot
 
-Before the runtime is started, a future control-plane worker will freeze and
+Before a future runtime is started, the Phase 14.1 control-plane worker freezes and
 verify the exact Phase 11 final, copy only the five reviewed files into a
 private execution-attempt input snapshot, and verify that copy. The runtime
 sees only this server-created snapshot, not the Phase 11 tree or an arbitrary
@@ -137,25 +139,28 @@ paths, alternate filenames, symlinks, hard links, extra files, or source
 content. Every path component is server-derived canonical UUID state and every
 authority-sensitive read is descriptor-relative and no-follow.
 
-## 5. Future storage contract
+## 5. Phase 14.1 private storage contract
 
-Phase 14 reserves the following conceptually; Phase 14.0 creates no directory:
+Phase 14.1 creates only the private attempt surfaces below; it does not create
+a final adapter surface:
 
 ```text
 DEPTSLM_DATA_DIR/training_runs/
   <department_uuid>/<execution_uuid>/
     attempts/<attempt_uuid>/
       input/ scratch/ logs/ output_stage/
-    final/
+    (no final adapter is created in Phase 14.1)
 ```
 
 Only canonical server UUIDs may form path components. Directories are private,
 symlinks and hard-link adoption are rejected, and filesystem existence never
 grants authority. Attempt scratch is not a successful result and raw logs are
 not PostgreSQL authority. All runtime data remains outside Git and derives from
-`DEPTSLM_DATA_DIR`; physical directory creation is deferred to Phase 14.1.
+`DEPTSLM_DATA_DIR`; physical directory creation is owned by the Phase 14.1
+worker and remains external to Git.
 
-The authoritative final surface is limited to `adapter_config.json`,
+Phase 14.1 creates no authoritative final surface. A later reviewed execution
+phase may limit one final surface to `adapter_config.json`,
 `adapter_model.safetensors`, and one DeptSLM-generated content-free execution
 manifest. Trainer state, optimizer state, checkpoints, tokenizer copies,
 TensorBoard events, model cards, arbitrary JSON, and third-party reports are
@@ -234,21 +239,25 @@ must agree before success.
 
 ## 10. Proposed lifecycle and retention fences
 
-Proposed states are `queued`, `running`, `succeeded`, `failed`,
-`cancel_requested`, and `cancelled`; Phase 14.0 adds no schema. Only a
-same-department `system_admin` or `department_admin` may eventually enqueue or
-cancel; read scope requires a separate review. There is no system-admin
+The implemented states are `queued`, `running`, `succeeded`, `failed`,
+`cancel_requested`, and `cancelled`; attempts are `registered`, `running`,
+`succeeded`, `failed`, `cancelled`, or `reclaimed`. Only a same-department
+`system_admin` or `department_admin` may enqueue, cancel, or retry; reads are
+available to same-department instructors as well. There is no system-admin
 cross-department bypass, automatic scheduler, automatic retry, automatic
 adapter intake, evaluation, approval, promotion, rollback, or fallback. An
-explicit retry creates a new attempt, and one exact job/profile may have at
-most one active execution under a future reviewed uniqueness rule.
+explicit retry creates a new attempt, and one exact job/profile has at most one
+active execution under the reviewed uniqueness rule. Job-first locking and
+server-time claim checks fence archive and purge races.
 
 Queued or running execution must fence purge and authority-invalidating
-mutation of its exact Phase 11 job. A succeeded execution with retained output
-must retain the exact Phase 11 job and upstream authority until the output is
-explicitly purged or a reviewed Phase 12 handoff consumes and retains the exact
-lineage. Phase 11 purge followed by a surviving Phase 14 result with silently
-broken provenance is forbidden.
+mutation of its exact Phase 11 job. Phase 14.1 fake success creates no retained
+output, so a terminal succeeded execution releases the active fence after its
+terminal transaction. A future execution phase with retained output must retain
+the exact Phase 11 job and upstream authority until that output is explicitly
+purged or a reviewed Phase 12 handoff consumes and retains the exact lineage.
+Phase 11 purge followed by a surviving Phase 14 result with silently broken
+provenance is forbidden.
 
 ## 11. Crash and non-atomicity model
 
@@ -258,8 +267,8 @@ death, successful exit before output validation, partial output, validation
 before rename, rename before PostgreSQL success, cancellation/exit races, lease
 loss, host crash, and publication interruption. PostgreSQL and filesystem
 publication are not atomic; filesystem presence alone never proves success.
-Unknown output is never adopted automatically. Later reconciliation must be
-descriptor-bound and authority-driven and is not part of Phase 14.0.
+Unknown output is never adopted automatically. Phase 14.1 creates no final
+output; later reconciliation and explicit adapter handoff remain deferred.
 
 ## 12. Closed future runtime envelopes
 
@@ -272,7 +281,8 @@ environment, identity/roles, database/Qdrant/API credentials, or deployment
 authority. A closed result reports `process_ready`, `execution_started`,
 `execution_succeeded`, `execution_failed`, or `execution_cancelled`, with exact
 IDs, input/runtime fingerprints, a safe fixed error code, and content-free
-output descriptor metadata. No HTTP or IPC is implemented in Phase 14.0.
+output descriptor metadata. Phase 14.1 exposes only the closed worker protocol
+internally; no public runtime or training endpoint exists.
 
 ## 13. Resource limits awaiting review
 
@@ -285,9 +295,9 @@ may be reused only where they govern the same final files.
 
 ## 14. Explicit non-goals
 
-Phase 14.0 does not install or invoke LlamaFactory, load a model/tokenizer,
-download weights or datasets, create adapters, add a runtime, queue, worker,
-API, UI, migration, dependency, Docker/Compose service, or Phase 10/11/12
-behavior. It does not alter adapter evaluation, governance, routing, intake,
-approval, promotion, rollback, or retention. Phase 14.1 and Phase 15 have not
-started, and no production-readiness claim is made.
+Phase 14.1 does not install or invoke LlamaFactory, load a model/tokenizer,
+download weights or datasets, create adapters, add a real runtime, or alter
+Phase 10/11/12 behavior. It does not alter adapter evaluation, governance,
+routing, intake, approval, promotion, rollback, or retention. Phase 14.2,
+Phase 14.3, and Phase 15 have not started, and no production-readiness claim is
+made.
