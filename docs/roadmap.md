@@ -155,19 +155,23 @@ merged and is not retroactively part of that history.
 Roadmap v2 begins after the completed Roadmap v1. Its first phase is a design
 and contract gate; it does not claim that training is implemented.
 
-### Phase 14.0 — Controlled training execution contract (current; design only)
+### Phase 14.0 — Controlled training execution contract (completed)
 
 - Define the threat model, immutable Phase 11 authority, worker/runtime split,
   storage and output contract, lifecycle, retention fences, crash model,
   hardware constraints, and supervised process boundary.
-- No training execution, model or tokenizer loading, LlamaFactory installation,
-  queue, worker, runtime service, migration, public API, or Phase 12 mutation.
+- The reviewed contract is complete. It still performs no training, model or
+  tokenizer loading, LlamaFactory installation, or Phase 12 mutation.
 
-### Phase 14.1 — Execution control plane (planned)
+### Phase 14.1 — Execution control plane (current; implemented control plane)
 
 - Add PostgreSQL execution and attempt authority, enqueue/cancel/read lifecycle,
-  leases, reclaim, retention fences, and a fake training runtime only.
-- Do not execute LlamaFactory or load a real model.
+  leases, reclaim, retention fences, descriptor-bound Phase 11 snapshots, and a
+  closed runtime protocol. The only runtime result accepted by tests is an
+  injected fake; the production worker fails closed when no reviewed runtime is
+  supplied.
+- Do not execute LlamaFactory, load a real model, publish adapters, or claim
+  Phase 14.1 is a training implementation.
 
 ### Phase 14.2 — Isolated real training runtime (planned)
 

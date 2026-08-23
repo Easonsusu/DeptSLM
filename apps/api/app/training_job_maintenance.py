@@ -17,6 +17,7 @@ from app.auth import AuthenticatedPrincipal
 from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.models import (
     AdapterUpstreamDependency,
+    TrainingExecution,
     TrainingJob,
     TrainingJobArtifactOperation,
     TrainingJobArtifactOperationItem,
@@ -25,6 +26,7 @@ from app.models import (
 )
 from app.services import ServiceError, append_mutation_audit, authorize_transaction
 from app.sft_artifacts import SftArtifactError, SftArtifactStore
+from app.training_execution_fences import has_active_training_execution
 from app.training_job_domain import (
     TrainingJobContractError,
     canonical_json_bytes,
@@ -115,7 +117,6 @@ def archive_training_job(
 ) -> bool:
     try:
         with factory.begin() as session:
-            scope, authorization = _authorize(session, department_id, actor_issuer, actor_subject)
             job = session.execute(
                 select(TrainingJob)
                 .where(
@@ -125,6 +126,9 @@ def archive_training_job(
             ).scalar_one_or_none()
             if job is None:
                 raise ServiceError(404, "Training job not found")
+            scope, authorization = _authorize(session, department_id, actor_issuer, actor_subject)
+            if has_active_training_execution(session, department_id, training_job_id, lock=True):
+                raise ServiceError(409, "Training job has an active execution")
             active_reservation = session.execute(
                 select(TrainingJobPurgeReservation)
                 .where(
@@ -243,7 +247,9 @@ def _register_candidates(
 ) -> tuple[UUID | None, tuple[_Candidate, ...]]:
     try:
         with factory.begin() as session:
-            _scope, authorization = _authorize(session, department_id, actor_issuer, actor_subject)
+            _scope, authorization = _authorize(
+                session, department_id, actor_issuer, actor_subject, lock=False
+            )
             jobs: list[TrainingJob] = []
             existing = session.execute(
                 select(TrainingJobArtifactOperation)
@@ -323,11 +329,28 @@ def _register_candidates(
                             AdapterUpstreamDependency.status == "active",
                         )
                         .exists(),
+                        ~select(TrainingExecution.id)
+                        .where(
+                            TrainingExecution.department_id == department_id,
+                            TrainingExecution.training_job_id == TrainingJob.id,
+                            TrainingExecution.status.in_(("queued", "running", "cancel_requested")),
+                        )
+                        .exists(),
                     )
-                    .order_by(retained_at, TrainingJob.id)
+                    # Lock target jobs in the same deterministic order used by
+                    # execution enqueue/archive and purge continuation paths.
+                    .order_by(TrainingJob.id)
                     .with_for_update(skip_locked=True)
                     .limit(limit)
                 ).all()
+                if operation_type == "purge":
+                    jobs = [
+                        job
+                        for job in jobs
+                        if not has_active_training_execution(
+                            session, department_id, job.id, lock=True
+                        )
+                    ]
                 attempts = []
                 for job in jobs:
                     attempts.extend(
@@ -355,6 +378,12 @@ def _register_candidates(
                 # An empty apply is a successful no-op. It must not create a
                 # resumable operation or an active reservation with no work.
                 return None, ()
+            # All selected jobs are locked before the department lock is
+            # reacquired, preserving job -> department order with execution
+            # enqueue/cancel/retry.
+            _scope, authorization = _authorize(
+                session, department_id, actor_issuer, actor_subject, lock=True
+            )
             operation = TrainingJobArtifactOperation(
                 id=uuid4(),
                 department_id=department_id,
@@ -699,8 +728,11 @@ def _execute_purge(
         operation_id=operation_id,
     )
     binding_outcomes = _bind_final_tombstones(
+        factory,
         data_dir,
         department_id,
+        actor_issuer,
+        actor_subject,
         final_candidates,
         purge_operation_id=operation_id,
     )
@@ -765,9 +797,71 @@ def _remove_candidates(
     return outcomes
 
 
+def _assert_no_active_execution_before_bytes(
+    factory: sessionmaker[Session],
+    *,
+    department_id: UUID,
+    training_job_id: UUID,
+    actor_issuer: str,
+    actor_subject: str,
+    operation_id: UUID,
+) -> None:
+    """Revalidate the exact purge/job fence immediately before storage I/O."""
+
+    try:
+        with factory.begin() as session:
+            # Resolve authorization without taking a department lock first;
+            # then lock the job, preserving the job -> department ordering
+            # used by execution enqueue and archive mutations.
+            _authorize(session, department_id, actor_issuer, actor_subject, lock=False)
+            job = session.execute(
+                select(TrainingJob)
+                .where(
+                    TrainingJob.id == training_job_id,
+                    TrainingJob.department_id == department_id,
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if job is None:
+                raise ServiceError(409, "Training-job purge authority changed")
+            _authorize(session, department_id, actor_issuer, actor_subject, lock=True)
+            # Lock the active execution fence before any dependent purge row.
+            # This is the same job -> department -> execution -> purge order
+            # used by every Phase 11/14.1 mutation path.
+            if has_active_training_execution(session, department_id, training_job_id, lock=True):
+                raise ServiceError(409, "Training job has an active execution")
+            reservation = session.execute(
+                select(TrainingJobPurgeReservation)
+                .where(
+                    TrainingJobPurgeReservation.operation_id == operation_id,
+                    TrainingJobPurgeReservation.department_id == department_id,
+                    TrainingJobPurgeReservation.training_job_id == training_job_id,
+                    TrainingJobPurgeReservation.status.in_(
+                        ("deletion_authorized", "tombstone_bound")
+                    ),
+                )
+                .with_for_update()
+            ).scalar_one_or_none()
+            if reservation is None:
+                raise ServiceError(409, "Training-job purge authority changed")
+            _assert_purge_authority(
+                session,
+                department_id,
+                reservation,
+                session.scalar(select(func.clock_timestamp())),
+            )
+    except ServiceError:
+        raise
+    except SQLAlchemyError as error:
+        raise ServiceError(503, "Database unavailable") from error
+
+
 def _bind_final_tombstones(
+    factory: sessionmaker[Session],
     data_dir: Path,
     department_id: UUID,
+    actor_issuer: str,
+    actor_subject: str,
     candidates: tuple[_Candidate, ...],
     *,
     purge_operation_id: UUID,
@@ -781,6 +875,17 @@ def _bind_final_tombstones(
             outcomes[_candidate_key(candidate)] = (False, "artifact_ownership_mismatch")
             continue
         try:
+            # Recheck the job fence immediately before the filesystem move.
+            # The active purge reservation blocks a new execution, while the
+            # job lock makes the enqueue/archive/purge ordering explicit.
+            _assert_no_active_execution_before_bytes(
+                factory,
+                department_id=department_id,
+                training_job_id=candidate.training_job_id,
+                actor_issuer=actor_issuer,
+                actor_subject=actor_subject,
+                operation_id=purge_operation_id,
+            )
             with SftArtifactStore(data_dir) as store:
                 identity = store.prepare_authorized_training_job_tombstone(
                     scope,
@@ -812,9 +917,19 @@ def _persist_tombstone_bindings(
         return
     try:
         with factory.begin() as session:
-            _authorize(session, department_id, actor_issuer, actor_subject)
+            _authorize(session, department_id, actor_issuer, actor_subject, lock=False)
             _locked_operation(session, operation_id, department_id, "purge")
             now = session.scalar(select(func.clock_timestamp()))
+            _lock_purge_job_ids(
+                session,
+                department_id,
+                {
+                    training_job_id
+                    for (training_job_id, _attempt_id, surface), (bound, value) in outcomes.items()
+                    if surface == "final" and bound and isinstance(value, dict)
+                },
+            )
+            _authorize(session, department_id, actor_issuer, actor_subject, lock=True)
             for key, (bound, value) in outcomes.items():
                 training_job_id, attempt_id, surface = key
                 if surface != "final" or not bound or not isinstance(value, dict):
@@ -834,6 +949,7 @@ def _persist_tombstone_bindings(
                 ).scalar_one_or_none()
                 if reservation is None:
                     raise ServiceError(409, "Training-job purge authority changed")
+                reservation = _lock_purge_reservation(session, reservation)
                 _job, _attempts, items, owner = _assert_purge_authority(
                     session, department_id, reservation, now
                 )
@@ -877,6 +993,17 @@ def _remove_bound_tombstones(
             return outcomes
         key = _candidate_key(step.candidate)
         try:
+            # A durable tombstone is still protected by the same exact job
+            # fence immediately before each byte unlink.  Never assume the
+            # earlier authorization transaction remains current.
+            _assert_no_active_execution_before_bytes(
+                factory,
+                department_id=department_id,
+                training_job_id=step.candidate.training_job_id,
+                actor_issuer=actor_issuer,
+                actor_subject=actor_subject,
+                operation_id=operation_id,
+            )
             with SftArtifactStore(data_dir) as store:
                 if step.name is None:
                     store.remove_bound_training_job_tombstone_directory(
@@ -929,11 +1056,14 @@ def _begin_bound_tombstone_step(
 ) -> _BoundTombstoneStep | None:
     try:
         with factory.begin() as session:
-            _authorize(session, department_id, actor_issuer, actor_subject)
+            _authorize(session, department_id, actor_issuer, actor_subject, lock=False)
             _locked_operation(session, operation_id, department_id, "purge")
             now = session.scalar(select(func.clock_timestamp()))
-            reservations = _active_reservations(session, operation_id, department_id)
+            reservations = _active_reservations(session, operation_id, department_id, lock=False)
+            _lock_purge_jobs(session, department_id, reservations)
+            _authorize(session, department_id, actor_issuer, actor_subject, lock=True)
             for reservation in reservations:
+                reservation = _lock_purge_reservation(session, reservation)
                 if reservation.status != "tombstone_bound":
                     continue
                 job, _attempts, items, owner = _assert_purge_authority(
@@ -988,21 +1118,22 @@ def _finish_bound_tombstone_unlink(
         raise ServiceError(409, "Training-job purge authority changed")
     try:
         with factory.begin() as session:
-            _authorize(session, department_id, actor_issuer, actor_subject)
+            _authorize(session, department_id, actor_issuer, actor_subject, lock=False)
             _locked_operation(session, operation_id, department_id, "purge")
             now = session.scalar(select(func.clock_timestamp()))
             reservation = session.execute(
-                select(TrainingJobPurgeReservation)
-                .where(
+                select(TrainingJobPurgeReservation).where(
                     TrainingJobPurgeReservation.operation_id == operation_id,
                     TrainingJobPurgeReservation.department_id == department_id,
                     TrainingJobPurgeReservation.training_job_id == step.candidate.training_job_id,
                     TrainingJobPurgeReservation.status == "tombstone_bound",
                 )
-                .with_for_update()
             ).scalar_one_or_none()
             if reservation is None:
                 raise ServiceError(409, "Training-job purge authority changed")
+            _lock_purge_job_ids(session, department_id, {step.candidate.training_job_id})
+            _authorize(session, department_id, actor_issuer, actor_subject, lock=True)
+            reservation = _lock_purge_reservation(session, reservation)
             _job, _attempts, _items, owner = _assert_purge_authority(
                 session, department_id, reservation, now
             )
@@ -1030,7 +1161,7 @@ def _candidate_key(candidate: _Candidate) -> tuple[UUID, UUID, str]:
 
 
 def _authorize(
-    session: Session, department_id: UUID, issuer: str, subject: str
+    session: Session, department_id: UUID, issuer: str, subject: str, *, lock: bool = True
 ) -> tuple[DepartmentRequestScope, object]:
     scope = DepartmentRequestScope(DepartmentScope(department_id))
     authorization = authorize_transaction(
@@ -1038,7 +1169,7 @@ def _authorize(
         AuthenticatedPrincipal(subject, issuer),
         scope,
         TRAINING_MUTATION_ROLES,
-        lock=True,
+        lock=lock,
         audit_action="training.job.maintenance.authorization",
     )
     return scope, authorization
@@ -1123,13 +1254,16 @@ def _authorize_purge_prerequisites(
 
     try:
         with factory.begin() as session:
-            _authorize(session, department_id, actor_issuer, actor_subject)
+            _authorize(session, department_id, actor_issuer, actor_subject, lock=False)
             _locked_operation(session, operation_id, department_id, "purge")
             now = session.scalar(select(func.clock_timestamp()))
-            reservations = _active_reservations(session, operation_id, department_id)
+            reservations = _active_reservations(session, operation_id, department_id, lock=False)
             if not reservations:
                 raise ServiceError(409, "Training-job purge reservation is unavailable")
+            _lock_purge_jobs(session, department_id, reservations)
+            _authorize(session, department_id, actor_issuer, actor_subject, lock=True)
             for reservation in reservations:
+                reservation = _lock_purge_reservation(session, reservation)
                 _reject_active_adapter_dependency(
                     session, department_id, reservation.training_job_id
                 )
@@ -1151,13 +1285,29 @@ def _persist_purge_stage_outcomes(
 ) -> None:
     try:
         with factory.begin() as session:
-            scope, authorization = _authorize(session, department_id, actor_issuer, actor_subject)
+            scope, authorization = _authorize(
+                session, department_id, actor_issuer, actor_subject, lock=False
+            )
             operation = _locked_operation(session, operation_id, department_id, "purge")
             now = session.scalar(select(func.clock_timestamp()))
+            # Lock every target job before any item or reservation row.  This
+            # keeps purge outcome persistence in the same job-first order as
+            # enqueue, archive, and the other retention fences.
+            _lock_purge_job_ids(
+                session,
+                department_id,
+                {training_job_id for training_job_id, _attempt_id, _surface in outcomes},
+            )
+            scope, authorization = _authorize(
+                session, department_id, actor_issuer, actor_subject, lock=True
+            )
             for key, (completed, reason) in outcomes.items():
                 item = _locked_item(session, operation_id, department_id, *key)
                 _record_item_outcome(item, completed, reason, now)
-            for reservation in _active_reservations(session, operation_id, department_id):
+            reservations = _active_reservations(session, operation_id, department_id, lock=False)
+            _lock_purge_jobs(session, department_id, reservations)
+            for reservation in reservations:
+                reservation = _lock_purge_reservation(session, reservation)
                 job, attempts, items, _owner = _assert_purge_authority(
                     session, department_id, reservation, now
                 )
@@ -1200,11 +1350,23 @@ def _authorize_final_deletion(
 
     try:
         with factory.begin() as session:
-            scope, authorization = _authorize(session, department_id, actor_issuer, actor_subject)
+            scope, authorization = _authorize(
+                session, department_id, actor_issuer, actor_subject, lock=False
+            )
             operation = _locked_operation(session, operation_id, department_id, "purge")
             now = session.scalar(select(func.clock_timestamp()))
             result: list[_Candidate] = []
-            for reservation in _active_reservations(session, operation_id, department_id):
+            reservations = _active_reservations(session, operation_id, department_id, lock=False)
+            _lock_purge_jobs(session, department_id, reservations)
+            scope, authorization = _authorize(
+                session, department_id, actor_issuer, actor_subject, lock=True
+            )
+            for reservation in reservations:
+                if has_active_training_execution(
+                    session, department_id, reservation.training_job_id, lock=True
+                ):
+                    raise ServiceError(409, "Training job has an active execution")
+                reservation = _lock_purge_reservation(session, reservation)
                 _reject_active_adapter_dependency(
                     session, department_id, reservation.training_job_id
                 )
@@ -1269,13 +1431,27 @@ def _persist_purge_final_outcomes(
         return
     try:
         with factory.begin() as session:
-            scope, authorization = _authorize(session, department_id, actor_issuer, actor_subject)
+            scope, authorization = _authorize(
+                session, department_id, actor_issuer, actor_subject, lock=False
+            )
             operation = _locked_operation(session, operation_id, department_id, "purge")
             now = session.scalar(select(func.clock_timestamp()))
-            for key, (completed, reason) in outcomes.items():
+            _lock_purge_job_ids(
+                session,
+                department_id,
+                {training_job_id for training_job_id, _attempt_id, _surface in outcomes},
+            )
+            scope, authorization = _authorize(
+                session, department_id, actor_issuer, actor_subject, lock=True
+            )
+            for key, (completed, reason) in sorted(outcomes.items(), key=lambda item: item[0]):
                 training_job_id, attempt_id, surface = key
                 if surface != "final":
                     raise ServiceError(409, "Training-job purge authority changed")
+                if has_active_training_execution(
+                    session, department_id, training_job_id, lock=True
+                ):
+                    raise ServiceError(409, "Training job has an active execution")
                 reservation = session.execute(
                     select(TrainingJobPurgeReservation)
                     .where(
@@ -1288,6 +1464,7 @@ def _persist_purge_final_outcomes(
                 ).scalar_one_or_none()
                 if reservation is None:
                     raise ServiceError(409, "Training-job purge authority changed")
+                reservation = _lock_purge_reservation(session, reservation)
                 job, attempts, items, owner = _assert_purge_authority(
                     session, department_id, reservation, now
                 )
@@ -1402,9 +1579,9 @@ def _record_item_outcome(
 
 
 def _active_reservations(
-    session: Session, operation_id: UUID, department_id: UUID
+    session: Session, operation_id: UUID, department_id: UUID, *, lock: bool = True
 ) -> list[TrainingJobPurgeReservation]:
-    return session.scalars(
+    query = (
         select(TrainingJobPurgeReservation)
         .where(
             TrainingJobPurgeReservation.operation_id == operation_id,
@@ -1414,8 +1591,54 @@ def _active_reservations(
             ),
         )
         .order_by(TrainingJobPurgeReservation.training_job_id)
+    )
+    if lock:
+        query = query.with_for_update()
+    return session.scalars(query).all()
+
+
+def _lock_purge_jobs(
+    session: Session,
+    department_id: UUID,
+    reservations: list[TrainingJobPurgeReservation],
+) -> None:
+    """Acquire every target job before dependent purge rows."""
+
+    _lock_purge_job_ids(
+        session,
+        department_id,
+        {reservation.training_job_id for reservation in reservations},
+    )
+
+
+def _lock_purge_job_ids(session: Session, department_id: UUID, job_ids: set[UUID]) -> None:
+    job_ids = sorted(job_ids, key=str)
+    if not job_ids:
+        return
+    jobs = session.scalars(
+        select(TrainingJob)
+        .where(
+            TrainingJob.department_id == department_id,
+            TrainingJob.id.in_(job_ids),
+        )
+        .order_by(TrainingJob.id)
         .with_for_update()
     ).all()
+    if {job.id for job in jobs} != set(job_ids):
+        raise ServiceError(409, "Training-job purge authority changed")
+
+
+def _lock_purge_reservation(
+    session: Session, reservation: TrainingJobPurgeReservation
+) -> TrainingJobPurgeReservation:
+    locked = session.execute(
+        select(TrainingJobPurgeReservation)
+        .where(TrainingJobPurgeReservation.id == reservation.id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if locked is None:
+        raise ServiceError(409, "Training-job purge authority changed")
+    return locked
 
 
 def _assert_purge_authority(

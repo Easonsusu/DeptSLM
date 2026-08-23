@@ -1,7 +1,7 @@
-# Database Model Through Phase 12.4
+# Database Model Through Phase 14.1
 
 DeptSLM uses PostgreSQL 16, SQLAlchemy 2, psycopg 3, and Alembic. Revision
-`0017_phase12_adapter_runtime_routing` is the current head after
+`0018_phase14_training_execution_control_plane` is the current head after
 `0013_phase12_adapter_reconciliation_cursor`, which follows
 `0012_phase12_adapter_reconciliation`. Alembic is the only schema-creation
 mechanism; runtime never calls `metadata.create_all`.
@@ -15,6 +15,16 @@ content-free `rag_answer_runtime_snapshots` table in migration
 foreign keys to the run and explicit deployment pointer. Phase 12.1E-C adds no schema or migration. It uses the existing exact
 `AdapterUpstreamDependency` row for the reviewed `active` to `released`
 lifecycle transition only after independently proving one completed E-B purge.
+
+Phase 14.1 adds the content-free `training_executions` and
+`training_execution_attempts` tables in migration
+`0018_phase14_training_execution_control_plane`. The parent freezes the exact
+approved Phase 11 publication and complete Phase 10 authority snapshot; the
+attempt table records server-time leases, claim/reclaim identity, input-snapshot
+fingerprints, and closed result classifications. A partial unique index allows
+only one queued/running/cancel-requested execution for one job/profile. No
+dataset records, configuration bodies, paths, logs, model output, or adapter
+bytes are stored, and Phase 14.1 produces no authoritative adapter output.
 
 ## Entities
 

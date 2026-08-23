@@ -73,6 +73,7 @@ temp/
 # small, reviewed synthetic fixtures.
 **/runtime/
 **/.runtime/
+**/training_runs/
 **/uploads/
 **/extracted_text/
 **/vector_snapshots/

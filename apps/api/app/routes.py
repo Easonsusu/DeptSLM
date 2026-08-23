@@ -137,6 +137,10 @@ from app.schemas import (
     SftDatasetBuildReviewRequest,
     SftSourceListResponse,
     SftSourceResponse,
+    TrainingExecutionCreateRequest,
+    TrainingExecutionListResponse,
+    TrainingExecutionMutationRequest,
+    TrainingExecutionResponse,
     TrainingJobCancelRequest,
     TrainingJobCreateRequest,
     TrainingJobListResponse,
@@ -172,6 +176,19 @@ from app.sft_services import (
     read_sft_build,
     read_sft_source,
     review_sft_build,
+)
+from app.training_execution_request_body import (
+    TRAINING_EXECUTION_BODY_MAX_BYTES,
+    TRAINING_EXECUTION_MUTATION_BODY_MAX_BYTES,
+    TrainingExecutionBodyError,
+    read_bounded_training_execution_object,
+)
+from app.training_execution_services import (
+    cancel_training_execution,
+    enqueue_training_execution,
+    list_training_executions,
+    read_training_execution,
+    retry_training_execution,
 )
 from app.training_job_request_body import (
     TRAINING_JOB_BODY_MAX_BYTES,
@@ -246,6 +263,17 @@ async def _validated_training_job_body(request: Request, model, *, maximum_bytes
         return model.model_validate(payload)
     except ValidationError:
         raise HTTPException(422, "Invalid training job request") from None
+
+
+async def _validated_training_execution_body(request: Request, model, *, maximum_bytes: int):
+    try:
+        payload = await read_bounded_training_execution_object(request, maximum_bytes=maximum_bytes)
+    except TrainingExecutionBodyError as error:
+        raise HTTPException(error.status_code, error.detail) from None
+    try:
+        return model.model_validate(payload)
+    except ValidationError:
+        raise HTTPException(422, "Invalid training execution request") from None
 
 
 async def _require_empty_sft_body(request: Request) -> None:
@@ -1847,6 +1875,141 @@ async def patch_training_job_review(
                 request_scope,
                 training_job_id,
                 action=body.action,
+                expected_version=body.expected_version,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/training/executions",
+    response_model=TrainingExecutionResponse,
+    status_code=202,
+    tags=["training-executions"],
+)
+async def post_training_execution(
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> TrainingExecutionResponse:
+    body = await _validated_training_execution_body(
+        request, TrainingExecutionCreateRequest, maximum_bytes=TRAINING_EXECUTION_BODY_MAX_BYTES
+    )
+    try:
+        return TrainingExecutionResponse.model_validate(
+            enqueue_training_execution(
+                session,
+                principal,
+                request_scope,
+                body,
+                code_revision=request.app.state.settings.training_job_code_revision,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/training/executions",
+    response_model=TrainingExecutionListResponse,
+    tags=["training-executions"],
+)
+def get_training_executions(
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> TrainingExecutionListResponse:
+    try:
+        rows = list_training_executions(
+            session, principal, request_scope, limit=limit, offset=offset
+        )
+        return TrainingExecutionListResponse(
+            items=[TrainingExecutionResponse.model_validate(row) for row in rows],
+            limit=limit,
+            offset=offset,
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.get(
+    "/departments/{department_id}/training/executions/{execution_id}",
+    response_model=TrainingExecutionResponse,
+    tags=["training-executions"],
+)
+def get_training_execution(
+    execution_id: UUID,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> TrainingExecutionResponse:
+    try:
+        return TrainingExecutionResponse.model_validate(
+            read_training_execution(session, principal, request_scope, execution_id)
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/training/executions/{execution_id}/cancel",
+    response_model=TrainingExecutionResponse,
+    tags=["training-executions"],
+)
+async def post_training_execution_cancel(
+    execution_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> TrainingExecutionResponse:
+    body = await _validated_training_execution_body(
+        request,
+        TrainingExecutionMutationRequest,
+        maximum_bytes=TRAINING_EXECUTION_MUTATION_BODY_MAX_BYTES,
+    )
+    try:
+        return TrainingExecutionResponse.model_validate(
+            cancel_training_execution(
+                session,
+                principal,
+                request_scope,
+                execution_id,
+                expected_version=body.expected_version,
+            )
+        )
+    except ServiceError as error:
+        _raise(error)
+
+
+@router.post(
+    "/departments/{department_id}/training/executions/{execution_id}/retry",
+    response_model=TrainingExecutionResponse,
+    tags=["training-executions"],
+)
+async def post_training_execution_retry(
+    execution_id: UUID,
+    request: Request,
+    session: DatabaseSession,
+    principal: Annotated[AuthenticatedPrincipal, Depends(require_authenticated_principal)],
+    request_scope: Annotated[DepartmentRequestScope, Depends(require_path_department_selector)],
+) -> TrainingExecutionResponse:
+    body = await _validated_training_execution_body(
+        request,
+        TrainingExecutionMutationRequest,
+        maximum_bytes=TRAINING_EXECUTION_MUTATION_BODY_MAX_BYTES,
+    )
+    try:
+        return TrainingExecutionResponse.model_validate(
+            retry_training_execution(
+                session,
+                principal,
+                request_scope,
+                execution_id,
                 expected_version=body.expected_version,
             )
         )
