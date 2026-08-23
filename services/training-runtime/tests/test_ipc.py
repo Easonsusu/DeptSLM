@@ -24,7 +24,9 @@ from deptslm_training_runtime.contract import (
 )
 from deptslm_training_runtime.ipc import TrainingRuntimeServer
 
-pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="real SCM_RIGHTS requires Linux CI")
+pytestmark = pytest.mark.skipif(
+    sys.platform != "linux", reason="real SCM_RIGHTS requires Linux CI"
+)
 
 
 def _request() -> dict[str, object]:
@@ -48,12 +50,16 @@ def _request() -> dict[str, object]:
     }
 
 
-def _frame(request: dict[str, object], token: bytes, *, nonce: bytes | None = None) -> bytes:
+def _frame(
+    request: dict[str, object], token: bytes, *, nonce: bytes | None = None
+) -> bytes:
     nonce = nonce or os.urandom(32)
     envelope = {
         "nonce": nonce.hex(),
         "request": request,
-        "mac": hmac.new(token, canonical_json_bytes(request) + nonce, hashlib.sha256).hexdigest(),
+        "mac": hmac.new(
+            token, canonical_json_bytes(request) + nonce, hashlib.sha256
+        ).hexdigest(),
     }
     payload = canonical_json_bytes(envelope)
     return struct.pack("!I", len(payload)) + payload
@@ -67,8 +73,8 @@ def _wait_socket(path: Path) -> None:
     pytest.fail("runtime socket did not become ready")
 
 
-def _socket_path(label: str) -> Path:
-    parent = Path("/private/tmp") / f"deptslm-runtime-{os.getpid()}-{uuid4().hex}-{label}"
+def _socket_path(root: Path, label: str) -> Path:
+    parent = root / f"deptslm-runtime-{os.getpid()}-{uuid4().hex}-{label}"
     parent.mkdir(mode=0o700)
     return parent / "runtime.sock"
 
@@ -110,7 +116,7 @@ def _directories(root: Path, count: int) -> list[int]:
 def test_real_four_directory_capabilities_and_private_socket(tmp_path: Path) -> None:
     parent = tmp_path / "ipc"
     parent.mkdir(mode=0o700)
-    socket_path = _socket_path("four")
+    socket_path = _socket_path(tmp_path, "four")
     token = b"runtime-token-" + b"x" * 40
     request = _request()
     source = _directories(tmp_path, 4)
@@ -125,7 +131,10 @@ def test_real_four_directory_capabilities_and_private_socket(tmp_path: Path) -> 
             seen.append((actual.st_dev, actual.st_ino))
             assert (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino)
         ready.set()
-        return {"classification": "execution_failed", "error_code": "runtime_hardware_unsupported"}
+        return {
+            "classification": "execution_failed",
+            "error_code": "runtime_hardware_unsupported",
+        }
 
     thread = threading.Thread(
         target=TrainingRuntimeServer(socket_path, token.decode(), handler).serve_once,
@@ -154,17 +163,21 @@ def test_real_four_directory_capabilities_and_private_socket(tmp_path: Path) -> 
 def test_wrong_fd_count_is_rejected(tmp_path: Path, count: int) -> None:
     parent = tmp_path / "ipc"
     parent.mkdir(mode=0o700)
-    socket_path = _socket_path(str(count))
+    socket_path = _socket_path(tmp_path, str(count))
     token = b"runtime-token-" + b"x" * 40
     thread = threading.Thread(
-        target=TrainingRuntimeServer(socket_path, token.decode(), lambda *_: {}).serve_once,
+        target=TrainingRuntimeServer(
+            socket_path, token.decode(), lambda *_: {}
+        ).serve_once,
         daemon=True,
     )
     thread.start()
     _wait_socket(socket_path)
     descriptors = _directories(tmp_path, count)
     try:
-        response, _mode = _send_request(socket_path, _frame(_request(), token), descriptors)
+        response, _mode = _send_request(
+            socket_path, _frame(_request(), token), descriptors
+        )
         assert response["error_code"] == "runtime_protocol_invalid"
     finally:
         for descriptor in descriptors:
@@ -176,10 +189,12 @@ def test_wrong_fd_count_is_rejected(tmp_path: Path, count: int) -> None:
 def test_bad_hmac_and_non_directory_capability_are_rejected(tmp_path: Path) -> None:
     parent = tmp_path / "ipc"
     parent.mkdir(mode=0o700)
-    socket_path = _socket_path("bad")
+    socket_path = _socket_path(tmp_path, "bad")
     token = b"runtime-token-" + b"x" * 40
     thread = threading.Thread(
-        target=TrainingRuntimeServer(socket_path, token.decode(), lambda *_: {}).serve_once,
+        target=TrainingRuntimeServer(
+            socket_path, token.decode(), lambda *_: {}
+        ).serve_once,
         daemon=True,
     )
     thread.start()
