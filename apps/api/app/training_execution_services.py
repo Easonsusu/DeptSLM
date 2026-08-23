@@ -71,6 +71,7 @@ def _lock_job_first(
         select(TrainingJob)
         .where(TrainingJob.id == job_id, TrainingJob.department_id == scope.department.value)
         .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
     if job is None:
         raise ServiceError(404, "Training job not found")
@@ -415,6 +416,7 @@ def _lock_execution(
             TrainingExecution.department_id == request_scope.department.value,
         )
         .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
     if row is None:
         raise ServiceError(404, "Training execution not found")

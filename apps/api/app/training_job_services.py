@@ -339,6 +339,7 @@ def _locked_job(
             TrainingJob.department_id == request_scope.department.value,
         )
         .with_for_update()
+        .execution_options(populate_existing=True)
     ).scalar_one_or_none()
     if job is None:
         raise ServiceError(404, "Training job not found")

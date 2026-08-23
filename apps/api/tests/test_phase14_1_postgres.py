@@ -429,30 +429,36 @@ def test_phase14_1_heartbeat_renewal_vs_cancel_has_one_job_first_order(
     claim = claim_next_training_execution(factory, uuid4(), 120, execution.execution_code_revision)
     assert claim is not None
     principal = AuthenticatedPrincipal(subject, issuer)
+    with factory() as session:
+        current = session.get(TrainingExecution, execution.id)
+        assert current is not None
+        expected_version = current.version
 
     def renew() -> object:
         return renew_execution_lease(factory, claim, 120)
 
     def cancel() -> object:
         with factory.begin() as session:
-            row = session.get(TrainingExecution, execution.id)
-            assert row is not None
             return cancel_training_execution(
                 session,
                 principal,
                 DepartmentRequestScope(DepartmentScope(department_id)),
                 execution.id,
-                expected_version=row.version,
+                expected_version=expected_version,
             ).status
 
     outcomes, errors, hooks = _run_forced_race(engine, "renew", {"renew": renew, "cancel": cancel})
     _assert_only_expected_conflicts(errors, allowed_labels=frozenset({"cancel"}))
     assert hooks.first_lock == {"renew": "job", "cancel": "job"}
     assert outcomes.get("renew") is True
-    assert outcomes.get("cancel") in {"cancel_requested", "cancelled"}
+    if "cancel" in errors:
+        assert isinstance(errors["cancel"], ServiceError)
+        assert errors["cancel"].status_code == 409
+    else:
+        assert outcomes.get("cancel") in {"cancel_requested", "cancelled"}
     with factory() as session:
         row = session.get(TrainingExecution, execution.id)
-        assert row is not None and row.status in {"cancel_requested", "cancelled"}
+        assert row is not None and row.status in {"running", "cancel_requested", "cancelled"}
 
 
 def _run_success_cancel_race(
@@ -468,6 +474,10 @@ def _run_success_cancel_race(
     claim = claim_next_training_execution(factory, uuid4(), 120, execution.execution_code_revision)
     assert claim is not None
     principal = AuthenticatedPrincipal(subject, issuer)
+    with factory() as session:
+        current = session.get(TrainingExecution, execution.id)
+        assert current is not None
+        expected_version = current.version
 
     def success() -> object:
         return _finalize(
@@ -482,14 +492,12 @@ def _run_success_cancel_race(
 
     def cancel() -> object:
         with factory.begin() as session:
-            row = session.get(TrainingExecution, execution.id)
-            assert row is not None
             return cancel_training_execution(
                 session,
                 principal,
                 DepartmentRequestScope(DepartmentScope(department_id)),
                 execution.id,
-                expected_version=row.version,
+                expected_version=expected_version,
             ).status
 
     operations = {"success": success, "cancel": cancel}
@@ -653,6 +661,12 @@ def _run_enqueue_archive_race(
 ) -> tuple[dict[str, object], dict[str, BaseException], _ExecutionLockHooks, sessionmaker, UUID]:
     factory, department_id, issuer, subject, execution = _approved_execution(engine, tmp_path)
     principal = AuthenticatedPrincipal(subject, issuer)
+    training_job_id = execution.training_job_id
+    with factory() as session:
+        job = session.get(TrainingJob, training_job_id)
+        assert job is not None
+        expected_job_version = job.version
+        code_revision = job.code_revision
     with factory.begin() as session:
         current = session.get(TrainingExecution, execution.id)
         assert current is not None
@@ -669,24 +683,22 @@ def _run_enqueue_archive_race(
 
     def enqueue() -> object:
         with factory.begin() as session:
-            job = session.get(TrainingJob, execution.training_job_id)
-            assert job is not None
             return enqueue_training_execution(
                 session,
                 principal,
                 DepartmentRequestScope(DepartmentScope(department_id)),
                 TrainingExecutionCreateRequest(
-                    training_job_id=job.id,
-                    expected_training_job_version=job.version,
+                    training_job_id=training_job_id,
+                    expected_training_job_version=expected_job_version,
                 ),
-                code_revision=job.code_revision,
+                code_revision=code_revision,
             ).status
 
     def archive() -> object:
         return archive_training_job(
             factory,
             department_id=department_id,
-            training_job_id=execution.training_job_id,
+            training_job_id=training_job_id,
             actor_issuer=issuer,
             actor_subject=subject,
             apply=True,
@@ -695,7 +707,7 @@ def _run_enqueue_archive_race(
     outcomes, errors, hooks = _run_forced_race(
         engine, first_label, {"enqueue": enqueue, "archive": archive}
     )
-    return outcomes, errors, hooks, factory, execution.training_job_id
+    return outcomes, errors, hooks, factory, training_job_id
 
 
 def test_phase14_1_enqueue_vs_archive_execution_first_fences_archive(
@@ -748,6 +760,12 @@ def _run_enqueue_purge_registration_race(
 ) -> tuple[dict[str, object], dict[str, BaseException], _ExecutionLockHooks, sessionmaker, UUID]:
     factory, department_id, issuer, subject, execution = _approved_execution(engine, tmp_path)
     principal = AuthenticatedPrincipal(subject, issuer)
+    training_job_id = execution.training_job_id
+    with factory() as session:
+        job = session.get(TrainingJob, training_job_id)
+        assert job is not None
+        expected_job_version = job.version
+        code_revision = job.code_revision
     with factory.begin() as session:
         current = session.get(TrainingExecution, execution.id)
         assert current is not None
@@ -761,17 +779,15 @@ def _run_enqueue_purge_registration_race(
 
     def enqueue() -> object:
         with factory.begin() as session:
-            job = session.get(TrainingJob, execution.training_job_id)
-            assert job is not None
             return enqueue_training_execution(
                 session,
                 principal,
                 DepartmentRequestScope(DepartmentScope(department_id)),
                 TrainingExecutionCreateRequest(
-                    training_job_id=job.id,
-                    expected_training_job_version=job.version,
+                    training_job_id=training_job_id,
+                    expected_training_job_version=expected_job_version,
                 ),
-                code_revision=job.code_revision,
+                code_revision=code_revision,
             ).status
 
     def purge() -> object:
@@ -780,7 +796,7 @@ def _run_enqueue_purge_registration_race(
         archive_training_job(
             factory,
             department_id=department_id,
-            training_job_id=execution.training_job_id,
+            training_job_id=training_job_id,
             actor_issuer=issuer,
             actor_subject=subject,
             apply=True,
@@ -790,7 +806,7 @@ def _run_enqueue_purge_registration_race(
         # server-authoritative lifecycle state while the enqueue race is
         # fenced by the job lock and version.
         with factory.begin() as session:
-            job = session.get(TrainingJob, execution.training_job_id)
+            job = session.get(TrainingJob, training_job_id)
             assert job is not None and job.review_status == "archived"
             job.archived_at = datetime.now(UTC) - timedelta(days=31)
             job.version += 1
@@ -808,7 +824,7 @@ def _run_enqueue_purge_registration_race(
     outcomes, errors, hooks = _run_forced_race(
         engine, first_label, {"enqueue": enqueue, "purge": purge}
     )
-    return outcomes, errors, hooks, factory, execution.training_job_id
+    return outcomes, errors, hooks, factory, training_job_id
 
 
 def test_phase14_1_enqueue_vs_purge_execution_first_has_no_reservation(
