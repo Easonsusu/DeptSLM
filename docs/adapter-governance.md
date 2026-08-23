@@ -1,7 +1,7 @@
 # Phase 12.3 adapter governance
 
 Phase 12.3 is the completed control-plane boundary between Phase 12.2 adapter
-evaluation and the current Phase 12.4 runtime router. It records human
+evaluation and the completed Phase 12.4 runtime router. It records human
 decisions and explicit deployment operations only. Phase 12.4 consumes this
 authority through immutable request snapshots; governance itself does not load
 an adapter, change RAG retrieval, or mutate deployment state during a request.

@@ -1,0 +1,74 @@
+services:
+  web:
+    user: "${DEPTSLM_DEMO_UID:-1001}:${DEPTSLM_DEMO_GID:-1001}"
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
+    environment:
+      API_URL: "http://api:8000"
+
+  api:
+    user: "${DEPTSLM_DEMO_UID:-1001}:${DEPTSLM_DEMO_GID:-1001}"
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    tmpfs:
+      - /runtime/deptslm:rw,noexec,nosuid,size=16m,uid=${DEPTSLM_DEMO_UID:-1001},gid=${DEPTSLM_DEMO_GID:-1001},mode=700
+    environment:
+      DEPTSLM_AUTH_MODE: "hs256"
+      DEPTSLM_RAG_RUNTIME_PROVIDER: "fake"
+      DEPTSLM_RAG_MIN_SCORE: "0.01"
+      DEPTSLM_EMBEDDING_PROVIDER: "fake"
+
+  rag-worker:
+    user: "${DEPTSLM_DEMO_UID:-1001}:${DEPTSLM_DEMO_GID:-1001}"
+    tmpfs:
+      - /runtime/deptslm:rw,noexec,nosuid,size=16m,uid=${DEPTSLM_DEMO_UID:-1001},gid=${DEPTSLM_DEMO_GID:-1001},mode=700
+    environment:
+      DEPTSLM_STORAGE_READ_ONLY: "0"
+
+  indexing-worker:
+    user: "${DEPTSLM_DEMO_UID:-1001}:${DEPTSLM_DEMO_GID:-1001}"
+    tmpfs:
+      - /runtime/deptslm:rw,noexec,nosuid,size=16m,uid=${DEPTSLM_DEMO_UID:-1001},gid=${DEPTSLM_DEMO_GID:-1001},mode=700
+      - /tmp:rw,noexec,nosuid,size=16m,uid=${DEPTSLM_DEMO_UID:-1001},gid=${DEPTSLM_DEMO_GID:-1001},mode=700
+    command: ["python", "-c", "import time; time.sleep(3600)"]
+    environment:
+      DEPTSLM_EMBEDDING_PROVIDER: "fake"
+
+  evaluator-worker:
+    command: ["python", "-c", "import time; time.sleep(3600)"]
+
+  adapter-evaluator:
+    user: "${DEPTSLM_DEMO_UID:-1001}:${DEPTSLM_DEMO_GID:-1001}"
+    tmpfs:
+      - /runtime/deptslm:rw,noexec,nosuid,size=16m,uid=${DEPTSLM_DEMO_UID:-1001},gid=${DEPTSLM_DEMO_GID:-1001},mode=700
+
+  rag-runtime:
+    user: "${DEPTSLM_DEMO_UID:-1001}:${DEPTSLM_DEMO_GID:-1001}"
+    environment:
+      DEPTSLM_RAG_RUNTIME_PROVIDER: "fake"
+
+  adapter-runtime:
+    user: "${DEPTSLM_DEMO_UID:-1001}:${DEPTSLM_DEMO_GID:-1001}"
+    tmpfs:
+      - /tmp/adapter-runtime:rw,noexec,nosuid,size=128m,uid=${DEPTSLM_DEMO_UID:-1001},gid=${DEPTSLM_DEMO_GID:-1001},mode=700
+    environment:
+      DEPTSLM_ADAPTER_RUNTIME_PROVIDER: "fake"
+
+  adapter-eval-runtime:
+    user: "${DEPTSLM_DEMO_UID:-1001}:${DEPTSLM_DEMO_GID:-1001}"
+    tmpfs:
+      - /tmp/adapter-eval:rw,noexec,nosuid,size=128m,uid=${DEPTSLM_DEMO_UID:-1001},gid=${DEPTSLM_DEMO_GID:-1001},mode=700
+    environment:
+      DEPTSLM_ADAPTER_EVAL_PROVIDER: "fake"
+
+  postgres:
+    volumes:
+      - demo-postgres-data:/var/lib/postgresql/data
+
+  qdrant:
+    volumes:
+      - demo-qdrant-data:/qdrant/storage
+
+volumes:
+  demo-postgres-data:
+  demo-qdrant-data:
