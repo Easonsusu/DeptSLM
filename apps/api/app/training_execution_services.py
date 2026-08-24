@@ -7,7 +7,7 @@ import re
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -467,13 +467,33 @@ def cancel_training_execution(
             execution.error_code = "cancelled"
             execution.finished_at = _server_now(session)
         elif execution.status == "running":
-            execution.status = "cancel_requested"
-            execution.cancellation_requested_at = _server_now(session)
+            requested_at = _server_now(session)
+            result = session.execute(
+                update(TrainingExecution)
+                .where(
+                    TrainingExecution.id == execution.id,
+                    TrainingExecution.department_id == request_scope.department.value,
+                    TrainingExecution.status == "running",
+                    TrainingExecution.version == expected_version,
+                )
+                .values(
+                    status="cancel_requested",
+                    cancellation_requested_at=requested_at,
+                    version=TrainingExecution.version + 1,
+                )
+            )
+            if result.rowcount != 1:
+                session.expire(execution)
+                session.refresh(execution)
+                raise ServiceError(409, "Training execution version conflict")
+            session.expire(execution)
+            session.refresh(execution)
         elif execution.status == "cancel_requested":
             return execution
         else:
             raise ServiceError(409, "Training execution is not cancellable")
-        execution.version += 1
+        if execution.status != "cancel_requested":
+            execution.version += 1
         append_mutation_audit(
             session,
             actor=authorization.identity,
