@@ -791,7 +791,7 @@ jobs:
           ./scripts/compose.sh --profile training run --rm --no-deps --entrypoint python training-execution-worker -I -c '
           from pathlib import Path
           mount = Path("/runtime/deptslm/training_datasets")
-          assert (mount / "mount-sentinel").read_text(encoding="ascii") == "compose-mount-sentinel\\n"
+          assert (mount / "mount-sentinel").read_text(encoding="ascii") == "compose-mount-sentinel\n"
           try:
               (mount / "must-not-write").write_text("x", encoding="ascii")
           except OSError:
