@@ -256,10 +256,7 @@ def _parse_manifest(raw: bytes) -> dict[str, object]:
             or descriptor["size"] < 1
             or not isinstance(descriptor["sha256"], str)
             or len(descriptor["sha256"]) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in descriptor["sha256"]
-            )
+            or any(character not in "0123456789abcdef" for character in descriptor["sha256"])
         ):
             raise ModelStoreError()
     return manifest
@@ -299,9 +296,7 @@ def _verify_tree(
                 child_identity = _require_private_directory(child_fd)
                 if not entry_identity.matches(child_identity):
                     raise ModelStoreError()
-                _verify_tree(
-                    child_fd, relative, expected_files, expected_directories, actual
-                )
+                _verify_tree(child_fd, relative, expected_files, expected_directories, actual)
                 _verify_entry(parent_fd, name, child_identity)
             finally:
                 os.close(child_fd)
