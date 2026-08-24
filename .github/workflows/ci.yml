@@ -719,7 +719,7 @@ jobs:
             exit 1
           fi
           # setuptools' distutils-precedence.pth is packaging metadata, not a model weight.
-          weight_matches="$(docker run --rm --entrypoint sh deptslm-training-runtime-ci -c 'find /opt/llamafactory -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) ! -path \"*/site-packages/distutils-precedence.pth\" -print 2>/dev/null || true')"
+          weight_matches="$(docker run --rm --entrypoint sh deptslm-training-runtime-ci -c 'find /opt/llamafactory -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) ! -name "distutils-precedence.pth" -print 2>/dev/null || true')"
           if [[ -n "$weight_matches" ]]; then
             printf 'Model-weight-like files unexpectedly present in training runtime image:\n%s\n' "$weight_matches" >&2
             exit 1
