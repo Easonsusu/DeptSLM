@@ -766,6 +766,7 @@ jobs:
             exit 0
           fi
           export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-compose-training-mount"
+          export DEPTSLM_POSTGRES_PASSWORD="ci-only-postgres-password-2026"
           export DEPTSLM_QDRANT_API_KEY="phase6-ci-compose-key-0123456789"
           export DEPTSLM_RAG_RUNTIME_TOKEN="phase7-ci-runtime-token-0123456789-abcdef"
           export DEPTSLM_ADAPTER_RUNTIME_TOKEN="phase12-ci-production-runtime-token-0123456789"
