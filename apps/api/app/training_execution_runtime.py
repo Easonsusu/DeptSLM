@@ -19,6 +19,7 @@ import struct
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Protocol
 from uuid import UUID
 
@@ -36,8 +37,36 @@ RUNTIME_SOCKET_ENV = "DEPTSLM_TRAINING_RUNTIME_SOCKET"
 RUNTIME_TOKEN_ENV = "DEPTSLM_TRAINING_RUNTIME_TOKEN"
 MAX_RUNTIME_IPC_FRAME_BYTES = 65_536
 RUNTIME_HANDSHAKE_TIMEOUT_SECONDS = 120.0
+RUNTIME_TRAINING_TIMEOUT_SECONDS = 12 * 60 * 60
 RUNTIME_HEARTBEAT_INTERVAL_SECONDS = 30.0
 _FRAME_HEADER = struct.Struct("!I")
+
+
+class StopReason(StrEnum):
+    """Closed worker-side reasons for interrupting a real runtime call."""
+
+    CANCELLED = "cancelled"
+    CLAIM_LOST = "claim_lost"
+    WORKER_SHUTDOWN = "worker_shutdown"
+    WORKER_TIMEOUT = "worker_timeout"
+
+
+def _stop_reason(value: object) -> StopReason | None:
+    if value is None or value is False:
+        return None
+    if isinstance(value, StopReason):
+        return value
+    if value is True:
+        # Existing injected tests used a boolean callback.  Preserve its
+        # fail-closed meaning while production callbacks return a closed
+        # reason so cancellation is not confused with claim loss.
+        return StopReason.CLAIM_LOST
+    if isinstance(value, str):
+        try:
+            return StopReason(value)
+        except ValueError:
+            return StopReason.CLAIM_LOST
+    return StopReason.CLAIM_LOST
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,21 +287,29 @@ class UnavailableTrainingRuntime:
 
 
 class UnixTrainingRuntimeClient:
-    """Synchronous private UDS client with exact four-FD capability transfer."""
+    """Private UDS client with separate handshake and training deadlines."""
 
     def __init__(
         self,
         socket_path: str,
         token: str,
         *,
-        timeout_seconds: float = RUNTIME_HANDSHAKE_TIMEOUT_SECONDS,
+        handshake_timeout_seconds: float = RUNTIME_HANDSHAKE_TIMEOUT_SECONDS,
+        training_timeout_seconds: float = RUNTIME_TRAINING_TIMEOUT_SECONDS,
+        timeout_seconds: float | None = None,
         heartbeat_interval_seconds: float = RUNTIME_HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         if not socket_path.startswith("/") or not token or len(token) < 32:
             raise TrainingExecutionError("runtime_auth_failed")
         self._socket_path = socket_path
         self._token = token.encode("utf-8")
-        self._timeout = max(1.0, timeout_seconds)
+        # ``timeout_seconds`` is retained as a compatibility alias for old
+        # callers that injected a short handshake timeout in tests.  It never
+        # limits the active training/result stage.
+        if timeout_seconds is not None:
+            handshake_timeout_seconds = timeout_seconds
+        self._handshake_timeout = max(0.01, handshake_timeout_seconds)
+        self._training_timeout = max(0.01, training_timeout_seconds)
         self._heartbeat_interval = min(30.0, max(0.1, heartbeat_interval_seconds))
 
     def run(
@@ -295,42 +332,80 @@ class UnixTrainingRuntimeClient:
             "mac": hmac.new(self._token, request_bytes + nonce, "sha256").hexdigest(),
         }
         frame = _encode_frame(envelope)
-        deadline = time.monotonic() + self._timeout
+        handshake_deadline = time.monotonic() + self._handshake_timeout
         last_heartbeat = time.monotonic()
+        stop_sent = False
 
-        def checkpoint() -> None:
+        def send_stop(reason: StopReason, deadline: float) -> None:
+            nonlocal stop_sent
+            if stop_sent:
+                return
+            stop_sent = True
+            try:
+                _send_control_frame(
+                    sock,
+                    reason.value,
+                    min(deadline, time.monotonic() + 1.0),
+                )
+            except (OSError, TrainingExecutionError):
+                # The local stop remains authoritative even if the runtime
+                # socket has already disappeared.  Never wait indefinitely
+                # just to transmit a best-effort interruption notice.
+                pass
+
+        def checkpoint(deadline: float) -> None:
             nonlocal last_heartbeat
-            if should_stop():
-                raise TrainingExecutionError("claim_lost")
+            reason = _stop_reason(should_stop())
+            if reason is not None:
+                send_stop(reason, deadline)
+                raise TrainingExecutionError(reason.value)
             now = time.monotonic()
             if now - last_heartbeat >= self._heartbeat_interval:
-                if heartbeat() is False:
-                    raise TrainingExecutionError("claim_lost")
+                heartbeat_value = heartbeat()
+                heartbeat_reason = (
+                    StopReason.CLAIM_LOST
+                    if heartbeat_value is False
+                    else _stop_reason(heartbeat_value)
+                )
+                if heartbeat_reason is not None:
+                    send_stop(heartbeat_reason, deadline)
+                    raise TrainingExecutionError(heartbeat_reason.value)
                 last_heartbeat = now
+            if now >= deadline:
+                raise TrainingExecutionError("worker_timeout")
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.setblocking(False)
         try:
-            _connect_with_deadline(sock, self._socket_path, deadline, checkpoint)
-            _send_fd_frame(sock, frame, fds, deadline, checkpoint)
+            _connect_with_deadline(
+                sock,
+                self._socket_path,
+                handshake_deadline,
+                lambda: checkpoint(handshake_deadline),
+            )
+            _send_fd_frame(
+                sock,
+                frame,
+                fds,
+                handshake_deadline,
+                lambda: checkpoint(handshake_deadline),
+            )
             response = bytearray()
-            while True:
-                now = time.monotonic()
-                if now >= deadline:
-                    raise TrainingExecutionError("worker_timeout")
-                checkpoint()
-                ready, _, _ = select.select([sock], [], [], min(0.2, deadline - now))
-                if not ready:
-                    continue
-                chunk = sock.recv(16 * 1024)
-                if not chunk:
-                    raise TrainingExecutionError("runtime_disconnected")
-                response.extend(chunk)
-                if len(response) > MAX_RUNTIME_IPC_FRAME_BYTES + _FRAME_HEADER.size:
-                    raise TrainingExecutionError("runtime_protocol_invalid")
-                frame_value = _try_decode_frame(response)
-                if frame_value is not None:
-                    return TrainingRuntimeResult.from_closed_mapping(frame_value)
+            acknowledgement = _receive_frame(
+                sock,
+                response,
+                handshake_deadline,
+                lambda deadline: checkpoint(deadline),
+            )
+            _validate_process_ready(acknowledgement, request)
+            training_deadline = time.monotonic() + self._training_timeout
+            final = _receive_frame(
+                sock,
+                response,
+                training_deadline,
+                lambda deadline: checkpoint(deadline),
+            )
+            return TrainingRuntimeResult.from_closed_mapping(final)
         except TrainingExecutionError:
             raise
         except (OSError, ValueError, json.JSONDecodeError, struct.error) as error:
@@ -358,13 +433,59 @@ def _try_decode_frame(buffer: bytearray) -> dict[str, object] | None:
         raise TrainingExecutionError("runtime_protocol_invalid")
     if len(buffer) < _FRAME_HEADER.size + length:
         return None
-    if len(buffer) != _FRAME_HEADER.size + length:
-        raise TrainingExecutionError("runtime_protocol_invalid")
     payload = bytes(buffer[_FRAME_HEADER.size : _FRAME_HEADER.size + length])
+    del buffer[: _FRAME_HEADER.size + length]
     value = json.loads(payload.decode("utf-8"))
     if not isinstance(value, dict):
         raise TrainingExecutionError("runtime_protocol_invalid")
     return value
+
+
+def _receive_frame(
+    sock: socket.socket,
+    buffer: bytearray,
+    deadline: float,
+    checkpoint: Callable[[float], None],
+) -> dict[str, object]:
+    while True:
+        frame_value = _try_decode_frame(buffer)
+        if frame_value is not None:
+            return frame_value
+        now = time.monotonic()
+        checkpoint(deadline)
+        ready, _, _ = select.select([sock], [], [], min(0.2, max(0.0, deadline - now)))
+        if not ready:
+            continue
+        chunk = sock.recv(16 * 1024)
+        if not chunk:
+            raise TrainingExecutionError("runtime_disconnected")
+        buffer.extend(chunk)
+        if len(buffer) > MAX_RUNTIME_IPC_FRAME_BYTES * 2 + _FRAME_HEADER.size:
+            raise TrainingExecutionError("runtime_protocol_invalid")
+
+
+def _validate_process_ready(value: dict[str, object], request: TrainingRuntimeRequest) -> None:
+    expected = {
+        "classification",
+        "department_id",
+        "execution_id",
+        "attempt_id",
+        "training_job_id",
+        "authority_fingerprint",
+        "input_snapshot_fingerprint",
+    }
+    if set(value) != expected or value.get("classification") != "process_ready":
+        raise TrainingExecutionError("runtime_protocol_invalid")
+    for key, expected_value in (
+        ("department_id", str(request.department_id)),
+        ("execution_id", str(request.execution_id)),
+        ("attempt_id", str(request.attempt_id)),
+        ("training_job_id", str(request.training_job_id)),
+        ("authority_fingerprint", request.authority_fingerprint),
+        ("input_snapshot_fingerprint", request.input_snapshot_fingerprint),
+    ):
+        if value.get(key) != expected_value:
+            raise TrainingExecutionError("runtime_protocol_invalid")
 
 
 def _connect_with_deadline(
@@ -413,6 +534,27 @@ def _send_fd_frame(
             first_send = False
             continue
         _, writable, _ = select.select([], [sock], [], min(0.2, deadline - time.monotonic()))
+        if not writable:
+            continue
+
+
+def _send_control_frame(sock: socket.socket, reason: str, deadline: float) -> None:
+    if reason not in {item.value for item in StopReason}:
+        raise TrainingExecutionError("runtime_protocol_invalid")
+    frame = _encode_frame({"control": "stop", "reason": reason})
+    sent = 0
+    while sent < len(frame):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TrainingExecutionError("worker_timeout")
+        try:
+            written = sock.send(frame[sent:])
+        except BlockingIOError:
+            written = 0
+        if written > 0:
+            sent += written
+            continue
+        _, writable, _ = select.select([], [sock], [], min(0.05, remaining))
         if not writable:
             continue
 
@@ -483,6 +625,7 @@ def validate_runtime_result_shape(
 
 
 __all__ = [
+    "StopReason",
     "TrainingExecutionRuntime",
     "TrainingRuntimeHandles",
     "TrainingRuntimeRequest",

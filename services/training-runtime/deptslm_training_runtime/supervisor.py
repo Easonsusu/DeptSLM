@@ -66,7 +66,7 @@ class TrainingProcessSupervisor:
         logs_fd: int,
         output_stage_fd: int,
         environment: dict[str, str],
-        should_stop: Callable[[], bool],
+        should_stop: Callable[[], object],
     ) -> ProcessResult:
         fds = (config_fd, input_fd, scratch_fd, logs_fd, output_stage_fd)
         if any(type(fd) is not int or fd < 0 for fd in fds) or len(set(fds)) != len(fds):
@@ -92,6 +92,7 @@ class TrainingProcessSupervisor:
         except (OSError, ValueError):
             return ProcessResult("execution_failed", "child_start_failed", 0, 0)
         self._process = process
+        started_at = time.monotonic()
         selector = selectors.DefaultSelector()
         counters = {"stdout": 0, "stderr": 0}
         log_descriptors: dict[str, int] = {}
@@ -102,26 +103,21 @@ class TrainingProcessSupervisor:
                 os.set_blocking(pipe.fileno(), False)
                 selector.register(pipe, selectors.EVENT_READ, name)
                 log_descriptors[name] = _open_log(logs_fd, name)
-            started = time.monotonic()
             while True:
-                if should_stop():
+                stop_reason = _stop_reason(should_stop())
+                if stop_reason is not None:
                     self.terminate()
                     return ProcessResult(
                         "execution_cancelled",
-                        "claim_lost",
+                        stop_reason,
                         counters["stdout"],
                         counters["stderr"],
                     )
-                elapsed = time.monotonic() - started
-                if process.poll() is None and elapsed > self._startup_timeout:
-                    self.terminate()
-                    return ProcessResult(
-                        "execution_failed",
-                        "child_start_failed",
-                        counters["stdout"],
-                        counters["stderr"],
-                    )
-                if elapsed > self._wall_timeout:
+                # A successful fixed executable spawn is the only reviewed
+                # process-start signal.  Model loading and training are part
+                # of the active wall-clock budget; never apply the old
+                # 600-second startup interval to a healthy long-running child.
+                if time.monotonic() - started_at > self._wall_timeout:
                     self.terminate()
                     return ProcessResult(
                         "execution_failed",
@@ -193,7 +189,8 @@ class TrainingProcessSupervisor:
                 os.close(descriptor)
             if process.poll() is None:
                 self.terminate()
-            self._process = None
+            else:
+                self._process = None
 
     def terminate(self) -> None:
         process, self._process = self._process, None
@@ -257,6 +254,21 @@ def _allowlisted_environment(values: dict[str, str]) -> dict[str, str]:
         result.pop(forbidden, None)
     result.update({"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_DATASETS_OFFLINE": "1"})
     return result
+
+
+def _stop_reason(value: object) -> str | None:
+    if value is None or value is False:
+        return None
+    if value is True:
+        return "claim_lost"
+    if isinstance(value, str) and value in {
+        "cancelled",
+        "claim_lost",
+        "worker_shutdown",
+        "worker_timeout",
+    }:
+        return value
+    return "claim_lost"
 
 
 def _open_log(logs_fd: int, name: str) -> int:

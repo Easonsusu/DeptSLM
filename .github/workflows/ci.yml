@@ -693,6 +693,7 @@ jobs:
           import importlib.metadata
           import importlib.util
           import llamafactory, torch, transformers, datasets, accelerate, peft, trl, safetensors
+          from deptslm_training_runtime.dependency_authority import verify_installed_distributions
           assert importlib.metadata.version("llamafactory") == "0.9.5"
           assert torch.__version__.split("+")[0] == "2.7.1"
           assert transformers.__version__ == "4.55.0"
@@ -701,14 +702,20 @@ jobs:
           assert peft.__version__ == "0.18.1"
           assert trl.__version__ == "0.19.1"
           assert safetensors.__version__ == "0.7.0"
+          assert importlib.metadata.version("bitsandbytes") == "0.50.1"
+          assert importlib.metadata.version("pip") == "25.1.1"
+          assert importlib.metadata.version("setuptools") == "80.9.0"
+          assert importlib.metadata.version("wheel") == "0.45.1"
+          assert importlib.metadata.version("build") == "1.2.2.post1"
+          assert verify_installed_distributions() == ("25ada56ca10b1a62367355e2ecb04af771c390e4de8562a548b21a694b164f96", 127)
           assert importlib.util.find_spec("llamafactory.cli") is not None
           assert importlib.util.find_spec("psycopg") is None
           '
           docker run --rm --entrypoint python deptslm-training-runtime-ci -I -m pip check
           lock_sha="$(docker run --rm --entrypoint sha256sum deptslm-training-runtime-ci /opt/llamafactory/requirements.lock | awk '{print $1}')"
           contract_sha="$(docker run --rm --entrypoint python deptslm-training-runtime-ci -I -c 'import hashlib,json; print(hashlib.sha256(json.dumps(json.load(open("/opt/llamafactory/environment.json")), sort_keys=True, separators=(",", ":")).encode()).hexdigest())')"
-          test "$lock_sha" = "2dd57192ecb2dfc314198b886e67205f558fb80d103d36821e08cc10327c5fab"
-          test "$contract_sha" = "dc891740f4120042847f0fd3be40dd31971283a69cdd13d91fd617953c614a0e"
+          test "$lock_sha" = "22e92e62895cdddc49ba6ab3545d2134dd6dbfb44616646b72cb09caa19cc5a5"
+          test "$contract_sha" = "123be4e6f366a28a0d56a7f51451397cdb05b5cb6a82a42ce66f487531c3978c"
           if docker image inspect deptslm-training-runtime-ci --format '{{json .Config.ExposedPorts}}' | grep -v -E 'null|^{}$' >/dev/null; then
             echo 'training-runtime must not expose a port' >&2
             exit 1
@@ -724,6 +731,48 @@ jobs:
             printf 'Model-weight-like files unexpectedly present in training runtime image:\n%s\n' "$weight_matches" >&2
             exit 1
           fi
+      - name: Compose-backed read-only training dataset mount smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! docker compose version >/dev/null 2>&1; then
+            echo 'Docker Compose unavailable; skipping training dataset mount smoke.'
+            exit 0
+          fi
+          export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-compose-training-mount"
+          export DEPTSLM_QDRANT_API_KEY="phase6-ci-compose-key-0123456789"
+          export DEPTSLM_RAG_RUNTIME_TOKEN="phase7-ci-runtime-token-0123456789-abcdef"
+          export DEPTSLM_ADAPTER_RUNTIME_TOKEN="phase12-ci-production-runtime-token-0123456789"
+          export DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN="phase12-ci-adapter-runtime-token-0123456789"
+          export DEPTSLM_TRAINING_EXECUTION_CODE_REVISION="5555555555555555555555555555555555555555"
+          export DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256="22e92e62895cdddc49ba6ab3545d2134dd6dbfb44616646b72cb09caa19cc5a5"
+          export DEPTSLM_TRAINING_ENVIRONMENT_FINGERPRINT="123be4e6f366a28a0d56a7f51451397cdb05b5cb6a82a42ce66f487531c3978c"
+          export DEPTSLM_TRAINING_RUNTIME_TOKEN="phase14-ci-training-runtime-token-0123456789"
+          export DEPTSLM_EVALUATION_CODE_REVISION="9999999999999999999999999999999999999999"
+          export DEPTSLM_SFT_CODE_REVISION="8888888888888888888888888888888888888888"
+          export DEPTSLM_TRAINING_JOB_CODE_REVISION="7777777777777777777777777777777777777777"
+          export DEPTSLM_ADAPTER_REGISTRY_CODE_REVISION="6666666666666666666666666666666666666666"
+          mkdir -p "$DEPTSLM_DATA_DIR"/{uploads,extracted_text,vector_snapshots,training_datasets,adapters,model_cache,eval_results,logs,exports,training_runs}
+          mkdir -p "$DEPTSLM_DATA_DIR/training_datasets/jobs" "$DEPTSLM_DATA_DIR/service_state"/{postgres,qdrant}
+          printf 'compose-mount-sentinel\n' > "$DEPTSLM_DATA_DIR/training_datasets/mount-sentinel"
+          ./scripts/compose.sh config --quiet
+          ./scripts/compose.sh --profile training run --rm --no-deps --entrypoint python training-execution-worker -I -c '
+          from pathlib import Path
+          mount = Path("/runtime/deptslm/training_datasets")
+          assert (mount / "mount-sentinel").read_text(encoding="ascii") == "compose-mount-sentinel\\n"
+          assert any(
+              len(parts := line.split()) > 5
+              and parts[4] == "/runtime/deptslm/training_datasets"
+              and "ro" in parts[5].split(",")
+              for line in Path("/proc/self/mountinfo").read_text().splitlines()
+          )
+          try:
+              (mount / "must-not-write").write_text("x", encoding="ascii")
+          except OSError:
+              pass
+          else:
+              raise AssertionError("training_datasets must be read-only")
+          '
       - name: Check raw streaming upload boundary
         run: |
           ! grep -R -E 'UploadFile|python-multipart|request\.body\(' apps/api/app apps/api/requirements*.txt
@@ -949,8 +998,8 @@ jobs:
             export DEPTSLM_ADAPTER_RUNTIME_TOKEN="phase12-ci-production-runtime-token-0123456789"
             export DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN="phase12-ci-adapter-runtime-token-0123456789"
             export DEPTSLM_TRAINING_EXECUTION_CODE_REVISION="5555555555555555555555555555555555555555"
-            export DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256="2dd57192ecb2dfc314198b886e67205f558fb80d103d36821e08cc10327c5fab"
-            export DEPTSLM_TRAINING_ENVIRONMENT_FINGERPRINT="dc891740f4120042847f0fd3be40dd31971283a69cdd13d91fd617953c614a0e"
+            export DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256="22e92e62895cdddc49ba6ab3545d2134dd6dbfb44616646b72cb09caa19cc5a5"
+            export DEPTSLM_TRAINING_ENVIRONMENT_FINGERPRINT="123be4e6f366a28a0d56a7f51451397cdb05b5cb6a82a42ce66f487531c3978c"
             export DEPTSLM_TRAINING_RUNTIME_TOKEN="phase14-ci-training-runtime-token-0123456789"
             export DEPTSLM_EVALUATION_CODE_REVISION="9999999999999999999999999999999999999999"
             export DEPTSLM_SFT_CODE_REVISION="8888888888888888888888888888888888888888"
@@ -1010,9 +1059,9 @@ jobs:
       DEPTSLM_TEST_QDRANT_API_KEY: phase13-ci-qdrant-key-0123456789
       DEPTSLM_TEST_QDRANT_ISOLATED: "1"
       DEPTSLM_TRAINING_EXECUTION_CODE_REVISION: "5555555555555555555555555555555555555555"
-      DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256: "2dd57192ecb2dfc314198b886e67205f558fb80d103d36821e08cc10327c5fab"
+      DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256: "22e92e62895cdddc49ba6ab3545d2134dd6dbfb44616646b72cb09caa19cc5a5"
       DEPTSLM_TRAINING_ENVIRONMENT_PROFILE_ID: deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1
-      DEPTSLM_TRAINING_ENVIRONMENT_FINGERPRINT: "dc891740f4120042847f0fd3be40dd31971283a69cdd13d91fd617953c614a0e"
+      DEPTSLM_TRAINING_ENVIRONMENT_FINGERPRINT: "123be4e6f366a28a0d56a7f51451397cdb05b5cb6a82a42ce66f487531c3978c"
       DEPTSLM_TRAINING_RUNTIME_TOKEN: phase14-ci-training-runtime-token-0123456789
     steps:
       - uses: actions/checkout@v4

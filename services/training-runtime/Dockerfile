@@ -23,14 +23,16 @@ RUN apt-get update \
     && chown -R deptslm:deptslm /opt/llamafactory /run/deptslm /runtime/deptslm
 
 COPY services/training-runtime/requirements.lock /opt/llamafactory/requirements.lock
+COPY services/training-runtime/installed-distributions.json /opt/llamafactory/installed-distributions.json
 COPY services/training-runtime/environment.json /opt/llamafactory/environment.json
 COPY services/training-runtime/entrypoint.sh /usr/local/bin/deptslm-training-runtime
 COPY services/training-runtime/pyproject.toml /opt/build/pyproject.toml
 COPY services/training-runtime/deptslm_training_runtime /opt/build/deptslm_training_runtime
 
-RUN /opt/llamafactory/bin/python -m pip install --no-cache-dir --requirement /opt/llamafactory/requirements.lock \
+RUN /opt/llamafactory/bin/python -m pip install --disable-pip-version-check --no-cache-dir --no-build-isolation --require-hashes --requirement /opt/llamafactory/requirements.lock \
+    && /opt/llamafactory/bin/python -m pip install --disable-pip-version-check --no-cache-dir --no-build-isolation --no-deps /opt/build \
     && /opt/llamafactory/bin/python -m pip check \
-    && /opt/llamafactory/bin/python -m pip install --no-cache-dir --no-deps /opt/build \
+    && /opt/llamafactory/bin/python -I -c 'from deptslm_training_runtime.dependency_authority import verify_installed_distributions; verify_installed_distributions()' \
     && rm -rf /opt/build \
     && chmod 0755 /usr/local/bin/deptslm-training-runtime
 

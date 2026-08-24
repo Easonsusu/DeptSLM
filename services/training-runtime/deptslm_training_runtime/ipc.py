@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import select
+import signal
 import socket
 import stat
 import struct
@@ -16,12 +17,32 @@ from pathlib import Path
 from .contract import MAX_HANDLES, MAX_IPC_FRAME_BYTES, canonical_json_bytes
 
 _HEADER = struct.Struct("!I")
+_STOP_REASONS = frozenset({"cancelled", "claim_lost", "worker_shutdown", "worker_timeout"})
 
 
 class RuntimeIpcError(RuntimeError):
     def __init__(self, code: str = "runtime_protocol_invalid") -> None:
         self.code = code
         super().__init__(code)
+
+
+class _StopSignal:
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self._reason = "worker_shutdown"
+        self._lock = threading.Lock()
+
+    def request(self, reason: str) -> None:
+        with self._lock:
+            if reason in _STOP_REASONS:
+                self._reason = reason
+            self.event.set()
+
+    def reason(self) -> str | bool:
+        if not self.event.is_set():
+            return False
+        with self._lock:
+            return self._reason
 
 
 def authenticate_frame(
@@ -93,7 +114,7 @@ class TrainingRuntimeServer:
         socket_path: Path,
         token: str,
         handler: Callable[
-            [dict[str, object], tuple[int, int, int, int], Callable[[], bool]],
+            [dict[str, object], tuple[int, int, int, int], Callable[[], object]],
             dict[str, object],
         ],
     ) -> None:
@@ -102,19 +123,64 @@ class TrainingRuntimeServer:
         self.socket_path = socket_path
         self.token = token.encode("utf-8")
         self.handler = handler
+        self._shutdown = threading.Event()
+        self._active_disconnect: _StopSignal | None = None
+        self._active_lock = threading.Lock()
 
     def serve_once(self) -> None:
+        self._serve(max_requests=1)
+
+    def serve_forever(self) -> None:
+        """Serve sequential requests until shutdown.
+
+        There is deliberately no worker pool: one runtime process owns at most
+        one active training child.  The signal handlers only set an event and
+        mark the active control connection disconnected; the request handler
+        performs the bounded TERM/KILL/reap operation.
+        """
+
+        self._serve(max_requests=None)
+
+    def shutdown(self) -> None:
+        self._shutdown.set()
+        with self._active_lock:
+            if self._active_disconnect is not None:
+                self._active_disconnect.request("worker_shutdown")
+
+    def _serve(self, *, max_requests: int | None) -> None:
         _prepare_socket(self.socket_path)
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        previous_handlers: dict[int, object] = {}
         try:
             os.umask(0o077)
             server.bind(str(self.socket_path))
             os.chmod(self.socket_path, 0o600)
             server.listen(1)
-            connection, _ = server.accept()
-            with connection:
-                self._serve_connection(connection)
+            server.settimeout(0.2)
+            if max_requests is None:
+                for signal_number in (signal.SIGTERM, signal.SIGINT):
+                    try:
+                        previous_handlers[signal_number] = signal.getsignal(signal_number)
+                        signal.signal(signal_number, lambda *_args: self.shutdown())
+                    except (ValueError, OSError):
+                        # Signal installation is unavailable in a test thread;
+                        # callers can use shutdown() directly there.
+                        pass
+            served = 0
+            while not self._shutdown.is_set() and (max_requests is None or served < max_requests):
+                try:
+                    connection, _ = server.accept()
+                except TimeoutError:
+                    continue
+                with connection:
+                    self._serve_connection(connection)
+                served += 1
         finally:
+            for signal_number, handler in previous_handlers.items():
+                try:
+                    signal.signal(signal_number, handler)
+                except (ValueError, OSError):
+                    pass
             server.close()
             try:
                 self.socket_path.unlink()
@@ -130,7 +196,10 @@ class TrainingRuntimeServer:
             request, fds = authenticate_frame(
                 payload, ancillary, self.token, expected_uid=os.getuid()
             )
-            disconnected = threading.Event()
+            connection.settimeout(None)
+            disconnected = _StopSignal()
+            with self._active_lock:
+                self._active_disconnect = disconnected
             watcher = threading.Thread(
                 target=_watch_disconnect,
                 args=(connection, disconnected),
@@ -138,13 +207,17 @@ class TrainingRuntimeServer:
             )
             watcher.start()
             try:
-                result = self.handler(request, fds, disconnected.is_set)
+                connection.sendall(_encode_response(_process_ready(request)))
+                result = self.handler(request, fds, disconnected.reason)
                 response = _encode_response(result)
-                connection.sendall(response)
+                if not disconnected.event.is_set():
+                    connection.sendall(response)
             finally:
-                disconnected.set()
+                disconnected.event.set()
                 watcher.join(timeout=1)
                 _close_fds(fds)
+                with self._active_lock:
+                    self._active_disconnect = None
         except RuntimeIpcError as error:
             try:
                 connection.sendall(_encode_response({"error_code": error.code}))
@@ -246,17 +319,45 @@ def _reject_received(
     raise RuntimeIpcError(code)
 
 
-def _watch_disconnect(connection: socket.socket, disconnected: threading.Event) -> None:
-    while not disconnected.is_set():
+def _watch_disconnect(connection: socket.socket, disconnected: _StopSignal) -> None:
+    buffer = bytearray()
+    while not disconnected.event.is_set():
         try:
             readable, _, _ = select.select([connection], [], [], 0.2)
             if readable:
-                data = connection.recv(1, socket.MSG_PEEK)
+                data = connection.recv(16 * 1024)
                 if data == b"":
-                    disconnected.set()
+                    disconnected.request("worker_shutdown")
+                    return
+                buffer.extend(data)
+                while True:
+                    if len(buffer) < _HEADER.size:
+                        break
+                    length = _HEADER.unpack(buffer[: _HEADER.size])[0]
+                    if not 1 <= length <= MAX_IPC_FRAME_BYTES:
+                        disconnected.request("worker_shutdown")
+                        return
+                    if len(buffer) < _HEADER.size + length:
+                        break
+                    payload = bytes(buffer[_HEADER.size : _HEADER.size + length])
+                    del buffer[: _HEADER.size + length]
+                    try:
+                        value = json.loads(payload.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        disconnected.request("worker_shutdown")
+                        return
+                    if (
+                        not isinstance(value, dict)
+                        or set(value) != {"control", "reason"}
+                        or value.get("control") != "stop"
+                        or value.get("reason") not in _STOP_REASONS
+                    ):
+                        disconnected.request("worker_shutdown")
+                        return
+                    disconnected.request(str(value["reason"]))
                     return
         except OSError:
-            disconnected.set()
+            disconnected.request("worker_shutdown")
             return
 
 
@@ -265,6 +366,20 @@ def _encode_response(value: dict[str, object]) -> bytes:
     if not 1 <= len(payload) <= MAX_IPC_FRAME_BYTES:
         raise RuntimeIpcError()
     return _HEADER.pack(len(payload)) + payload
+
+
+def _process_ready(request: dict[str, object]) -> dict[str, object]:
+    """Return the closed acknowledgement sent before active training starts."""
+
+    return {
+        "classification": "process_ready",
+        "department_id": request["department_id"],
+        "execution_id": request["execution_id"],
+        "attempt_id": request["attempt_id"],
+        "training_job_id": request["training_job_id"],
+        "authority_fingerprint": request["authority_fingerprint"],
+        "input_snapshot_fingerprint": request["input_snapshot_fingerprint"],
+    }
 
 
 def _close_fds(fds: list[int] | tuple[int, ...]) -> None:

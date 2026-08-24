@@ -168,6 +168,19 @@ Hugging Face token. LoRA and QLoRA NF4 support fail closed on unreviewed
 hardware; no silent CPU, precision, quantization, or device fallback is
 allowed.
 
+The private runtime image is pinned to the reviewed CUDA 12.6 digest
+`sha256:8aef630a54bc5c5146ae5ce68e6af5caa3df0fb690bb91544175c91f307e4356`,
+the hash-locked dependency graph, and its installed-distribution manifest.
+The control plane alone may read `training_datasets` and write `training_runs`;
+the runtime receives only read-only `model_cache` and the private IPC volume.
+The runtime handshake ends at an explicit `process_ready` within 120 seconds;
+one sequential persistent server then permits a 12-hour active training/result
+wall clock. Closed cancellation, claim-loss, shutdown, and timeout reasons are
+propagated, and no healthy child is killed by a short startup ceiling. Model
+validation remains descriptor-bound: regular files require `st_nlink == 1`,
+while directories use private no-follow retained descriptors and parent-entry
+identity checks without requiring a numeric link count of one.
+
 The Phase 14.2 control plane receives PostgreSQL and external training-run
 storage only. Its private runtime receives no PostgreSQL, Qdrant, API-auth,
 membership, RAG, evaluation, adapter, cloud, or Hugging Face credentials; it

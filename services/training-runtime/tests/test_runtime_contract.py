@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -17,6 +18,10 @@ from deptslm_training_runtime.config import (  # noqa: E402
     rematerialize_execution_config,
 )
 from deptslm_training_runtime.contract import SEMANTIC_PROFILES  # noqa: E402
+from deptslm_training_runtime.dependency_authority import (  # noqa: E402
+    DependencyAuthorityError,
+    read_expected_manifest,
+)
 from deptslm_training_runtime.hardware import (  # noqa: E402
     HardwarePreflightError,
     preflight_hardware,
@@ -99,6 +104,24 @@ def test_output_stage_rejects_symlink_and_limits(tmp_path: Path) -> None:
 def test_hardware_preflight_fails_closed_without_supported_cuda() -> None:
     with pytest.raises(HardwarePreflightError, match="runtime_hardware_unsupported"):
         preflight_hardware()
+
+
+def test_installed_distribution_manifest_is_closed_and_normalized(tmp_path: Path) -> None:
+    manifest = read_expected_manifest(RUNTIME_ROOT / "installed-distributions.json")
+    distributions = manifest["distributions"]
+    assert manifest["manifest_version"] == 1
+    assert isinstance(distributions, dict)
+    assert len(distributions) == 127
+    assert all(name == name.lower() and "_" not in name for name in distributions)
+
+    altered = dict(manifest)
+    altered["distributions"] = dict(distributions)
+    altered["distributions"]["unexpected"] = "1.0"
+    altered_path = tmp_path / "installed-distributions.json"
+    altered_path.write_text(json.dumps(altered), encoding="utf-8")
+    assert read_expected_manifest(altered_path)["distributions"]["unexpected"] == "1.0"
+    with pytest.raises(DependencyAuthorityError):
+        read_expected_manifest(tmp_path / "missing.json")
 
 
 def test_supervisor_rejects_non_fixed_executable(tmp_path: Path) -> None:

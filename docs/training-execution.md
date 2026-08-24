@@ -123,8 +123,10 @@ normal internet egress; it uses `network_mode: none`, a read-only root
 filesystem,
 `cap_drop=ALL`, `no-new-privileges`, bounded private tmpfs/process count, a
 server-owned runtime token, an exact read-only model-cache mount, and one
-server-created attempt area are required. Both runtime services are added only
-under the opt-in Compose `training` profile.
+server-created attempt area. The control-plane worker alone receives
+`training_datasets` read-only plus `training_runs` read-write; the private
+runtime receives neither dataset nor training-run storage. Both runtime
+services are added only under the opt-in Compose `training` profile.
 
 ## 4. Private input snapshot
 
@@ -189,12 +191,19 @@ recorded fingerprints.
 ## 7. Phase 14.2 runtime implementation
 
 The real data-plane image is pinned to the reviewed Linux/x86_64 CUDA 12.6
-base digest and an exact `requirements.lock`. It installs LlamaFactory `0.9.5`
+base image
+`nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04@sha256:8aef630a54bc5c5146ae5ce68e6af5caa3df0fb690bb91544175c91f307e4356`
+and an exact `requirements.lock` whose SHA-256 is
+`22e92e62895cdddc49ba6ab3545d2134dd6dbfb44616646b72cb09caa19cc5a5`. It installs LlamaFactory `0.9.5`
 and the pinned Torch, Transformers, datasets, Accelerate, PEFT, TRL,
 torchdata, safetensors, sentencepiece, tiktoken, bitsandbytes, and supporting
 packages only in `services/training-runtime`. API and control-plane images
-remain free of that stack. The source-controlled `environment.json`, lock
-SHA-256, and derived environment fingerprint are content-free provenance.
+remain free of that stack. The source-controlled `environment.json` records
+the lock digest, installed-distribution manifest fingerprint
+`25ada56ca10b1a62367355e2ecb04af771c390e4de8562a548b21a694b164f96` (127
+distributions), and derived environment fingerprint
+`123be4e6f366a28a0d56a7f51451397cdb05b5cb6a82a42ce66f487531c3978c`; these
+are content-free provenance, not runtime authority by themselves.
 
 The worker sends exactly four private directory descriptors (`input`,
 `scratch`, `logs`, `output_stage`) over a private Unix socket using SCM_RIGHTS.
@@ -204,8 +213,13 @@ a fresh nonce, constant-time comparison, restrictive socket ownership, and
 Linux `SO_PEERCRED` supplement the server-side scope checks.
 
 The runtime independently validates the exact Qwen3 model manifest and
-revision, rejects symlinks/hard links and unexpected files, enforces offline
-environment variables, and performs Linux/x86_64/one-GPU/BF16 preflight.
+revision through retained no-follow descriptors. Regular authoritative files
+must be private, owned by the runtime user, and `st_nlink == 1`; directories
+use private ownership/mode and retained descriptor plus parent-entry identity
+checks without requiring a numeric link count of one. Symlinks, substituted
+entries, hard-linked files, unexpected files, and mutation during hashing are
+rejected. It also enforces offline environment variables and performs
+Linux/x86_64/one-GPU/BF16 preflight.
 QLoRA additionally requires the pinned bitsandbytes NF4 kernel preflight; no
 CPU, FP16, MPS, multi-GPU, ROCm, or semantic fallback is permitted.
 
@@ -218,6 +232,12 @@ and inherited environments are forbidden. The child runs in a dedicated
 process group/session with unrelated descriptors closed and a sanitized,
 server-owned environment.
 
+The IPC handshake has a 120-second deadline ending at an explicit
+`process_ready` acknowledgement. After readiness, one sequential persistent
+runtime serves one request at a time under a 12-hour active training/result
+wall clock; a healthy child is not killed by a short startup ceiling. Closed
+stop reasons (`cancelled`, `claim_lost`, `worker_shutdown`, and
+`worker_timeout`) are propagated over the authenticated control channel.
 Startup and wall-clock deadlines, bounded stdout/stderr and log bytes,
 bounded filesystem output and process count, disk-full handling, child exit
 classification, cancellation, shutdown, complete process-tree kill, and
@@ -323,8 +343,8 @@ protocol internally; no public runtime or training endpoint exists.
 
 ## 14. Reviewed Phase 14.2 resource limits
 
-Phase 14.2 fixes one runtime request, 120-second IPC handshake/response clock,
-600-second startup ceiling, 12-hour training wall clock, 30-second heartbeats,
+Phase 14.2 fixes one runtime request, a 120-second handshake deadline through
+`process_ready`, a 12-hour active training/result wall clock, 30-second heartbeats,
 20-second TERM grace, 10-second KILL/reap bound, 32 MiB combined stdout/stderr
 logs, 8 GiB scratch/output ceilings, 2 GiB per output file, 4,096 output files,
 16 directory levels, 512 container processes, and a 256 MiB runtime tmpfs.
