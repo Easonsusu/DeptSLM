@@ -98,7 +98,7 @@ class _ExecutionLockHooks:
         self.local = threading.local()
         self.first_lock: dict[str, str] = {}
         self.callbacks: dict[tuple[str, str], Callable[[], None]] = {}
-        self.events: list[tuple[str, str, int]] = []
+        self.events: list[tuple[str, str, int, str]] = []
         self._guard = threading.Lock()
 
     def install(self) -> None:
@@ -146,7 +146,7 @@ class _ExecutionLockHooks:
                 "execution_update" if "update training_executions" in normalized else "advisory"
             )
             with self._guard:
-                self.events.append((label, event_kind, cursor.rowcount))
+                self.events.append((label, event_kind, cursor.rowcount, normalized[:240]))
         if kind is None or label is None:
             return
         with self._guard:
