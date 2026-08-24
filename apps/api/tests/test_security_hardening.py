@@ -105,8 +105,7 @@ def test_linux_model_locks_include_hashed_cuda_platform_dependencies() -> None:
         lock = lock_path.read_text(encoding="utf-8")
         for package in required:
             assert (
-                f'{package} ; platform_system == "Linux" and '
-                'platform_machine == "x86_64"'
+                f'{package} ; platform_system == "Linux" and platform_machine == "x86_64"'
             ) in lock, (lock_path, package)
 
 
