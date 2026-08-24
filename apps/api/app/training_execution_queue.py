@@ -124,13 +124,13 @@ def _valid_claim(
     if lock:
         job_query = job_query.with_for_update()
     serialization_acquired = (
-        _try_training_job_serialization(session, claim.training_job_id) if lock else False
+        _try_training_job_serialization(session, claim.execution_id) if lock else False
     )
     job = session.execute(job_query).scalar_one_or_none()
     if job is None:
         return None
     if lock:
-        _finish_training_job_serialization(session, job.id, serialization_acquired)
+        _finish_training_job_serialization(session, claim.execution_id, serialization_acquired)
     execution_query = select(TrainingExecution).where(
         TrainingExecution.id == claim.execution_id,
         TrainingExecution.department_id == claim.department_id,

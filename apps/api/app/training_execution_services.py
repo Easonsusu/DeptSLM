@@ -73,7 +73,12 @@ def _server_now(session: Session) -> datetime:
 
 
 def _lock_job_first(
-    session: Session, principal: AuthenticatedPrincipal, scope: DepartmentRequestScope, job_id: UUID
+    session: Session,
+    principal: AuthenticatedPrincipal,
+    scope: DepartmentRequestScope,
+    job_id: UUID,
+    *,
+    serialization_id: UUID | None = None,
 ) -> tuple[TrainingJob, object]:
     """Use job -> department lock order for enqueue/cancel/retry races."""
 
@@ -87,7 +92,7 @@ def _lock_job_first(
         lock=False,
         audit_action="training.execution.authorization.selector",
     )
-    serialization_acquired = _try_training_job_serialization(session, job_id)
+    serialization_acquired = _try_training_job_serialization(session, serialization_id or job_id)
     job = session.execute(
         select(TrainingJob)
         .where(TrainingJob.id == job_id, TrainingJob.department_id == scope.department.value)
@@ -96,7 +101,7 @@ def _lock_job_first(
     ).scalar_one_or_none()
     if job is None:
         raise ServiceError(404, "Training job not found")
-    _finish_training_job_serialization(session, job.id, serialization_acquired)
+    _finish_training_job_serialization(session, serialization_id or job.id, serialization_acquired)
     authorization = authorize_transaction(
         session,
         principal,
@@ -464,7 +469,13 @@ def _authorize_execution_mutation(
     ).scalar_one_or_none()
     if execution_probe is None:
         raise ServiceError(404, "Training execution not found")
-    job, authorization = _lock_job_first(session, principal, request_scope, execution_probe)
+    job, authorization = _lock_job_first(
+        session,
+        principal,
+        request_scope,
+        execution_probe,
+        serialization_id=execution_id,
+    )
     execution = _lock_execution(session, request_scope, execution_id)
     return execution, authorization, job
 
