@@ -35,6 +35,10 @@ reducing dependency and local-configuration exposure:
 - Production Python images install committed exact lockfiles with hashes where
   practical; the CUDA training image retains its reviewed exact platform lock
   and does not perform a mutable pip self-upgrade.
+  Linux/x86_64 model-bearing locks also carry the exact PyTorch `2.7.1`
+  CUDA 12.6 wheel set and Triton `3.3.1` as platform-marked, hash-pinned
+  entries. This keeps Ubuntu image installs complete even though lock
+  generation on macOS does not evaluate Linux dependency markers.
   Node uses `pnpm-lock.yaml` as the authoritative frozen lock. Dependabot,
   full-history secret scanning, dependency auditing, and high/critical
   filesystem scanning run through separate low-noise security automation.

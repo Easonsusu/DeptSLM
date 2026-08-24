@@ -75,6 +75,41 @@ def test_node_lock_uses_exact_patched_transitive_overrides() -> None:
         assert value in lock
 
 
+def test_linux_model_locks_include_hashed_cuda_platform_dependencies() -> None:
+    required = (
+        "nvidia-cublas-cu12==12.6.4.1",
+        "nvidia-cuda-cupti-cu12==12.6.80",
+        "nvidia-cuda-nvrtc-cu12==12.6.77",
+        "nvidia-cuda-runtime-cu12==12.6.77",
+        "nvidia-cudnn-cu12==9.5.1.17",
+        "nvidia-cufft-cu12==11.3.0.4",
+        "nvidia-cufile-cu12==1.11.1.6",
+        "nvidia-curand-cu12==10.3.7.77",
+        "nvidia-cusolver-cu12==11.7.1.2",
+        "nvidia-cusparse-cu12==12.5.4.2",
+        "nvidia-cusparselt-cu12==0.6.3",
+        "nvidia-nccl-cu12==2.26.2",
+        "nvidia-nvjitlink-cu12==12.6.85",
+        "nvidia-nvtx-cu12==12.6.77",
+        "triton==3.3.1",
+    )
+    lock_paths = (
+        REPOSITORY_ROOT / "apps/api/requirements-ci.lock",
+        REPOSITORY_ROOT / "services/rag-worker/requirements-vector.lock",
+        REPOSITORY_ROOT / "services/rag-runtime/requirements.lock",
+        REPOSITORY_ROOT / "services/adapter-runtime/requirements.lock",
+        REPOSITORY_ROOT / "services/adapter-eval-runtime/requirements.lock",
+    )
+
+    for lock_path in lock_paths:
+        lock = lock_path.read_text(encoding="utf-8")
+        for package in required:
+            assert (
+                f'{package} ; platform_system == "Linux" and '
+                'platform_machine == "x86_64"'
+            ) in lock, (lock_path, package)
+
+
 def test_model_loading_security_contract_remains_pinned_and_offline() -> None:
     runtime = (
         REPOSITORY_ROOT / "services/training-runtime/deptslm_training_runtime/contract.py"

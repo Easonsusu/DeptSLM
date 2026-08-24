@@ -673,6 +673,58 @@ numpy==2.5.2 \
     #   scipy
     #   sentence-transformers
     #   transformers
+nvidia-cublas-cu12==12.6.4.1 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:08ed2686e9875d01b58e3cb379c6896df8e76c75e0d4a7f7dace3d7b6d9ef8eb
+    # via torch
+nvidia-cuda-cupti-cu12==12.6.80 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:6768bad6cab4f19e8292125e5f1ac8aa7d1718704012a0e3272a6f61c4bce132 \
+    --hash=sha256:a3eff6cdfcc6a4c35db968a06fcadb061cbc7d6dde548609a941ff8701b98b73
+    # via torch
+nvidia-cuda-nvrtc-cu12==12.6.77 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:35b0cc6ee3a9636d5409133e79273ce1f3fd087abb0532d2d2e8fff1fe9efc53
+    # via torch
+nvidia-cuda-runtime-cu12==12.6.77 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:ba3b56a4f896141e25e19ab287cd71e52a6a0f4b29d0d31609f60e3b4d5219b7 \
+    --hash=sha256:a84d15d5e1da416dd4774cb42edf5e954a3e60cc945698dc1d5be02321c44dc8
+    # via torch
+nvidia-cudnn-cu12==9.5.1.17 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:30ac3869f6db17d170e0e556dd6cc5eee02647abc31ca856634d5a40f82c15b2
+    # via torch
+nvidia-cufft-cu12==11.3.0.4 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:ccba62eb9cef5559abd5e0d54ceed2d9934030f51163df018532142a8ec533e5 \
+    --hash=sha256:768160ac89f6f7b459bee747e8d175dbf53619cfe74b2a5636264163138013ca
+    # via torch
+nvidia-cufile-cu12==1.11.1.6 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:cc23469d1c7e52ce6c1d55253273d32c565dd22068647f3aa59b3c6b005bf159
+    # via torch
+nvidia-curand-cu12==10.3.7.77 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:a42cd1344297f70b9e39a1e4f467a4e1c10f1da54ff7a85c12197f6c652c8bdf \
+    --hash=sha256:99f1a32f1ac2bd134897fc7a203f779303261268a65762a623bf30cc9fe79117
+    # via torch
+nvidia-cusolver-cu12==11.7.1.2 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:e9e49843a7707e42022babb9bcfa33c29857a93b88020c4e4434656a655b698c \
+    --hash=sha256:6cf28f17f64107a0c4d7802be5ff5537b2130bfc112f25d5a30df227058ca0e6
+    # via torch
+nvidia-cusparse-cu12==12.5.4.2 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:7556d9eca156e18184b94947ade0fba5bb47d69cec46bf8660fd2c71a4b48b73 \
+    --hash=sha256:23749a6571191a215cb74d1cdbff4a86e7b19f1200c071b3fcf844a5bea23a2f
+    # via torch
+nvidia-cusparselt-cu12==0.6.3 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:e5c8a26c36445dd2e6812f1177978a24e2d37cacce7e090f297a688d1ec44f46
+    # via torch
+nvidia-nccl-cu12==2.26.2 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:694cf3879a206553cc9d7dbda76b13efaf610fdb70a50cba303de1b0d1530ac6
+    # via torch
+nvidia-nvjitlink-cu12==12.6.85 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:eedc36df9e88b682efe4309aa16b5b4e78c2407eac59e8c10a6a47535164369a
+    # via torch
+nvidia-nvtx-cu12==12.6.77 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:b90bed3df379fa79afbd21be8e04a0314336b8ae16768b58f2d34cb1d04cd7d2 \
+    --hash=sha256:6574241a3ec5fdc9334353ab8c479fe75841dbe8f4532a8fc97ce63503330ba1
+    # via torch
+triton==3.3.1 ; platform_system == "Linux" and platform_machine == "x86_64" \
+    --hash=sha256:9999e83aba21e1a78c1f36f21bce621b77bcaa530277a50484a7cb4a822f6e43
+    # via torch
 packaging==26.3 \
     --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79 \
     --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
