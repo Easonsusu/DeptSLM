@@ -59,6 +59,11 @@ def _frame(request: dict[str, object], token: bytes, *, nonce: bytes | None = No
     return struct.pack("!I", len(payload)) + payload
 
 
+def _stop_frame(reason: str) -> bytes:
+    payload = canonical_json_bytes({"control": "stop", "reason": reason})
+    return struct.pack("!I", len(payload)) + payload
+
+
 def _wait_socket(path: Path) -> None:
     for _ in range(100):
         if path.exists():
@@ -88,18 +93,26 @@ def _send_request(
             )
         ]
         connection.sendmsg([frame], ancillary)
-        header = connection.recv(4)
-        assert len(header) == 4
-        size = struct.unpack("!I", header)[0]
-        body = connection.recv(size)
-        while len(body) < size:
-            body += connection.recv(size - len(body))
-        return json.loads(body.decode("utf-8")), socket_mode
+        first = _receive_response(connection)
+        if first.get("classification") == "process_ready":
+            return _receive_response(connection), socket_mode
+        return first, socket_mode
     finally:
         connection.close()
 
 
+def _receive_response(connection: socket.socket) -> dict[str, object]:
+    header = connection.recv(4)
+    assert len(header) == 4
+    size = struct.unpack("!I", header)[0]
+    body = connection.recv(size)
+    while len(body) < size:
+        body += connection.recv(size - len(body))
+    return json.loads(body.decode("utf-8"))
+
+
 def _directories(root: Path, count: int) -> list[int]:
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptors: list[int] = []
     for index in range(count):
         path = root / f"cap-{index}"
@@ -202,3 +215,59 @@ def test_bad_hmac_and_non_directory_capability_are_rejected(tmp_path: Path) -> N
             os.close(descriptor)
     thread.join(2)
     assert not thread.is_alive()
+
+
+def test_persistent_server_is_sequential_and_propagates_closed_stop_reason(tmp_path: Path) -> None:
+    socket_path = _socket_path(tmp_path, "persistent")
+    token = b"runtime-token-" + b"x" * 40
+    server: TrainingRuntimeServer
+    calls: list[int] = []
+    active = 0
+    maximum_active = 0
+    stopped = threading.Event()
+    observed_reason: list[object] = []
+
+    def handler(_request, _fds, stop_reason):
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        calls.append(len(calls) + 1)
+        if len(calls) == 1:
+            while not stop_reason():
+                time.sleep(0.01)
+            observed_reason.append(stop_reason())
+            stopped.set()
+        active -= 1
+        return {"classification": "execution_failed", "error_code": "cancelled"}
+
+    server = TrainingRuntimeServer(socket_path, token.decode(), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    _wait_socket(socket_path)
+    descriptors = _directories(tmp_path / "first", 4)
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    connection.connect(str(socket_path))
+    try:
+        connection.sendmsg(
+            [_frame(_request(), token)],
+            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("=4i", *descriptors))],
+        )
+        assert _receive_response(connection)["classification"] == "process_ready"
+        connection.sendall(_stop_frame("cancelled"))
+        assert stopped.wait(2)
+    finally:
+        connection.close()
+        for descriptor in descriptors:
+            os.close(descriptor)
+    second = _directories(tmp_path / "second", 4)
+    try:
+        response, _ = _send_request(socket_path, _frame(_request(), token), second)
+        assert response == {"classification": "execution_failed", "error_code": "cancelled"}
+    finally:
+        for descriptor in second:
+            os.close(descriptor)
+    server.shutdown()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert observed_reason == ["cancelled"]
+    assert maximum_active == 1

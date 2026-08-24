@@ -40,6 +40,8 @@ from app.training_execution_domain import (
     validate_runtime_result,
 )
 from app.training_execution_runtime import (
+    RUNTIME_TRAINING_TIMEOUT_SECONDS,
+    StopReason,
     TrainingExecutionRuntime,
     TrainingRuntimeHandles,
     TrainingRuntimeRequest,
@@ -57,6 +59,10 @@ class TrainingExecutionQueueError(RuntimeError):
     def __init__(self, code: str = "database_unavailable") -> None:
         self.code = code if code in EXECUTION_ERROR_CODES else "database_unavailable"
         super().__init__(self.code)
+
+
+CONTROL_PLANE_OVERHEAD_SECONDS = 15 * 60
+DEFAULT_OPERATION_SECONDS = int(RUNTIME_TRAINING_TIMEOUT_SECONDS + CONTROL_PLANE_OVERHEAD_SECONDS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,12 +162,28 @@ def check_execution_claim(factory: sessionmaker[Session], claim: ClaimedTraining
 def execution_should_stop(factory: sessionmaker[Session], claim: ClaimedTrainingExecution) -> bool:
     """Return true for cancellation, claim loss, or database failure."""
 
+    return execution_stop_reason(factory, claim) is not None
+
+
+def execution_stop_reason(
+    factory: sessionmaker[Session], claim: ClaimedTrainingExecution
+) -> str | None:
+    """Return the exact server-authoritative reason for stopping a runtime."""
+
     try:
         with factory() as session:
             owned = _valid_claim(session, claim)
-            return owned is None or owned[0].status == "cancel_requested"
+            if owned is None:
+                return StopReason.CLAIM_LOST.value
+            if owned[0].status == "cancel_requested":
+                return StopReason.CANCELLED.value
+            return None
     except SQLAlchemyError:
-        return True
+        # Database unavailability cannot be treated as user cancellation or
+        # ownership.  It is a worker shutdown-style fail-closed interruption;
+        # finalization still requires a live claim and therefore cannot
+        # terminalize a replacement's execution.
+        return StopReason.WORKER_SHUTDOWN.value
 
 
 def renew_execution_lease(
@@ -464,7 +486,7 @@ def process_training_execution(
     *,
     runtime: TrainingExecutionRuntime | None = None,
     lease_seconds: int = 300,
-    operation_seconds: int = 3600,
+    operation_seconds: int = DEFAULT_OPERATION_SECONDS,
     should_stop: Callable[[], bool] = lambda: False,
 ) -> bool:
     deadline = time.monotonic() + max(1, operation_seconds)
@@ -480,12 +502,16 @@ def process_training_execution(
         )
 
     def checkpoint() -> None:
-        if should_stop():
-            raise TrainingExecutionQueueError("worker_shutdown")
+        requested_stop = should_stop()
+        if requested_stop:
+            if isinstance(requested_stop, str) and requested_stop in EXECUTION_ERROR_CODES:
+                raise TrainingExecutionQueueError(requested_stop)
+            raise TrainingExecutionQueueError(StopReason.WORKER_SHUTDOWN.value)
         if time.monotonic() >= deadline:
-            raise TrainingExecutionQueueError("worker_timeout")
-        if not check_execution_claim(factory, claim):
-            raise TrainingExecutionQueueError("claim_lost")
+            raise TrainingExecutionQueueError(StopReason.WORKER_TIMEOUT.value)
+        reason = execution_stop_reason(factory, claim)
+        if reason is not None:
+            raise TrainingExecutionQueueError(reason)
 
     stage = None
     snapshot = None
@@ -549,7 +575,7 @@ def process_training_execution(
                     logs_fd=stage.logs_fd,
                     output_stage_fd=stage.output_stage_fd,
                 ),
-                should_stop=lambda: should_stop() or execution_should_stop(factory, claim),
+                should_stop=lambda: should_stop() or execution_stop_reason(factory, claim) or False,
                 heartbeat=lambda: renew_execution_lease(factory, claim, lease_seconds),
             )
             result_mapping = (
@@ -678,12 +704,16 @@ def process_training_execution(
         return False
     except (TrainingExecutionError, TrainingExecutionStorageError) as error:
         code = getattr(error, "code", "input_snapshot_failed")
+        cancelled = code in {
+            StopReason.CANCELLED.value,
+            StopReason.WORKER_SHUTDOWN.value,
+        }
         _finalize(
             factory,
             claim,
-            status="failed",
+            status="cancelled" if cancelled else "failed",
             error_code=code,
-            classification="execution_failed",
+            classification="execution_cancelled" if cancelled else "execution_failed",
             runtime_fp=None,
             input_fp=None,
         )
@@ -705,6 +735,7 @@ __all__ = [
     "check_execution_claim",
     "claim_next_training_execution",
     "execution_should_stop",
+    "execution_stop_reason",
     "process_training_execution",
     "renew_execution_lease",
 ]

@@ -9,6 +9,8 @@ import os
 import socket
 import struct
 import sys
+import threading
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -27,10 +29,20 @@ from deptslm_training_runtime.contract import (  # noqa: E402
     canonical_json_bytes,
     request_mapping,
 )
-from deptslm_training_runtime.ipc import authenticate_frame  # noqa: E402
+from deptslm_training_runtime.ipc import (  # noqa: E402
+    TrainingRuntimeServer,
+    authenticate_frame,
+)
 from deptslm_training_runtime.output_stage import inspect_output_stage  # noqa: E402
 
-from app.training_execution_runtime import TrainingRuntimeResult  # noqa: E402
+from app.training_execution_domain import TrainingExecutionError  # noqa: E402
+from app.training_execution_runtime import (  # noqa: E402
+    RUNTIME_TRAINING_TIMEOUT_SECONDS,
+    TrainingRuntimeHandles,
+    TrainingRuntimeRequest,
+    TrainingRuntimeResult,
+    UnixTrainingRuntimeClient,
+)
 
 
 def _request() -> dict[str, object]:
@@ -149,3 +161,85 @@ def test_base_runtime_result_mapping_remains_fake() -> None:
         "classification",
         "error_code",
     }
+
+
+def test_real_client_has_explicit_process_ready_and_separate_training_deadline(
+    tmp_path: Path,
+) -> None:
+    token = "training-runtime-test-token-0123456789abcdef"
+    socket_parent = Path("/tmp") / f"deptslm-{uuid4().hex}"
+    socket_parent.mkdir(mode=0o700)
+    socket_path = socket_parent / "runtime.sock"
+    request_ids = {
+        key: uuid4()
+        for key in ("department", "execution", "attempt", "job", "publication", "namespace")
+    }
+    request = TrainingRuntimeRequest(
+        contract_version="phase14-training-execution-v1",
+        department_id=request_ids["department"],
+        execution_id=request_ids["execution"],
+        attempt_id=request_ids["attempt"],
+        training_job_id=request_ids["job"],
+        publication_attempt_id=request_ids["publication"],
+        authority_fingerprint="a" * 64,
+        input_snapshot_fingerprint="b" * 64,
+        profile_id="phase11-qwen3-0.6b-lora-v1",
+        base_model_id="Qwen/Qwen3-0.6B",
+        base_model_revision="c1899de289a04d12100db370d81485cdf75e47ca",
+        attempt_namespace=request_ids["namespace"],
+        runtime_contract_version="phase14-training-runtime-v1",
+        dependency_lock_sha256="c" * 64,
+        environment_profile_id="deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1",
+        expected_environment_fingerprint="d" * 64,
+        execution_code_revision="e" * 40,
+    )
+    directories = []
+    for index in range(4):
+        directory = tmp_path / f"cap-{index}"
+        directory.mkdir(mode=0o700)
+        directories.append(os.open(directory, os.O_RDONLY | os.O_DIRECTORY))
+
+    def handler(_value, _fds, _stop):
+        time.sleep(0.15)
+        return {
+            "department_id": str(request.department_id),
+            "execution_id": str(request.execution_id),
+            "attempt_id": str(request.attempt_id),
+            "training_job_id": str(request.training_job_id),
+            "authority_fingerprint": request.authority_fingerprint,
+            "input_snapshot_fingerprint": request.input_snapshot_fingerprint,
+            "runtime_fingerprint": "f" * 64,
+            "classification": "execution_succeeded",
+            "error_code": None,
+        }
+
+    server = TrainingRuntimeServer(socket_path, token, handler)
+    thread = threading.Thread(target=server.serve_once, daemon=True)
+    thread.start()
+    for _ in range(100):
+        if socket_path.exists():
+            break
+        time.sleep(0.01)
+    assert socket_path.exists()
+    try:
+        with pytest.raises(TrainingExecutionError, match="worker_timeout"):
+            UnixTrainingRuntimeClient(
+                str(socket_path),
+                token,
+                handshake_timeout_seconds=1.0,
+                training_timeout_seconds=0.03,
+                heartbeat_interval_seconds=0.01,
+            ).run(
+                request,
+                handles=TrainingRuntimeHandles(*directories),
+                should_stop=lambda: False,
+                heartbeat=lambda: None,
+            )
+    finally:
+        for descriptor in directories:
+            os.close(descriptor)
+        thread.join(2)
+        socket_path.unlink(missing_ok=True)
+        socket_parent.rmdir()
+    assert not thread.is_alive()
+    assert RUNTIME_TRAINING_TIMEOUT_SECONDS == 12 * 60 * 60

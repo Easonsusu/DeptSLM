@@ -28,6 +28,10 @@ from .contract import (
     canonical_json_bytes,
     request_mapping,
 )
+from .dependency_authority import (
+    DependencyAuthorityError,
+    verify_installed_distributions,
+)
 from .hardware import HardwarePreflightError, preflight_hardware
 from .model_store import ModelStoreError, validate_model_directory
 from .output_stage import inspect_output_stage
@@ -70,6 +74,16 @@ class TrainingRuntime:
             raise RuntimeSettingsError("runtime_dependency_mismatch") from error
         if lock_digest != self.dependency_lock_sha256:
             raise RuntimeSettingsError("runtime_dependency_mismatch")
+        try:
+            installed_fingerprint, installed_count = verify_installed_distributions()
+        except DependencyAuthorityError as error:
+            raise RuntimeSettingsError("runtime_dependency_mismatch") from error
+        if (
+            environment_contract.get("installed_distribution_manifest_sha256")
+            != installed_fingerprint
+            or environment_contract.get("installed_distribution_count") != installed_count
+        ):
+            raise RuntimeSettingsError("runtime_dependency_mismatch")
         if os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN"):
             raise RuntimeSettingsError("runtime_environment_invalid")
         if os.getenv("DATABASE_URL") or os.getenv("DEPTSLM_DATA_DIR"):
@@ -79,7 +93,7 @@ class TrainingRuntime:
         self,
         request_value: dict[str, object],
         fds: tuple[int, int, int, int],
-        disconnected: Callable[[], bool],
+        disconnected: Callable[[], object],
     ) -> dict[str, object]:
         input_fd, scratch_fd, logs_fd, output_fd = fds
         try:
@@ -109,8 +123,9 @@ class TrainingRuntime:
                 model_path=str(self.model_path),
             )
             try:
-                if disconnected():
-                    return _failure(request, "runtime_disconnected")
+                stop_reason = disconnected()
+                if stop_reason:
+                    return _failure(request, _stop_code(stop_reason))
                 supervisor = TrainingProcessSupervisor()
                 result = supervisor.run(
                     config_fd=rematerialized.config_fd,
@@ -179,6 +194,17 @@ def _required_token() -> str:
     return token
 
 
+def _stop_code(value: object) -> str:
+    if isinstance(value, str) and value in {
+        "cancelled",
+        "claim_lost",
+        "worker_shutdown",
+        "worker_timeout",
+    }:
+        return value
+    return "runtime_disconnected"
+
+
 def _environment_contract() -> tuple[str, dict[str, object]]:
     path = Path(
         os.getenv(
@@ -195,6 +221,10 @@ def _environment_contract() -> tuple[str, dict[str, object]]:
         "environment_profile_id": "deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1",
         "python_version": "3.12",
         "llamafactory_version": "0.9.5",
+        "installed_distribution_manifest_sha256": (
+            "25ada56ca10b1a62367355e2ecb04af771c390e4de8562a548b21a694b164f96"
+        ),
+        "installed_distribution_count": 127,
         "supported_os": "Linux",
         "supported_architecture": "x86_64",
         "expected_cuda_runtime_family": "12.6",
@@ -206,7 +236,7 @@ def _environment_contract() -> tuple[str, dict[str, object]]:
     }
     if not isinstance(value, dict) or any(value.get(key) != item for key, item in expected.items()):
         raise RuntimeSettingsError("runtime_dependency_mismatch")
-    if not isinstance(value.get("dependency_lock_sha256"), str) or len(value) != 9:
+    if not isinstance(value.get("dependency_lock_sha256"), str) or len(value) != 11:
         raise RuntimeSettingsError("runtime_dependency_mismatch")
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest(), value
 
@@ -430,7 +460,7 @@ def _failure(request: dict[str, object], code: str) -> dict[str, object]:
         "hardware_fingerprint": None,
         "runtime_fingerprint": "0" * 64,
         "classification": "execution_cancelled"
-        if code in {"cancelled", "claim_lost", "runtime_disconnected"}
+        if code in {"cancelled", "claim_lost", "worker_shutdown", "runtime_disconnected"}
         else "execution_failed",
         "error_code": code if code in SAFE_ERROR_CODES else "runtime_protocol_invalid",
         "output_stage_fingerprint": None,

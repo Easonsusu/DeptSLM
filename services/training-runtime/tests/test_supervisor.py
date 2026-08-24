@@ -59,7 +59,7 @@ def _run(
     *,
     stop=lambda: False,
     startup: float = 2.0,
-    wall: float = 2.0,
+    wall: float = 5.0,
     term_grace: float = 0.2,
     kill_reap: float = 2.0,
 ):
@@ -119,7 +119,7 @@ def test_cancellation_and_wall_timeout_reap_the_child(tmp_path: Path) -> None:
 def test_sigterm_ignored_uses_bounded_sigkill_and_reaps_grandchild(tmp_path: Path) -> None:
     marker = tmp_path / "grandchild.pid"
     child = _child(tmp_path / "grandchild", "grandchild", marker)
-    result = _run(child, tmp_path / "grandchild-root", wall=1.0)
+    result = _run(child, tmp_path / "grandchild-root", wall=10.0)
     assert result.error_code == "child_timeout"
     for _ in range(40):
         if marker.exists():
@@ -134,6 +134,26 @@ def test_sigterm_ignored_uses_bounded_sigkill_and_reaps_grandchild(tmp_path: Pat
             return
         time.sleep(0.025)
     pytest.fail("grandchild process survived process-group termination")
+
+
+def test_slow_start_is_not_rejected_by_the_legacy_startup_interval(tmp_path: Path) -> None:
+    child = _child(tmp_path / "slow-start", "hang")
+    calls = 0
+
+    def stop() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls > 4
+
+    result = _run(
+        child,
+        tmp_path / "slow-start-root",
+        startup=0.01,
+        wall=5.0,
+        stop=stop,
+    )
+    assert result.classification == "execution_cancelled"
+    assert result.error_code == "claim_lost"
 
 
 def test_log_flood_is_bounded_and_test_executable_is_not_production_selectable(

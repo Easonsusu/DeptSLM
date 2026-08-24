@@ -12,7 +12,7 @@ def main() -> int:
     socket_path = Path(
         os.getenv("DEPTSLM_TRAINING_RUNTIME_SOCKET", "/run/deptslm/training-runtime.sock")
     )
-    TrainingRuntimeServer(socket_path, runtime.token, runtime.handle).serve_once()
+    TrainingRuntimeServer(socket_path, runtime.token, runtime.handle).serve_forever()
     return 0
 
 

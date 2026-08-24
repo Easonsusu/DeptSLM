@@ -56,14 +56,20 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 
 > **Phase 14 status:** Phase 14.0 and Phase 14.1 are complete. Phase 14.2
 > adds the first reviewed real-training runtime behind the opt-in `training`
-> Compose profile: an exact LlamaFactory 0.9.5 lock, pinned Qwen3 cache,
+> Compose profile: an exact LlamaFactory 0.9.5 lock (SHA-256
+> `22e92e62895cdddc49ba6ab3545d2134dd6dbfb44616646b72cb09caa19cc5a5`), pinned
+> Qwen3 cache, and CUDA 12.6 base digest
+> `sha256:8aef630a54bc5c5146ae5ce68e6af5caa3df0fb690bb91544175c91f307e4356`,
 > offline Linux/NVIDIA/BF16 and NF4 preflight, private HMAC-authenticated Unix
 > SCM_RIGHTS transfer of one exact attempt, server-owned config
 > rematerialization, fixed process-group supervision, and sealed private
 > output-stage evidence. A real success may create candidate adapter bytes in
 > private staging, but it creates no authoritative or published adapter and
 > does not hand output to Phase 12. Normal CI remains model-free and downloads
-> no model weights. Phase 14.3 and Phase 15 remain unstarted. See [the training
+> no model weights. The runtime acknowledges `process_ready` within 120 seconds,
+> then allows a 12-hour active training/result wall clock; closed cancellation,
+> claim-loss, shutdown, and timeout reasons stop the child safely. Phase 14.3
+> and Phase 15 remain unstarted. See [the training
 > execution contract](docs/training-execution.md).
 
 The governance worker is deliberately narrower than the API: its dedicated
