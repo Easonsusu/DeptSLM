@@ -14,7 +14,7 @@ import pytest
 from alembic.config import Config
 from sqlalchemy import event, inspect, select, text
 from sqlalchemy.orm import sessionmaker
-from test_phase11_postgres import _succeeded_training_job
+from test_phase11_postgres import _succeeded_training_job, _unique_code_revision
 
 from alembic import command
 from app.auth import AuthenticatedPrincipal
@@ -404,6 +404,7 @@ def _approved_execution(
     with factory.begin() as session:
         job = session.get(TrainingJob, job_id)
         assert job is not None
+        execution_code_revision = _unique_code_revision()
         execution = enqueue_training_execution(
             session,
             principal,
@@ -412,7 +413,7 @@ def _approved_execution(
                 training_job_id=job.id,
                 expected_training_job_version=job.version,
             ),
-            execution_code_revision="b" * 40,
+            execution_code_revision=execution_code_revision,
         )
         execution_id = execution.id
     with factory() as session:
@@ -441,7 +442,7 @@ def test_phase14_1_captures_immutable_authority_and_enforces_active_uniqueness(
                     training_job_id=job.id,
                     expected_training_job_version=job.version,
                 ),
-                execution_code_revision="b" * 40,
+                execution_code_revision=execution.execution_code_revision,
             )
 
 
