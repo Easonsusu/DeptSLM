@@ -13,7 +13,7 @@ jobs:
     name: Repository artifact policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Reject forbidden tracked artifacts
         shell: bash
         run: |
@@ -65,18 +65,32 @@ jobs:
     name: Web type-check and build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11.7.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @deptslm/web typecheck
       - run: pnpm --filter @deptslm/web test
-      - run: pnpm --filter @deptslm/web build
+      - name: Build web with a non-production bearer sentinel
+        env:
+          DEPTSLM_WEB_DEV_BEARER_TOKEN: ci-browser-only-bearer-sentinel
+        run: pnpm --filter @deptslm/web build
+      - name: Verify the server-only bearer never enters browser assets
+        shell: bash
+        env:
+          DEPTSLM_WEB_DEV_BEARER_TOKEN: ci-browser-only-bearer-sentinel
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${DEPTSLM_WEB_DEV_BEARER_TOKEN}"
+          if rg --binary-files=without-match --fixed-strings "${DEPTSLM_WEB_DEV_BEARER_TOKEN}" apps/web/.next/static >/dev/null 2>&1; then
+            echo "The server-only development bearer appeared in browser assets." >&2
+            exit 1
+          fi
       - name: Verify web checks leave the checkout clean
         shell: bash
         run: |
@@ -92,10 +106,10 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
         env:
           POSTGRES_DB: deptslm_test
-          POSTGRES_PASSWORD: deptslm
+          POSTGRES_PASSWORD: ci-only-postgres-password-2026
           POSTGRES_USER: deptslm
         ports:
           - 5432:5432
@@ -105,36 +119,48 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       qdrant:
-        image: qdrant/qdrant:v1.13.4
+        image: qdrant/qdrant:v1.16.3@sha256:0425e3e03e7fd9b3dc95c4214546afe19de2eb2e28ca621441a56663ac6e1f46
         env:
           QDRANT__SERVICE__API_KEY: phase6-ci-qdrant-key-0123456789
         ports:
           - 6333:6333
     env:
-      DATABASE_URL: postgresql+psycopg://deptslm:deptslm@localhost:5432/deptslm_test
-      DATABASE_TEST_URL: postgresql+psycopg://deptslm:deptslm@localhost:5432/deptslm_test
+      DEPTSLM_POSTGRES_PASSWORD: ci-only-postgres-password-2026
+      DATABASE_URL: postgresql+psycopg://deptslm:ci-only-postgres-password-2026@localhost:5432/deptslm_test
+      DATABASE_TEST_URL: postgresql+psycopg://deptslm:ci-only-postgres-password-2026@localhost:5432/deptslm_test
       DEPTSLM_REQUIRE_POSTGRES_TESTS: "1"
       DEPTSLM_REQUIRE_QDRANT_TESTS: "1"
       DEPTSLM_TEST_QDRANT_URL: http://localhost:6333
       DEPTSLM_TEST_QDRANT_API_KEY: phase6-ci-qdrant-key-0123456789
       DEPTSLM_TEST_QDRANT_ISOLATED: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: |
             apps/api/requirements.txt
             apps/api/requirements-dev.txt
+            apps/api/requirements.lock
+            apps/api/requirements-ci.in
+            apps/api/requirements-ci.lock
+            apps/api/requirements-worker.in
+            apps/api/requirements-worker.lock
+            services/rag-worker/requirements-*.in
+            services/rag-worker/requirements-*.lock
             services/rag-worker/pyproject.toml
             services/rag-runtime/pyproject.toml
             services/adapter-runtime/pyproject.toml
             services/training-runtime/requirements.lock
             services/training-runtime/requirements-test.txt
+            services/training-runtime/requirements-test.lock
             services/training-runtime/pyproject.toml
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -r requirements-dev.txt
+      - run: python -m pip install --require-hashes -r requirements-ci.lock
+        working-directory: apps/api
+      - run: python -m pip install --no-deps .
+        working-directory: apps/api
+      - run: python -m pip install --no-deps ../../services/rag-worker
         working-directory: apps/api
       - name: Check Python dependency consistency
         working-directory: apps/api
@@ -167,7 +193,7 @@ jobs:
       - name: Run pinned training-runtime protocol and supervision tests
         working-directory: services/training-runtime
         run: |
-          python -m pip install --requirement requirements-test.txt
+          python -m pip install --require-hashes --requirement requirements-test.lock
           python -m pytest -q tests
       - name: Run one-shot worker smoke test
         working-directory: apps/api
@@ -362,7 +388,7 @@ jobs:
     name: Infrastructure static checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Check shell syntax
         run: |
           bash -n scripts/setup_google_drive_storage.sh
@@ -719,7 +745,7 @@ jobs:
             exit 1
           fi
           # setuptools' distutils-precedence.pth is packaging metadata, not a model weight.
-          weight_matches="$(docker run --rm --entrypoint sh deptslm-training-runtime-ci -c 'find /opt/llamafactory -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) ! -path \"*/site-packages/distutils-precedence.pth\" -print 2>/dev/null || true')"
+          weight_matches="$(docker run --rm --entrypoint sh deptslm-training-runtime-ci -c 'find /opt/llamafactory -type f \( -name "*.safetensors" -o -name "*.bin" -o -name "*.gguf" -o -name "*.pt" -o -name "*.pth" \) ! -name "distutils-precedence.pth" -print 2>/dev/null || true')"
           if [[ -n "$weight_matches" ]]; then
             printf 'Model-weight-like files unexpectedly present in training runtime image:\n%s\n' "$weight_matches" >&2
             exit 1
@@ -983,10 +1009,10 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
         env:
           POSTGRES_DB: deptslm_test
-          POSTGRES_PASSWORD: deptslm
+          POSTGRES_PASSWORD: ci-only-postgres-password-2026
           POSTGRES_USER: deptslm
         ports:
           - 5432:5432
@@ -996,26 +1022,33 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       qdrant:
-        image: qdrant/qdrant:v1.13.4
+        image: qdrant/qdrant:v1.16.3@sha256:0425e3e03e7fd9b3dc95c4214546afe19de2eb2e28ca621441a56663ac6e1f46
         env:
           QDRANT__SERVICE__API_KEY: phase13-ci-qdrant-key-0123456789
         ports:
           - 6333:6333
     env:
-      DATABASE_URL: postgresql+psycopg://deptslm:deptslm@localhost:5432/deptslm_test
-      DATABASE_TEST_URL: postgresql+psycopg://deptslm:deptslm@localhost:5432/deptslm_test
+      DEPTSLM_POSTGRES_PASSWORD: ci-only-postgres-password-2026
+      DATABASE_URL: postgresql+psycopg://deptslm:ci-only-postgres-password-2026@localhost:5432/deptslm_test
+      DATABASE_TEST_URL: postgresql+psycopg://deptslm:ci-only-postgres-password-2026@localhost:5432/deptslm_test
       DEPTSLM_REQUIRE_POSTGRES_TESTS: "1"
       DEPTSLM_REQUIRE_QDRANT_TESTS: "1"
       DEPTSLM_TEST_QDRANT_URL: http://localhost:6333
       DEPTSLM_TEST_QDRANT_API_KEY: phase13-ci-qdrant-key-0123456789
       DEPTSLM_TEST_QDRANT_ISOLATED: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: apps/api/requirements-dev.txt
+          cache-dependency-path: |
+            apps/api/requirements-ci.in
+            apps/api/requirements-ci.lock
+            apps/api/requirements-worker.in
+            apps/api/requirements-worker.lock
+            services/rag-worker/requirements-*.in
+            services/rag-worker/requirements-*.lock
       - name: Verify Phase 14.2 runtime scope and migration head
         shell: bash
         run: |
@@ -1037,8 +1070,9 @@ jobs:
       - name: Run Phase 13 transport and route-surface tests
         working-directory: apps/api
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
+          python -m pip install --require-hashes -r requirements-ci.lock
+          python -m pip install --no-deps .
+          python -m pip install --no-deps ../../services/rag-worker
           export DEPTSLM_DATA_DIR="$RUNNER_TEMP/deptslm-phase13-data"
           mkdir -p "$DEPTSLM_DATA_DIR"/{uploads,extracted_text,vector_snapshots,training_datasets,adapters,model_cache,eval_results,logs,exports}
           mkdir -p "$DEPTSLM_DATA_DIR"/service_state/{postgres,qdrant}

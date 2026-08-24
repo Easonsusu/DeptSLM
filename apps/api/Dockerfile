@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -12,8 +12,8 @@ RUN addgroup --system --gid 1001 deptslm \
     && touch /app/deptslm_worker/__init__.py \
     && chown -R deptslm:deptslm /runtime/deptslm
 
-COPY apps/api/requirements.txt ./
-RUN pip install --no-cache-dir --disable-pip-version-check -r requirements.txt
+COPY apps/api/requirements.lock ./requirements.lock
+RUN pip install --no-cache-dir --disable-pip-version-check --require-hashes -r requirements.lock
 
 COPY --chown=deptslm:deptslm apps/api/app ./app
 COPY --chown=deptslm:deptslm apps/api/alembic.ini ./alembic.ini

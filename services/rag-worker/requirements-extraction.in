@@ -1,0 +1,4 @@
+# External dependencies for the extraction worker image. The local API and
+# worker packages are installed separately with --no-deps.
+-r ../../apps/api/requirements-worker.lock
+pypdf>=6.14.2,<7.0.0

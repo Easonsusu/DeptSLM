@@ -2,7 +2,14 @@
 
 ## Fixed collection
 
-Phase 6 pins Qdrant server `1.13.4` and qdrant-client `1.13.3`. The only collection is `deptslm_chunks_qwen3_0_6b_1024_v1`. Its vector configuration must be a named-vector mapping whose key set is exactly `{dense}`; `dense` is size 1024 with cosine distance. Unnamed vectors, missing or renamed `dense`, extra named vectors, wrong dimensions, and wrong distance all fail closed. Collection names are constants and are never accepted from an API or client.
+Phase 6 pins Qdrant server `1.16.3` by image digest and constrains
+qdrant-client to `>=1.16.2,<1.17.0`. The only collection is
+`deptslm_chunks_qwen3_0_6b_1024_v1`. Its vector configuration must be a
+named-vector mapping whose key set is exactly `{dense}`; `dense` is size 1024
+with cosine distance. Unnamed vectors, missing or renamed `dense`, extra named
+vectors, wrong dimensions, and wrong distance all fail closed. Collection names
+are constants and are never accepted from an API or client. Qdrant's local
+development ports bind only to `127.0.0.1`, and the API key remains required.
 
 Ordinary workers verify but never create, delete, or repair collection schema. Bootstrap is explicit and idempotent:
 

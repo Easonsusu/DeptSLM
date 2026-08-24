@@ -1,0 +1,13 @@
+# External packages used by the API, worker, and Qdrant/vector CI checks.
+# Local projects are installed separately with --no-deps after this file is
+# locked; their maintainable dependency declarations remain in pyproject.toml.
+-r requirements.lock
+httpx>=0.28.0,<1.0.0
+huggingface-hub>=0.30.0,<1.0.0
+pypdf>=6.14.2,<7.0.0
+pytest>=9.0.3,<10.0.0
+ruff>=0.11.0,<1.0.0
+safetensors==0.7.0
+sentence-transformers>=5.0.0,<6.0.0
+torch==2.7.1
+transformers==4.55.0

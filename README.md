@@ -216,13 +216,16 @@ Prerequisites for the complete local stack are Git, Docker Desktop with Docker C
 
    The script is safe to run repeatedly. Copy the printed `DEPTSLM_DATA_DIR` value.
 
-3. Create a local environment file and replace the example storage path with the value printed by the script:
+3. Create a local environment file with fresh development secrets. The
+   bootstrap command refuses to overwrite an existing `.env`:
 
    ```bash
-   umask 077
-   cp .env.example .env
-   chmod 600 .env
+   DEPTSLM_DATA_DIR="/absolute/path/printed/by/setup" ./scripts/bootstrap_local_env.sh
    ```
+
+   For manual setup, copy `.env.example`, set a long random
+   `DEPTSLM_POSTGRES_PASSWORD`, replace `DEPTSLM_DATA_DIR`, and keep `.env`
+   mode `600`. Never commit `.env`.
 
    Never commit `.env`.
 
@@ -243,7 +246,7 @@ Prerequisites for the complete local stack are Git, Docker Desktop with Docker C
    curl http://localhost:8000/version
    ```
 
-   Protected identity checks additionally require the development/test authentication variables documented in [.env.example](.env.example). Compose passes those variables only to the API container; the generated secret remains only in the untracked `.env`. The Compose migration command uses the internal `postgres` hostname. Host-shell Alembic commands must override `DATABASE_URL` with a host-accessible `localhost` URL. HS256 is allowed only with an explicit reviewed local environment and a non-placeholder secret of at least 32 bytes.
+   Protected identity checks additionally require the development/test authentication variables documented in [.env.example](.env.example). Compose passes the API auth secret only to the API container; the generated PostgreSQL password is used by Compose to derive its internal `DATABASE_URL`. The optional `DEPTSLM_WEB_DEV_BEARER_TOKEN` is server-only Next middleware configuration and is fail-closed outside local/development/test. The Compose migration command uses the internal `postgres` hostname. Host-shell Alembic commands must construct a temporary `localhost` URL from the same untracked PostgreSQL secret. HS256 is allowed only with an explicit reviewed local environment and a non-placeholder secret of at least 32 bytes.
 
    Bootstrap the first local department only after migration:
 

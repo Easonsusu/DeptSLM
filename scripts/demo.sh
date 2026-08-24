@@ -39,6 +39,7 @@ random_value() {
 }
 
 auth_secret=$(random_value)
+postgres_password=$(random_value)
 qdrant_key=$(random_value)
 rag_token=$(random_value)
 adapter_token=$(random_value)
@@ -54,7 +55,7 @@ cat >"${env_file}" <<EOF
 DEPTSLM_DATA_DIR=${runtime_root}
 DEPTSLM_DEMO_UID=$(id -u)
 DEPTSLM_DEMO_GID=$(id -g)
-DATABASE_URL=postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm
+DEPTSLM_POSTGRES_PASSWORD=${postgres_password}
 ENVIRONMENT=test
 API_PORT=${api_port}
 WEB_PORT=${web_port}

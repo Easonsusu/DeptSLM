@@ -31,7 +31,7 @@ python -m alembic upgrade head
 python -m pytest -m postgres
 ```
 
-Never run migration-cycle tests against shared or production data. Non-database tests remain runnable with `python -m pytest -m "not postgres and not qdrant"`. Qdrant integration tests require a disposable Qdrant 1.13.4 service plus `DEPTSLM_TEST_QDRANT_URL`, `DEPTSLM_TEST_QDRANT_API_KEY`, `DEPTSLM_TEST_QDRANT_ISOLATED=1`, and `DEPTSLM_REQUIRE_QDRANT_TESTS=1`; CI must not silently skip either PostgreSQL or Qdrant tests.
+Never run migration-cycle tests against shared or production data. Non-database tests remain runnable with `python -m pytest -m "not postgres and not qdrant"`. Qdrant integration tests require a disposable Qdrant 1.16.3 service plus `DEPTSLM_TEST_QDRANT_URL`, `DEPTSLM_TEST_QDRANT_API_KEY`, `DEPTSLM_TEST_QDRANT_ISOLATED=1`, and `DEPTSLM_REQUIRE_QDRANT_TESTS=1`; CI must not silently skip either PostgreSQL or Qdrant tests.
 
 For the Compose-managed database, use the image-contained migration path:
 

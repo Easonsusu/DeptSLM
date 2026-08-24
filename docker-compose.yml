@@ -3,6 +3,7 @@ name: deptslm
 # Local-development stack. Use scripts/compose.sh so the host path is verified
 # as absolute, existing, and outside this repository before Compose runs.
 x-deptslm-wrapper-required: "${DEPTSLM_COMPOSE_WRAPPER:?Run ./scripts/compose.sh instead of invoking docker compose directly}"
+x-deptslm-database-url: &deptslm-database-url "postgresql+psycopg://deptslm:${DEPTSLM_POSTGRES_PASSWORD:?Set DEPTSLM_POSTGRES_PASSWORD in the untracked .env file}@postgres:5432/deptslm"
 
 services:
   web:
@@ -12,6 +13,7 @@ services:
     environment:
       API_URL: "http://api:8000"
       ENVIRONMENT: "${ENVIRONMENT:-development}"
+      DEPTSLM_WEB_DEV_BEARER_TOKEN: "${DEPTSLM_WEB_DEV_BEARER_TOKEN:-}"
       PORT: "3000"
     ports:
       - "127.0.0.1:${WEB_PORT:-3000}:3000"
@@ -34,7 +36,7 @@ services:
       dockerfile: apps/api/Dockerfile
     environment:
       API_PORT: "${API_PORT:-8000}"
-      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DATABASE_URL: *deptslm-database-url
       DEPTSLM_AUTH_MODE: "${DEPTSLM_AUTH_MODE:-disabled}"
       DEPTSLM_AUTH_ISSUER: "${DEPTSLM_AUTH_ISSUER:-}"
       DEPTSLM_AUTH_AUDIENCE: "${DEPTSLM_AUTH_AUDIENCE:-}"
@@ -97,10 +99,10 @@ services:
       - adapter-prod-internal
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     environment:
       POSTGRES_DB: deptslm
-      POSTGRES_PASSWORD: deptslm
+      POSTGRES_PASSWORD: "${DEPTSLM_POSTGRES_PASSWORD:?Set DEPTSLM_POSTGRES_PASSWORD in the untracked .env file}"
       POSTGRES_USER: deptslm
     ports:
       - "127.0.0.1:5432:5432"
@@ -119,7 +121,7 @@ services:
       - postgres-internal
 
   qdrant:
-    image: qdrant/qdrant:v1.13.4
+    image: qdrant/qdrant:v1.16.3@sha256:0425e3e03e7fd9b3dc95c4214546afe19de2eb2e28ca621441a56663ac6e1f46
     environment:
       QDRANT__SERVICE__API_KEY: "${DEPTSLM_QDRANT_API_KEY:?Set a non-placeholder Qdrant API key in the untracked .env file}"
     ports:
@@ -140,7 +142,7 @@ services:
       dockerfile: services/rag-worker/Dockerfile
       target: extraction
     environment:
-      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DATABASE_URL: *deptslm-database-url
       DEPTSLM_DATA_DIR: /runtime/deptslm
       DEPTSLM_EXTRACTION_TIMEOUT_SECONDS: "${DEPTSLM_EXTRACTION_TIMEOUT_SECONDS:-120}"
       DEPTSLM_MAX_EXTRACTED_BYTES: "${DEPTSLM_MAX_EXTRACTED_BYTES:-104857600}"
@@ -182,7 +184,7 @@ services:
       target: indexing
     command: ["python", "-m", "deptslm_worker.indexer", "--poll"]
     environment:
-      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DATABASE_URL: *deptslm-database-url
       DEPTSLM_DATA_DIR: /runtime/deptslm
       DEPTSLM_QDRANT_URL: "${DEPTSLM_QDRANT_URL:-http://qdrant:6333}"
       DEPTSLM_QDRANT_API_KEY: "${DEPTSLM_QDRANT_API_KEY:?Set a non-placeholder Qdrant API key in the untracked .env file}"
@@ -230,7 +232,7 @@ services:
       target: evaluator
     command: ["python", "-m", "deptslm_worker.evaluator", "--poll"]
     environment:
-      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DATABASE_URL: *deptslm-database-url
       DEPTSLM_DATA_DIR: /runtime/deptslm
       DEPTSLM_STORAGE_READ_ONLY: "1"
       DEPTSLM_QDRANT_URL: "${DEPTSLM_QDRANT_URL:-http://qdrant:6333}"
@@ -314,7 +316,7 @@ services:
       target: adapter-evaluator
     command: ["python", "-m", "deptslm_worker.adapter_evaluator", "--poll"]
     environment:
-      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DATABASE_URL: *deptslm-database-url
       DEPTSLM_DATA_DIR: /runtime/deptslm
       DEPTSLM_STORAGE_READ_ONLY: "1"
       DEPTSLM_QDRANT_URL: "${DEPTSLM_QDRANT_URL:-http://qdrant:6333}"
@@ -494,7 +496,7 @@ services:
       context: .
       dockerfile: services/training-worker/Dockerfile
     environment:
-      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DATABASE_URL: *deptslm-database-url
       DEPTSLM_DATA_DIR: /runtime/deptslm
       DEPTSLM_SFT_WORKER_ID: "${DEPTSLM_SFT_WORKER_ID:-00000000-0000-0000-0000-000000000010}"
       DEPTSLM_SFT_CODE_REVISION: "${DEPTSLM_SFT_CODE_REVISION:?Set the exact lowercase 40-character code revision}"
@@ -523,7 +525,7 @@ services:
       context: .
       dockerfile: services/training-job-worker/Dockerfile
     environment:
-      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DATABASE_URL: *deptslm-database-url
       DEPTSLM_DATA_DIR: /runtime/deptslm
       DEPTSLM_TRAINING_JOB_WORKER_ID: "${DEPTSLM_TRAINING_JOB_WORKER_ID:-00000000-0000-0000-0000-000000000011}"
       DEPTSLM_TRAINING_JOB_CODE_REVISION: "${DEPTSLM_TRAINING_JOB_CODE_REVISION:?Set the exact lowercase 40-character code revision}"
@@ -554,7 +556,7 @@ services:
       context: .
       dockerfile: services/training-execution-worker/Dockerfile
     environment:
-      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DATABASE_URL: *deptslm-database-url
       DEPTSLM_DATA_DIR: /runtime/deptslm
       DEPTSLM_TRAINING_EXECUTION_CODE_REVISION: "${DEPTSLM_TRAINING_EXECUTION_CODE_REVISION:?Set the exact lowercase 40-character code revision}"
       DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256: "${DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256:?Set the reviewed training-runtime lock SHA-256}"
@@ -627,7 +629,7 @@ services:
       context: .
       dockerfile: services/adapter-registry-worker/Dockerfile
     environment:
-      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DATABASE_URL: *deptslm-database-url
       DEPTSLM_DATA_DIR: /runtime/deptslm
       DEPTSLM_ADAPTER_REGISTRY_WORKER_ID: "${DEPTSLM_ADAPTER_REGISTRY_WORKER_ID:-00000000-0000-0000-0000-000000000012}"
       DEPTSLM_ADAPTER_REGISTRY_POLL_SECONDS: "${DEPTSLM_ADAPTER_REGISTRY_POLL_SECONDS:-5}"
@@ -673,7 +675,7 @@ services:
       context: .
       dockerfile: services/adapter-governance-worker/Dockerfile
     environment:
-      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DATABASE_URL: *deptslm-database-url
       DEPTSLM_DATA_DIR: /runtime/deptslm
       DEPTSLM_STORAGE_READ_ONLY: "1"
       DEPTSLM_ADAPTER_GOVERNANCE_WORKER_ID: "${DEPTSLM_ADAPTER_GOVERNANCE_WORKER_ID:-00000000-0000-0000-0000-000000000014}"
@@ -701,7 +703,7 @@ services:
       context: .
       dockerfile: services/adapter-maintenance/Dockerfile
     environment:
-      DATABASE_URL: "${DATABASE_URL:-postgresql+psycopg://deptslm:deptslm@postgres:5432/deptslm}"
+      DATABASE_URL: *deptslm-database-url
       DEPTSLM_DATA_DIR: /runtime/deptslm
       DEPTSLM_ADAPTER_RECONCILIATION_MIN_AGE_SECONDS: "${DEPTSLM_ADAPTER_RECONCILIATION_MIN_AGE_SECONDS:-3600}"
       DEPTSLM_ADAPTER_PURGE_MAX_OPERATIONS: "${DEPTSLM_ADAPTER_PURGE_MAX_OPERATIONS:-1}"

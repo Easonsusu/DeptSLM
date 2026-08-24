@@ -16,7 +16,6 @@ RUN apt-get update \
     && apt-get install --no-install-recommends -y python3.12 python3.12-venv python3-pip ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && python3.12 -m venv /opt/llamafactory \
-    && /opt/llamafactory/bin/python -m pip install --no-cache-dir --upgrade pip \
     && addgroup --system --gid 1001 deptslm \
     && adduser --system --uid 1001 --ingroup deptslm deptslm \
     && mkdir -p /run/deptslm /runtime/deptslm/model_cache \

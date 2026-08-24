@@ -9,6 +9,71 @@ deployment, provide a formal proof, or add an identity provider, TLS
 termination, rate limiting, secret rotation, backups, high availability,
 malware scanning, OCR, or trusted training execution.
 
+## 2026 hardening pass
+
+The current hardening branch keeps the Phase 14.2 contracts unchanged while
+reducing dependency and local-configuration exposure:
+
+- Qdrant is pinned to server `1.16.3` by image digest and the Python client is
+  constrained to `>=1.16.2,<1.17.0`. This is above the `1.15.6` fix for
+  [GHSA-f632-vm87-2m2f](https://github.com/advisories/GHSA-f632-vm87-2m2f).
+  `DepartmentQdrant`, its typed `DepartmentScope`, fixed collection contract,
+  API key, and loopback-only development ports remain in force.
+- Next is locked at the latest resolved `15.5.x` patch at the time of this
+  pass (`15.5.23`, with `package.json` requiring at least `15.5.21`). CI and
+  container builds use frozen lockfile installation. The workspace lock uses
+  exact patched overrides for `sharp` `0.35.3`, `postcss` `8.5.26`, and
+  `nanoid` `3.3.18`; `pnpm audit --audit-level high` reports no known
+  vulnerabilities for the final tree.
+- Compose requires `DEPTSLM_POSTGRES_PASSWORD` and derives every internal
+  `DATABASE_URL` from that same untracked value. The PostgreSQL development
+  port, when enabled, binds only to `127.0.0.1`.
+- `DEPTSLM_WEB_DEV_BEARER_TOKEN` is a server-only Next middleware bridge for
+  `local`, `development`, and `test`. It is never a `NEXT_PUBLIC_*` value,
+  browser storage value, page value, log value, or replacement for FastAPI
+  authentication. Unknown and production-like environments fail closed.
+- Production Python images install committed exact lockfiles with hashes where
+  practical; the CUDA training image retains its reviewed exact platform lock
+  and does not perform a mutable pip self-upgrade.
+  Node uses `pnpm-lock.yaml` as the authoritative frozen lock. Dependabot,
+  full-history secret scanning, dependency auditing, and high/critical
+  filesystem scanning run through separate low-noise security automation.
+
+### Model-runtime residual exposure
+
+Transformers remains pinned at `4.55.0` in the reviewed model runtimes. The
+current authoritative advisory
+[GHSA-29pf-2h5f-8g72](https://github.com/advisories/GHSA-29pf-2h5f-8g72)
+affects versions below its `5.3.0` fix and therefore includes `4.55.0` in
+general. The relevant exploit requires a runtime to accept attacker-controlled
+model/config inputs. DeptSLM closes that caller-controlled path with fixed
+model IDs and immutable revisions, descriptor-verified model directories,
+no symlink or hard-link substitution, `local_files_only=True`,
+`trust_remote_code=False`, safetensors-only loading, offline environment
+variables, and no arbitrary CLI, shell, callback, resume path, or hub token.
+
+The pinned model stack also produces exact `pip-audit` associations for the
+Transformers conversion/deserialization rows `PYSEC-2025-213` through
+`PYSEC-2025-218` (`CVE-2025-14924`, `CVE-2025-14926` through
+`CVE-2025-14930`) and `PYSEC-2026-2289` (`CVE-2026-4372`). The current
+PyTorch `2.7.1` stack produces `PYSEC-2025-203`, `PYSEC-2025-204`,
+`PYSEC-2025-206`, `PYSEC-2026-139`, `PYSEC-2026-1970`, `PYSEC-2026-2286`,
+`GHSA-vgrw-7cvw-pwgx`, `GHSA-rrmf-rvhw-rf47`, and
+`GHSA-qfhq-4f3w-5fph`; several are local-only or function/version-specific,
+but they remain visible in the uploaded audit reports. No compatible upgrade
+was accepted for the reviewed LlamaFactory `0.9.5`, PEFT `0.18.1`, Qwen3,
+CUDA, and Phase 14.2 runtime contract during this pass. Python audits remain
+reporting evidence for these exact model-runtime locks, while the filesystem
+gate hard-fails applicable high/critical findings outside the exact model
+runtime directories and mixed `apps/api/requirements-ci.lock` exception used
+by that scan (the vector-worker lock is likewise excluded as the exact
+model-bearing worker lock). This is a narrow documented residual, not a
+blanket ignore.
+
+A malicious model cache, malicious administrator-provided model bytes, or a
+compromised host remains a residual exposure and must be resolved before a
+future runtime phase accepts a compatible patched model stack.
+
 ## Protected assets
 
 Authentication secrets, Qdrant keys, internal runtime tokens, PostgreSQL

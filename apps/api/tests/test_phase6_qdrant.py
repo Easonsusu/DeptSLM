@@ -1,4 +1,4 @@
-"""Qdrant 1.13.4 integration coverage for Phase 6 tenant isolation."""
+"""Qdrant 1.16.3 integration coverage for Phase 6 tenant isolation."""
 
 from __future__ import annotations
 
