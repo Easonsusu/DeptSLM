@@ -753,7 +753,11 @@ jobs:
           export DEPTSLM_TRAINING_JOB_CODE_REVISION="7777777777777777777777777777777777777777"
           export DEPTSLM_ADAPTER_REGISTRY_CODE_REVISION="6666666666666666666666666666666666666666"
           mkdir -p "$DEPTSLM_DATA_DIR"/{uploads,extracted_text,vector_snapshots,training_datasets,adapters,model_cache,eval_results,logs,exports,training_runs}
-          mkdir -p "$DEPTSLM_DATA_DIR/training_datasets/jobs" "$DEPTSLM_DATA_DIR/service_state"/{postgres,qdrant}
+          mkdir -p "$DEPTSLM_DATA_DIR/training_datasets/jobs"
+          mkdir -p "$DEPTSLM_DATA_DIR"/adapters/{imports,registry,.staging/imports,.staging/registry}
+          mkdir -p "$DEPTSLM_DATA_DIR"/adapters/.deleting/{source_stage,source_final,registry_stage,registry_final}
+          mkdir -p "$DEPTSLM_DATA_DIR"/adapters/.purge-deleting/{source_stage,source_final,registry_stage,registry_final}
+          mkdir -p "$DEPTSLM_DATA_DIR/service_state"/{postgres,qdrant}
           printf 'compose-mount-sentinel\n' > "$DEPTSLM_DATA_DIR/training_datasets/mount-sentinel"
           ./scripts/compose.sh config --quiet
           ./scripts/compose.sh --profile training run --rm --no-deps --entrypoint python training-execution-worker -I -c '
