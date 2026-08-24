@@ -112,6 +112,7 @@ def _receive_response(connection: socket.socket) -> dict[str, object]:
 
 
 def _directories(root: Path, count: int) -> list[int]:
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptors: list[int] = []
     for index in range(count):
         path = root / f"cap-{index}"
