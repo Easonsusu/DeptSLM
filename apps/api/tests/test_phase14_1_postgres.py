@@ -97,7 +97,9 @@ class _ExecutionLockHooks:
         self.engine = engine
         self.local = threading.local()
         self.first_lock: dict[str, str] = {}
+        self.first_advisory: set[str] = set()
         self.callbacks: dict[tuple[str, str], Callable[[], None]] = {}
+        self.advisory_callbacks: dict[str, Callable[[], None]] = {}
         self._guard = threading.Lock()
 
     def install(self) -> None:
@@ -129,11 +131,23 @@ class _ExecutionLockHooks:
     def after(self, label: str, kind: str, callback: Callable[[], None]) -> None:
         self.callbacks[(label, kind)] = callback
 
+    def after_advisory(self, label: str, callback: Callable[[], None]) -> None:
+        self.advisory_callbacks[label] = callback
+
     def _after_cursor_execute(
         self, _connection, _cursor, statement, _parameters, _context, _executemany
     ) -> None:
-        kind = self._lock_kind(statement)
+        normalized = " ".join(statement.lower().split())
         label = getattr(self.local, "participant", None)
+        if label is not None and "pg_advisory_xact_lock" in normalized:
+            with self._guard:
+                first_advisory = label not in self.first_advisory
+                if first_advisory:
+                    self.first_advisory.add(label)
+                callback = self.advisory_callbacks.get(label) if first_advisory else None
+            if callback is not None:
+                callback()
+        kind = self._lock_kind(statement)
         if kind is None or label is None:
             return
         with self._guard:
@@ -212,6 +226,91 @@ def _run_forced_race(
         hooks.uninstall()
     assert all(not thread.is_alive() for thread in threads), "race worker remained alive"
     return outcomes, errors, hooks
+
+
+def _run_pre_row_advisory_race(
+    engine,
+    first_label: str,
+    operations: dict[str, Callable[[], object]],
+) -> tuple[dict[str, object], dict[str, BaseException], _ExecutionLockHooks, bool]:
+    """Force the second transaction to reach the advisory fence first.
+
+    The first transaction pauses from the after-advisory hook, before its
+    production function can issue TrainingJob FOR UPDATE. The competing
+    transaction's before-advisory hook proves it reached the same blocking
+    fence while its job-row hook remains unobserved.
+    """
+
+    hooks = _ExecutionLockHooks(engine)
+    first_advisory_seen = threading.Event()
+    competing_advisory_started = threading.Event()
+    competing_job_lock_started = threading.Event()
+    outcomes: dict[str, object] = {}
+    errors: dict[str, BaseException] = {}
+    callback_errors: list[BaseException] = []
+    labels = tuple(operations)
+    competing_label = next(label for label in labels if label != first_label)
+    job_lock_started_before_release = False
+
+    def target(label: str) -> None:
+        hooks.participant(label)
+        try:
+            outcomes[label] = operations[label]()
+        except BaseException as error:  # noqa: BLE001 - surfaced by assertions below
+            errors[label] = error
+        finally:
+            hooks.clear_participant()
+
+    def pause_after_first_advisory() -> None:
+        nonlocal job_lock_started_before_release
+        first_advisory_seen.set()
+        if not competing_advisory_started.wait(_RACE_WAIT_SECONDS):
+            callback_errors.append(AssertionError("competing advisory lock was not reached"))
+        job_lock_started_before_release = competing_job_lock_started.is_set()
+
+    hooks.after_advisory(first_label, pause_after_first_advisory)
+
+    def before_cursor_execute(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        label = getattr(hooks.local, "participant", None)
+        if label != competing_label:
+            return
+        normalized = " ".join(statement.lower().split())
+        if "pg_advisory_xact_lock" in normalized:
+            competing_advisory_started.set()
+        if hooks._lock_kind(statement) == "job":
+            competing_job_lock_started.set()
+
+    hooks.install()
+    event.listen(engine, "before_cursor_execute", before_cursor_execute)
+    threads: list[threading.Thread] = []
+    try:
+        with _bounded_race_database(engine):
+            first = threading.Thread(
+                target=target, args=(first_label,), name=f"phase14-2-{first_label}", daemon=True
+            )
+            first.start()
+            if not first_advisory_seen.wait(_RACE_WAIT_SECONDS):
+                pytest.fail("timed out waiting for the first advisory fence")
+            threads.append(first)
+            competing = threading.Thread(
+                target=target,
+                args=(competing_label,),
+                name=f"phase14-2-{competing_label}",
+                daemon=True,
+            )
+            competing.start()
+            threads.append(competing)
+            for thread in threads:
+                thread.join(_RACE_WAIT_SECONDS + 5)
+    finally:
+        event.remove(engine, "before_cursor_execute", before_cursor_execute)
+        hooks.uninstall()
+    assert all(not thread.is_alive() for thread in threads), "pre-row race worker remained alive"
+    if callback_errors:
+        raise callback_errors[0]
+    return outcomes, errors, hooks, job_lock_started_before_release
 
 
 def _assert_no_database_race_errors(errors: dict[str, BaseException]) -> None:
@@ -560,6 +659,82 @@ def _run_success_cancel_race(
     operations = {"success": success, "cancel": cancel}
     outcomes, errors, hooks = _run_forced_race(engine, first_label, operations)
     return outcomes, errors, hooks, factory, execution
+
+
+def _run_pre_row_success_cancel_race(
+    engine, tmp_path: Path, *, first_label: str
+) -> tuple[
+    dict[str, object],
+    dict[str, BaseException],
+    _ExecutionLockHooks,
+    bool,
+    sessionmaker,
+    TrainingExecution,
+]:
+    factory, department_id, issuer, subject, execution = _approved_execution(engine, tmp_path)
+    claim = claim_next_training_execution(
+        factory, uuid4(), 120, execution.execution_code_revision
+    )
+    assert claim is not None
+    principal = AuthenticatedPrincipal(subject, issuer)
+    with factory() as session:
+        current = session.get(TrainingExecution, execution.id)
+        assert current is not None
+        expected_version = current.version
+
+    def success() -> object:
+        return _finalize(
+            factory,
+            claim,
+            status="succeeded",
+            error_code=None,
+            classification="execution_succeeded",
+            runtime_fp="a" * 64,
+            input_fp="b" * 64,
+        )
+
+    def cancel() -> object:
+        with factory.begin() as session:
+            return cancel_training_execution(
+                session,
+                principal,
+                DepartmentRequestScope(DepartmentScope(department_id)),
+                execution.id,
+                expected_version=expected_version,
+            ).status
+
+    operations = {"success": success, "cancel": cancel}
+    outcomes, errors, hooks, job_lock_started = _run_pre_row_advisory_race(
+        engine, first_label, operations
+    )
+    return outcomes, errors, hooks, job_lock_started, factory, execution
+
+
+@pytest.mark.parametrize("first_label", ["success", "cancel"])
+def test_phase14_2_pre_row_advisory_race_has_canonical_lock_order(
+    engine, tmp_path: Path, first_label: str
+) -> None:
+    outcomes, errors, hooks, job_lock_started, factory, execution = (
+        _run_pre_row_success_cancel_race(engine, tmp_path, first_label=first_label)
+    )
+    _assert_only_expected_conflicts(
+        errors, allowed_labels=frozenset({"cancel"}) if first_label == "success" else frozenset()
+    )
+    assert hooks.first_advisory == {"success", "cancel"}
+    assert not job_lock_started, (
+        "competing transaction acquired TrainingJob before advisory release"
+    )
+    if first_label == "success":
+        assert outcomes.get("success") is True
+        with factory() as session:
+            row = session.get(TrainingExecution, execution.id)
+            assert row is not None and row.status == "succeeded"
+    else:
+        assert outcomes.get("cancel") == "cancel_requested"
+        assert outcomes.get("success") is True
+        with factory() as session:
+            row = session.get(TrainingExecution, execution.id)
+            assert row is not None and row.status == "cancelled"
 
 
 def test_phase14_1_fake_success_vs_cancel_success_first_is_terminal(engine, tmp_path: Path) -> None:

@@ -39,6 +39,7 @@ from app.training_execution_domain import (
     validate_real_runtime_result,
     validate_runtime_result,
 )
+from app.training_execution_locking import acquire_training_execution_serialization
 from app.training_execution_runtime import (
     RUNTIME_TRAINING_TIMEOUT_SECONDS,
     StopReason,
@@ -91,30 +92,10 @@ def _server_now(session: Session) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-def _try_training_job_serialization(session: Session, job_id: UUID) -> bool:
-    """Try the same transaction-scoped fence used by API mutations."""
-
-    raw = job_id.bytes
-    first = int.from_bytes(raw[:4], "big", signed=True)
-    second = int.from_bytes(raw[4:8], "big", signed=True)
-    return bool(session.scalar(select(func.pg_try_advisory_xact_lock(first, second))))
-
-
-def _finish_training_job_serialization(session: Session, job_id: UUID, acquired: bool) -> None:
-    """Wait for a competing transaction's exact job fence after row lock."""
-
-    if acquired:
-        return
-    raw = job_id.bytes
-    first = int.from_bytes(raw[:4], "big", signed=True)
-    second = int.from_bytes(raw[4:8], "big", signed=True)
-    session.execute(select(func.pg_advisory_xact_lock(first, second)))
-
-
 def _valid_claim(
     session: Session, claim: ClaimedTrainingExecution, *, lock: bool = False
 ) -> tuple[TrainingExecution, TrainingExecutionAttempt, TrainingJob] | None:
-    # All Phase 11/14.1 mutation paths use the same job-first order.  The
+    # All Phase 11/14.1 mutation paths use the same advisory -> job order. The
     # immutable claim already carries training_job_id, so never lock the
     # execution merely to discover its parent job.
     job_query = select(TrainingJob).where(
@@ -122,15 +103,11 @@ def _valid_claim(
         TrainingJob.department_id == claim.department_id,
     )
     if lock:
+        acquire_training_execution_serialization(session, claim.execution_id)
         job_query = job_query.with_for_update()
-    serialization_acquired = (
-        _try_training_job_serialization(session, claim.execution_id) if lock else False
-    )
     job = session.execute(job_query).scalar_one_or_none()
     if job is None:
         return None
-    if lock:
-        _finish_training_job_serialization(session, claim.execution_id, serialization_acquired)
     execution_query = select(TrainingExecution).where(
         TrainingExecution.id == claim.execution_id,
         TrainingExecution.department_id == claim.department_id,
@@ -302,7 +279,9 @@ def claim_next_training_execution(
             )
             if execution_probe is None:
                 return None
-            # Job is deliberately locked before the execution row.
+            # Acquire the same execution fence before taking the job row lock
+            # used by every other execution mutation path.
+            acquire_training_execution_serialization(session, candidate)
             job = session.execute(
                 select(TrainingJob)
                 .where(

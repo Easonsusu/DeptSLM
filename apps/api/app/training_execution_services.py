@@ -31,6 +31,7 @@ from app.training_execution_domain import (
     execution_authority_fingerprint,
     training_job_authority_snapshot,
 )
+from app.training_execution_locking import acquire_training_execution_serialization
 from app.training_job_domain import (
     TrainingJobContractError,
     canonical_json_bytes,
@@ -43,26 +44,6 @@ EXECUTION_READ_ROLES = frozenset(
 EXECUTION_MUTATION_ROLES = frozenset({DepartmentRole.SYSTEM_ADMIN, DepartmentRole.DEPARTMENT_ADMIN})
 ACTIVE_EXECUTION_STATUSES = ("queued", "running", "cancel_requested")
 ACTIVE_PURGE_STATUSES = ("registered", "deletion_authorized", "tombstone_bound")
-
-
-def _try_training_job_serialization(session: Session, job_id: UUID) -> bool:
-    """Try to acquire the transaction-scoped execution fence before row lock."""
-
-    raw = job_id.bytes
-    first = int.from_bytes(raw[:4], "big", signed=True)
-    second = int.from_bytes(raw[4:8], "big", signed=True)
-    return bool(session.scalar(select(func.pg_try_advisory_xact_lock(first, second))))
-
-
-def _finish_training_job_serialization(session: Session, job_id: UUID, acquired: bool) -> None:
-    """Wait for a competing transaction's exact job fence after row lock."""
-
-    if acquired:
-        return
-    raw = job_id.bytes
-    first = int.from_bytes(raw[:4], "big", signed=True)
-    second = int.from_bytes(raw[4:8], "big", signed=True)
-    session.execute(select(func.pg_advisory_xact_lock(first, second)))
 
 
 def _server_now(session: Session) -> datetime:
@@ -80,7 +61,7 @@ def _lock_job_first(
     *,
     serialization_id: UUID | None = None,
 ) -> tuple[TrainingJob, object]:
-    """Use job -> department lock order for enqueue/cancel/retry races."""
+    """Use advisory -> job -> department order for execution mutation races."""
 
     # Resolve the path selector without taking a department lock so the job is
     # always the first mutable object locked by this service.
@@ -92,7 +73,7 @@ def _lock_job_first(
         lock=False,
         audit_action="training.execution.authorization.selector",
     )
-    serialization_acquired = _try_training_job_serialization(session, serialization_id or job_id)
+    acquire_training_execution_serialization(session, serialization_id or job_id)
     job = session.execute(
         select(TrainingJob)
         .where(TrainingJob.id == job_id, TrainingJob.department_id == scope.department.value)
@@ -101,7 +82,6 @@ def _lock_job_first(
     ).scalar_one_or_none()
     if job is None:
         raise ServiceError(404, "Training job not found")
-    _finish_training_job_serialization(session, serialization_id or job.id, serialization_acquired)
     authorization = authorize_transaction(
         session,
         principal,
