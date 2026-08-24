@@ -136,6 +136,19 @@ def test_rag_worker_evaluator_stages_install_the_local_api_package() -> None:
         assert "--no-deps /build/api" in stage
 
 
+def test_rag_runtime_image_keeps_database_and_vector_clients_out() -> None:
+    dockerfile = (REPOSITORY_ROOT / "services/rag-runtime/Dockerfile").read_text(encoding="utf-8")
+    runtime_lock = (REPOSITORY_ROOT / "services/rag-runtime/requirements.lock").read_text(
+        encoding="utf-8"
+    )
+
+    assert "requirements-worker.lock" not in dockerfile
+    assert "-r /build/api-requirements.lock" not in dockerfile
+    assert "-r /build/runtime-requirements.lock" in dockerfile
+    assert "psycopg==" not in runtime_lock
+    assert "qdrant-client==" not in runtime_lock
+
+
 def test_model_loading_security_contract_remains_pinned_and_offline() -> None:
     runtime = (
         REPOSITORY_ROOT / "services/training-runtime/deptslm_training_runtime/contract.py"

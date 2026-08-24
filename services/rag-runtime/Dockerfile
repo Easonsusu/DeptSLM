@@ -10,7 +10,6 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY apps/api/requirements-worker.lock /build/api-requirements.lock
 COPY services/rag-runtime/requirements.lock /build/runtime-requirements.lock
 
 RUN addgroup --system --gid 1001 deptslm \
@@ -25,9 +24,8 @@ COPY services/rag-runtime/deptslm_runtime /build/runtime/deptslm_runtime
 COPY services/rag-runtime/deptslm_worker /build/runtime/deptslm_worker
 COPY services/rag-worker/deptslm_worker/model_store.py /build/runtime/deptslm_worker/model_store.py
 
-RUN pip install --no-cache-dir --disable-pip-version-check --require-hashes -r /build/api-requirements.lock \
+RUN pip install --no-cache-dir --disable-pip-version-check --require-hashes -r /build/runtime-requirements.lock \
     && pip install --no-cache-dir --disable-pip-version-check --no-deps /build/api \
-    && pip install --no-cache-dir --disable-pip-version-check --require-hashes -r /build/runtime-requirements.lock \
     && pip install --no-cache-dir --disable-pip-version-check --no-deps /build/runtime \
     && rm -rf /build
 
