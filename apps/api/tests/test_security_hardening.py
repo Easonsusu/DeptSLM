@@ -123,6 +123,19 @@ def test_indexing_image_uses_the_reviewed_vector_model_lock() -> None:
     assert "transformers==4.55.0" in vector_lock
 
 
+def test_rag_worker_evaluator_stages_install_the_local_api_package() -> None:
+    dockerfile = (REPOSITORY_ROOT / "services/rag-worker/Dockerfile").read_text(encoding="utf-8")
+
+    for stage_name, next_stage_marker in (
+        ("evaluator", "FROM worker-source AS adapter-evaluator"),
+        ("adapter-evaluator", "FROM extraction AS final"),
+    ):
+        stage = dockerfile.split(f"FROM worker-source AS {stage_name}", 1)[1].split(
+            next_stage_marker, 1
+        )[0]
+        assert "--no-deps /build/api" in stage
+
+
 def test_model_loading_security_contract_remains_pinned_and_offline() -> None:
     runtime = (
         REPOSITORY_ROOT / "services/training-runtime/deptslm_training_runtime/contract.py"
