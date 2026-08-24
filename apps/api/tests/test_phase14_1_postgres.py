@@ -8,6 +8,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 from uuid import UUID, uuid4
 
 import pytest
@@ -164,12 +165,14 @@ def _run_forced_race(
     engine,
     first_label: str,
     operations: dict[str, Callable[[], object]],
+    *,
+    boundary: Literal["job", "advisory"] = "job",
 ) -> tuple[dict[str, object], dict[str, BaseException], _ExecutionLockHooks]:
-    """Run real production operations with one deterministic first lock."""
+    """Run real production operations with one deterministic first boundary."""
 
     hooks = _ExecutionLockHooks(engine)
-    first_lock_seen = threading.Event()
-    competing_job_lock_started = threading.Event()
+    first_boundary_seen = threading.Event()
+    competing_boundary_started = threading.Event()
     outcomes: dict[str, object] = {}
     errors: dict[str, BaseException] = {}
 
@@ -182,22 +185,32 @@ def _run_forced_race(
         finally:
             hooks.clear_participant()
 
-    def hold_first_job_lock() -> None:
-        # The first transaction retains TrainingJob while every competing
-        # participant has reached its own FOR UPDATE statement. This forces
+    def hold_first_boundary() -> None:
+        # The first transaction retains its selected boundary while every
+        # competing participant has reached the same SQL boundary. This forces
         # real contention without sleeps or arbitrary timing assumptions.
-        first_lock_seen.set()
-        if not competing_job_lock_started.wait(_RACE_WAIT_SECONDS):
-            raise AssertionError("timed out waiting for the competing job lock")
+        first_boundary_seen.set()
+        name = "advisory lock" if boundary == "advisory" else "job lock"
+        if not competing_boundary_started.wait(_RACE_WAIT_SECONDS):
+            raise AssertionError(f"timed out waiting for the competing {name}")
 
-    hooks.after(first_label, "job", hold_first_job_lock)
+    if boundary == "advisory":
+        hooks.after_advisory(first_label, hold_first_boundary)
+    else:
+        hooks.after(first_label, "job", hold_first_boundary)
 
     def before_cursor_execute(
         _connection, _cursor, statement, _parameters, _context, _executemany
     ) -> None:
         label = getattr(hooks.local, "participant", None)
-        if label != first_label and hooks._lock_kind(statement) == "job":
-            competing_job_lock_started.set()
+        if label == first_label:
+            return
+        normalized = " ".join(statement.lower().split())
+        if boundary == "advisory":
+            if "pg_advisory_xact_lock" in normalized:
+                competing_boundary_started.set()
+        elif hooks._lock_kind(statement) == "job":
+            competing_boundary_started.set()
 
     hooks.install()
     event.listen(engine, "before_cursor_execute", before_cursor_execute)
@@ -208,8 +221,9 @@ def _run_forced_race(
                 target=target, args=(first_label,), name=f"phase14-1-{first_label}", daemon=True
             )
             first.start()
-            if not first_lock_seen.wait(_RACE_WAIT_SECONDS):
-                pytest.fail(f"timed out waiting for {first_label} to lock TrainingJob")
+            if not first_boundary_seen.wait(_RACE_WAIT_SECONDS):
+                name = "advisory fence" if boundary == "advisory" else "TrainingJob"
+                pytest.fail(f"timed out waiting for {first_label} to reach {name}")
             threads.append(first)
             for label in operations:
                 if label == first_label:
@@ -603,7 +617,9 @@ def test_phase14_1_heartbeat_renewal_vs_cancel_has_one_job_first_order(
                 expected_version=expected_version,
             ).status
 
-    outcomes, errors, hooks = _run_forced_race(engine, "renew", {"renew": renew, "cancel": cancel})
+    outcomes, errors, hooks = _run_forced_race(
+        engine, "renew", {"renew": renew, "cancel": cancel}, boundary="advisory"
+    )
     _assert_only_expected_conflicts(errors, allowed_labels=frozenset({"cancel"}))
     assert hooks.first_lock == {"renew": "job", "cancel": "job"}
     assert outcomes.get("renew") is True
@@ -657,7 +673,7 @@ def _run_success_cancel_race(
             ).status
 
     operations = {"success": success, "cancel": cancel}
-    outcomes, errors, hooks = _run_forced_race(engine, first_label, operations)
+    outcomes, errors, hooks = _run_forced_race(engine, first_label, operations, boundary="advisory")
     return outcomes, errors, hooks, factory, execution
 
 
