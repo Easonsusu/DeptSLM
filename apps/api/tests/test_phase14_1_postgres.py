@@ -168,8 +168,8 @@ def _run_forced_race(
     """Run real production operations with one deterministic first lock."""
 
     hooks = _ExecutionLockHooks(engine)
-    first_advisory_seen = threading.Event()
-    competing_advisory_started = threading.Event()
+    first_lock_seen = threading.Event()
+    competing_job_lock_started = threading.Event()
     outcomes: dict[str, object] = {}
     errors: dict[str, BaseException] = {}
 
@@ -182,24 +182,22 @@ def _run_forced_race(
         finally:
             hooks.clear_participant()
 
-    def hold_first_advisory_lock() -> None:
-        # The first transaction retains its advisory fence while the competing
-        # participant reaches the same blocking fence, before either can
-        # proceed to its TrainingJob FOR UPDATE. This forces real contention
-        # without sleeps or arbitrary timing assumptions.
-        first_advisory_seen.set()
-        if not competing_advisory_started.wait(_RACE_WAIT_SECONDS):
-            raise AssertionError("timed out waiting for the competing advisory lock")
+    def hold_first_job_lock() -> None:
+        # The first transaction retains TrainingJob while every competing
+        # participant has reached its own FOR UPDATE statement. This forces
+        # real contention without sleeps or arbitrary timing assumptions.
+        first_lock_seen.set()
+        if not competing_job_lock_started.wait(_RACE_WAIT_SECONDS):
+            raise AssertionError("timed out waiting for the competing job lock")
 
-    hooks.after_advisory(first_label, hold_first_advisory_lock)
+    hooks.after(first_label, "job", hold_first_job_lock)
 
     def before_cursor_execute(
         _connection, _cursor, statement, _parameters, _context, _executemany
     ) -> None:
         label = getattr(hooks.local, "participant", None)
-        normalized = " ".join(statement.lower().split())
-        if label != first_label and "pg_advisory_xact_lock" in normalized:
-            competing_advisory_started.set()
+        if label != first_label and hooks._lock_kind(statement) == "job":
+            competing_job_lock_started.set()
 
     hooks.install()
     event.listen(engine, "before_cursor_execute", before_cursor_execute)
@@ -210,8 +208,8 @@ def _run_forced_race(
                 target=target, args=(first_label,), name=f"phase14-1-{first_label}", daemon=True
             )
             first.start()
-            if not first_advisory_seen.wait(_RACE_WAIT_SECONDS):
-                pytest.fail(f"timed out waiting for {first_label} to acquire the advisory fence")
+            if not first_lock_seen.wait(_RACE_WAIT_SECONDS):
+                pytest.fail(f"timed out waiting for {first_label} to lock TrainingJob")
             threads.append(first)
             for label in operations:
                 if label == first_label:
