@@ -89,7 +89,10 @@ def validate_model_directory(path: Path) -> Path:
         ):
             raise ModelStoreError()
         expected_file = files.get(relative)
-        if not isinstance(expected_file, dict) or expected_file.get("size") != metadata.st_size:
+        if (
+            not isinstance(expected_file, dict)
+            or expected_file.get("size") != metadata.st_size
+        ):
             raise ModelStoreError()
         digest = _hash_file(item, metadata)
         if expected_file.get("sha256") != digest:
