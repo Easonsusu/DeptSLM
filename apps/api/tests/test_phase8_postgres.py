@@ -131,7 +131,7 @@ def test_00_migration_paths_schema_and_orm_sync(engine) -> None:
     command.upgrade(config, "head")
     with engine.connect() as connection:
         assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-            "0018_phase14_training_execution_control_plane"
+            "0019_phase14_training_runtime"
         )
     inspector = inspect(engine)
     tables = {

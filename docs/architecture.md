@@ -2,7 +2,7 @@
 
 ## Status and boundaries
 
-Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 completed the internal department-scoped evaluation runner; Phase 10 completed the metadata-only builder for human-authored supervised fine-tuning dataset artifacts; Phase 11 completed the isolated LlamaFactory job-bundle generator that never executes training. Phase 12.0 through Phase 12.4 are complete. Phase 12.2 compares one exact validated adapter with the exact Phase 7 baseline through one shared Phase 9 retrieval/prompt/seed context and publishes only content-free numeric evidence. Phase 12.3 adds separate review, approval, deployment, promotion, rollback, retention, and immutable event metadata authorities without loading or routing adapters. Phase 12.4 adds only server-owned generation routing through a separate private runtime and immutable request snapshots; retrieval remains the Phase 7 path. Phase 13 consolidates the final threat model, transport and Compose hardening, synthetic Docker demo, and recovery documentation. Roadmap v2 Phase 14.0 defines the supervised execution contract, and Phase 14.1 adds only its metadata control plane; no real training execution exists. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or either evaluation runtime. Public vector search, conversations, streaming, reranking, training, or automatic approval/promotion remain unimplemented.
+Phase 7's one-turn grounded-answer boundary is complete. Phase 8 adds structured PostgreSQL-only feedback, a constrained same-department review workflow, server-time expiry, and explicit authorized purge. Phase 9 completed the internal department-scoped evaluation runner; Phase 10 completed the metadata-only builder for human-authored supervised fine-tuning dataset artifacts; Phase 11 completed the isolated LlamaFactory job-bundle generator that never executes training. Phase 12.0 through Phase 12.4 are complete. Phase 12.2 compares one exact validated adapter with the exact Phase 7 baseline through one shared Phase 9 retrieval/prompt/seed context and publishes only content-free numeric evidence. Phase 12.3 adds separate review, approval, deployment, promotion, rollback, retention, and immutable event metadata authorities without loading or routing adapters. Phase 12.4 adds only server-owned generation routing through a separate private runtime and immutable request snapshots; retrieval remains the Phase 7 path. Phase 13 consolidates the final threat model, transport and Compose hardening, synthetic Docker demo, and recovery documentation. Roadmap v2 Phase 14.0 defines the supervised execution contract, Phase 14.1 adds its metadata control plane, and Phase 14.2 adds the private pinned offline runtime with exact dependency-lock, installed-distribution, model-cache, and CUDA-image fingerprints; real candidate output remains non-authoritative and no automatic handoff exists. Feedback persists no question, answer, prompt, evidence, or free text and cannot contact Qdrant, artifacts, or either evaluation runtime. Public vector search, conversations, streaming, reranking, training, or automatic approval/promotion remain unimplemented.
 
 Phase 9 publication is deliberately non-atomic across PostgreSQL and external storage. A server-generated publication UUID and exact positive run attempt number bind each staged and final result manifest to the department, suite, run, and code revision. Result staging and publication run in killable leased children; PostgreSQL writes the succeeded state only after descriptor-relative no-follow final-artifact verification. Reclaim and the administrator-only `reconcile-artifacts` command delete only an exact manifest-proven, non-succeeded attempt. Reconciliation records a durable content-free batch before filesystem mutation and terminalizes the owned run or suite metadata with one batch audit, so a later authorized invocation can resume a crash window. They never delete unknown, mismatched, succeeded, or committed artifacts. A crash after an external rename can therefore leave an untrusted orphan, but never an authoritative result.
 
@@ -349,16 +349,24 @@ PostgreSQL claims, Qdrant retrieval, Phase 5 artifacts, result publication, and 
 
 ## Roadmap v2 Phase 14 training execution boundary
 
-Roadmap v1 Phase 0–13 is complete. Phase 14.0 is complete and Phase 14.1 adds
-only a metadata control plane: Phase 11 still creates immutable reviewable
-LlamaFactory bundles and no DeptSLM component executes training. The control
-plane freezes one approved same-
-department Phase 11 authority, creates a verified five-file input snapshot, and
-send only a closed content-free envelope to a separate private training data
-plane. The data plane will have no public port, Docker socket, host network,
-PostgreSQL/Qdrant/API/RAG/evaluation/adapter credentials, or normal internet
-egress. It will use a fixed supervised child, offline local model cache, and
-bounded process, disk, log, and deadline controls.
+Roadmap v1 Phase 0–13 is complete. Phase 14.0 and Phase 14.1 are complete, and
+Phase 14.2 adds the private pinned offline training runtime. The control plane
+freezes one approved same-department Phase 11 authority, creates a verified
+five-file input snapshot, and sends only a closed content-free envelope to a
+separate private data plane. The data plane has no public port, Docker socket,
+host network, PostgreSQL/Qdrant/API/RAG/evaluation/adapter credentials, or
+normal internet egress. It uses a fixed supervised child, offline local model
+cache, and bounded process, disk, log, and deadline controls. The runtime image
+is pinned to CUDA 12.6 digest
+`sha256:8aef630a54bc5c5146ae5ce68e6af5caa3df0fb690bb91544175c91f307e4356`,
+the lock SHA is
+`22e92e62895cdddc49ba6ab3545d2134dd6dbfb44616646b72cb09caa19cc5a5`, and
+the environment fingerprint is
+`123be4e6f366a28a0d56a7f51451397cdb05b5cb6a82a42ce66f487531c3978c`. The
+handshake ends at `process_ready`; active training has a 12-hour wall clock and
+closed cancellation, claim-loss, shutdown, and timeout reasons. The runtime
+receives only model-cache and IPC mounts; the control plane receives read-only
+`training_datasets` and `training_runs` separately.
 
 The future output authority is only a DeptSLM execution manifest plus
 `adapter_config.json` and `adapter_model.safetensors`, validated by the
@@ -372,6 +380,14 @@ TrainingExecutionAttempt`, followed by dependent purge rows. The worker uses
 the immutable claimed job identity and never locks an execution first merely to
 discover its parent. Its closed runtime request contains only content-free
 authority fields; retained descriptors are process-local handles outside that
-request and are never serialized or persisted. Phase 14.1 creates
-no final adapter and retains no training output authority; explicit reviewed
-handoff remains deferred. Phase 14.2/14.3 remain separate.
+request and are never serialized or persisted. Phase 14.2 may retain private
+non-authoritative candidate output after a real success and keeps the exact
+Phase 11 source fenced until Phase 14.3. No adapter is published or handed to
+Phase 12, and Phase 14.3/15 remain separate.
+
+Phase 11 bundle generation and Phase 14 execution use independent authorities:
+`TrainingJob.code_revision` is the immutable bundle/manifest authority, while
+`DEPTSLM_TRAINING_EXECUTION_CODE_REVISION` is the separately validated executor
+authority. Enqueue, claim, runtime IPC, and result fingerprints capture both
+exact lowercase SHAs; the runtime never falls back between them or requires
+them to be equal.

@@ -52,6 +52,7 @@ class Settings:
     evaluation_code_revision: str | None
     sft_code_revision: str | None
     training_job_code_revision: str | None
+    training_execution_code_revision: str | None
     rag: RagSettings | None
 
     @classmethod
@@ -158,6 +159,17 @@ class Settings:
                 "DEPTSLM_TRAINING_JOB_CODE_REVISION must be an exact lowercase "
                 "40-character Git commit SHA."
             )
+        training_execution_code_revision = _optional_environment(
+            "DEPTSLM_TRAINING_EXECUTION_CODE_REVISION"
+        )
+        if (
+            training_execution_code_revision is not None
+            and re.fullmatch(r"[0-9a-f]{40}", training_execution_code_revision) is None
+        ):
+            raise ConfigurationError(
+                "DEPTSLM_TRAINING_EXECUTION_CODE_REVISION must be an exact lowercase "
+                "40-character Git commit SHA."
+            )
 
         database_url = os.getenv("DATABASE_URL", "").strip()
         if not database_url:
@@ -199,6 +211,7 @@ class Settings:
             evaluation_code_revision=evaluation_code_revision,
             sft_code_revision=sft_code_revision,
             training_job_code_revision=training_job_code_revision,
+            training_execution_code_revision=training_execution_code_revision,
             rag=rag,
         )
 

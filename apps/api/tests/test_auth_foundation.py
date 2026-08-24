@@ -86,6 +86,17 @@ def auth_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("DEPTSLM_AUTH_SECRET", SECRET)
 
 
+def test_training_job_and_execution_revisions_are_loaded_from_separate_environment_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    auth_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv("DEPTSLM_TRAINING_JOB_CODE_REVISION", "1" * 40)
+    monkeypatch.setenv("DEPTSLM_TRAINING_EXECUTION_CODE_REVISION", "2" * 40)
+    settings = Settings.from_environment()
+    assert settings.training_job_code_revision == "1" * 40
+    assert settings.training_execution_code_revision == "2" * 40
+
+
 def test_valid_token_returns_safe_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     auth_environment(monkeypatch, tmp_path)
     with TestClient(app) as client:

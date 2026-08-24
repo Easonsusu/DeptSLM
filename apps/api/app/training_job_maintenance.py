@@ -26,7 +26,7 @@ from app.models import (
 )
 from app.services import ServiceError, append_mutation_audit, authorize_transaction
 from app.sft_artifacts import SftArtifactError, SftArtifactStore
-from app.training_execution_fences import has_active_training_execution
+from app.training_execution_fences import has_training_execution_retention_fence
 from app.training_job_domain import (
     TrainingJobContractError,
     canonical_json_bytes,
@@ -127,7 +127,9 @@ def archive_training_job(
             if job is None:
                 raise ServiceError(404, "Training job not found")
             scope, authorization = _authorize(session, department_id, actor_issuer, actor_subject)
-            if has_active_training_execution(session, department_id, training_job_id, lock=True):
+            if has_training_execution_retention_fence(
+                session, department_id, training_job_id, lock=True
+            ):
                 raise ServiceError(409, "Training job has an active execution")
             active_reservation = session.execute(
                 select(TrainingJobPurgeReservation)
@@ -347,7 +349,7 @@ def _register_candidates(
                     jobs = [
                         job
                         for job in jobs
-                        if not has_active_training_execution(
+                        if not has_training_execution_retention_fence(
                             session, department_id, job.id, lock=True
                         )
                     ]
@@ -828,7 +830,9 @@ def _assert_no_active_execution_before_bytes(
             # Lock the active execution fence before any dependent purge row.
             # This is the same job -> department -> execution -> purge order
             # used by every Phase 11/14.1 mutation path.
-            if has_active_training_execution(session, department_id, training_job_id, lock=True):
+            if has_training_execution_retention_fence(
+                session, department_id, training_job_id, lock=True
+            ):
                 raise ServiceError(409, "Training job has an active execution")
             reservation = session.execute(
                 select(TrainingJobPurgeReservation)
@@ -1362,7 +1366,7 @@ def _authorize_final_deletion(
                 session, department_id, actor_issuer, actor_subject, lock=True
             )
             for reservation in reservations:
-                if has_active_training_execution(
+                if has_training_execution_retention_fence(
                     session, department_id, reservation.training_job_id, lock=True
                 ):
                     raise ServiceError(409, "Training job has an active execution")
@@ -1448,7 +1452,7 @@ def _persist_purge_final_outcomes(
                 training_job_id, attempt_id, surface = key
                 if surface != "final":
                     raise ServiceError(409, "Training-job purge authority changed")
-                if has_active_training_execution(
+                if has_training_execution_retention_fence(
                     session, department_id, training_job_id, lock=True
                 ):
                     raise ServiceError(409, "Training job has an active execution")

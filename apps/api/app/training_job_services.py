@@ -11,9 +11,10 @@ from sqlalchemy.orm import Session
 
 from app.auth import AuthenticatedPrincipal, DepartmentRole
 from app.authorization import DepartmentRequestScope
-from app.models import SftDatasetBuild, TrainingExecution, TrainingJob, TrainingJobPurgeReservation
+from app.models import SftDatasetBuild, TrainingJob, TrainingJobPurgeReservation
 from app.schemas import TrainingJobCreateRequest
 from app.services import ServiceError, append_mutation_audit, authorize_transaction
+from app.training_execution_fences import has_training_execution_retention_fence
 from app.training_job_domain import (
     BASE_MODEL_ID,
     BASE_MODEL_LICENSE,
@@ -278,17 +279,8 @@ def review_training_job(
             )
         _version(job, expected_version)
         if action == "archive":
-            if (
-                session.scalar(
-                    select(TrainingExecution.id)
-                    .where(
-                        TrainingExecution.department_id == job.department_id,
-                        TrainingExecution.training_job_id == job.id,
-                        TrainingExecution.status.in_(("queued", "running", "cancel_requested")),
-                    )
-                    .with_for_update()
-                )
-                is not None
+            if has_training_execution_retention_fence(
+                session, job.department_id, job.id, lock=True
             ):
                 raise ServiceError(409, "Training job has an active execution")
             _require_no_active_purge_reservation(session, job)

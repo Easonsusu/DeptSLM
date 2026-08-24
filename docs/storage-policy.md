@@ -406,26 +406,27 @@ rollback. PostgreSQL, external files, and runtime processes are not
 transactionally atomic; activated bytes without committed succeeded authority
 remain untrusted.
 
-### Phase 14.1 training execution storage
+### Phase 14.2 training execution storage
 
-Roadmap v2 Phase 14.1 owns `DEPTSLM_DATA_DIR/training_runs` for private
-execution attempts. It creates no final adapter surface. The server-derived
+Roadmap v2 Phase 14.2 owns `DEPTSLM_DATA_DIR/training_runs` for private
+execution attempts. A real success may retain candidate bytes only in its
+private output stage; it creates no authoritative final adapter surface. The server-derived
 layout is:
 
 ```text
 training_runs/<department_uuid>/<execution_uuid>/
   attempts/<attempt_uuid>/{input,scratch,logs,output_stage}/
-  (no final adapter in Phase 14.1)
+  (no authoritative adapter in Phase 14.2)
 ```
 
-Only canonical UUIDs may form path components. Future directories and files
-must be private, descriptor-relative, no-follow, and free of symlink or
-hard-link adoption. The exact PostgreSQL execution attempt and its frozen Phase
+Only canonical UUIDs may form path components. Runtime directories and files
+are private, descriptor-relative, no-follow, and free of symlink or hard-link
+adoption. The exact PostgreSQL execution attempt and its frozen Phase
 11 authority, not filesystem presence, own every surface. Scratch, logs, and
 staged output are non-authoritative; logs are private external artifacts and
 never PostgreSQL, API, audit, browser, or Git content. The authoritative final
-surface is not created by Phase 14.1; adapter publication, real-runtime quotas,
-retention, and purge remain deferred to reviewed Phase 14.2/14.3 work.
+surface is not created by Phase 14.2; adapter publication, retention release,
+and purge remain deferred to reviewed Phase 14.3 work.
 
 ## Google Drive limitations
 

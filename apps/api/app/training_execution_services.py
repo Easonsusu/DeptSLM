@@ -7,7 +7,7 @@ import re
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -31,6 +31,7 @@ from app.training_execution_domain import (
     execution_authority_fingerprint,
     training_job_authority_snapshot,
 )
+from app.training_execution_locking import acquire_training_execution_serialization
 from app.training_job_domain import (
     TrainingJobContractError,
     canonical_json_bytes,
@@ -53,9 +54,14 @@ def _server_now(session: Session) -> datetime:
 
 
 def _lock_job_first(
-    session: Session, principal: AuthenticatedPrincipal, scope: DepartmentRequestScope, job_id: UUID
+    session: Session,
+    principal: AuthenticatedPrincipal,
+    scope: DepartmentRequestScope,
+    job_id: UUID,
+    *,
+    serialization_id: UUID | None = None,
 ) -> tuple[TrainingJob, object]:
-    """Use job -> department lock order for enqueue/cancel/retry races."""
+    """Use advisory -> job -> department order for execution mutation races."""
 
     # Resolve the path selector without taking a department lock so the job is
     # always the first mutable object locked by this service.
@@ -67,6 +73,7 @@ def _lock_job_first(
         lock=False,
         audit_action="training.execution.authorization.selector",
     )
+    acquire_training_execution_serialization(session, serialization_id or job_id)
     job = session.execute(
         select(TrainingJob)
         .where(TrainingJob.id == job_id, TrainingJob.department_id == scope.department.value)
@@ -287,6 +294,7 @@ def _parent_from_job(
         "execution_code_revision": execution_code_revision,
         "authority_fingerprint": execution_authority_fingerprint(
             execution_id=execution_id,
+            training_job_code_revision=job.code_revision,
             execution_code_revision=execution_code_revision,
             snapshot=snapshot,
         ),
@@ -303,7 +311,7 @@ def enqueue_training_execution(
     request_scope: DepartmentRequestScope,
     request: TrainingExecutionCreateRequest,
     *,
-    code_revision: str | None = None,
+    execution_code_revision: str | None = None,
 ) -> TrainingExecution:
     try:
         job, authorization = _lock_job_first(
@@ -312,15 +320,17 @@ def enqueue_training_execution(
         if job.version != request.expected_training_job_version:
             raise ServiceError(409, "Training job version conflict")
         snapshot = _require_phase11_authority(session, job)
-        execution_revision = code_revision or job.code_revision
-        if re.fullmatch(r"[0-9a-f]{40}", execution_revision) is None:
+        if (
+            execution_code_revision is None
+            or re.fullmatch(r"[0-9a-f]{40}", execution_code_revision) is None
+        ):
             raise ServiceError(409, "Training execution code authority is unavailable")
         execution = _parent_from_job(
             execution_id=uuid4(),
             job=job,
             requester_id=authorization.identity.id,
             snapshot=snapshot,
-            execution_code_revision=execution_revision,
+            execution_code_revision=execution_code_revision,
         )
         session.add(execution)
         session.flush()
@@ -439,7 +449,13 @@ def _authorize_execution_mutation(
     ).scalar_one_or_none()
     if execution_probe is None:
         raise ServiceError(404, "Training execution not found")
-    job, authorization = _lock_job_first(session, principal, request_scope, execution_probe)
+    job, authorization = _lock_job_first(
+        session,
+        principal,
+        request_scope,
+        execution_probe,
+        serialization_id=execution_id,
+    )
     execution = _lock_execution(session, request_scope, execution_id)
     return execution, authorization, job
 
@@ -459,18 +475,41 @@ def cancel_training_execution(
         if execution.version != expected_version:
             raise ServiceError(409, "Training execution version conflict")
         _require_no_active_purge(session, job)
-        if execution.status == "queued":
-            execution.status = "cancelled"
-            execution.error_code = "cancelled"
-            execution.finished_at = _server_now(session)
-        elif execution.status == "running":
-            execution.status = "cancel_requested"
-            execution.cancellation_requested_at = _server_now(session)
-        elif execution.status == "cancel_requested":
-            return execution
-        else:
+        scope_filter = (
+            TrainingExecution.id == execution.id,
+            TrainingExecution.department_id == request_scope.department.value,
+            TrainingExecution.version == expected_version,
+        )
+        requested_at = _server_now(session)
+        running_result = session.execute(
+            update(TrainingExecution)
+            .where(*scope_filter, TrainingExecution.status == "running")
+            .values(
+                status="cancel_requested",
+                cancellation_requested_at=requested_at,
+                version=TrainingExecution.version + 1,
+            )
+        )
+        transitioned = running_result.rowcount == 1
+        if not transitioned:
+            finished_at = _server_now(session)
+            queued_result = session.execute(
+                update(TrainingExecution)
+                .where(*scope_filter, TrainingExecution.status == "queued")
+                .values(
+                    status="cancelled",
+                    error_code="cancelled",
+                    finished_at=finished_at,
+                    version=TrainingExecution.version + 1,
+                )
+            )
+            transitioned = queued_result.rowcount == 1
+        session.expire(execution)
+        session.refresh(execution)
+        if not transitioned:
+            if execution.status == "cancel_requested":
+                return execution
             raise ServiceError(409, "Training execution is not cancellable")
-        execution.version += 1
         append_mutation_audit(
             session,
             actor=authorization.identity,

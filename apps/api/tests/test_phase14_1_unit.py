@@ -61,6 +61,8 @@ def test_runtime_request_is_closed_and_descriptor_free() -> None:
         "Qwen/Qwen3-0.6B",
         "c1899de289a04d12100db370d81485cdf75e47ca",
         attempt_id,
+        "a" * 40,
+        "b" * 40,
     )
     validate_runtime_request(request)
     assert set(request.__dataclass_fields__).isdisjoint(
@@ -143,6 +145,8 @@ def test_fake_runtime_is_deterministic_and_content_free() -> None:
         "Qwen/Qwen3-0.6B",
         "c1899de289a04d12100db370d81485cdf75e47ca",
         attempt_id,
+        "a" * 40,
+        "b" * 40,
     )
     heartbeat_calls: list[bool] = []
     result = FakeTrainingRuntime().run(

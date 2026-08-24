@@ -8,13 +8,14 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 from uuid import UUID, uuid4
 
 import pytest
 from alembic.config import Config
 from sqlalchemy import event, inspect, select, text
 from sqlalchemy.orm import sessionmaker
-from test_phase11_postgres import _succeeded_training_job
+from test_phase11_postgres import _succeeded_training_job, _unique_code_revision
 
 from alembic import command
 from app.auth import AuthenticatedPrincipal
@@ -97,7 +98,9 @@ class _ExecutionLockHooks:
         self.engine = engine
         self.local = threading.local()
         self.first_lock: dict[str, str] = {}
+        self.first_advisory: set[str] = set()
         self.callbacks: dict[tuple[str, str], Callable[[], None]] = {}
+        self.advisory_callbacks: dict[str, Callable[[], None]] = {}
         self._guard = threading.Lock()
 
     def install(self) -> None:
@@ -129,11 +132,23 @@ class _ExecutionLockHooks:
     def after(self, label: str, kind: str, callback: Callable[[], None]) -> None:
         self.callbacks[(label, kind)] = callback
 
+    def after_advisory(self, label: str, callback: Callable[[], None]) -> None:
+        self.advisory_callbacks[label] = callback
+
     def _after_cursor_execute(
         self, _connection, _cursor, statement, _parameters, _context, _executemany
     ) -> None:
-        kind = self._lock_kind(statement)
+        normalized = " ".join(statement.lower().split())
         label = getattr(self.local, "participant", None)
+        if label is not None and "pg_advisory_xact_lock" in normalized:
+            with self._guard:
+                first_advisory = label not in self.first_advisory
+                if first_advisory:
+                    self.first_advisory.add(label)
+                callback = self.advisory_callbacks.get(label) if first_advisory else None
+            if callback is not None:
+                callback()
+        kind = self._lock_kind(statement)
         if kind is None or label is None:
             return
         with self._guard:
@@ -150,12 +165,14 @@ def _run_forced_race(
     engine,
     first_label: str,
     operations: dict[str, Callable[[], object]],
+    *,
+    boundary: Literal["job", "advisory"] = "job",
 ) -> tuple[dict[str, object], dict[str, BaseException], _ExecutionLockHooks]:
-    """Run real production operations with one deterministic first lock."""
+    """Run real production operations with one deterministic first boundary."""
 
     hooks = _ExecutionLockHooks(engine)
-    first_lock_seen = threading.Event()
-    competing_job_lock_started = threading.Event()
+    first_boundary_seen = threading.Event()
+    competing_boundary_started = threading.Event()
     outcomes: dict[str, object] = {}
     errors: dict[str, BaseException] = {}
 
@@ -168,22 +185,32 @@ def _run_forced_race(
         finally:
             hooks.clear_participant()
 
-    def hold_first_job_lock() -> None:
-        # The first transaction retains TrainingJob while every competing
-        # participant has reached its own FOR UPDATE statement.  This forces
+    def hold_first_boundary() -> None:
+        # The first transaction retains its selected boundary while every
+        # competing participant has reached the same SQL boundary. This forces
         # real contention without sleeps or arbitrary timing assumptions.
-        first_lock_seen.set()
-        if not competing_job_lock_started.wait(_RACE_WAIT_SECONDS):
-            raise AssertionError("timed out waiting for the competing job lock")
+        first_boundary_seen.set()
+        name = "advisory lock" if boundary == "advisory" else "job lock"
+        if not competing_boundary_started.wait(_RACE_WAIT_SECONDS):
+            raise AssertionError(f"timed out waiting for the competing {name}")
 
-    hooks.after(first_label, "job", hold_first_job_lock)
+    if boundary == "advisory":
+        hooks.after_advisory(first_label, hold_first_boundary)
+    else:
+        hooks.after(first_label, "job", hold_first_boundary)
 
     def before_cursor_execute(
         _connection, _cursor, statement, _parameters, _context, _executemany
     ) -> None:
         label = getattr(hooks.local, "participant", None)
-        if label != first_label and hooks._lock_kind(statement) == "job":
-            competing_job_lock_started.set()
+        if label == first_label:
+            return
+        normalized = " ".join(statement.lower().split())
+        if boundary == "advisory":
+            if "pg_advisory_xact_lock" in normalized:
+                competing_boundary_started.set()
+        elif hooks._lock_kind(statement) == "job":
+            competing_boundary_started.set()
 
     hooks.install()
     event.listen(engine, "before_cursor_execute", before_cursor_execute)
@@ -194,8 +221,9 @@ def _run_forced_race(
                 target=target, args=(first_label,), name=f"phase14-1-{first_label}", daemon=True
             )
             first.start()
-            if not first_lock_seen.wait(_RACE_WAIT_SECONDS):
-                pytest.fail(f"timed out waiting for {first_label} to lock TrainingJob")
+            if not first_boundary_seen.wait(_RACE_WAIT_SECONDS):
+                name = "advisory fence" if boundary == "advisory" else "TrainingJob"
+                pytest.fail(f"timed out waiting for {first_label} to reach {name}")
             threads.append(first)
             for label in operations:
                 if label == first_label:
@@ -212,6 +240,91 @@ def _run_forced_race(
         hooks.uninstall()
     assert all(not thread.is_alive() for thread in threads), "race worker remained alive"
     return outcomes, errors, hooks
+
+
+def _run_pre_row_advisory_race(
+    engine,
+    first_label: str,
+    operations: dict[str, Callable[[], object]],
+) -> tuple[dict[str, object], dict[str, BaseException], _ExecutionLockHooks, bool]:
+    """Force the second transaction to reach the advisory fence first.
+
+    The first transaction pauses from the after-advisory hook, before its
+    production function can issue TrainingJob FOR UPDATE. The competing
+    transaction's before-advisory hook proves it reached the same blocking
+    fence while its job-row hook remains unobserved.
+    """
+
+    hooks = _ExecutionLockHooks(engine)
+    first_advisory_seen = threading.Event()
+    competing_advisory_started = threading.Event()
+    competing_job_lock_started = threading.Event()
+    outcomes: dict[str, object] = {}
+    errors: dict[str, BaseException] = {}
+    callback_errors: list[BaseException] = []
+    labels = tuple(operations)
+    competing_label = next(label for label in labels if label != first_label)
+    job_lock_started_before_release = False
+
+    def target(label: str) -> None:
+        hooks.participant(label)
+        try:
+            outcomes[label] = operations[label]()
+        except BaseException as error:  # noqa: BLE001 - surfaced by assertions below
+            errors[label] = error
+        finally:
+            hooks.clear_participant()
+
+    def pause_after_first_advisory() -> None:
+        nonlocal job_lock_started_before_release
+        first_advisory_seen.set()
+        if not competing_advisory_started.wait(_RACE_WAIT_SECONDS):
+            callback_errors.append(AssertionError("competing advisory lock was not reached"))
+        job_lock_started_before_release = competing_job_lock_started.is_set()
+
+    hooks.after_advisory(first_label, pause_after_first_advisory)
+
+    def before_cursor_execute(
+        _connection, _cursor, statement, _parameters, _context, _executemany
+    ) -> None:
+        label = getattr(hooks.local, "participant", None)
+        if label != competing_label:
+            return
+        normalized = " ".join(statement.lower().split())
+        if "pg_advisory_xact_lock" in normalized:
+            competing_advisory_started.set()
+        if hooks._lock_kind(statement) == "job":
+            competing_job_lock_started.set()
+
+    hooks.install()
+    event.listen(engine, "before_cursor_execute", before_cursor_execute)
+    threads: list[threading.Thread] = []
+    try:
+        with _bounded_race_database(engine):
+            first = threading.Thread(
+                target=target, args=(first_label,), name=f"phase14-2-{first_label}", daemon=True
+            )
+            first.start()
+            if not first_advisory_seen.wait(_RACE_WAIT_SECONDS):
+                pytest.fail("timed out waiting for the first advisory fence")
+            threads.append(first)
+            competing = threading.Thread(
+                target=target,
+                args=(competing_label,),
+                name=f"phase14-2-{competing_label}",
+                daemon=True,
+            )
+            competing.start()
+            threads.append(competing)
+            for thread in threads:
+                thread.join(_RACE_WAIT_SECONDS + 5)
+    finally:
+        event.remove(engine, "before_cursor_execute", before_cursor_execute)
+        hooks.uninstall()
+    assert all(not thread.is_alive() for thread in threads), "pre-row race worker remained alive"
+    if callback_errors:
+        raise callback_errors[0]
+    return outcomes, errors, hooks, job_lock_started_before_release
 
 
 def _assert_no_database_race_errors(errors: dict[str, BaseException]) -> None:
@@ -250,7 +363,7 @@ def _assert_only_expected_conflicts(
 def test_phase14_1_migration_cycle_and_schema_contract(engine, tmp_path: Path) -> None:
     config = Config("alembic.ini")
     command.downgrade(config, "0017_phase12_adapter_runtime_routing")
-    command.upgrade(config, "0018_phase14_training_execution_control_plane")
+    command.upgrade(config, "head")
 
     # Prove the downgrade from a populated Phase 14.1 schema, not only from
     # empty tables.  The queued parent and registered attempt exercise the
@@ -274,16 +387,52 @@ def test_phase14_1_migration_cycle_and_schema_contract(engine, tmp_path: Path) -
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM training_executions")) == 1
         assert connection.scalar(text("SELECT count(*) FROM training_execution_attempts")) == 1
+        connection.execute(
+            text(
+                "UPDATE training_execution_attempts SET status='succeeded', "
+                "worker_id='00000000-0000-0000-0000-000000000091', "
+                "claim_token='00000000-0000-0000-0000-000000000092', "
+                "claimed_at=clock_timestamp(), finished_at=clock_timestamp(), "
+                "runtime_kind='real', runtime_contract_version='phase14-training-runtime-v1', "
+                "runtime_dependency_lock_sha256=:digest, "
+                "runtime_environment_profile_id="
+                "'deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1', "
+                "runtime_environment_fingerprint=:digest, "
+                "runtime_hardware_profile_id='linux-x86_64-nvidia-cuda126-bf16-v1', "
+                "runtime_hardware_fingerprint=:digest, output_stage_fingerprint=:digest, "
+                "output_file_count=1, output_total_bytes=1, output_retained_at=clock_timestamp(), "
+                "input_snapshot_fingerprint=:digest, runtime_fingerprint=:digest, "
+                "result_classification='execution_succeeded', error_code=NULL"
+            ),
+            {"digest": "a" * 64},
+        )
+        connection.commit()
+
+    command.downgrade(config, "0018_phase14_training_execution_control_plane")
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0018_phase14_training_execution_control_plane"
+        )
+    legacy_inspector = inspect(engine)
+    legacy_attempt_columns = {
+        item["name"] for item in legacy_inspector.get_columns("training_execution_attempts")
+    }
+    assert "runtime_kind" not in legacy_attempt_columns
+    command.upgrade(config, "head")
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0019_phase14_training_runtime"
+        )
 
     command.downgrade(config, "0017_phase12_adapter_runtime_routing")
     inspector = inspect(engine)
     assert not inspector.has_table("training_execution_attempts")
     assert not inspector.has_table("training_executions")
 
-    command.upgrade(config, "0018_phase14_training_execution_control_plane")
+    command.upgrade(config, "head")
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0018_phase14_training_execution_control_plane"
+            "0019_phase14_training_runtime"
         )
     inspector = inspect(engine)
     execution_columns = {item["name"] for item in inspector.get_columns("training_executions")}
@@ -309,6 +458,18 @@ def test_phase14_1_migration_cycle_and_schema_contract(engine, tmp_path: Path) -
         "input_snapshot_fingerprint",
         "runtime_fingerprint",
         "result_classification",
+        "runtime_kind",
+        "runtime_contract_version",
+        "runtime_dependency_lock_sha256",
+        "runtime_environment_profile_id",
+        "runtime_environment_fingerprint",
+        "runtime_hardware_profile_id",
+        "runtime_hardware_fingerprint",
+        "output_stage_fingerprint",
+        "output_file_count",
+        "output_total_bytes",
+        "output_retained_at",
+        "output_purged_at",
     }.issubset(attempt_columns)
     assert any(
         index["name"] == "uq_training_execution_active_job_profile" and index["unique"]
@@ -325,7 +486,15 @@ def test_phase14_1_migration_cycle_and_schema_contract(engine, tmp_path: Path) -
     attempt_checks = {
         item["name"] for item in inspector.get_check_constraints("training_execution_attempts")
     }
-    assert "ck_training_execution_attempt_success_contract" in attempt_checks
+    assert {
+        "ck_training_execution_attempt_success_contract",
+        "ck_training_execution_attempt_runtime_kind",
+        "ck_training_execution_attempt_runtime_contract",
+        "ck_training_execution_attempt_runtime_hashes",
+        "ck_training_execution_attempt_output_bounds",
+        "ck_training_execution_attempt_real_success_contract",
+        "ck_training_execution_attempt_output_retention",
+    }.issubset(attempt_checks)
 
 
 def _approved_execution(
@@ -348,6 +517,7 @@ def _approved_execution(
     with factory.begin() as session:
         job = session.get(TrainingJob, job_id)
         assert job is not None
+        execution_code_revision = _unique_code_revision()
         execution = enqueue_training_execution(
             session,
             principal,
@@ -356,7 +526,7 @@ def _approved_execution(
                 training_job_id=job.id,
                 expected_training_job_version=job.version,
             ),
-            code_revision=job.code_revision,
+            execution_code_revision=execution_code_revision,
         )
         execution_id = execution.id
     with factory() as session:
@@ -385,7 +555,7 @@ def test_phase14_1_captures_immutable_authority_and_enforces_active_uniqueness(
                     training_job_id=job.id,
                     expected_training_job_version=job.version,
                 ),
-                code_revision=job.code_revision,
+                execution_code_revision=execution.execution_code_revision,
             )
 
 
@@ -447,7 +617,9 @@ def test_phase14_1_heartbeat_renewal_vs_cancel_has_one_job_first_order(
                 expected_version=expected_version,
             ).status
 
-    outcomes, errors, hooks = _run_forced_race(engine, "renew", {"renew": renew, "cancel": cancel})
+    outcomes, errors, hooks = _run_forced_race(
+        engine, "renew", {"renew": renew, "cancel": cancel}, boundary="advisory"
+    )
     _assert_only_expected_conflicts(errors, allowed_labels=frozenset({"cancel"}))
     assert hooks.first_lock == {"renew": "job", "cancel": "job"}
     assert outcomes.get("renew") is True
@@ -501,8 +673,82 @@ def _run_success_cancel_race(
             ).status
 
     operations = {"success": success, "cancel": cancel}
-    outcomes, errors, hooks = _run_forced_race(engine, first_label, operations)
+    outcomes, errors, hooks = _run_forced_race(engine, first_label, operations, boundary="advisory")
     return outcomes, errors, hooks, factory, execution
+
+
+def _run_pre_row_success_cancel_race(
+    engine, tmp_path: Path, *, first_label: str
+) -> tuple[
+    dict[str, object],
+    dict[str, BaseException],
+    _ExecutionLockHooks,
+    bool,
+    sessionmaker,
+    TrainingExecution,
+]:
+    factory, department_id, issuer, subject, execution = _approved_execution(engine, tmp_path)
+    claim = claim_next_training_execution(factory, uuid4(), 120, execution.execution_code_revision)
+    assert claim is not None
+    principal = AuthenticatedPrincipal(subject, issuer)
+    with factory() as session:
+        current = session.get(TrainingExecution, execution.id)
+        assert current is not None
+        expected_version = current.version
+
+    def success() -> object:
+        return _finalize(
+            factory,
+            claim,
+            status="succeeded",
+            error_code=None,
+            classification="execution_succeeded",
+            runtime_fp="a" * 64,
+            input_fp="b" * 64,
+        )
+
+    def cancel() -> object:
+        with factory.begin() as session:
+            return cancel_training_execution(
+                session,
+                principal,
+                DepartmentRequestScope(DepartmentScope(department_id)),
+                execution.id,
+                expected_version=expected_version,
+            ).status
+
+    operations = {"success": success, "cancel": cancel}
+    outcomes, errors, hooks, job_lock_started = _run_pre_row_advisory_race(
+        engine, first_label, operations
+    )
+    return outcomes, errors, hooks, job_lock_started, factory, execution
+
+
+@pytest.mark.parametrize("first_label", ["success", "cancel"])
+def test_phase14_2_pre_row_advisory_race_has_canonical_lock_order(
+    engine, tmp_path: Path, first_label: str
+) -> None:
+    outcomes, errors, hooks, job_lock_started, factory, execution = (
+        _run_pre_row_success_cancel_race(engine, tmp_path, first_label=first_label)
+    )
+    _assert_only_expected_conflicts(
+        errors, allowed_labels=frozenset({"cancel"}) if first_label == "success" else frozenset()
+    )
+    assert hooks.first_advisory == {"success", "cancel"}
+    assert not job_lock_started, (
+        "competing transaction acquired TrainingJob before advisory release"
+    )
+    if first_label == "success":
+        assert outcomes.get("success") is True
+        with factory() as session:
+            row = session.get(TrainingExecution, execution.id)
+            assert row is not None and row.status == "succeeded"
+    else:
+        assert outcomes.get("cancel") == "cancel_requested"
+        assert outcomes.get("success") is True
+        with factory() as session:
+            row = session.get(TrainingExecution, execution.id)
+            assert row is not None and row.status == "cancelled"
 
 
 def test_phase14_1_fake_success_vs_cancel_success_first_is_terminal(engine, tmp_path: Path) -> None:
@@ -585,6 +831,54 @@ def test_phase14_1_expired_reclaim_fences_stale_owner_finalize(engine, tmp_path:
         ).all()
         assert row is not None and row.status == "succeeded"
         assert {attempt.status for attempt in attempts} == {"reclaimed", "succeeded"}
+
+
+def test_phase14_2_real_success_retains_phase11_fence(engine, tmp_path: Path) -> None:
+    factory, department_id, issuer, subject, execution = _approved_execution(engine, tmp_path)
+    claim = claim_next_training_execution(factory, uuid4(), 120, execution.execution_code_revision)
+    assert claim is not None
+    runtime_details = {
+        "runtime_kind": "real",
+        "runtime_contract_version": "phase14-training-runtime-v1",
+        "dependency_lock_sha256": "a" * 64,
+        "environment_profile_id": "deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1",
+        "environment_fingerprint": "b" * 64,
+        "hardware_profile_id": "linux-x86_64-nvidia-one-gpu-bf16",
+        "hardware_fingerprint": "c" * 64,
+        "output_stage_fingerprint": "d" * 64,
+        "output_file_count": 1,
+        "output_total_bytes": 1,
+    }
+    assert _finalize(
+        factory,
+        claim,
+        status="succeeded",
+        error_code=None,
+        classification="execution_succeeded",
+        runtime_fp="e" * 64,
+        input_fp="f" * 64,
+        runtime_details=runtime_details,
+    )
+    with factory() as session:
+        attempt = session.scalar(
+            select(TrainingExecutionAttempt).where(
+                TrainingExecutionAttempt.id == claim.attempt_id,
+                TrainingExecutionAttempt.department_id == department_id,
+            )
+        )
+        assert attempt is not None
+        assert attempt.runtime_kind == "real"
+        assert attempt.output_retained_at is not None
+        assert attempt.output_purged_at is None
+    with pytest.raises(ServiceError, match="active execution"):
+        archive_training_job(
+            factory,
+            department_id=department_id,
+            training_job_id=execution.training_job_id,
+            actor_issuer=issuer,
+            actor_subject=subject,
+            apply=True,
+        )
 
 
 def test_phase14_1_active_execution_blocks_legacy_pre_byte_delete_fence(
@@ -691,7 +985,7 @@ def _run_enqueue_archive_race(
                     training_job_id=training_job_id,
                     expected_training_job_version=expected_job_version,
                 ),
-                code_revision=code_revision,
+                execution_code_revision=code_revision,
             ).status
 
     def archive() -> object:
@@ -787,7 +1081,7 @@ def _run_enqueue_purge_registration_race(
                     training_job_id=training_job_id,
                     expected_training_job_version=expected_job_version,
                 ),
-                code_revision=code_revision,
+                execution_code_revision=code_revision,
             ).status
 
     def purge() -> object:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
@@ -23,6 +24,7 @@ from app.training_job_domain import (
 )
 
 EXECUTION_CONTRACT_VERSION = "phase14-training-execution-v1"
+REAL_RUNTIME_CONTRACT_VERSION = "phase14-training-runtime-v1"
 EXECUTION_MODEL_ID = BASE_MODEL_ID
 EXECUTION_MODEL_REVISION = BASE_MODEL_REVISION
 EXECUTION_MODEL_LICENSE = BASE_MODEL_LICENSE
@@ -75,11 +77,29 @@ RUNTIME_ERROR_CODES = frozenset(
     {
         "runtime_unavailable",
         "runtime_protocol_invalid",
+        "runtime_environment_invalid",
+        "runtime_hardware_unsupported",
+        "runtime_model_unavailable",
+        "runtime_dependency_mismatch",
+        "runtime_auth_failed",
+        "runtime_busy",
+        "training_config_invalid",
+        "child_start_failed",
+        "child_failed",
+        "child_timeout",
+        "runtime_disconnected",
+        "output_limit_exceeded",
+        "output_invalid",
+        "runtime_cleanup_failed",
         "cancelled",
         "worker_shutdown",
         "worker_timeout",
     }
 )
+# The queue and persistence validators share one safe vocabulary. Keeping the
+# runtime-specific codes here prevents a private data-plane error from being
+# rewritten to a generic protocol failure.
+EXECUTION_ERROR_CODES = EXECUTION_ERROR_CODES | RUNTIME_ERROR_CODES
 
 
 class TrainingExecutionError(RuntimeError):
@@ -208,14 +228,19 @@ def authority_fingerprint(snapshot: dict[str, Any]) -> str:
 
 
 def execution_authority_fingerprint(
-    *, execution_id: UUID, execution_code_revision: str, snapshot: dict[str, Any]
+    *,
+    execution_id: UUID,
+    training_job_code_revision: str,
+    execution_code_revision: str,
+    snapshot: dict[str, Any],
 ) -> str:
-    """Hash the complete Phase 11 snapshot under the Phase 14 contract."""
+    """Hash the complete Phase 11 snapshot and both execution authorities."""
 
     return authority_fingerprint(
         {
             "execution_contract_version": EXECUTION_CONTRACT_VERSION,
             "job": snapshot,
+            "training_job_code_revision": training_job_code_revision,
             "execution_id": str(execution_id),
             "execution_code_revision": execution_code_revision,
         }
@@ -232,6 +257,62 @@ def runtime_fingerprint(*, execution_id: UUID, attempt_id: UUID, authority: str)
             }
         )
     ).hexdigest()
+
+
+def real_runtime_fingerprint(
+    *,
+    execution_id: UUID,
+    attempt_id: UUID,
+    authority_fingerprint_value: str,
+    input_snapshot_fingerprint: str,
+    runtime_contract_version: str,
+    llamafactory_version: str,
+    dependency_lock_sha256: str,
+    environment_profile_id: str,
+    environment_fingerprint: str,
+    hardware_profile_id: str,
+    hardware_fingerprint: str,
+    base_model_id: str,
+    base_model_revision: str,
+    profile_id: str,
+    training_job_code_revision: str,
+    execution_code_revision: str,
+    output_stage_fingerprint: str,
+) -> str:
+    """Return the versioned authority fingerprint for one real runtime.
+
+    The fake Phase 14.1 fingerprint intentionally keeps its historical meaning;
+    this helper is used only by real Phase 14.2 results.
+    """
+
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "runtime_fingerprint_version": "phase14-real-runtime-fingerprint-v1",
+                "execution_id": str(execution_id),
+                "attempt_id": str(attempt_id),
+                "authority_fingerprint": authority_fingerprint_value,
+                "input_snapshot_fingerprint": input_snapshot_fingerprint,
+                "runtime_contract_version": runtime_contract_version,
+                "llamafactory_version": llamafactory_version,
+                "dependency_lock_sha256": dependency_lock_sha256,
+                "environment_profile_id": environment_profile_id,
+                "environment_fingerprint": environment_fingerprint,
+                "hardware_profile_id": hardware_profile_id,
+                "hardware_fingerprint": hardware_fingerprint,
+                "base_model_id": base_model_id,
+                "base_model_revision": base_model_revision,
+                "profile_id": profile_id,
+                "training_job_code_revision": training_job_code_revision,
+                "execution_code_revision": execution_code_revision,
+                "output_stage_fingerprint": output_stage_fingerprint,
+            }
+        )
+    ).hexdigest()
+
+
+def _sha256_text(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
 def validate_runtime_result(
@@ -303,10 +384,141 @@ def validate_runtime_result(
     )
 
 
+def validate_real_runtime_result(
+    *,
+    department_id: UUID,
+    execution_id: UUID,
+    attempt_id: UUID,
+    training_job_id: UUID,
+    authority_fingerprint_value: str,
+    input_snapshot_fingerprint: str,
+    profile_id: str,
+    base_model_id: str,
+    base_model_revision: str,
+    training_job_code_revision: str,
+    execution_code_revision: str,
+    dependency_lock_sha256: str,
+    environment_profile_id: str,
+    environment_fingerprint: str,
+    result: object,
+) -> tuple[str, str | None, str, dict[str, object]]:
+    """Validate and independently fingerprint a real runtime response."""
+
+    if not isinstance(result, dict):
+        raise TrainingExecutionError("runtime_protocol_invalid")
+    required = {
+        "department_id",
+        "execution_id",
+        "attempt_id",
+        "training_job_id",
+        "authority_fingerprint",
+        "input_snapshot_fingerprint",
+        "runtime_kind",
+        "runtime_contract_version",
+        "dependency_lock_sha256",
+        "environment_profile_id",
+        "environment_fingerprint",
+        "hardware_profile_id",
+        "hardware_fingerprint",
+        "runtime_fingerprint",
+        "classification",
+        "error_code",
+        "output_stage_fingerprint",
+        "output_file_count",
+        "output_total_bytes",
+    }
+    if set(result) != required or result.get("runtime_kind") != "real":
+        raise TrainingExecutionError("runtime_protocol_invalid")
+    if any(
+        result.get(key) != value
+        for key, value in {
+            "department_id": str(department_id),
+            "execution_id": str(execution_id),
+            "attempt_id": str(attempt_id),
+            "training_job_id": str(training_job_id),
+            "authority_fingerprint": authority_fingerprint_value,
+            "input_snapshot_fingerprint": input_snapshot_fingerprint,
+            "runtime_contract_version": REAL_RUNTIME_CONTRACT_VERSION,
+            "dependency_lock_sha256": dependency_lock_sha256,
+            "environment_profile_id": environment_profile_id,
+            "environment_fingerprint": environment_fingerprint,
+        }.items()
+    ):
+        raise TrainingExecutionError("runtime_protocol_invalid")
+    classification = result.get("classification")
+    error_code = result.get("error_code")
+    if classification in {"execution_failed", "execution_cancelled"}:
+        if not isinstance(error_code, str) or error_code not in RUNTIME_ERROR_CODES:
+            raise TrainingExecutionError("runtime_protocol_invalid")
+        return (
+            classification,
+            error_code,
+            None,
+            {
+                "runtime_kind": "real",
+                "runtime_contract_version": REAL_RUNTIME_CONTRACT_VERSION,
+                "dependency_lock_sha256": dependency_lock_sha256,
+                "environment_profile_id": environment_profile_id,
+                "environment_fingerprint": environment_fingerprint,
+            },
+        )
+    if (
+        not _sha256_text(result.get("hardware_fingerprint"))
+        or not isinstance(result.get("hardware_profile_id"), str)
+        or not _sha256_text(result.get("output_stage_fingerprint"))
+        or type(result.get("output_file_count")) is not int
+        or result["output_file_count"] < 1
+        or type(result.get("output_total_bytes")) is not int
+        or result["output_total_bytes"] < 1
+        or error_code is not None
+        or classification != "execution_succeeded"
+    ):
+        raise TrainingExecutionError("runtime_protocol_invalid")
+    expected = real_runtime_fingerprint(
+        execution_id=execution_id,
+        attempt_id=attempt_id,
+        authority_fingerprint_value=authority_fingerprint_value,
+        input_snapshot_fingerprint=input_snapshot_fingerprint,
+        runtime_contract_version=REAL_RUNTIME_CONTRACT_VERSION,
+        llamafactory_version=EXECUTION_LLAMFACTORY_VERSION,
+        dependency_lock_sha256=dependency_lock_sha256,
+        environment_profile_id=environment_profile_id,
+        environment_fingerprint=environment_fingerprint,
+        hardware_profile_id=result["hardware_profile_id"],
+        hardware_fingerprint=result["hardware_fingerprint"],
+        base_model_id=base_model_id,
+        base_model_revision=base_model_revision,
+        profile_id=profile_id,
+        training_job_code_revision=training_job_code_revision,
+        execution_code_revision=execution_code_revision,
+        output_stage_fingerprint=result["output_stage_fingerprint"],
+    )
+    if result.get("runtime_fingerprint") != expected:
+        raise TrainingExecutionError("runtime_protocol_invalid")
+    return (
+        "execution_succeeded",
+        None,
+        expected,
+        {
+            "runtime_kind": "real",
+            "runtime_contract_version": REAL_RUNTIME_CONTRACT_VERSION,
+            "dependency_lock_sha256": dependency_lock_sha256,
+            "environment_profile_id": environment_profile_id,
+            "environment_fingerprint": environment_fingerprint,
+            "hardware_profile_id": result["hardware_profile_id"],
+            "hardware_fingerprint": result["hardware_fingerprint"],
+            "output_stage_fingerprint": result["output_stage_fingerprint"],
+            "output_file_count": result["output_file_count"],
+            "output_total_bytes": result["output_total_bytes"],
+        },
+    )
+
+
 __all__ = [
     "AUTHORITY_FIELDS",
     "EXECUTION_ATTEMPT_STATUSES",
     "EXECUTION_CONTRACT_VERSION",
+    "REAL_RUNTIME_CONTRACT_VERSION",
     "EXECUTION_ERROR_CODES",
     "EXECUTION_LLAMFACTORY_VERSION",
     "EXECUTION_MODEL_ID",
@@ -320,6 +532,8 @@ __all__ = [
     "authority_fingerprint",
     "canonical_json_bytes",
     "execution_authority_fingerprint",
+    "real_runtime_fingerprint",
     "training_job_authority_snapshot",
     "validate_runtime_result",
+    "validate_real_runtime_result",
 ]

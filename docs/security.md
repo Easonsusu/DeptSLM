@@ -76,8 +76,8 @@ base remains explicit. No automatic model download occurs.
 
 ## Phase 14 training-execution boundary
 
-Roadmap v2 Phase 14.0 completed the contract, and Phase 14.1 implements only
-the metadata control plane. The threat model adds
+Roadmap v2 Phase 14.0 and Phase 14.1 completed the contract and control plane;
+Phase 14.2 adds the first private real-training runtime. The threat model adds
 malicious human-authored examples, malicious but schema-valid Phase 11 bundles,
 semantic configuration drift, arbitrary CLI or shell injection, environment
 inheritance, model-cache substitution, training dependency drift,
@@ -87,19 +87,29 @@ RAM exhaustion, GPU OOM, process explosion, hung/orphan children, cancellation
 races, stale leases, host crashes, publication crashes, a compromised training
 runtime, and a compromised Docker host.
 
-The Phase 14.1 worker receives only PostgreSQL and external training-run
-storage. An eventual private runtime receives no PostgreSQL, Qdrant,
-API-auth, membership, RAG, evaluation, adapter, or cloud credentials. It has
-no public port, Docker socket, host networking, or normal internet egress and
-must use a fixed executable/argv boundary, sanitized environment, process-group
-supervision, deadlines, byte/process/disk bounds, and complete tree reaping.
+The Phase 14.2 worker receives only PostgreSQL, exact external training-run
+surfaces, and the private runtime IPC token/socket. The private runtime
+receives no PostgreSQL, Qdrant, API-auth, membership, RAG, evaluation, adapter,
+or cloud credentials. It uses `network_mode: none`, has no public port or
+Docker socket, and uses a fixed executable/argv boundary, sanitized offline
+environment, process-group supervision, deadlines, byte/process/disk bounds,
+and complete tree reaping.
 The runtime consumes only a verified server-created snapshot of one approved
 Phase 11 bundle and cannot turn filesystem presence or a zero exit code into
-authority. No real Phase 14 runtime exists yet; Phase 14.1's production worker
-fails closed without one.
+authority. Candidate adapter bytes are private and non-authoritative until a
+future Phase 14.3 handoff.
+
+The Phase 11 bundle revision and the Phase 14 executor revision are separate
+security authorities. `TrainingJob.code_revision` is checked against the
+immutable Phase 11 manifest; the executor uses only the exact lowercase SHA
+from `DEPTSLM_TRAINING_EXECUTION_CODE_REVISION`. Both are frozen in the
+control-plane authority and attempt fingerprints, so a changed bundle or a
+changed executor is rejected independently.
 
 Phase 14 provides no hardware or cryptographic attestation. A compromised
 host or runtime can invalidate the supervised-execution provenance claim; this
 residual risk remains explicitly outside the contract. Real execution,
 training dependency pinning, numeric resource bounds, and hardware fingerprints
-require reviewed Phase 14.2 work. Phase 14.2 and Phase 14.3 have not started.
+are reviewed in Phase 14.2. Normal CI downloads no model weights and performs
+no real training; qualifying NVIDIA/LoRA/QLoRA validation is an explicit
+opt-in gate. Phase 14.3 and Phase 15 have not started.

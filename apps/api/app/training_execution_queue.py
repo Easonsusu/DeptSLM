@@ -6,6 +6,7 @@ executes training and fails closed; tests may inject a deterministic fake.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from collections.abc import Callable
@@ -14,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -31,15 +32,21 @@ from app.services import ServiceError, append_mutation_audit
 from app.training_execution_domain import (
     EXECUTION_ERROR_CODES,
     EXECUTION_PROFILES,
+    REAL_RUNTIME_CONTRACT_VERSION,
     TrainingExecutionError,
     execution_authority_fingerprint,
     training_job_authority_snapshot,
+    validate_real_runtime_result,
     validate_runtime_result,
 )
+from app.training_execution_locking import acquire_training_execution_serialization
 from app.training_execution_runtime import (
+    RUNTIME_TRAINING_TIMEOUT_SECONDS,
+    StopReason,
     TrainingExecutionRuntime,
     TrainingRuntimeHandles,
     TrainingRuntimeRequest,
+    UnixTrainingRuntimeClient,
     validate_runtime_request,
 )
 from app.training_execution_storage import (
@@ -53,6 +60,10 @@ class TrainingExecutionQueueError(RuntimeError):
     def __init__(self, code: str = "database_unavailable") -> None:
         self.code = code if code in EXECUTION_ERROR_CODES else "database_unavailable"
         super().__init__(self.code)
+
+
+CONTROL_PLANE_OVERHEAD_SECONDS = 15 * 60
+DEFAULT_OPERATION_SECONDS = int(RUNTIME_TRAINING_TIMEOUT_SECONDS + CONTROL_PLANE_OVERHEAD_SECONDS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +81,8 @@ class ClaimedTrainingExecution:
     base_model_id: str
     base_model_revision: str
     llamafactory_version: str
+    training_job_code_revision: str
+    execution_code_revision: str
 
 
 def _server_now(session: Session) -> datetime:
@@ -82,7 +95,7 @@ def _server_now(session: Session) -> datetime:
 def _valid_claim(
     session: Session, claim: ClaimedTrainingExecution, *, lock: bool = False
 ) -> tuple[TrainingExecution, TrainingExecutionAttempt, TrainingJob] | None:
-    # All Phase 11/14.1 mutation paths use the same job-first order.  The
+    # All Phase 11/14.1 mutation paths use the same advisory -> job order. The
     # immutable claim already carries training_job_id, so never lock the
     # execution merely to discover its parent job.
     job_query = select(TrainingJob).where(
@@ -90,6 +103,7 @@ def _valid_claim(
         TrainingJob.department_id == claim.department_id,
     )
     if lock:
+        acquire_training_execution_serialization(session, claim.execution_id)
         job_query = job_query.with_for_update()
     job = session.execute(job_query).scalar_one_or_none()
     if job is None:
@@ -132,9 +146,13 @@ def _valid_claim(
         or execution.authority_fingerprint
         != execution_authority_fingerprint(
             execution_id=execution.id,
+            training_job_code_revision=execution.training_job_code_revision,
             execution_code_revision=execution.execution_code_revision,
             snapshot=training_job_authority_snapshot(job),
         )
+        or execution.training_job_code_revision != job.code_revision
+        or execution.training_job_code_revision != claim.training_job_code_revision
+        or execution.execution_code_revision != claim.execution_code_revision
     ):
         return None
     return execution, attempt, job
@@ -144,19 +162,71 @@ def check_execution_claim(factory: sessionmaker[Session], claim: ClaimedTraining
     try:
         with factory() as session:
             return _valid_claim(session, claim) is not None
-    except SQLAlchemyError:
+    except (SQLAlchemyError, TrainingExecutionQueueError):
         return False
 
 
 def execution_should_stop(factory: sessionmaker[Session], claim: ClaimedTrainingExecution) -> bool:
     """Return true for cancellation, claim loss, or database failure."""
 
+    return execution_stop_reason(factory, claim) is not None
+
+
+def execution_stop_reason(
+    factory: sessionmaker[Session], claim: ClaimedTrainingExecution
+) -> str | None:
+    """Return the exact server-authoritative reason for stopping a runtime."""
+
     try:
         with factory() as session:
             owned = _valid_claim(session, claim)
-            return owned is None or owned[0].status == "cancel_requested"
-    except SQLAlchemyError:
-        return True
+            if owned is None:
+                return StopReason.CLAIM_LOST.value
+            if owned[0].status == "cancel_requested":
+                return StopReason.CANCELLED.value
+            return None
+    except (SQLAlchemyError, TrainingExecutionQueueError):
+        # Database unavailability cannot be treated as user cancellation or
+        # ownership.  It is a worker shutdown-style fail-closed interruption;
+        # finalization still requires a live claim and therefore cannot
+        # terminalize a replacement's execution.
+        return StopReason.WORKER_SHUTDOWN.value
+
+
+def _external_stop_reason(value: object) -> str | None:
+    """Normalize an injected worker signal to one closed stop reason.
+
+    A legacy boolean callback is intentionally interpreted as worker shutdown,
+    never as claim loss.  Runtime IPC receives only the resulting closed value.
+    """
+
+    if value is None or value is False:
+        return None
+    if isinstance(value, StopReason):
+        return value.value
+    if value is True:
+        return StopReason.WORKER_SHUTDOWN.value
+    if isinstance(value, str):
+        try:
+            return StopReason(value).value
+        except ValueError:
+            return StopReason.WORKER_SHUTDOWN.value
+    return StopReason.WORKER_SHUTDOWN.value
+
+
+def _closed_stop_reason(
+    *, external: object, authoritative: str | None, deadline_reached: bool
+) -> str | None:
+    """Combine external, server, and deadline signals without type collapse."""
+
+    external_reason = _external_stop_reason(external)
+    if external_reason is not None:
+        return external_reason
+    if authoritative is not None:
+        return _external_stop_reason(authoritative)
+    if deadline_reached:
+        return StopReason.WORKER_TIMEOUT.value
+    return None
 
 
 def renew_execution_lease(
@@ -175,21 +245,24 @@ def renew_execution_lease(
             attempt.lease_expires_at = expires
             attempt.version += 1
             return True
-    except SQLAlchemyError:
+    except (SQLAlchemyError, TrainingExecutionQueueError):
         return False
 
 
 def claim_next_training_execution(
-    factory: sessionmaker[Session], worker_id: UUID, lease_seconds: int, code_revision: str
+    factory: sessionmaker[Session],
+    worker_id: UUID,
+    lease_seconds: int,
+    execution_code_revision: str,
 ) -> ClaimedTrainingExecution | None:
-    if re.fullmatch(r"[0-9a-f]{40}", code_revision) is None:
+    if re.fullmatch(r"[0-9a-f]{40}", execution_code_revision) is None:
         raise TrainingExecutionQueueError("training_job_authority_changed")
     try:
         with factory.begin() as session:
             candidate = session.scalar(
                 select(TrainingExecution.id)
                 .where(
-                    TrainingExecution.execution_code_revision == code_revision,
+                    TrainingExecution.execution_code_revision == execution_code_revision,
                     (TrainingExecution.status == "queued")
                     | (
                         TrainingExecution.status.in_(("running", "cancel_requested"))
@@ -206,7 +279,9 @@ def claim_next_training_execution(
             )
             if execution_probe is None:
                 return None
-            # Job is deliberately locked before the execution row.
+            # Acquire the same execution fence before taking the job row lock
+            # used by every other execution mutation path.
+            acquire_training_execution_serialization(session, candidate)
             job = session.execute(
                 select(TrainingJob)
                 .where(
@@ -260,6 +335,7 @@ def claim_next_training_execution(
             snapshot = training_job_authority_snapshot(job)
             expected_fp = execution_authority_fingerprint(
                 execution_id=execution.id,
+                training_job_code_revision=execution.training_job_code_revision,
                 execution_code_revision=execution.execution_code_revision,
                 snapshot=snapshot,
             )
@@ -276,7 +352,7 @@ def claim_next_training_execution(
             if (
                 job.profile_id not in EXECUTION_PROFILES
                 or job.code_revision != execution.training_job_code_revision
-                or code_revision != execution.execution_code_revision
+                or execution_code_revision != execution.execution_code_revision
             ):
                 execution.status = "failed"
                 execution.error_code = "training_job_authority_changed"
@@ -356,6 +432,8 @@ def claim_next_training_execution(
                 base_model_id=execution.base_model_id,
                 base_model_revision=execution.base_model_revision,
                 llamafactory_version=execution.llamafactory_version,
+                training_job_code_revision=execution.training_job_code_revision,
+                execution_code_revision=execution.execution_code_revision,
             )
     except TrainingExecutionQueueError:
         raise
@@ -372,6 +450,7 @@ def _finalize(
     classification: str,
     runtime_fp: str | None,
     input_fp: str | None,
+    runtime_details: dict[str, object] | None = None,
 ) -> bool:
     try:
         with factory.begin() as session:
@@ -379,11 +458,71 @@ def _finalize(
             if owned is None:
                 return False
             execution, attempt, job = owned
+            purge_conflict = False
+            try:
+                _require_no_active_purge_reservation(session, job)
+            except ServiceError:
+                # A committed Phase 11 purge reservation wins the finalization
+                # race.  The attempt is terminalized as a safe authority
+                # failure; its output remains non-authoritative and is cleaned
+                # by the caller rather than becoming retained success.
+                status = "failed"
+                error_code = "training_job_authority_changed"
+                classification = "execution_failed"
+                purge_conflict = True
             now = _server_now(session)
             if execution.status == "cancel_requested" and status == "succeeded":
                 status = "cancelled"
                 error_code = "cancelled"
                 classification = "execution_cancelled"
+            success_cas = False
+            if status == "succeeded" and execution.status == "running":
+                # Claim success is an explicit compare-and-set.  This keeps
+                # the success-first outcome terminal even if a stale cancel
+                # request was already queued behind the same job lock; the
+                # cancellation path uses the matching running/version guard.
+                result = session.execute(
+                    update(TrainingExecution)
+                    .where(
+                        TrainingExecution.id == execution.id,
+                        TrainingExecution.department_id == claim.department_id,
+                        TrainingExecution.training_job_id == claim.training_job_id,
+                        TrainingExecution.current_attempt_id == claim.attempt_id,
+                        TrainingExecution.worker_id == claim.worker_id,
+                        TrainingExecution.claim_token == claim.claim_token,
+                        TrainingExecution.status == "running",
+                        TrainingExecution.version == execution.version,
+                    )
+                    .values(
+                        status="succeeded",
+                        error_code=None,
+                        finished_at=now,
+                        current_attempt_id=None,
+                        worker_id=None,
+                        claim_token=None,
+                        lease_expires_at=None,
+                        version=TrainingExecution.version + 1,
+                    )
+                )
+                if result.rowcount != 1:
+                    session.expire(execution)
+                    session.refresh(execution)
+                    if execution.status == "cancel_requested":
+                        status = "cancelled"
+                        error_code = "cancelled"
+                        classification = "execution_cancelled"
+                    else:
+                        return False
+                else:
+                    execution.status = "succeeded"
+                    execution.error_code = None
+                    execution.finished_at = now
+                    execution.current_attempt_id = None
+                    execution.worker_id = None
+                    execution.claim_token = None
+                    execution.lease_expires_at = None
+                    execution.version += 1
+                    success_cas = True
             attempt.status = (
                 "succeeded"
                 if status == "succeeded"
@@ -396,15 +535,30 @@ def _finalize(
             attempt.input_snapshot_fingerprint = input_fp
             attempt.result_classification = classification
             attempt.error_code = error_code
+            details = runtime_details or {}
+            attempt.runtime_kind = str(details.get("runtime_kind", "fake"))
+            attempt.runtime_contract_version = details.get("runtime_contract_version")
+            attempt.runtime_dependency_lock_sha256 = details.get("dependency_lock_sha256")
+            attempt.runtime_environment_profile_id = details.get("environment_profile_id")
+            attempt.runtime_environment_fingerprint = details.get("environment_fingerprint")
+            attempt.runtime_hardware_profile_id = details.get("hardware_profile_id")
+            attempt.runtime_hardware_fingerprint = details.get("hardware_fingerprint")
+            attempt.output_stage_fingerprint = details.get("output_stage_fingerprint")
+            attempt.output_file_count = details.get("output_file_count")
+            attempt.output_total_bytes = details.get("output_total_bytes")
+            if status == "succeeded" and attempt.runtime_kind == "real":
+                attempt.output_retained_at = now
+                attempt.output_purged_at = None
             attempt.version += 1
-            execution.status = status
-            execution.error_code = error_code
-            execution.finished_at = now
-            execution.current_attempt_id = None
-            execution.worker_id = None
-            execution.claim_token = None
-            execution.lease_expires_at = None
-            execution.version += 1
+            if not success_cas:
+                execution.status = status
+                execution.error_code = error_code
+                execution.finished_at = now
+                execution.current_attempt_id = None
+                execution.worker_id = None
+                execution.claim_token = None
+                execution.lease_expires_at = None
+                execution.version += 1
             if status == "succeeded":
                 actor = session.scalar(
                     select(UserIdentity).where(UserIdentity.id == job.requested_by_user_id)
@@ -419,8 +573,8 @@ def _finalize(
                         resource_type="training_execution",
                         resource_id=execution.id,
                     )
-            return True
-    except SQLAlchemyError:
+            return not purge_conflict
+    except (SQLAlchemyError, TrainingExecutionQueueError):
         return False
 
 
@@ -431,8 +585,8 @@ def process_training_execution(
     *,
     runtime: TrainingExecutionRuntime | None = None,
     lease_seconds: int = 300,
-    operation_seconds: int = 3600,
-    should_stop: Callable[[], bool] = lambda: False,
+    operation_seconds: int = DEFAULT_OPERATION_SECONDS,
+    should_stop: Callable[[], object] = lambda: False,
 ) -> bool:
     deadline = time.monotonic() + max(1, operation_seconds)
     if runtime is None:
@@ -447,15 +601,24 @@ def process_training_execution(
         )
 
     def checkpoint() -> None:
-        if should_stop():
-            raise TrainingExecutionQueueError("worker_shutdown")
-        if time.monotonic() >= deadline:
-            raise TrainingExecutionQueueError("worker_timeout")
-        if not check_execution_claim(factory, claim):
-            raise TrainingExecutionQueueError("claim_lost")
+        reason = _closed_stop_reason(
+            external=should_stop(), authoritative=None, deadline_reached=False
+        )
+        if reason is None and time.monotonic() >= deadline:
+            reason = StopReason.WORKER_TIMEOUT.value
+        if reason is None:
+            reason = _closed_stop_reason(
+                external=None,
+                authoritative=execution_stop_reason(factory, claim),
+                deadline_reached=False,
+            )
+        if reason is not None:
+            raise TrainingExecutionQueueError(reason)
 
     stage = None
     snapshot = None
+    finalized_success = False
+    retained_output_stage = False
     try:
         with factory() as session:
             job = session.scalar(
@@ -495,8 +658,33 @@ def process_training_execution(
                 base_model_id=claim.base_model_id,
                 base_model_revision=claim.base_model_revision,
                 attempt_namespace=claim.attempt_id,
+                runtime_contract_version=REAL_RUNTIME_CONTRACT_VERSION
+                if isinstance(runtime, UnixTrainingRuntimeClient)
+                else "",
+                dependency_lock_sha256=os.getenv("DEPTSLM_TRAINING_DEPENDENCY_LOCK_SHA256", ""),
+                environment_profile_id=os.getenv("DEPTSLM_TRAINING_ENVIRONMENT_PROFILE_ID", ""),
+                expected_environment_fingerprint=os.getenv(
+                    "DEPTSLM_TRAINING_ENVIRONMENT_FINGERPRINT", ""
+                ),
+                training_job_code_revision=claim.training_job_code_revision,
+                execution_code_revision=claim.execution_code_revision,
             )
             validate_runtime_request(request)
+
+            def runtime_stop_reason() -> str | None:
+                reason = _closed_stop_reason(
+                    external=should_stop(), authoritative=None, deadline_reached=False
+                )
+                if reason is None and time.monotonic() >= deadline:
+                    reason = StopReason.WORKER_TIMEOUT.value
+                if reason is None:
+                    reason = _closed_stop_reason(
+                        external=None,
+                        authoritative=execution_stop_reason(factory, claim),
+                        deadline_reached=False,
+                    )
+                return reason
+
             result = runtime.run(
                 request,
                 handles=TrainingRuntimeHandles(
@@ -505,20 +693,63 @@ def process_training_execution(
                     logs_fd=stage.logs_fd,
                     output_stage_fd=stage.output_stage_fd,
                 ),
-                should_stop=lambda: should_stop() or execution_should_stop(factory, claim),
+                should_stop=runtime_stop_reason,
                 heartbeat=lambda: renew_execution_lease(factory, claim, lease_seconds),
             )
-            classification, error_code, runtime_fp = validate_runtime_result(
-                department_id=claim.department_id,
-                execution_id=claim.execution_id,
-                attempt_id=claim.attempt_id,
-                training_job_id=claim.training_job_id,
-                authority_fingerprint_value=claim.authority_fingerprint,
-                input_snapshot_fingerprint=snapshot.fingerprint,
-                result=result.as_closed_mapping()
-                if hasattr(result, "as_closed_mapping")
-                else result,
+            result_mapping = (
+                result.as_closed_mapping() if hasattr(result, "as_closed_mapping") else result
             )
+            runtime_details = None
+            if isinstance(result_mapping, dict) and result_mapping.get("runtime_kind") == "real":
+                (
+                    classification,
+                    error_code,
+                    runtime_fp,
+                    runtime_details,
+                ) = validate_real_runtime_result(
+                    department_id=claim.department_id,
+                    execution_id=claim.execution_id,
+                    attempt_id=claim.attempt_id,
+                    training_job_id=claim.training_job_id,
+                    authority_fingerprint_value=claim.authority_fingerprint,
+                    input_snapshot_fingerprint=snapshot.fingerprint,
+                    profile_id=claim.profile_id,
+                    base_model_id=claim.base_model_id,
+                    base_model_revision=claim.base_model_revision,
+                    training_job_code_revision=claim.training_job_code_revision,
+                    execution_code_revision=claim.execution_code_revision,
+                    dependency_lock_sha256=request.dependency_lock_sha256,
+                    environment_profile_id=request.environment_profile_id,
+                    environment_fingerprint=request.expected_environment_fingerprint,
+                    result=result_mapping,
+                )
+                evidence = TrainingExecutionArtifactStore.inspect_output_stage(
+                    stage.output_stage_fd
+                )
+                if (
+                    evidence.fingerprint != runtime_details["output_stage_fingerprint"]
+                    or evidence.file_count != runtime_details["output_file_count"]
+                    or evidence.total_bytes != runtime_details["output_total_bytes"]
+                ):
+                    raise TrainingExecutionQueueError("runtime_protocol_invalid")
+                TrainingExecutionArtifactStore.seal_output_stage(stage.output_stage_fd)
+                sealed = TrainingExecutionArtifactStore.inspect_output_stage(stage.output_stage_fd)
+                if (
+                    sealed.fingerprint != evidence.fingerprint
+                    or sealed.file_count != evidence.file_count
+                    or sealed.total_bytes != evidence.total_bytes
+                ):
+                    raise TrainingExecutionQueueError("runtime_protocol_invalid")
+            else:
+                classification, error_code, runtime_fp = validate_runtime_result(
+                    department_id=claim.department_id,
+                    execution_id=claim.execution_id,
+                    attempt_id=claim.attempt_id,
+                    training_job_id=claim.training_job_id,
+                    authority_fingerprint_value=claim.authority_fingerprint,
+                    input_snapshot_fingerprint=snapshot.fingerprint,
+                    result=result_mapping,
+                )
             checkpoint()
             status = (
                 "succeeded"
@@ -528,7 +759,43 @@ def process_training_execution(
                 else "failed"
             )
             code = error_code or ("runtime_protocol_invalid" if status == "failed" else None)
-            return _finalize(
+            candidate_retained = (
+                status == "succeeded"
+                and runtime_details is not None
+                and runtime_details.get("runtime_kind") == "real"
+            )
+            # Terminalize only after transient input/scratch/log bytes have
+            # been removed. A cleanup failure is itself a safe failed outcome;
+            # no real output becomes retained authority until that failure-free
+            # cleanup and the final PostgreSQL claim check both complete.
+            try:
+                checkpoint()
+                TrainingExecutionArtifactStore.remove_nonretained_attempt_data(
+                    stage, retain_output_stage=candidate_retained
+                )
+                checkpoint()
+            except TrainingExecutionStorageError:
+                status = "failed"
+                code = "runtime_cleanup_failed"
+                classification = "execution_failed"
+                candidate_retained = False
+                runtime_fp = None
+                if runtime_details is not None:
+                    runtime_details = {
+                        key: value
+                        for key, value in runtime_details.items()
+                        if key
+                        in {
+                            "runtime_kind",
+                            "runtime_contract_version",
+                            "dependency_lock_sha256",
+                            "environment_profile_id",
+                            "environment_fingerprint",
+                            "hardware_profile_id",
+                            "hardware_fingerprint",
+                        }
+                    }
+            result_value = _finalize(
                 factory,
                 claim,
                 status=status,
@@ -536,7 +803,11 @@ def process_training_execution(
                 classification=classification,
                 runtime_fp=runtime_fp,
                 input_fp=snapshot.fingerprint,
+                runtime_details=runtime_details,
             )
+            finalized_success = status == "succeeded" and result_value
+            retained_output_stage = finalized_success and candidate_retained
+            return result_value
     except TrainingExecutionQueueError as error:
         _finalize(
             factory,
@@ -552,18 +823,28 @@ def process_training_execution(
         return False
     except (TrainingExecutionError, TrainingExecutionStorageError) as error:
         code = getattr(error, "code", "input_snapshot_failed")
+        cancelled = code in {
+            StopReason.CANCELLED.value,
+            StopReason.WORKER_SHUTDOWN.value,
+        }
         _finalize(
             factory,
             claim,
-            status="failed",
+            status="cancelled" if cancelled else "failed",
             error_code=code,
-            classification="execution_failed",
+            classification="execution_cancelled" if cancelled else "execution_failed",
             runtime_fp=None,
             input_fp=None,
         )
         return False
     finally:
         if stage is not None:
+            try:
+                TrainingExecutionArtifactStore.remove_nonretained_attempt_data(
+                    stage, retain_output_stage=retained_output_stage
+                )
+            except TrainingExecutionStorageError:
+                pass
             stage.close()
 
 
@@ -572,7 +853,9 @@ __all__ = [
     "TrainingExecutionQueueError",
     "check_execution_claim",
     "claim_next_training_execution",
+    "_closed_stop_reason",
     "execution_should_stop",
+    "execution_stop_reason",
     "process_training_execution",
     "renew_execution_lease",
 ]

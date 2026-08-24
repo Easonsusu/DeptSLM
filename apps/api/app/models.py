@@ -4226,8 +4226,12 @@ class TrainingExecution(Base):
             "'training_job_unavailable','training_job_authority_changed',"
             "'training_job_artifact_missing','training_job_artifact_mismatch',"
             "'input_snapshot_failed','runtime_unavailable','runtime_protocol_invalid',"
-            "'department_unavailable','requester_unauthorized','claim_lost','cancelled',"
-            "'worker_shutdown','worker_timeout','database_unavailable')",
+            "'runtime_environment_invalid','runtime_hardware_unsupported',"
+            "'runtime_model_unavailable','runtime_dependency_mismatch','runtime_auth_failed',"
+            "'runtime_busy','training_config_invalid','child_start_failed','child_failed',"
+            "'child_timeout','runtime_disconnected','output_limit_exceeded','output_invalid',"
+            "'runtime_cleanup_failed','department_unavailable','requester_unauthorized',"
+            "'claim_lost','cancelled','worker_shutdown','worker_timeout','database_unavailable')",
             name="ck_training_execution_error_code",
         ),
         CheckConstraint(
@@ -4415,8 +4419,12 @@ class TrainingExecutionAttempt(Base):
             "'training_job_unavailable','training_job_authority_changed',"
             "'training_job_artifact_missing','training_job_artifact_mismatch',"
             "'input_snapshot_failed','runtime_unavailable','runtime_protocol_invalid',"
-            "'department_unavailable','requester_unauthorized','claim_lost','cancelled',"
-            "'worker_shutdown','worker_timeout','database_unavailable')",
+            "'runtime_environment_invalid','runtime_hardware_unsupported',"
+            "'runtime_model_unavailable','runtime_dependency_mismatch','runtime_auth_failed',"
+            "'runtime_busy','training_config_invalid','child_start_failed','child_failed',"
+            "'child_timeout','runtime_disconnected','output_limit_exceeded','output_invalid',"
+            "'runtime_cleanup_failed','department_unavailable','requester_unauthorized',"
+            "'claim_lost','cancelled','worker_shutdown','worker_timeout','database_unavailable')",
             name="ck_training_execution_attempt_error_code",
         ),
         CheckConstraint(
@@ -4430,6 +4438,54 @@ class TrainingExecutionAttempt(Base):
             "runtime_fingerprint ~ '^[0-9a-f]{64}$' AND "
             "result_classification = 'execution_succeeded' AND error_code IS NULL)",
             name="ck_training_execution_attempt_success_contract",
+        ),
+        CheckConstraint(
+            "runtime_kind IN ('fake','real')",
+            name="ck_training_execution_attempt_runtime_kind",
+        ),
+        CheckConstraint(
+            "runtime_contract_version IS NULL OR runtime_contract_version = "
+            "'phase14-training-runtime-v1'",
+            name="ck_training_execution_attempt_runtime_contract",
+        ),
+        CheckConstraint(
+            "(runtime_dependency_lock_sha256 IS NULL OR "
+            "runtime_dependency_lock_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(runtime_environment_fingerprint IS NULL OR "
+            "runtime_environment_fingerprint ~ '^[0-9a-f]{64}$') AND "
+            "(runtime_hardware_fingerprint IS NULL OR "
+            "runtime_hardware_fingerprint ~ '^[0-9a-f]{64}$') AND "
+            "(output_stage_fingerprint IS NULL OR "
+            "output_stage_fingerprint ~ '^[0-9a-f]{64}$')",
+            name="ck_training_execution_attempt_runtime_hashes",
+        ),
+        CheckConstraint(
+            "(output_file_count IS NULL AND output_total_bytes IS NULL) OR "
+            "(output_file_count >= 0 AND output_file_count <= 4096 AND "
+            "output_total_bytes >= 0 AND output_total_bytes <= 8589934592)",
+            name="ck_training_execution_attempt_output_bounds",
+        ),
+        CheckConstraint(
+            "status <> 'succeeded' OR runtime_kind <> 'real' OR ("
+            "runtime_contract_version = 'phase14-training-runtime-v1' AND "
+            "runtime_dependency_lock_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "runtime_environment_profile_id IS NOT NULL AND "
+            "runtime_environment_profile_id <> '' AND "
+            "runtime_environment_fingerprint ~ '^[0-9a-f]{64}$' AND "
+            "runtime_hardware_profile_id IS NOT NULL AND runtime_hardware_profile_id <> '' AND "
+            "runtime_hardware_fingerprint ~ '^[0-9a-f]{64}$' AND "
+            "output_stage_fingerprint ~ '^[0-9a-f]{64}$' AND "
+            "output_file_count >= 1 AND output_total_bytes >= 1 AND "
+            "output_retained_at IS NOT NULL AND output_purged_at IS NULL AND "
+            "input_snapshot_fingerprint ~ '^[0-9a-f]{64}$' AND "
+            "runtime_fingerprint ~ '^[0-9a-f]{64}$' AND "
+            "result_classification = 'execution_succeeded' AND error_code IS NULL)",
+            name="ck_training_execution_attempt_real_success_contract",
+        ),
+        CheckConstraint(
+            "output_purged_at IS NULL OR (runtime_kind = 'real' AND "
+            "output_retained_at IS NOT NULL)",
+            name="ck_training_execution_attempt_output_retention",
         ),
         Index(
             "uq_training_execution_attempt_active",
@@ -4459,6 +4515,18 @@ class TrainingExecutionAttempt(Base):
     runtime_fingerprint: Mapped[str | None] = mapped_column(String(64))
     result_classification: Mapped[str | None] = mapped_column(String(32))
     error_code: Mapped[str | None] = mapped_column(String(64))
+    runtime_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="fake")
+    runtime_contract_version: Mapped[str | None] = mapped_column(String(100))
+    runtime_dependency_lock_sha256: Mapped[str | None] = mapped_column(String(64))
+    runtime_environment_profile_id: Mapped[str | None] = mapped_column(String(100))
+    runtime_environment_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    runtime_hardware_profile_id: Mapped[str | None] = mapped_column(String(100))
+    runtime_hardware_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    output_stage_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    output_file_count: Mapped[int | None] = mapped_column(Integer)
+    output_total_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    output_retained_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    output_purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="registered")
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = utc_timestamp()

@@ -1,4 +1,4 @@
-"""Static guardrails for the Phase 14.0/14.1 execution boundary."""
+"""Static guardrails for the Roadmap v2 Phase 14 execution boundary."""
 
 from __future__ import annotations
 
@@ -10,21 +10,19 @@ ROOT = Path(__file__).resolve().parents[3]
 VERSIONS = ROOT / "apps" / "api" / "alembic" / "versions"
 
 
-def test_phase14_1_advances_the_alembic_head_once() -> None:
+def test_phase14_2_advances_the_alembic_head_once() -> None:
     revisions = sorted(path.stem for path in VERSIONS.glob("*.py"))
-    assert revisions[-1] == "0018_phase14_training_execution_control_plane"
-    migration = (VERSIONS / "0018_phase14_training_execution_control_plane.py").read_text(
-        encoding="utf-8"
-    )
-    assert 'down_revision = "0017_phase12_adapter_runtime_routing"' in migration
-    assert "0019" not in migration
+    assert revisions[-1] == "0019_phase14_training_runtime"
+    migration = (VERSIONS / "0019_phase14_training_runtime.py").read_text(encoding="utf-8")
+    assert 'down_revision = "0018_phase14_training_execution_control_plane"' in migration
+    assert "0019_phase14_training_runtime" in migration
 
 
-def test_phase14_1_has_only_the_control_plane_and_no_runtime_service() -> None:
+def test_phase14_2_adds_only_the_private_runtime_service() -> None:
     assert not (ROOT / "services" / "training-execution").exists()
-    assert not (ROOT / "services" / "training-runtime").exists()
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
-    assert not re.search(r"(?m)^\s+(?:training-execution|training-runtime):", compose)
+    assert re.search(r"(?m)^\s+training-execution-worker:", compose)
+    assert re.search(r"(?m)^\s+training-runtime:", compose)
 
     routes = (ROOT / "apps" / "api" / "app" / "routes.py").read_text(encoding="utf-8")
     assert "/training/executions" in routes
@@ -32,7 +30,7 @@ def test_phase14_1_has_only_the_control_plane_and_no_runtime_service() -> None:
     assert "/training/executions/{execution_id}/retry" in routes
 
 
-def test_phase14_1_does_not_install_or_execute_llamafactory() -> None:
+def test_phase14_2_keeps_the_real_training_stack_out_of_the_api() -> None:
     api_requirements = (
         (ROOT / "apps" / "api" / "requirements.txt").read_text(encoding="utf-8").lower()
     )
@@ -40,18 +38,14 @@ def test_phase14_1_does_not_install_or_execute_llamafactory() -> None:
     assert "llamafactory" not in api_requirements
     assert "llamafactory" not in json.dumps(web_package).lower()
 
-    executable_roots = (ROOT / "apps" / "api" / "app", ROOT / "services")
-    executable_files = [
-        path
-        for root in executable_roots
-        for path in root.rglob("*")
-        if path.is_file() and path.suffix in {".py", ".sh"}
-    ]
-    training_command = re.compile(r"llamafactory-cli\s+train", re.IGNORECASE)
-    assert not any(
-        training_command.search(path.read_text(encoding="utf-8", errors="ignore"))
-        for path in executable_files
+    runtime_requirements = (
+        (ROOT / "services" / "training-runtime" / "requirements.lock")
+        .read_text(encoding="utf-8")
+        .lower()
     )
+    assert "llamafactory==0.9.5" in runtime_requirements
+    runtime = (ROOT / "services" / "training-runtime" / "deptslm_training_runtime").rglob("*.py")
+    assert any("llamafactory-cli" in path.read_text(encoding="utf-8") for path in runtime)
 
 
 def test_phase14_1_does_not_add_training_credentials_or_docker_socket() -> None:
@@ -62,14 +56,14 @@ def test_phase14_1_does_not_add_training_credentials_or_docker_socket() -> None:
     assert "HUGGING_FACE_HUB_TOKEN" not in training_worker
 
 
-def test_phase14_1_contract_and_phase11_identity_are_documented() -> None:
+def test_phase14_2_contract_and_phase11_identity_are_documented() -> None:
     contract = (ROOT / "docs" / "training-execution.md").read_text(encoding="utf-8")
     roadmap = (ROOT / "docs" / "roadmap.md").read_text(encoding="utf-8")
     assert (
         "Phase 11 currently generates an immutable reviewable LlamaFactory job bundle." in contract
     )
     assert "Phase 14.0 is complete." in contract
-    assert "Phase 14.1 implements only the metadata control" in contract
+    assert "Phase 14.2" in contract
     assert "## Roadmap v2" in roadmap
     assert "Phase 14.0" in roadmap
     assert "Phase 14.1" in roadmap
@@ -87,9 +81,9 @@ def test_phase14_1_contract_and_phase11_identity_are_documented() -> None:
         assert value in contract
 
 
-def test_phase14_1_reuses_static_adapter_validation_and_forbids_automation() -> None:
+def test_phase14_2_preserves_the_future_adapter_handoff_boundary() -> None:
     contract = (ROOT / "docs" / "training-execution.md").read_text(encoding="utf-8")
     assert "existing Phase 12.1A model-free static adapter validator" in contract
     assert re.search(r"automatic\s+adapter intake", contract)
     assert "automatic" in contract
-    assert "Phase 14.1 does not install or invoke LlamaFactory" in contract
+    assert "Phase 14.3" in contract
