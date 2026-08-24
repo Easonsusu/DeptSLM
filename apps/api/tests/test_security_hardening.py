@@ -109,6 +109,20 @@ def test_linux_model_locks_include_hashed_cuda_platform_dependencies() -> None:
             ) in lock, (lock_path, package)
 
 
+def test_indexing_image_uses_the_reviewed_vector_model_lock() -> None:
+    dockerfile = (REPOSITORY_ROOT / "services/rag-worker/Dockerfile").read_text(encoding="utf-8")
+    indexing_stage = dockerfile.split("FROM worker-source AS indexing", 1)[1].split(
+        "FROM worker-source AS evaluator", 1
+    )[0]
+    vector_lock = (REPOSITORY_ROOT / "services/rag-worker/requirements-vector.lock").read_text(
+        encoding="utf-8"
+    )
+
+    assert "-r /build/vector-requirements.lock" in indexing_stage
+    assert "sentence-transformers==5.7.0" in vector_lock
+    assert "transformers==4.55.0" in vector_lock
+
+
 def test_model_loading_security_contract_remains_pinned_and_offline() -> None:
     runtime = (
         REPOSITORY_ROOT / "services/training-runtime/deptslm_training_runtime/contract.py"

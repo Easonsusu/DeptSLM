@@ -37,7 +37,10 @@ CMD ["python", "-m", "deptslm_worker", "--poll"]
 
 FROM worker-source AS indexing
 ENV DEPTSLM_STORAGE_READ_ONLY=1
-RUN pip install --no-cache-dir --disable-pip-version-check --require-hashes -r /build/indexing-requirements.lock \
+# The indexing worker performs local embeddings and therefore uses the
+# separately reviewed, model-pinned vector lock rather than the vector-free
+# metadata/indexing lock.
+RUN pip install --no-cache-dir --disable-pip-version-check --require-hashes -r /build/vector-requirements.lock \
     && pip install --no-cache-dir --disable-pip-version-check --no-deps /build/api \
     && pip install --no-cache-dir --disable-pip-version-check --no-deps /build/worker \
     && rm -rf /build
