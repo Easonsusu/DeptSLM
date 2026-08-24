@@ -29,7 +29,13 @@ COPY services/training-runtime/entrypoint.sh /usr/local/bin/deptslm-training-run
 COPY services/training-runtime/pyproject.toml /opt/build/pyproject.toml
 COPY services/training-runtime/deptslm_training_runtime /opt/build/deptslm_training_runtime
 
-RUN /opt/llamafactory/bin/python -m pip install --disable-pip-version-check --no-cache-dir --no-build-isolation --require-hashes --requirement /opt/llamafactory/requirements.lock \
+RUN printf '%s\n' \
+    'setuptools==80.9.0 --hash=sha256:062d34222ad13e0cc312a4c02d73f059e86a4acbfbdea8f8f76b28c99f306922 --hash=sha256:f36b47402ecde768dbfafc46e8e4207b4360c654f1f3bb84475f0a28628fb19c' \
+    'wheel==0.45.1 --hash=sha256:661e1abd9198507b1409a20c02106d9670b2576e916d58f520316666abca6729 --hash=sha256:708e7481cc80179af0e556bbf0cc00b8444c7321e2700b8d8580231d13017248' \
+    > /tmp/build-tools.lock \
+    && /opt/llamafactory/bin/python -m pip install --disable-pip-version-check --no-cache-dir --no-build-isolation --require-hashes --no-deps --requirement /tmp/build-tools.lock \
+    && rm -f /tmp/build-tools.lock \
+    && /opt/llamafactory/bin/python -m pip install --disable-pip-version-check --no-cache-dir --no-build-isolation --require-hashes --requirement /opt/llamafactory/requirements.lock \
     && /opt/llamafactory/bin/python -m pip install --disable-pip-version-check --no-cache-dir --no-build-isolation --no-deps /opt/build \
     && /opt/llamafactory/bin/python -m pip check \
     && /opt/llamafactory/bin/python -I -c 'from deptslm_training_runtime.dependency_authority import verify_installed_distributions; verify_installed_distributions()' \
