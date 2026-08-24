@@ -12,6 +12,7 @@ description = "Exact historical CI fixtures are visibly synthetic and are never 
 paths = ['''^\.github/workflows/ci\.yml$''']
 regexTarget = "line"
 regexes = [
+  '''phase[0-9]+-ci-[A-Za-z0-9-]+''',
   '''phase12-ci-production-runtime-token-0123456789''',
   '''phase7-ci-runtime-token-0123456789-abcdef''',
   '''phase6-ci-compose-key-0123456789''',
