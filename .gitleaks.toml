@@ -21,7 +21,7 @@ id = "generic-api-key"
   [[rules.allowlists]]
   description = "The adapter contract documents a forbidden file suffix, not a secret."
   condition = "AND"
-  regexTarget = "match"
+  regexTarget = "line"
   paths = ['''^docs/adapter-registry\.md$''']
   regexes = ['''\.pth''']
 
