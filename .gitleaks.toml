@@ -4,13 +4,13 @@ useDefault = true
 [[allowlists]]
 description = "A test imports a separately declared synthetic secret; it is not a credential value."
 paths = ['''^apps/api/tests/test_phase13_integration\.py$''']
-regexTarget = "line"
+regexTarget = "match"
 regexes = ['''SECRET = phase7_tests\.SECRET''']
 
 [[allowlists]]
 description = "Exact historical CI fixtures are visibly synthetic and are never used outside disposable test containers."
 paths = ['''^\.github/workflows/ci\.yml$''']
-regexTarget = "line"
+regexTarget = "match"
 regexes = [
   '''phase[0-9]+-ci-[A-Za-z0-9-]+''',
   '''phase12-ci-production-runtime-token-0123456789''',
@@ -21,13 +21,13 @@ regexes = [
 [[allowlists]]
 description = "The adapter contract documents a forbidden file suffix, not a secret."
 paths = ['''^docs/adapter-registry\.md$''']
-regexTarget = "line"
+regexTarget = "match"
 regexes = ['''\.pth''']
 
 [[allowlists]]
 description = "Exact historical PostgreSQL test fixtures are synthetic and are not credentials."
 paths = ['''^apps/api/tests/test_phase[3-9]_postgres\.py$''']
-regexTarget = "line"
+regexTarget = "match"
 regexes = ['''phase-[3-9]-test-secret-0123456789-abcdefghijklmnopqrstuvwxyz''']
 
 [[allowlists]]
