@@ -45,6 +45,15 @@ ACTIVE_EXECUTION_STATUSES = ("queued", "running", "cancel_requested")
 ACTIVE_PURGE_STATUSES = ("registered", "deletion_authorized", "tombstone_bound")
 
 
+def _lock_training_job_serialization(session: Session, job_id: UUID) -> None:
+    """Hold a transaction-scoped fence for all execution mutations of a job."""
+
+    raw = job_id.bytes
+    first = int.from_bytes(raw[:4], "big", signed=True)
+    second = int.from_bytes(raw[4:8], "big", signed=True)
+    session.execute(select(func.pg_advisory_xact_lock(first, second)))
+
+
 def _server_now(session: Session) -> datetime:
     value = session.execute(select(func.clock_timestamp())).scalar_one()
     if value.tzinfo is None:
@@ -75,6 +84,7 @@ def _lock_job_first(
     ).scalar_one_or_none()
     if job is None:
         raise ServiceError(404, "Training job not found")
+    _lock_training_job_serialization(session, job.id)
     authorization = authorize_transaction(
         session,
         principal,

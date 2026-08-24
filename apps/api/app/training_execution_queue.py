@@ -91,6 +91,15 @@ def _server_now(session: Session) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
+def _lock_training_job_serialization(session: Session, job_id: UUID) -> None:
+    """Hold the same transaction-scoped fence used by API mutations."""
+
+    raw = job_id.bytes
+    first = int.from_bytes(raw[:4], "big", signed=True)
+    second = int.from_bytes(raw[4:8], "big", signed=True)
+    session.execute(select(func.pg_advisory_xact_lock(first, second)))
+
+
 def _valid_claim(
     session: Session, claim: ClaimedTrainingExecution, *, lock: bool = False
 ) -> tuple[TrainingExecution, TrainingExecutionAttempt, TrainingJob] | None:
@@ -106,6 +115,8 @@ def _valid_claim(
     job = session.execute(job_query).scalar_one_or_none()
     if job is None:
         return None
+    if lock:
+        _lock_training_job_serialization(session, job.id)
     execution_query = select(TrainingExecution).where(
         TrainingExecution.id == claim.execution_id,
         TrainingExecution.department_id == claim.department_id,
