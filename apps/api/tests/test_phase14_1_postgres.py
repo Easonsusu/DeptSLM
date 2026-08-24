@@ -11,12 +11,8 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
-from alembic.config import Config
-from sqlalchemy import event, inspect, select, text
-from sqlalchemy.orm import sessionmaker
-from test_phase11_postgres import _succeeded_training_job, _unique_code_revision
-
 from alembic import command
+from alembic.config import Config
 from app.auth import AuthenticatedPrincipal
 from app.authorization import DepartmentRequestScope, DepartmentScope
 from app.database import create_database_engine
@@ -46,6 +42,9 @@ from app.training_job_maintenance import (
     archive_training_job,
 )
 from app.training_job_services import review_training_job
+from sqlalchemy import event, inspect, select, text
+from sqlalchemy.orm import sessionmaker
+from test_phase11_postgres import _succeeded_training_job, _unique_code_revision
 
 pytestmark = pytest.mark.postgres
 
@@ -672,9 +671,7 @@ def _run_pre_row_success_cancel_race(
     TrainingExecution,
 ]:
     factory, department_id, issuer, subject, execution = _approved_execution(engine, tmp_path)
-    claim = claim_next_training_execution(
-        factory, uuid4(), 120, execution.execution_code_revision
-    )
+    claim = claim_next_training_execution(factory, uuid4(), 120, execution.execution_code_revision)
     assert claim is not None
     principal = AuthenticatedPrincipal(subject, issuer)
     with factory() as session:

@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-
 APP_ROOT = Path(__file__).resolve().parents[1] / "app"
 
 
@@ -26,11 +25,7 @@ def _call_lines(
         if not isinstance(call, ast.Call):
             continue
         target = call.func
-        if (
-            attribute is not None
-            and isinstance(target, ast.Attribute)
-            and target.attr == attribute
-        ):
+        if attribute is not None and isinstance(target, ast.Attribute) and target.attr == attribute:
             lines.append(call.lineno)
         if name is not None and isinstance(target, ast.Name) and target.id == name:
             lines.append(call.lineno)
@@ -56,9 +51,9 @@ def test_phase14_execution_paths_acquire_advisory_before_training_job_row() -> N
 def test_phase14_mutation_helpers_preserve_job_before_execution_order() -> None:
     services = _function_nodes(APP_ROOT / "training_execution_services.py")
     node = services["_authorize_execution_mutation"]
-    assert _call_lines(node, name="_lock_job_first")[0] < _call_lines(
-        node, name="_lock_execution"
-    )[0]
+    assert (
+        _call_lines(node, name="_lock_job_first")[0] < _call_lines(node, name="_lock_execution")[0]
+    )
 
 
 def test_phase14_uses_one_blocking_advisory_helper_without_try_wait_split() -> None:

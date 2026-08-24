@@ -18,9 +18,7 @@ def _advisory_key(serialization_id: UUID) -> tuple[int, int]:
     )
 
 
-def acquire_training_execution_serialization(
-    session: Session, serialization_id: UUID
-) -> None:
+def acquire_training_execution_serialization(session: Session, serialization_id: UUID) -> None:
     """Block on the exact transaction-scoped execution advisory fence.
 
     Callers must invoke this before taking the corresponding TrainingJob row
