@@ -30,7 +30,7 @@ declared external training association, not proven training provenance.
 | `web` | Next.js user interface | One-turn department answer form plus the landing page; no stored history. |
 | `api` | FastAPI control plane | Auth, content workflows, internal scoped retrieval, citation validation, and final authority; no model inference dependencies. |
 | `postgres` | Application metadata database and worker queues | Identities, memberships, content/job metadata, content-free answer/citation provenance, and audit events. |
-| `qdrant` | Local vector service | Pinned 1.13.4, localhost ports, API-key protected, fixed Phase 6 collection; no production claim. |
+| `qdrant` | Local vector service | Pinned 1.16.3, localhost ports, API-key protected, fixed Phase 6 collection; no production claim. |
 | `rag-worker` | Extraction jobs | Source verification, constrained parsing, normalization, and chunking; no Qdrant/model dependency. |
 | `indexing-worker` | Phase 6 embedding/indexing jobs | Read-only extracted/model mounts, offline pinned model, typed department Qdrant adapter; no public retrieval. |
 | `model-admin` | Explicit model preparation | Writes only the external model cache when invoked; receives no database or Qdrant credentials. |
@@ -114,13 +114,17 @@ The script searches likely directories under:
 
 It detects the existing personal-drive folder (`My Drive` or the localized `我的雲端硬碟`), creates `DeptSLM` and the required artifact subdirectories without deleting existing files, then prints the `DEPTSLM_DATA_DIR` value. With multiple accounts it chooses the strongest unambiguous match and stops without writing if the best candidates are tied.
 
-Create a local, untracked environment file:
+Create a local, untracked environment file after the external directory exists.
+The bootstrap command generates fresh local-only secrets, including the
+required PostgreSQL password and a short-lived development bearer. It refuses
+to overwrite an existing `.env`:
 
 ```bash
-umask 077
-cp .env.example .env
-chmod 600 .env
+DEPTSLM_DATA_DIR="/absolute/path/printed/by/setup" ./scripts/bootstrap_local_env.sh
 ```
+
+For a manual setup, copy `.env.example` instead, set a long random
+`DEPTSLM_POSTGRES_PASSWORD`, and keep the file mode at `600`.
 
 `scripts/compose.sh` rejects a symlink, non-regular, foreign-owned, or
 group/other-readable `.env`. `./scripts/compose.sh config` first validates the
@@ -131,7 +135,8 @@ interpolation values. Secret values are never a normal wrapper output.
 Set these values as appropriate for the local environment:
 
 - `DEPTSLM_DATA_DIR`: the absolute path printed by the setup script
-- `DATABASE_URL`: the API PostgreSQL connection URL using `postgresql+psycopg://`
+- `DEPTSLM_POSTGRES_PASSWORD`: one long untracked local secret; Compose derives
+  both PostgreSQL's password and all internal `DATABASE_URL` values from it
 - `DEPTSLM_QDRANT_URL`: indexing/admin-only Qdrant URL; local Compose uses `http://qdrant:6333`
 - `DEPTSLM_QDRANT_API_KEY`: long non-placeholder untracked key, also configured on local Qdrant
 - `DEPTSLM_QDRANT_COLLECTION`: fixed `deptslm_chunks_qwen3_0_6b_1024_v1`
@@ -142,6 +147,9 @@ Set these values as appropriate for the local environment:
 - `API_PORT`: API host port, normally `8000`
 - `WEB_PORT`: web host port, normally `3000`
 - `ENVIRONMENT`: local environment name, normally `development`
+- `DEPTSLM_WEB_DEV_BEARER_TOKEN`: server-only local bridge token. The
+  bootstrap command creates it; it is ignored in production, staging, and
+  unknown environments and is never sent to browser code.
 
 Do not commit `.env`. Do not put production credentials in `.env.example` or Compose defaults.
 
@@ -154,7 +162,19 @@ Build the API image and apply the schema through Compose before startup:
 ./scripts/compose.sh run --rm api python -m alembic upgrade head
 ```
 
-This command uses the Compose-internal `postgres` hostname from `.env`. When running Alembic directly from the host in `apps/api`, set `DATABASE_URL` to a host-accessible URL such as `postgresql+psycopg://deptslm:deptslm@localhost:5432/deptslm`; the Compose hostname does not resolve from the host.
+This command uses the Compose-internal `postgres` hostname from `.env`. When
+running Alembic directly from the host in `apps/api`, construct a temporary
+host-accessible URL from the same untracked secret; the Compose hostname does
+not resolve from the host:
+
+```bash
+DATABASE_URL="postgresql+psycopg://deptslm:${DEPTSLM_POSTGRES_PASSWORD}@localhost:5432/deptslm" \
+  python -m alembic upgrade head
+```
+
+PostgreSQL and Qdrant development ports are loopback-only (`127.0.0.1`), not
+host-wide listeners. Internal service-to-service access uses the private
+Compose networks.
 
 Bootstrap the first local department through the same image:
 
@@ -255,7 +275,15 @@ Google Drive is appropriate for the requested local artifact layout, but it is n
 
 CI must not depend on a developer's Google Drive or reuse real data. It should create a temporary directory, export that absolute path as `DEPTSLM_DATA_DIR`, run the relevant checks, and discard the directory afterward. Test inputs must be small and synthetic.
 
-GitHub Actions provides PostgreSQL 16 and Qdrant 1.13.4 with isolated test credentials. Locally, run `python -m pytest -m "not postgres and not qdrant"` without services, or provide isolated PostgreSQL/Qdrant settings. Neither suite silently skips in CI, and the fake embedding provider is accepted only with exact `ENVIRONMENT=test`. CI never downloads the real model.
+GitHub Actions provides PostgreSQL 16 and Qdrant 1.16.3 with isolated test credentials. Locally, run `python -m pytest -m "not postgres and not qdrant"` without services, or provide isolated PostgreSQL/Qdrant settings. Neither suite silently skips in CI, and the fake embedding provider is accepted only with exact `ENVIRONMENT=test`. CI never downloads the real model.
+
+Production image bases and Python deployment locks are pinned by digest or
+hash where practical. Dependabot opens low-noise weekly updates; review the
+new digest, run the Compose/static/security gates, and update the tag comment
+and digest together. The API/worker/runtime locks and CI-only test lock use
+hash verification; the CUDA training lock remains exact but platform-specific
+because its NVIDIA wheel set is selected by the pinned runtime image. Do not
+replace a digest with a mutable `latest` tag.
 
 CI builds API, extraction-worker, indexing-worker, and private RAG-runtime targets. It verifies migration `0006_phase8_rag_feedback`, confirms dependency/credential isolation and absence of model weights, runs extraction/indexing empty-queue and fake-runtime request smoke tests, exercises Qdrant bootstrap/tenant isolation/retrieval authority, and runs PostgreSQL migration/API/feedback-retention coverage with temporary `uploads`, `extracted_text`, and `model_cache`. Controlled child tests prove timeout/restart, cancellation/shutdown, framing bounds, capacity release, and a child environment without the runtime token or other secrets. Feedback tests prove PostgreSQL-only isolation and content-free schemas; they require no storage mount. Fake models are allowed only in exact test mode; real-model smokes remain opt-in. CI never uses Google Drive or downloads a model.
 

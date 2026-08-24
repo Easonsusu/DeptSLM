@@ -1,4 +1,4 @@
-FROM node:22-alpine AS dependencies
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS dependencies
 
 WORKDIR /app
 RUN corepack enable && corepack prepare pnpm@11.7.0 --activate
@@ -7,7 +7,7 @@ COPY apps/web/package.json ./apps/web/package.json
 COPY packages/shared/package.json ./packages/shared/package.json
 RUN pnpm install --frozen-lockfile --filter @deptslm/web...
 
-FROM node:22-alpine AS builder
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS builder
 
 WORKDIR /app
 RUN corepack enable && corepack prepare pnpm@11.7.0 --activate
@@ -16,7 +16,7 @@ COPY apps/web ./apps/web
 COPY packages/shared ./packages/shared
 RUN pnpm --filter @deptslm/web build
 
-FROM node:22-alpine AS runner
+FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS runner
 
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \

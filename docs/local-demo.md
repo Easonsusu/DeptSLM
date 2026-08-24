@@ -7,6 +7,11 @@ reads the repository `.env`, the user's Google Drive folder, real university
 data, or real model weights. Fake embedding and base-runtime providers are
 used with the production model revisions still pinned in the environment; the
 demo-only retrieval threshold is intentionally not a production quality gate.
+The temporary environment contains a fresh random PostgreSQL password; the
+demo never relies on the committed `deptslm/deptslm` credential (which is not
+present). The browser-facing web service is only smoke-tested for its landing
+page; the server-only development bearer bridge is not a production login
+mechanism.
 
 Run it from the repository root:
 

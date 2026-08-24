@@ -23,9 +23,7 @@ from app.main import app
 def _client(monkeypatch, tmp_path: Path, *, projection: AdapterMetadataProjection | None = None):
     (tmp_path / "uploads").mkdir()
     monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv(
-        "DATABASE_URL", "postgresql+psycopg://deptslm:deptslm@127.0.0.1:1/deptslm_test"
-    )
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://deptslm@127.0.0.1:1/deptslm_test")
     monkeypatch.setenv("ENVIRONMENT", "test")
     monkeypatch.setenv("DEPTSLM_AUTH_MODE", "disabled")
     department_id = uuid4()

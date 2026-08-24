@@ -36,6 +36,12 @@ def test_version(client: TestClient) -> None:
     assert response.json() == {"name": "DeptSLM", "version": "0.1.0"}
 
 
+def test_protected_api_without_authentication_returns_401(client: TestClient) -> None:
+    response = client.get("/auth/me")
+
+    assert response.status_code == 401
+
+
 def test_startup_requires_data_directory(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("DEPTSLM_DATA_DIR", raising=False)
 

@@ -358,12 +358,14 @@ def test_compose_wrapper_config_does_not_display_secret_sentinels() -> None:
         fake_docker.chmod(stat.S_IRWXU)
         sentinels = (
             "phase13-auth-sentinel",
+            "phase13-postgres-sentinel",
             "phase13-qdrant-sentinel",
             "phase13-rag-sentinel",
             "phase13-adapter-sentinel",
             "phase13-eval-sentinel",
             "phase13-hf-sentinel",
             "phase14-training-runtime-sentinel",
+            "phase13-web-dev-bearer-sentinel",
         )
         environment = os.environ.copy()
         environment.update(
@@ -371,12 +373,14 @@ def test_compose_wrapper_config_does_not_display_secret_sentinels() -> None:
                 "PATH": f"{fake_bin}:{environment['PATH']}",
                 "DEPTSLM_DATA_DIR": str(data_dir),
                 "DEPTSLM_AUTH_SECRET": sentinels[0],
-                "DEPTSLM_QDRANT_API_KEY": sentinels[1],
-                "DEPTSLM_RAG_RUNTIME_TOKEN": sentinels[2],
-                "DEPTSLM_ADAPTER_RUNTIME_TOKEN": sentinels[3],
-                "DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN": sentinels[4],
-                "HF_TOKEN": sentinels[5],
-                "DEPTSLM_TRAINING_RUNTIME_TOKEN": sentinels[6],
+                "DEPTSLM_POSTGRES_PASSWORD": sentinels[1],
+                "DEPTSLM_QDRANT_API_KEY": sentinels[2],
+                "DEPTSLM_RAG_RUNTIME_TOKEN": sentinels[3],
+                "DEPTSLM_ADAPTER_RUNTIME_TOKEN": sentinels[4],
+                "DEPTSLM_ADAPTER_EVAL_RUNTIME_TOKEN": sentinels[5],
+                "HF_TOKEN": sentinels[6],
+                "DEPTSLM_TRAINING_RUNTIME_TOKEN": sentinels[7],
+                "DEPTSLM_WEB_DEV_BEARER_TOKEN": sentinels[8],
             }
         )
         result = subprocess.run(

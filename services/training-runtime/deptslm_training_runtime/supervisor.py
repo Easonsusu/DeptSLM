@@ -167,11 +167,8 @@ class TrainingProcessSupervisor:
                     descriptor = log_descriptors.get(name)
                     if descriptor is not None:
                         _bounded_write(descriptor, block)
-                if process.poll() is not None:
-                    # Drain any final pipe bytes before returning.
-                    if not selector.get_map():
-                        break
                 if process.poll() is not None and not selector.get_map():
+                    # Drain any final pipe bytes before returning.
                     break
             return ProcessResult(
                 "execution_succeeded" if process.returncode == 0 else "execution_failed",

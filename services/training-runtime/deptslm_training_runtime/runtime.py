@@ -28,7 +28,10 @@ from .contract import (
     canonical_json_bytes,
     request_mapping,
 )
-from .dependency_authority import DependencyAuthorityError, verify_installed_distributions
+from .dependency_authority import (
+    DependencyAuthorityError,
+    verify_installed_distributions,
+)
 from .hardware import HardwarePreflightError, preflight_hardware
 from .model_store import ModelStoreError, validate_model_directory
 from .output_stage import inspect_output_stage

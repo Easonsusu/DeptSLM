@@ -48,7 +48,7 @@ def _root(tmp_path: Path) -> Path:
 def _settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> WorkerSettings:
     _root(tmp_path)
     monkeypatch.setenv("DEPTSLM_DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://deptslm:deptslm@127.0.0.1:1/test")
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://deptslm@127.0.0.1:1/test")
     return WorkerSettings.from_environment()
 
 
