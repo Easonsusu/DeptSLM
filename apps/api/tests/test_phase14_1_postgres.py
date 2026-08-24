@@ -98,7 +98,6 @@ class _ExecutionLockHooks:
         self.local = threading.local()
         self.first_lock: dict[str, str] = {}
         self.callbacks: dict[tuple[str, str], Callable[[], None]] = {}
-        self.events: list[tuple[str, str, int, str]] = []
         self._guard = threading.Lock()
 
     def install(self) -> None:
@@ -131,22 +130,10 @@ class _ExecutionLockHooks:
         self.callbacks[(label, kind)] = callback
 
     def _after_cursor_execute(
-        self, _connection, cursor, statement, _parameters, _context, _executemany
+        self, _connection, _cursor, statement, _parameters, _context, _executemany
     ) -> None:
         kind = self._lock_kind(statement)
         label = getattr(self.local, "participant", None)
-        normalized = " ".join(statement.lower().split())
-        if label is not None and (
-            kind is not None
-            or "update training_executions" in normalized
-            or "pg_try_advisory_xact_lock" in normalized
-            or "pg_advisory_xact_lock" in normalized
-        ):
-            event_kind = kind or (
-                "execution_update" if "update training_executions" in normalized else "advisory"
-            )
-            with self._guard:
-                self.events.append((label, event_kind, cursor.rowcount, normalized[:240]))
         if kind is None or label is None:
             return
         with self._guard:
@@ -579,12 +566,6 @@ def test_phase14_1_fake_success_vs_cancel_success_first_is_terminal(engine, tmp_
         engine, tmp_path, first_label="success"
     )
     _assert_only_expected_conflicts(errors, allowed_labels=frozenset({"cancel"}))
-    print(
-        "RACE_DIAGNOSTIC",
-        outcomes,
-        {key: type(value).__name__ for key, value in errors.items()},
-        hooks.events,
-    )
     assert hooks.first_lock == {"success": "job", "cancel": "job"}
     assert outcomes.get("success") is True
     with factory() as session:

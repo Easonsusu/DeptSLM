@@ -495,38 +495,41 @@ def cancel_training_execution(
         if execution.version != expected_version:
             raise ServiceError(409, "Training execution version conflict")
         _require_no_active_purge(session, job)
-        if execution.status == "queued":
-            execution.status = "cancelled"
-            execution.error_code = "cancelled"
-            execution.finished_at = _server_now(session)
-        elif execution.status == "running":
-            requested_at = _server_now(session)
-            result = session.execute(
+        scope_filter = (
+            TrainingExecution.id == execution.id,
+            TrainingExecution.department_id == request_scope.department.value,
+            TrainingExecution.version == expected_version,
+        )
+        requested_at = _server_now(session)
+        running_result = session.execute(
+            update(TrainingExecution)
+            .where(*scope_filter, TrainingExecution.status == "running")
+            .values(
+                status="cancel_requested",
+                cancellation_requested_at=requested_at,
+                version=TrainingExecution.version + 1,
+            )
+        )
+        transitioned = running_result.rowcount == 1
+        if not transitioned:
+            finished_at = _server_now(session)
+            queued_result = session.execute(
                 update(TrainingExecution)
-                .where(
-                    TrainingExecution.id == execution.id,
-                    TrainingExecution.department_id == request_scope.department.value,
-                    TrainingExecution.status == "running",
-                    TrainingExecution.version == expected_version,
-                )
+                .where(*scope_filter, TrainingExecution.status == "queued")
                 .values(
-                    status="cancel_requested",
-                    cancellation_requested_at=requested_at,
+                    status="cancelled",
+                    error_code="cancelled",
+                    finished_at=finished_at,
                     version=TrainingExecution.version + 1,
                 )
             )
-            if result.rowcount != 1:
-                session.expire(execution)
-                session.refresh(execution)
-                raise ServiceError(409, "Training execution version conflict")
-            session.expire(execution)
-            session.refresh(execution)
-        elif execution.status == "cancel_requested":
-            return execution
-        else:
+            transitioned = queued_result.rowcount == 1
+        session.expire(execution)
+        session.refresh(execution)
+        if not transitioned:
+            if execution.status == "cancel_requested":
+                return execution
             raise ServiceError(409, "Training execution is not cancellable")
-        if execution.status != "cancel_requested":
-            execution.version += 1
         append_mutation_audit(
             session,
             actor=authorization.identity,
