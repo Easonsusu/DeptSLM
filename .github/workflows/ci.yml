@@ -765,9 +765,15 @@ jobs:
           mount = Path("/runtime/deptslm/training_datasets")
           assert (mount / "mount-sentinel").read_text(encoding="ascii") == "compose-mount-sentinel\\n"
           assert any(
-              len(parts := line.split()) > 5
-              and parts[4] == "/runtime/deptslm/training_datasets"
-              and "ro" in parts[5].split(",")
+              len(fields := line.split()) > 5
+              and fields[4] == "/runtime/deptslm/training_datasets"
+              and (
+                  "ro" in fields[5].split(",")
+                  or (
+                      len(post := line.partition(" - ")[2].split()) >= 3
+                      and "ro" in post[2].split(",")
+                  )
+              )
               for line in Path("/proc/self/mountinfo").read_text().splitlines()
           )
           try:
