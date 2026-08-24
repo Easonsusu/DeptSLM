@@ -15,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -471,6 +471,54 @@ def _finalize(
                 status = "cancelled"
                 error_code = "cancelled"
                 classification = "execution_cancelled"
+            success_cas = False
+            if status == "succeeded" and execution.status == "running":
+                # Claim success is an explicit compare-and-set.  This keeps
+                # the success-first outcome terminal even if a stale cancel
+                # request was already queued behind the same job lock; the
+                # cancellation path uses the matching running/version guard.
+                result = session.execute(
+                    update(TrainingExecution)
+                    .where(
+                        TrainingExecution.id == execution.id,
+                        TrainingExecution.department_id == claim.department_id,
+                        TrainingExecution.training_job_id == claim.training_job_id,
+                        TrainingExecution.current_attempt_id == claim.attempt_id,
+                        TrainingExecution.worker_id == claim.worker_id,
+                        TrainingExecution.claim_token == claim.claim_token,
+                        TrainingExecution.status == "running",
+                        TrainingExecution.version == execution.version,
+                    )
+                    .values(
+                        status="succeeded",
+                        error_code=None,
+                        finished_at=now,
+                        current_attempt_id=None,
+                        worker_id=None,
+                        claim_token=None,
+                        lease_expires_at=None,
+                        version=TrainingExecution.version + 1,
+                    )
+                )
+                if result.rowcount != 1:
+                    session.expire(execution)
+                    session.refresh(execution)
+                    if execution.status == "cancel_requested":
+                        status = "cancelled"
+                        error_code = "cancelled"
+                        classification = "execution_cancelled"
+                    else:
+                        return False
+                else:
+                    execution.status = "succeeded"
+                    execution.error_code = None
+                    execution.finished_at = now
+                    execution.current_attempt_id = None
+                    execution.worker_id = None
+                    execution.claim_token = None
+                    execution.lease_expires_at = None
+                    execution.version += 1
+                    success_cas = True
             attempt.status = (
                 "succeeded"
                 if status == "succeeded"
@@ -498,14 +546,15 @@ def _finalize(
                 attempt.output_retained_at = now
                 attempt.output_purged_at = None
             attempt.version += 1
-            execution.status = status
-            execution.error_code = error_code
-            execution.finished_at = now
-            execution.current_attempt_id = None
-            execution.worker_id = None
-            execution.claim_token = None
-            execution.lease_expires_at = None
-            execution.version += 1
+            if not success_cas:
+                execution.status = status
+                execution.error_code = error_code
+                execution.finished_at = now
+                execution.current_attempt_id = None
+                execution.worker_id = None
+                execution.claim_token = None
+                execution.lease_expires_at = None
+                execution.version += 1
             if status == "succeeded":
                 actor = session.scalar(
                     select(UserIdentity).where(UserIdentity.id == job.requested_by_user_id)
