@@ -91,9 +91,20 @@ def _server_now(session: Session) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
-def _lock_training_job_serialization(session: Session, job_id: UUID) -> None:
-    """Hold the same transaction-scoped fence used by API mutations."""
+def _try_training_job_serialization(session: Session, job_id: UUID) -> bool:
+    """Try the same transaction-scoped fence used by API mutations."""
 
+    raw = job_id.bytes
+    first = int.from_bytes(raw[:4], "big", signed=True)
+    second = int.from_bytes(raw[4:8], "big", signed=True)
+    return bool(session.scalar(select(func.pg_try_advisory_xact_lock(first, second))))
+
+
+def _finish_training_job_serialization(session: Session, job_id: UUID, acquired: bool) -> None:
+    """Wait for a competing transaction's exact job fence after row lock."""
+
+    if acquired:
+        return
     raw = job_id.bytes
     first = int.from_bytes(raw[:4], "big", signed=True)
     second = int.from_bytes(raw[4:8], "big", signed=True)
@@ -112,11 +123,14 @@ def _valid_claim(
     )
     if lock:
         job_query = job_query.with_for_update()
+    serialization_acquired = (
+        _try_training_job_serialization(session, claim.training_job_id) if lock else False
+    )
     job = session.execute(job_query).scalar_one_or_none()
     if job is None:
         return None
     if lock:
-        _lock_training_job_serialization(session, job.id)
+        _finish_training_job_serialization(session, job.id, serialization_acquired)
     execution_query = select(TrainingExecution).where(
         TrainingExecution.id == claim.execution_id,
         TrainingExecution.department_id == claim.department_id,

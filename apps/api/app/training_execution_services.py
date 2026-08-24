@@ -45,9 +45,20 @@ ACTIVE_EXECUTION_STATUSES = ("queued", "running", "cancel_requested")
 ACTIVE_PURGE_STATUSES = ("registered", "deletion_authorized", "tombstone_bound")
 
 
-def _lock_training_job_serialization(session: Session, job_id: UUID) -> None:
-    """Hold a transaction-scoped fence for all execution mutations of a job."""
+def _try_training_job_serialization(session: Session, job_id: UUID) -> bool:
+    """Try to acquire the transaction-scoped execution fence before row lock."""
 
+    raw = job_id.bytes
+    first = int.from_bytes(raw[:4], "big", signed=True)
+    second = int.from_bytes(raw[4:8], "big", signed=True)
+    return bool(session.scalar(select(func.pg_try_advisory_xact_lock(first, second))))
+
+
+def _finish_training_job_serialization(session: Session, job_id: UUID, acquired: bool) -> None:
+    """Wait for a competing transaction's exact job fence after row lock."""
+
+    if acquired:
+        return
     raw = job_id.bytes
     first = int.from_bytes(raw[:4], "big", signed=True)
     second = int.from_bytes(raw[4:8], "big", signed=True)
@@ -76,6 +87,7 @@ def _lock_job_first(
         lock=False,
         audit_action="training.execution.authorization.selector",
     )
+    serialization_acquired = _try_training_job_serialization(session, job_id)
     job = session.execute(
         select(TrainingJob)
         .where(TrainingJob.id == job_id, TrainingJob.department_id == scope.department.value)
@@ -84,7 +96,7 @@ def _lock_job_first(
     ).scalar_one_or_none()
     if job is None:
         raise ServiceError(404, "Training job not found")
-    _lock_training_job_serialization(session, job.id)
+    _finish_training_job_serialization(session, job.id, serialization_acquired)
     authorization = authorize_transaction(
         session,
         principal,
