@@ -39,6 +39,10 @@ from app.training_execution_domain import (  # noqa: E402
     TrainingExecutionError,
     execution_authority_fingerprint,
 )
+from app.training_execution_queue import (  # noqa: E402
+    _closed_stop_reason,
+    _external_stop_reason,
+)
 from app.training_execution_runtime import (  # noqa: E402
     RUNTIME_TRAINING_TIMEOUT_SECONDS,
     StopReason,
@@ -47,10 +51,6 @@ from app.training_execution_runtime import (  # noqa: E402
     TrainingRuntimeResult,
     UnixTrainingRuntimeClient,
     _stop_reason,
-)
-from app.training_execution_queue import (  # noqa: E402
-    _closed_stop_reason,
-    _external_stop_reason,
 )
 
 
