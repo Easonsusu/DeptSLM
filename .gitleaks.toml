@@ -1,35 +1,46 @@
 [extend]
 useDefault = true
 
-[[allowlists]]
-description = "A test imports a separately declared synthetic secret; it is not a credential value."
-paths = ['''^apps/api/tests/test_phase13_integration\.py$''']
-regexTarget = "match"
-regexes = ['''SECRET = phase7_tests\.SECRET''']
+[[rules]]
+id = "generic-api-key"
 
-[[allowlists]]
-description = "Exact historical CI fixtures are visibly synthetic and are never used outside disposable test containers."
-paths = ['''^\.github/workflows/ci\.yml$''']
-regexTarget = "match"
-regexes = [
-  '''phase[0-9]+-ci-[A-Za-z0-9-]+''',
-  '''phase12-ci-production-runtime-token-0123456789''',
-  '''phase7-ci-runtime-token-0123456789-abcdef''',
-  '''phase6-ci-compose-key-0123456789''',
-]
+  [[rules.allowlists]]
+  description = "The Phase 13 integration test imports a separately declared synthetic secret."
+  condition = "AND"
+  regexTarget = "secret"
+  paths = ['''^apps/api/tests/test_phase13_integration\.py$''']
+  regexes = ['''phase7_tests\.SECRET''']
 
-[[allowlists]]
-description = "The adapter contract documents a forbidden file suffix, not a secret."
-paths = ['''^docs/adapter-registry\.md$''']
-regexTarget = "match"
-regexes = ['''\.pth''']
+  [[rules.allowlists]]
+  description = "The historical CI Qdrant fixture is synthetic and disposable."
+  condition = "AND"
+  regexTarget = "secret"
+  paths = ['''^\.github/workflows/ci\.yml$''']
+  regexes = ['''phase6-ci-compose-key-0123456789''']
 
-[[allowlists]]
-description = "Exact historical PostgreSQL test fixtures are synthetic and are not credentials."
-paths = ['''^apps/api/tests/test_phase[3-9]_postgres\.py$''']
-regexTarget = "match"
-regexes = ['''phase-[3-9]-test-secret-0123456789-abcdefghijklmnopqrstuvwxyz''']
+  [[rules.allowlists]]
+  description = "The adapter contract documents a forbidden file suffix, not a secret."
+  condition = "AND"
+  regexTarget = "match"
+  paths = ['''^docs/adapter-registry\.md$''']
+  regexes = ['''\.pth''']
 
-[[allowlists]]
-description = "Next build output is ignored generated data and is never committed."
-paths = ['''^apps/web/\.next/''']
+  [[rules.allowlists]]
+  description = "The historical PostgreSQL test fixtures are synthetic and are not credentials."
+  condition = "AND"
+  regexTarget = "secret"
+  paths = ['''^apps/api/tests/test_phase[3-9]_postgres\.py$''']
+  regexes = ['''phase-[3-9]-test-secret-0123456789-abcdefghijklmnopqrstuvwxyz''']
+
+[[rules]]
+id = "curl-auth-header"
+
+  [[rules.allowlists]]
+  description = "Historical CI authorization headers use disposable synthetic tokens."
+  condition = "AND"
+  regexTarget = "match"
+  paths = ['''^\.github/workflows/ci\.yml$''']
+  regexes = [
+    '''phase12-ci-production-runtime-token-0123456789''',
+    '''phase7-ci-runtime-token-0123456789-abcdef''',
+  ]
