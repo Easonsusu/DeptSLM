@@ -29,6 +29,11 @@ retention timestamps in migration `0019_phase14_training_runtime`. A successful
 real attempt keeps private candidate output fenced for later reviewed handoff;
 it is not an authoritative adapter.
 
+`TrainingJob.code_revision` is the Phase 11 bundle/manifest authority, while
+`TrainingExecution.execution_code_revision` is the independently configured
+Phase 14 executor authority. Both are content-free metadata and are retained
+and fingerprinted separately; migration `0019` remains the current head.
+
 ## Entities
 
 ```mermaid

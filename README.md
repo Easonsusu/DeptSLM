@@ -72,6 +72,12 @@ DeptSLM is a university departmental small language model (SLM) customization pl
 > and Phase 15 remain unstarted. See [the training
 > execution contract](docs/training-execution.md).
 
+Phase 11 bundle code and Phase 14 executor code are separate authorities:
+`TrainingJob.code_revision` is checked against the immutable bundle manifest,
+while `DEPTSLM_TRAINING_EXECUTION_CODE_REVISION` identifies the deployed
+executor. Both exact lowercase SHAs are captured and fingerprinted; no fallback
+or equality requirement exists between them.
+
 The governance worker is deliberately narrower than the API: its dedicated
 settings loader requires PostgreSQL plus only the external read-only
 `adapters/registry` root. It validates the exact three-file registry-final

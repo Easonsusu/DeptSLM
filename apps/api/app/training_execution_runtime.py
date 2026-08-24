@@ -57,16 +57,15 @@ def _stop_reason(value: object) -> StopReason | None:
     if isinstance(value, StopReason):
         return value
     if value is True:
-        # Existing injected tests used a boolean callback.  Preserve its
-        # fail-closed meaning while production callbacks return a closed
-        # reason so cancellation is not confused with claim loss.
-        return StopReason.CLAIM_LOST
+        # A legacy external callback can only signal worker shutdown.  Claim
+        # loss is supplied separately by the server-authoritative callback.
+        return StopReason.WORKER_SHUTDOWN
     if isinstance(value, str):
         try:
             return StopReason(value)
         except ValueError:
-            return StopReason.CLAIM_LOST
-    return StopReason.CLAIM_LOST
+            return StopReason.WORKER_SHUTDOWN
+    return StopReason.WORKER_SHUTDOWN
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,11 +82,12 @@ class TrainingRuntimeRequest:
     base_model_id: str
     base_model_revision: str
     attempt_namespace: UUID
+    training_job_code_revision: str
+    execution_code_revision: str
     runtime_contract_version: str = ""
     dependency_lock_sha256: str = ""
     environment_profile_id: str = ""
     expected_environment_fingerprint: str = ""
-    execution_code_revision: str = ""
 
     def as_closed_mapping(self) -> dict[str, object]:
         return {
@@ -106,6 +106,7 @@ class TrainingRuntimeRequest:
             "dependency_lock_sha256": self.dependency_lock_sha256,
             "environment_profile_id": self.environment_profile_id,
             "expected_environment_fingerprint": self.expected_environment_fingerprint,
+            "training_job_code_revision": self.training_job_code_revision,
             "execution_code_revision": self.execution_code_revision,
         }
 
@@ -252,8 +253,8 @@ class TrainingExecutionRuntime(Protocol):
         request: TrainingRuntimeRequest,
         *,
         handles: TrainingRuntimeHandles,
-        should_stop: Callable[[], bool],
-        heartbeat: Callable[[], None],
+        should_stop: Callable[[], object],
+        heartbeat: Callable[[], object],
     ) -> TrainingRuntimeResult | dict[str, object]: ...
 
 
@@ -265,8 +266,8 @@ class UnavailableTrainingRuntime:
         request: TrainingRuntimeRequest,
         *,
         handles: TrainingRuntimeHandles,
-        should_stop: Callable[[], bool],
-        heartbeat: Callable[[], None],
+        should_stop: Callable[[], object],
+        heartbeat: Callable[[], object],
     ) -> TrainingRuntimeResult:
         del handles, should_stop, heartbeat
         return TrainingRuntimeResult(
@@ -317,7 +318,7 @@ class UnixTrainingRuntimeClient:
         request: TrainingRuntimeRequest,
         *,
         handles: TrainingRuntimeHandles,
-        should_stop: Callable[[], bool],
+        should_stop: Callable[[], object],
         heartbeat: Callable[[], object],
     ) -> TrainingRuntimeResult:
         validate_runtime_request(request)
@@ -362,11 +363,12 @@ class UnixTrainingRuntimeClient:
             now = time.monotonic()
             if now - last_heartbeat >= self._heartbeat_interval:
                 heartbeat_value = heartbeat()
-                heartbeat_reason = (
-                    StopReason.CLAIM_LOST
-                    if heartbeat_value is False
-                    else _stop_reason(heartbeat_value)
-                )
+                if heartbeat_value is False:
+                    heartbeat_reason = StopReason.CLAIM_LOST
+                elif heartbeat_value is True:
+                    heartbeat_reason = None
+                else:
+                    heartbeat_reason = _stop_reason(heartbeat_value)
                 if heartbeat_reason is not None:
                     send_stop(heartbeat_reason, deadline)
                     raise TrainingExecutionError(heartbeat_reason.value)
@@ -571,6 +573,8 @@ def validate_runtime_request(request: TrainingRuntimeRequest) -> None:
         or request.profile_id not in EXECUTION_PROFILES
         or request.base_model_id != EXECUTION_MODEL_ID
         or request.base_model_revision != EXECUTION_MODEL_REVISION
+        or not re.fullmatch(r"[0-9a-f]{40}", request.training_job_code_revision)
+        or not re.fullmatch(r"[0-9a-f]{40}", request.execution_code_revision)
         or re.fullmatch(r"[0-9a-f]{64}", request.authority_fingerprint) is None
         or re.fullmatch(r"[0-9a-f]{64}", request.input_snapshot_fingerprint) is None
         or any(
@@ -594,8 +598,6 @@ def validate_runtime_request(request: TrainingRuntimeRequest) -> None:
         if not request.environment_profile_id or not re.fullmatch(
             r"[0-9a-f]{64}", request.expected_environment_fingerprint
         ):
-            raise TrainingExecutionError("runtime_protocol_invalid")
-        if not re.fullmatch(r"[0-9a-f]{40}", request.execution_code_revision):
             raise TrainingExecutionError("runtime_protocol_invalid")
 
 

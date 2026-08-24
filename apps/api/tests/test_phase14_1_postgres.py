@@ -412,7 +412,7 @@ def _approved_execution(
                 training_job_id=job.id,
                 expected_training_job_version=job.version,
             ),
-            code_revision=job.code_revision,
+            execution_code_revision="b" * 40,
         )
         execution_id = execution.id
     with factory() as session:
@@ -441,7 +441,7 @@ def test_phase14_1_captures_immutable_authority_and_enforces_active_uniqueness(
                     training_job_id=job.id,
                     expected_training_job_version=job.version,
                 ),
-                code_revision=job.code_revision,
+                execution_code_revision="b" * 40,
             )
 
 
@@ -795,7 +795,7 @@ def _run_enqueue_archive_race(
                     training_job_id=training_job_id,
                     expected_training_job_version=expected_job_version,
                 ),
-                code_revision=code_revision,
+                execution_code_revision=code_revision,
             ).status
 
     def archive() -> object:
@@ -891,7 +891,7 @@ def _run_enqueue_purge_registration_race(
                     training_job_id=training_job_id,
                     expected_training_job_version=expected_job_version,
                 ),
-                code_revision=code_revision,
+                execution_code_revision=code_revision,
             ).status
 
     def purge() -> object:

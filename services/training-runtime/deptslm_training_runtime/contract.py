@@ -166,6 +166,7 @@ def request_mapping(value: dict[str, Any]) -> dict[str, Any]:
         "dependency_lock_sha256",
         "environment_profile_id",
         "expected_environment_fingerprint",
+        "training_job_code_revision",
         "execution_code_revision",
     }
     if set(value) != expected:
@@ -206,7 +207,9 @@ def request_mapping(value: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value[key], str) or re.fullmatch(r"[0-9a-f]{64}", value[key]) is None:
             raise ValueError("runtime_protocol_invalid")
     if (
-        not isinstance(value["execution_code_revision"], str)
+        not isinstance(value["training_job_code_revision"], str)
+        or re.fullmatch(r"[0-9a-f]{40}", value["training_job_code_revision"]) is None
+        or not isinstance(value["execution_code_revision"], str)
         or re.fullmatch(r"[0-9a-f]{40}", value["execution_code_revision"]) is None
     ):
         raise ValueError("runtime_protocol_invalid")

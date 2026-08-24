@@ -287,6 +287,7 @@ def _parent_from_job(
         "execution_code_revision": execution_code_revision,
         "authority_fingerprint": execution_authority_fingerprint(
             execution_id=execution_id,
+            training_job_code_revision=job.code_revision,
             execution_code_revision=execution_code_revision,
             snapshot=snapshot,
         ),
@@ -303,7 +304,7 @@ def enqueue_training_execution(
     request_scope: DepartmentRequestScope,
     request: TrainingExecutionCreateRequest,
     *,
-    code_revision: str | None = None,
+    execution_code_revision: str | None = None,
 ) -> TrainingExecution:
     try:
         job, authorization = _lock_job_first(
@@ -312,15 +313,17 @@ def enqueue_training_execution(
         if job.version != request.expected_training_job_version:
             raise ServiceError(409, "Training job version conflict")
         snapshot = _require_phase11_authority(session, job)
-        execution_revision = code_revision or job.code_revision
-        if re.fullmatch(r"[0-9a-f]{40}", execution_revision) is None:
+        if (
+            execution_code_revision is None
+            or re.fullmatch(r"[0-9a-f]{40}", execution_code_revision) is None
+        ):
             raise ServiceError(409, "Training execution code authority is unavailable")
         execution = _parent_from_job(
             execution_id=uuid4(),
             job=job,
             requester_id=authorization.identity.id,
             snapshot=snapshot,
-            execution_code_revision=execution_revision,
+            execution_code_revision=execution_code_revision,
         )
         session.add(execution)
         session.flush()

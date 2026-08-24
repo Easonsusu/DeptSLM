@@ -228,14 +228,19 @@ def authority_fingerprint(snapshot: dict[str, Any]) -> str:
 
 
 def execution_authority_fingerprint(
-    *, execution_id: UUID, execution_code_revision: str, snapshot: dict[str, Any]
+    *,
+    execution_id: UUID,
+    training_job_code_revision: str,
+    execution_code_revision: str,
+    snapshot: dict[str, Any],
 ) -> str:
-    """Hash the complete Phase 11 snapshot under the Phase 14 contract."""
+    """Hash the complete Phase 11 snapshot and both execution authorities."""
 
     return authority_fingerprint(
         {
             "execution_contract_version": EXECUTION_CONTRACT_VERSION,
             "job": snapshot,
+            "training_job_code_revision": training_job_code_revision,
             "execution_id": str(execution_id),
             "execution_code_revision": execution_code_revision,
         }
@@ -270,6 +275,7 @@ def real_runtime_fingerprint(
     base_model_id: str,
     base_model_revision: str,
     profile_id: str,
+    training_job_code_revision: str,
     execution_code_revision: str,
     output_stage_fingerprint: str,
 ) -> str:
@@ -297,6 +303,7 @@ def real_runtime_fingerprint(
                 "base_model_id": base_model_id,
                 "base_model_revision": base_model_revision,
                 "profile_id": profile_id,
+                "training_job_code_revision": training_job_code_revision,
                 "execution_code_revision": execution_code_revision,
                 "output_stage_fingerprint": output_stage_fingerprint,
             }
@@ -388,6 +395,7 @@ def validate_real_runtime_result(
     profile_id: str,
     base_model_id: str,
     base_model_revision: str,
+    training_job_code_revision: str,
     execution_code_revision: str,
     dependency_lock_sha256: str,
     environment_profile_id: str,
@@ -481,6 +489,7 @@ def validate_real_runtime_result(
         base_model_id=base_model_id,
         base_model_revision=base_model_revision,
         profile_id=profile_id,
+        training_job_code_revision=training_job_code_revision,
         execution_code_revision=execution_code_revision,
         output_stage_fingerprint=result["output_stage_fingerprint"],
     )

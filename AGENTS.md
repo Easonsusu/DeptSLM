@@ -168,6 +168,12 @@ Hugging Face token. LoRA and QLoRA NF4 support fail closed on unreviewed
 hardware; no silent CPU, precision, quantization, or device fallback is
 allowed.
 
+Phase 11 bundle generation and Phase 14 execution use separate code
+authorities: `TrainingJob.code_revision` must match the immutable Phase 11
+manifest, while the executor must receive the exact lowercase SHA from
+`DEPTSLM_TRAINING_EXECUTION_CODE_REVISION`. Capture and fingerprint both; do
+not infer one from the other or require equality.
+
 The private runtime image is pinned to the reviewed CUDA 12.6 digest
 `sha256:8aef630a54bc5c5146ae5ce68e6af5caa3df0fb690bb91544175c91f307e4356`,
 the hash-locked dependency graph, and its installed-distribution manifest.

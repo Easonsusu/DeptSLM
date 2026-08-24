@@ -99,6 +99,13 @@ Phase 11 bundle and cannot turn filesystem presence or a zero exit code into
 authority. Candidate adapter bytes are private and non-authoritative until a
 future Phase 14.3 handoff.
 
+The Phase 11 bundle revision and the Phase 14 executor revision are separate
+security authorities. `TrainingJob.code_revision` is checked against the
+immutable Phase 11 manifest; the executor uses only the exact lowercase SHA
+from `DEPTSLM_TRAINING_EXECUTION_CODE_REVISION`. Both are frozen in the
+control-plane authority and attempt fingerprints, so a changed bundle or a
+changed executor is rejected independently.
+
 Phase 14 provides no hardware or cryptographic attestation. A compromised
 host or runtime can invalidate the supervised-execution provenance claim; this
 residual risk remains explicitly outside the contract. Real execution,

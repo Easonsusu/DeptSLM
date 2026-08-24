@@ -326,7 +326,7 @@ def _parse_manifest(raw: bytes, request: dict[str, object]) -> dict[str, object]
         or value.get("evaluation_contamination_reviewed") is not True
     ):
         raise TrainingConfigError("training_config_invalid")
-    if value.get("code_revision") != request.get("execution_code_revision"):
+    if value.get("code_revision") != request.get("training_job_code_revision"):
         raise TrainingConfigError("training_config_invalid")
     for key in (
         "department_id",
@@ -483,6 +483,7 @@ def _real_runtime_fingerprint(request: dict[str, object], hardware: object, outp
         "base_model_id": request["base_model_id"],
         "base_model_revision": request["base_model_revision"],
         "profile_id": request["profile_id"],
+        "training_job_code_revision": request.get("training_job_code_revision", ""),
         "execution_code_revision": request.get("execution_code_revision", ""),
         "output_stage_fingerprint": output,
     }

@@ -80,6 +80,7 @@ class ClaimedTrainingExecution:
     base_model_id: str
     base_model_revision: str
     llamafactory_version: str
+    training_job_code_revision: str
     execution_code_revision: str
 
 
@@ -143,9 +144,13 @@ def _valid_claim(
         or execution.authority_fingerprint
         != execution_authority_fingerprint(
             execution_id=execution.id,
+            training_job_code_revision=execution.training_job_code_revision,
             execution_code_revision=execution.execution_code_revision,
             snapshot=training_job_authority_snapshot(job),
         )
+        or execution.training_job_code_revision != job.code_revision
+        or execution.training_job_code_revision != claim.training_job_code_revision
+        or execution.execution_code_revision != claim.execution_code_revision
     ):
         return None
     return execution, attempt, job
@@ -155,7 +160,7 @@ def check_execution_claim(factory: sessionmaker[Session], claim: ClaimedTraining
     try:
         with factory() as session:
             return _valid_claim(session, claim) is not None
-    except SQLAlchemyError:
+    except (SQLAlchemyError, TrainingExecutionQueueError):
         return False
 
 
@@ -178,12 +183,48 @@ def execution_stop_reason(
             if owned[0].status == "cancel_requested":
                 return StopReason.CANCELLED.value
             return None
-    except SQLAlchemyError:
+    except (SQLAlchemyError, TrainingExecutionQueueError):
         # Database unavailability cannot be treated as user cancellation or
         # ownership.  It is a worker shutdown-style fail-closed interruption;
         # finalization still requires a live claim and therefore cannot
         # terminalize a replacement's execution.
         return StopReason.WORKER_SHUTDOWN.value
+
+
+def _external_stop_reason(value: object) -> str | None:
+    """Normalize an injected worker signal to one closed stop reason.
+
+    A legacy boolean callback is intentionally interpreted as worker shutdown,
+    never as claim loss.  Runtime IPC receives only the resulting closed value.
+    """
+
+    if value is None or value is False:
+        return None
+    if isinstance(value, StopReason):
+        return value.value
+    if value is True:
+        return StopReason.WORKER_SHUTDOWN.value
+    if isinstance(value, str):
+        try:
+            return StopReason(value).value
+        except ValueError:
+            return StopReason.WORKER_SHUTDOWN.value
+    return StopReason.WORKER_SHUTDOWN.value
+
+
+def _closed_stop_reason(
+    *, external: object, authoritative: str | None, deadline_reached: bool
+) -> str | None:
+    """Combine external, server, and deadline signals without type collapse."""
+
+    external_reason = _external_stop_reason(external)
+    if external_reason is not None:
+        return external_reason
+    if authoritative is not None:
+        return _external_stop_reason(authoritative)
+    if deadline_reached:
+        return StopReason.WORKER_TIMEOUT.value
+    return None
 
 
 def renew_execution_lease(
@@ -202,21 +243,24 @@ def renew_execution_lease(
             attempt.lease_expires_at = expires
             attempt.version += 1
             return True
-    except SQLAlchemyError:
+    except (SQLAlchemyError, TrainingExecutionQueueError):
         return False
 
 
 def claim_next_training_execution(
-    factory: sessionmaker[Session], worker_id: UUID, lease_seconds: int, code_revision: str
+    factory: sessionmaker[Session],
+    worker_id: UUID,
+    lease_seconds: int,
+    execution_code_revision: str,
 ) -> ClaimedTrainingExecution | None:
-    if re.fullmatch(r"[0-9a-f]{40}", code_revision) is None:
+    if re.fullmatch(r"[0-9a-f]{40}", execution_code_revision) is None:
         raise TrainingExecutionQueueError("training_job_authority_changed")
     try:
         with factory.begin() as session:
             candidate = session.scalar(
                 select(TrainingExecution.id)
                 .where(
-                    TrainingExecution.execution_code_revision == code_revision,
+                    TrainingExecution.execution_code_revision == execution_code_revision,
                     (TrainingExecution.status == "queued")
                     | (
                         TrainingExecution.status.in_(("running", "cancel_requested"))
@@ -287,6 +331,7 @@ def claim_next_training_execution(
             snapshot = training_job_authority_snapshot(job)
             expected_fp = execution_authority_fingerprint(
                 execution_id=execution.id,
+                training_job_code_revision=execution.training_job_code_revision,
                 execution_code_revision=execution.execution_code_revision,
                 snapshot=snapshot,
             )
@@ -303,7 +348,7 @@ def claim_next_training_execution(
             if (
                 job.profile_id not in EXECUTION_PROFILES
                 or job.code_revision != execution.training_job_code_revision
-                or code_revision != execution.execution_code_revision
+                or execution_code_revision != execution.execution_code_revision
             ):
                 execution.status = "failed"
                 execution.error_code = "training_job_authority_changed"
@@ -383,6 +428,7 @@ def claim_next_training_execution(
                 base_model_id=execution.base_model_id,
                 base_model_revision=execution.base_model_revision,
                 llamafactory_version=execution.llamafactory_version,
+                training_job_code_revision=execution.training_job_code_revision,
                 execution_code_revision=execution.execution_code_revision,
             )
     except TrainingExecutionQueueError:
@@ -475,7 +521,7 @@ def _finalize(
                         resource_id=execution.id,
                     )
             return not purge_conflict
-    except SQLAlchemyError:
+    except (SQLAlchemyError, TrainingExecutionQueueError):
         return False
 
 
@@ -487,7 +533,7 @@ def process_training_execution(
     runtime: TrainingExecutionRuntime | None = None,
     lease_seconds: int = 300,
     operation_seconds: int = DEFAULT_OPERATION_SECONDS,
-    should_stop: Callable[[], bool] = lambda: False,
+    should_stop: Callable[[], object] = lambda: False,
 ) -> bool:
     deadline = time.monotonic() + max(1, operation_seconds)
     if runtime is None:
@@ -502,14 +548,17 @@ def process_training_execution(
         )
 
     def checkpoint() -> None:
-        requested_stop = should_stop()
-        if requested_stop:
-            if isinstance(requested_stop, str) and requested_stop in EXECUTION_ERROR_CODES:
-                raise TrainingExecutionQueueError(requested_stop)
-            raise TrainingExecutionQueueError(StopReason.WORKER_SHUTDOWN.value)
-        if time.monotonic() >= deadline:
-            raise TrainingExecutionQueueError(StopReason.WORKER_TIMEOUT.value)
-        reason = execution_stop_reason(factory, claim)
+        reason = _closed_stop_reason(
+            external=should_stop(), authoritative=None, deadline_reached=False
+        )
+        if reason is None and time.monotonic() >= deadline:
+            reason = StopReason.WORKER_TIMEOUT.value
+        if reason is None:
+            reason = _closed_stop_reason(
+                external=None,
+                authoritative=execution_stop_reason(factory, claim),
+                deadline_reached=False,
+            )
         if reason is not None:
             raise TrainingExecutionQueueError(reason)
 
@@ -564,9 +613,25 @@ def process_training_execution(
                 expected_environment_fingerprint=os.getenv(
                     "DEPTSLM_TRAINING_ENVIRONMENT_FINGERPRINT", ""
                 ),
+                training_job_code_revision=claim.training_job_code_revision,
                 execution_code_revision=claim.execution_code_revision,
             )
             validate_runtime_request(request)
+
+            def runtime_stop_reason() -> str | None:
+                reason = _closed_stop_reason(
+                    external=should_stop(), authoritative=None, deadline_reached=False
+                )
+                if reason is None and time.monotonic() >= deadline:
+                    reason = StopReason.WORKER_TIMEOUT.value
+                if reason is None:
+                    reason = _closed_stop_reason(
+                        external=None,
+                        authoritative=execution_stop_reason(factory, claim),
+                        deadline_reached=False,
+                    )
+                return reason
+
             result = runtime.run(
                 request,
                 handles=TrainingRuntimeHandles(
@@ -575,7 +640,7 @@ def process_training_execution(
                     logs_fd=stage.logs_fd,
                     output_stage_fd=stage.output_stage_fd,
                 ),
-                should_stop=lambda: should_stop() or execution_stop_reason(factory, claim) or False,
+                should_stop=runtime_stop_reason,
                 heartbeat=lambda: renew_execution_lease(factory, claim, lease_seconds),
             )
             result_mapping = (
@@ -598,6 +663,7 @@ def process_training_execution(
                     profile_id=claim.profile_id,
                     base_model_id=claim.base_model_id,
                     base_model_revision=claim.base_model_revision,
+                    training_job_code_revision=claim.training_job_code_revision,
                     execution_code_revision=claim.execution_code_revision,
                     dependency_lock_sha256=request.dependency_lock_sha256,
                     environment_profile_id=request.environment_profile_id,
@@ -734,6 +800,7 @@ __all__ = [
     "TrainingExecutionQueueError",
     "check_execution_claim",
     "claim_next_training_execution",
+    "_closed_stop_reason",
     "execution_should_stop",
     "execution_stop_reason",
     "process_training_execution",

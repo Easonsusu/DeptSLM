@@ -35,13 +35,22 @@ from deptslm_training_runtime.ipc import (  # noqa: E402
 )
 from deptslm_training_runtime.output_stage import inspect_output_stage  # noqa: E402
 
-from app.training_execution_domain import TrainingExecutionError  # noqa: E402
+from app.training_execution_domain import (  # noqa: E402
+    TrainingExecutionError,
+    execution_authority_fingerprint,
+)
 from app.training_execution_runtime import (  # noqa: E402
     RUNTIME_TRAINING_TIMEOUT_SECONDS,
+    StopReason,
     TrainingRuntimeHandles,
     TrainingRuntimeRequest,
     TrainingRuntimeResult,
     UnixTrainingRuntimeClient,
+    _stop_reason,
+)
+from app.training_execution_queue import (  # noqa: E402
+    _closed_stop_reason,
+    _external_stop_reason,
 )
 
 
@@ -62,6 +71,7 @@ def _request() -> dict[str, object]:
         "dependency_lock_sha256": "c" * 64,
         "environment_profile_id": "deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1",
         "expected_environment_fingerprint": "d" * 64,
+        "training_job_code_revision": "f" * 40,
         "execution_code_revision": "e" * 40,
     }
 
@@ -76,6 +86,59 @@ def test_real_runtime_contract_is_exact_and_profiles_are_closed() -> None:
     }
     assert SEMANTIC_PROFILES["phase11-qwen3-0.6b-lora-v1"]["enable_liger_kernel"] is False
     assert SEMANTIC_PROFILES["phase11-qwen3-0.6b-qlora-nf4-v1"]["quantization_type"] == "nf4"
+
+
+def test_phase11_and_phase14_code_authorities_are_independent() -> None:
+    training_job_revision = "1" * 40
+    execution_revision = "2" * 40
+    other_revision = "3" * 40
+    execution_id = uuid4()
+    snapshot = {"code_revision": training_job_revision, "status": "succeeded"}
+    first = execution_authority_fingerprint(
+        execution_id=execution_id,
+        training_job_code_revision=training_job_revision,
+        execution_code_revision=execution_revision,
+        snapshot=snapshot,
+    )
+    changed_job = execution_authority_fingerprint(
+        execution_id=execution_id,
+        training_job_code_revision=other_revision,
+        execution_code_revision=execution_revision,
+        snapshot={**snapshot, "code_revision": other_revision},
+    )
+    changed_executor = execution_authority_fingerprint(
+        execution_id=execution_id,
+        training_job_code_revision=training_job_revision,
+        execution_code_revision=other_revision,
+        snapshot=snapshot,
+    )
+    assert first != changed_job
+    assert first != changed_executor
+
+
+def test_external_stop_signals_are_closed_and_do_not_collapse_to_claim_loss() -> None:
+    assert _external_stop_reason(False) is None
+    assert _external_stop_reason(True) == StopReason.WORKER_SHUTDOWN.value
+    assert _stop_reason(True) is StopReason.WORKER_SHUTDOWN
+    assert _external_stop_reason(StopReason.CANCELLED) == StopReason.CANCELLED.value
+    assert _external_stop_reason("claim_lost") == StopReason.CLAIM_LOST.value
+    assert _external_stop_reason("unexpected") == StopReason.WORKER_SHUTDOWN.value
+    assert (
+        _closed_stop_reason(
+            external=False, authoritative=StopReason.CANCELLED.value, deadline_reached=False
+        )
+        == StopReason.CANCELLED.value
+    )
+    assert (
+        _closed_stop_reason(external=False, authoritative=None, deadline_reached=True)
+        == StopReason.WORKER_TIMEOUT.value
+    )
+    assert (
+        _closed_stop_reason(
+            external=True, authoritative=StopReason.CLAIM_LOST.value, deadline_reached=True
+        )
+        == StopReason.WORKER_SHUTDOWN.value
+    )
 
 
 def test_runtime_request_rejects_paths_and_unknown_fields() -> None:
@@ -191,6 +254,7 @@ def test_real_client_has_explicit_process_ready_and_separate_training_deadline(
         dependency_lock_sha256="c" * 64,
         environment_profile_id="deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1",
         expected_environment_fingerprint="d" * 64,
+        training_job_code_revision="f" * 40,
         execution_code_revision="e" * 40,
     )
     directories = []

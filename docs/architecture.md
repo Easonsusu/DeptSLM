@@ -384,3 +384,10 @@ request and are never serialized or persisted. Phase 14.2 may retain private
 non-authoritative candidate output after a real success and keeps the exact
 Phase 11 source fenced until Phase 14.3. No adapter is published or handed to
 Phase 12, and Phase 14.3/15 remain separate.
+
+Phase 11 bundle generation and Phase 14 execution use independent authorities:
+`TrainingJob.code_revision` is the immutable bundle/manifest authority, while
+`DEPTSLM_TRAINING_EXECUTION_CODE_REVISION` is the separately validated executor
+authority. Enqueue, claim, runtime IPC, and result fingerprints capture both
+exact lowercase SHAs; the runtime never falls back between them or requires
+them to be equal.

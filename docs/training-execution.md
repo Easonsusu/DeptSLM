@@ -51,6 +51,22 @@ browser content, caller-supplied model/repository, CLI flags, environment
 variables, failed/queued/running or stale jobs, purged jobs, or a Phase 10
 dataset without an approved Phase 11 job.
 
+### Independent code authorities
+
+Phase 11 `TrainingJob.code_revision` and Phase 14.2
+`TrainingExecution.execution_code_revision` are independent frozen authorities.
+The former is copied into the five-file Phase 11 bundle and is the value the
+private runtime compares with `manifest.json.code_revision`. The latter comes
+only from `DEPTSLM_TRAINING_EXECUTION_CODE_REVISION`, identifies the deployed
+Phase 14 executor, and is required for enqueue, claim, runtime IPC, and
+provenance validation. They must both be exact lowercase 40-character SHAs;
+neither is inferred from or required to equal the other. The authority and
+attempt fingerprints bind the complete Phase 11 snapshot plus both revisions.
+For example, a bundle generated at `1111111111111111111111111111111111111111`
+may be executed only by a separately configured executor at
+`2222222222222222222222222222222222222222` when both authorities are captured
+and revalidated.
+
 ## 2. Preserved training semantics
 
 The reviewed semantic contract remains:
@@ -207,8 +223,9 @@ are content-free provenance, not runtime authority by themselves.
 
 The worker sends exactly four private directory descriptors (`input`,
 `scratch`, `logs`, `output_stage`) over a private Unix socket using SCM_RIGHTS.
-The closed request contains no path, descriptor integer, config, command,
-credentials, or training content. HMAC-SHA256 over canonical request bytes and
+The closed request contains both code-revision authorities but no path,
+descriptor integer, config, command, credentials, or training content.
+HMAC-SHA256 over canonical request bytes and
 a fresh nonce, constant-time comparison, restrictive socket ownership, and
 Linux `SO_PEERCRED` supplement the server-side scope checks.
 

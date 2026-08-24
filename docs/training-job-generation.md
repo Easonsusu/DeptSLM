@@ -27,3 +27,8 @@ lock. Phase 12 intake remains explicit and administrator-controlled; Phase 14.2
 candidate bytes remain private and non-authoritative. No automatic handoff,
 evaluation, approval, promotion, rollback, or routing is added. Phase 14.3
 remains unstarted.
+
+The Phase 11 bundle's `code_revision` remains its immutable manifest authority.
+Phase 14.2 executes it under the separate exact SHA supplied by
+`DEPTSLM_TRAINING_EXECUTION_CODE_REVISION`; the two authorities are captured
+independently and are not inferred or required to match.

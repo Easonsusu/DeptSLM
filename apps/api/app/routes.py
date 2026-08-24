@@ -1904,7 +1904,7 @@ async def post_training_execution(
                 principal,
                 request_scope,
                 body,
-                code_revision=request.app.state.settings.training_job_code_revision,
+                execution_code_revision=request.app.state.settings.training_execution_code_revision,
             )
         )
     except ServiceError as error:

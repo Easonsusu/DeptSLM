@@ -44,6 +44,7 @@ def _request() -> dict[str, object]:
         "dependency_lock_sha256": "c" * 64,
         "environment_profile_id": "deptslm-phase14-training-runtime-linux-x86_64-cuda126-v1",
         "expected_environment_fingerprint": "d" * 64,
+        "training_job_code_revision": "f" * 40,
         "execution_code_revision": "e" * 40,
     }
 
