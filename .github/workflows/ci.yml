@@ -786,12 +786,12 @@ jobs:
           mkdir -p "$DEPTSLM_DATA_DIR"/adapters/.purge-deleting/{source_stage,source_final,registry_stage,registry_final}
           mkdir -p "$DEPTSLM_DATA_DIR/service_state"/{postgres,qdrant}
           chmod 0777 "$DEPTSLM_DATA_DIR/training_datasets"
-          printf 'compose-mount-sentinel\n' > "$DEPTSLM_DATA_DIR/training_datasets/mount-sentinel"
+          printf 'deptslm-compose-training-datasets-sentinel\n' > "$DEPTSLM_DATA_DIR/training_datasets/deptslm-ci-training-datasets-mount-sentinel"
           ./scripts/compose.sh config --quiet
           ./scripts/compose.sh --profile training run --rm --no-deps --entrypoint python training-execution-worker -I -c '
           from pathlib import Path
           mount = Path("/runtime/deptslm/training_datasets")
-          assert (mount / "mount-sentinel").read_text(encoding="ascii") == "compose-mount-sentinel\n"
+          assert (mount / "deptslm-ci-training-datasets-mount-sentinel").read_text(encoding="ascii") == "deptslm-compose-training-datasets-sentinel\n"
           try:
               (mount / "must-not-write").write_text("x", encoding="ascii")
           except OSError:
